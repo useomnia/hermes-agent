@@ -337,6 +337,36 @@ class TestAdapterInit:
         assert isinstance(agent, FakeAgent)
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
 
+    def test_create_agent_forwards_reasoning_callback(self, monkeypatch):
+        """_create_agent threads reasoning_callback into AIAgent so the agent
+        can stream reasoning deltas back to the chat-completions SSE writer."""
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {})
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda: {"enabled": True}),
+        )
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        def _sentinel(_text):
+            return None
+
+        adapter._create_agent(session_id="api-session", reasoning_callback=_sentinel)
+
+        assert captured["reasoning_callback"] is _sentinel
+
 
 # ---------------------------------------------------------------------------
 # Auth checking
@@ -1118,6 +1148,77 @@ class TestChatCompletionsEndpoint:
                                 assert "ls -la" not in content or content == "Here are the files."
                 # Final content must also be present
                 assert "Here are the files." in body
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_reasoning_content(self, adapter):
+        """reasoning_callback deltas surface as delta.reasoning_content chunks,
+        ordered before the visible answer and never mixed into delta.content."""
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                reason_cb = kwargs.get("reasoning_callback")
+                text_cb = kwargs.get("stream_delta_callback")
+                # Reasoning streams first (thinking phase), then the answer.
+                if reason_cb:
+                    reason_cb("Let me think")
+                    reason_cb(" about it.")
+                    reason_cb("")    # empty deltas must be dropped, not emitted
+                    reason_cb(None)  # None must neither crash nor emit a null chunk
+                if text_cb:
+                    await asyncio.sleep(0.05)
+                    text_cb("The answer is 42.")
+                return (
+                    {"final_response": "The answer is 42.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "what is the answer"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "[DONE]" in body
+
+        reasoning_parts: list = []
+        content_parts: list = []
+        order: list = []  # "reasoning" / "content" in arrival order
+        for line in body.splitlines():
+            if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                continue
+            try:
+                chunk = _json.loads(line[len("data: "):])
+            except _json.JSONDecodeError:
+                continue
+            if chunk.get("object") != "chat.completion.chunk":
+                continue
+            for choice in chunk.get("choices", []):
+                delta = choice.get("delta", {})
+                if "reasoning_content" in delta:
+                    reasoning_parts.append(delta["reasoning_content"])
+                    order.append("reasoning")
+                if delta.get("content"):
+                    content_parts.append(delta["content"])
+                    order.append("content")
+
+        # Reasoning streamed incrementally on the reasoning_content channel.
+        assert "".join(reasoning_parts) == "Let me think about it."
+        # Visible answer streamed as content, kept separate from reasoning.
+        assert "".join(content_parts) == "The answer is 42."
+        # Empty / None reasoning deltas were dropped, not emitted as chunks.
+        assert "" not in reasoning_parts and None not in reasoning_parts
+        # All reasoning arrives before the visible answer (OpenAI ordering).
+        assert order == ["reasoning", "reasoning", "content"]
+        # Reasoning text must never leak into delta.content.
+        assert "Let me think" not in "".join(content_parts)
 
     @pytest.mark.asyncio
     async def test_stream_tool_progress_skips_internal_events(self, adapter):
