@@ -42,6 +42,7 @@ you pass `HERMES_E2E_REBUILD=1`.
 | `test_smoke.py` | `/health`, bearer auth is enforced, `/v1/models` advertises the model, a basic non-streaming chat completion |
 | `test_structured_output.py` | `response_format: json_schema` (chat **and** `/v1/responses`) is enforced; `response_format: json_object` matches the backend's expected behavior |
 | `test_streaming.py` | SSE yields content deltas; `delta.reasoning_content` is well-formed when the backend emits reasoning |
+| `test_subagent_progress.py` | a `delegate_task` batch streams its child activity as `event: hermes.tool.progress` (`subagent.*` status + identity fields), well-formed when the model delegates |
 
 ## How it works
 
@@ -112,7 +113,8 @@ HERMES_E2E=1 HERMES_E2E_REBUILD=1 pytest tests/e2e/gateway -v -s
 `HERMES_E2E_REBUILD=1` forces a fresh `docker build` so you're probing the new
 code, not a stale image. A green run means the gateway still speaks the
 OpenAI-compatible contract (auth, models, json_schema, json_object, streaming +
-`reasoning_content`) across every backend you have a key for.
+`reasoning_content`, and `hermes.tool.progress` subagent events) across every
+backend you have a key for.
 
 ## Knobs (env vars)
 

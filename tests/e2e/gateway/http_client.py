@@ -62,11 +62,19 @@ class GatewayClient:
         except urllib.error.HTTPError as err:
             return Response(err.code, err.read().decode("utf-8", "replace"))
 
-    def stream(self, path: str, payload: dict, *, auth: bool = True) -> Iterator[str]:
-        """Yield SSE ``data:`` payload lines (the part after ``data: ``).
+    def stream_events(
+        self, path: str, payload: dict, *, auth: bool = True
+    ) -> Iterator[tuple[str, str]]:
+        """Yield ``(event, data)`` for each dispatched SSE block.
 
-        ``[DONE]`` sentinels are skipped. Raises ``HTTPError`` for non-2xx so
-        callers see the failure rather than an empty stream.
+        ``event`` is the name from the block's ``event:`` line, or the SSE
+        default ``"message"`` when the block has none. This is the only way to
+        tell apart channels multiplexed on one connection under different event
+        names: the default chat-completion chunks carry no ``event:`` line (so
+        ``"message"``), while tool progress rides a custom
+        ``event: hermes.tool.progress``. ``[DONE]`` sentinels are skipped.
+        Raises ``HTTPError`` for non-2xx so callers see the failure rather than
+        an empty stream.
         """
         body = {**payload, "stream": True}
         req = urllib.request.Request(
@@ -76,13 +84,27 @@ class GatewayClient:
             headers=self._headers(auth=auth, stream=True),
         )
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            event = "message"
             for raw in resp:
                 line = raw.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[len("data:"):].strip()
-                if data and data != "[DONE]":
-                    yield data
+                if not line:
+                    event = "message"  # blank line dispatches the block — reset
+                elif line.startswith("event:"):
+                    event = line[len("event:"):].strip()
+                elif line.startswith("data:"):
+                    data = line[len("data:"):].strip()
+                    if data and data != "[DONE]":
+                        yield (event, data)
+
+    def stream(self, path: str, payload: dict, *, auth: bool = True) -> Iterator[str]:
+        """Yield SSE ``data:`` payload lines (the part after ``data: ``).
+
+        Event names are discarded — every block's data is yielded flat. Use
+        :meth:`stream_events` when you need to tell channels apart by event name
+        (e.g. ``hermes.tool.progress``). ``[DONE]`` sentinels are skipped.
+        """
+        for _, data in self.stream_events(path, payload, auth=auth):
+            yield data
 
 
 # ── payload extractors ──────────────────────────────────────────────────────
@@ -110,3 +132,24 @@ def chat_delta(chunk: dict) -> dict:
         return chunk["choices"][0].get("delta") or {}
     except (KeyError, IndexError, TypeError):
         return {}
+
+
+# The SSE event name the gateway uses for its tool-progress channel — distinct
+# from the unnamed (default ``"message"``) chat-completion chunks. Match it
+# against the first element of a :meth:`GatewayClient.stream_events` pair.
+TOOL_PROGRESS_EVENT = "hermes.tool.progress"
+
+
+def tool_progress(data: str) -> Optional[dict]:
+    """Decode a ``hermes.tool.progress`` event's ``data`` payload.
+
+    Unlike chat chunks, the progress event's ``data`` *is* the progress object —
+    ``tool``/``status``/``preview``, plus for delegated work the child-identity
+    fields (``subagent_id``/``parent_id``/``depth``/``task_index``/…). Returns
+    the decoded dict, or ``None`` if the payload isn't a JSON object.
+    """
+    try:
+        obj = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
