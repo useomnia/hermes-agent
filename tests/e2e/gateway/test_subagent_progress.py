@@ -7,6 +7,10 @@ as a custom ``event: hermes.tool.progress`` — so a multi-minute delegation
 isn't silent on the wire, and a client disconnect (the stop button) is noticed
 promptly instead of only at the 30s SSE keepalive.
 
+This also covers the live per-subagent trace: each child streams its reasoning
+and its response up as ``subagent.reasoning`` / ``subagent.response`` events,
+whose ``preview`` carries the running (tail-capped) text.
+
 Like the reasoning probe, this validates *shape when present* and skips when the
 backend produces no subagent activity: whether a model chooses to delegate for a
 given prompt — and whether ``delegate_task`` is in the image's toolset — is
@@ -77,6 +81,12 @@ def test_subagent_progress_shape(gateway):
         # Always set by the gateway, even when the underlying event names no
         # tool (then it's None) — assert presence, not truthiness.
         assert "tool" in ev, f"progress event missing 'tool' key: {ev}"
+        # preview is always set too, but is None for events that carry no text
+        # (e.g. subagent.start); when present it's the streamed string.
+        if ev.get("preview") is not None:
+            assert isinstance(ev["preview"], str), (
+                f"preview must be a str when set, got {ev['preview']!r}"
+            )
         for key in _INT_FIELDS:
             if key in ev:
                 assert isinstance(ev[key], int) and not isinstance(ev[key], bool), (
@@ -85,3 +95,40 @@ def test_subagent_progress_shape(gateway):
         for key in _STR_FIELDS:
             if key in ev:
                 assert isinstance(ev[key], str), f"{key} must be a str, got {ev[key]!r}"
+
+
+def test_subagent_reasoning_and_response_streamed(gateway):
+    """Each subagent streams its reasoning / response up as a live trace.
+
+    ``subagent.reasoning`` and ``subagent.response`` carry the child's running,
+    tail-capped text in ``preview``. Like the rest of this probe it's presence-
+    gated: a model that delegates but emits no reasoning/response stream (or no
+    delegation at all) skips rather than fails.
+    """
+    progress = _collect_subagent_progress(gateway)
+    if not progress:
+        pytest.skip(
+            f"{gateway.provider.id} streamed no subagent.* progress for this prompt "
+            "(model didn't delegate, or delegate_task isn't in the image's toolset)"
+        )
+
+    streamed = [
+        ev for ev in progress if ev.get("status") in ("subagent.reasoning", "subagent.response")
+    ]
+    if not streamed:
+        pytest.skip(
+            f"{gateway.provider.id} delegated but streamed no subagent.reasoning/"
+            "subagent.response events (model emitted no reasoning/response stream)"
+        )
+
+    for ev in streamed:
+        preview = ev.get("preview")
+        assert isinstance(preview, str) and preview.strip(), (
+            f"{ev['status']} must carry non-empty preview text, got {preview!r}"
+        )
+        # The trace is keyed per child by subagent_id — present whenever the
+        # delegation assigned one (presence-gated, like the other identity fields).
+        if "subagent_id" in ev:
+            assert isinstance(ev["subagent_id"], str), (
+                f"subagent_id must be a str, got {ev['subagent_id']!r}"
+            )
