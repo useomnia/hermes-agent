@@ -774,6 +774,14 @@ def _build_child_progress_callback(
             _relay("subagent.complete", preview=preview, **kwargs)
             return
 
+        # Streamed reasoning / response relayed up from the child agent (the
+        # spawn site wires child.reasoning_callback / stream_delta_callback to
+        # fire these with the running, tail-capped text). Pass them straight
+        # through so the gateway can stream a live per-subagent trace.
+        if event_type in ("subagent.reasoning", "subagent.response"):
+            _relay(event_type, preview=preview, **kwargs)
+            return
+
         # Normalise legacy strings, new-style "delegate.*" strings, and
         # DelegateEvent enum values all to a single DelegateEvent.  The
         # original implementation only accepted the five legacy strings;
@@ -1147,6 +1155,47 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+
+    # Stream the child's reasoning and response up to the parent as
+    # subagent.reasoning / subagent.response, so the chat can show a live trace
+    # per subagent (the child's first-line teaser was all that surfaced before).
+    # We relay the running, tail-capped text, throttled by a growth step to bound
+    # SSE traffic / re-renders; _omnio_stream_flush emits the final tail on
+    # completion. The child runs the streaming path because these callbacks make
+    # _has_stream_consumers() true.
+    if child_progress_cb:
+        _STREAM_CAP = 4000  # keep only the tail — reasoning/response can be long
+        _STREAM_STEP = 48  # relay once this many new chars have accumulated
+
+        def _make_stream_relay(event_name, _cb=child_progress_cb):
+            chunks = []
+            sent_len = [0]
+
+            def _relay(text="", *, flush=False):
+                if text:
+                    chunks.append(text)
+                acc = "".join(chunks)
+                if len(acc) > _STREAM_CAP:
+                    acc = acc[-_STREAM_CAP:]
+                    chunks[:] = [acc]
+                if not acc or (not flush and len(acc) - sent_len[0] < _STREAM_STEP):
+                    return
+                sent_len[0] = len(acc)
+                try:
+                    _cb(event_name, preview=acc)
+                except Exception as exc:
+                    logger.debug("%s relay failed: %s", event_name, exc)
+
+            return _relay
+
+        _reasoning_relay = _make_stream_relay("subagent.reasoning")
+        _response_relay = _make_stream_relay("subagent.response")
+        child.reasoning_callback = lambda text: _reasoning_relay(text)
+        child.stream_delta_callback = lambda text: _response_relay(text)
+        child._omnio_stream_flush = lambda: (
+            _reasoning_relay(flush=True),
+            _response_relay(flush=True),
+        )
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -1630,6 +1679,15 @@ def _run_single_child(
                 child_progress_cb._flush()
             except Exception as e:
                 logger.debug("Progress callback flush failed: %s", e)
+
+        # Emit the final tail of the streamed reasoning / response trace (the
+        # throttle may have held back the last sub-step worth of characters).
+        _stream_flush = getattr(child, "_omnio_stream_flush", None)
+        if _stream_flush is not None:
+            try:
+                _stream_flush()
+            except Exception as e:
+                logger.debug("Subagent stream flush failed: %s", e)
 
         duration = round(time.monotonic() - child_start, 2)
 

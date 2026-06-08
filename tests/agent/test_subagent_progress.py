@@ -158,6 +158,34 @@ class TestBuildChildProgressCallback:
         assert parent_cb.call_args.args[0] == "subagent.thinking"
         assert parent_cb.call_args.args[2] == "some reasoning text"
 
+    def test_reasoning_event_passed_through_to_gateway(self):
+        """A child's streamed reasoning rides subagent.reasoning, verbatim."""
+        parent = MagicMock()
+        parent._delegate_spinner = None
+        parent_cb = MagicMock()
+        parent.tool_progress_callback = parent_cb
+
+        cb = _build_child_progress_callback(0, "test goal", parent)
+        cb("subagent.reasoning", preview="weighing the antique mirror angle")
+
+        parent_cb.assert_called_once()
+        assert parent_cb.call_args.args[0] == "subagent.reasoning"
+        assert parent_cb.call_args.args[2] == "weighing the antique mirror angle"
+
+    def test_response_event_passed_through_to_gateway(self):
+        """A child's streamed response rides subagent.response, verbatim."""
+        parent = MagicMock()
+        parent._delegate_spinner = None
+        parent_cb = MagicMock()
+        parent.tool_progress_callback = parent_cb
+
+        cb = _build_child_progress_callback(0, "test goal", parent)
+        cb("subagent.response", preview="She found the antique mirror at the estate sale")
+
+        parent_cb.assert_called_once()
+        assert parent_cb.call_args.args[0] == "subagent.response"
+        assert parent_cb.call_args.args[2] == "She found the antique mirror at the estate sale"
+
     def test_parallel_callbacks_independent(self):
         """Each child's callback batches tool names independently."""
         parent = MagicMock()
