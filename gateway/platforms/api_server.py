@@ -1953,14 +1953,35 @@ class APIServerAdapter(BasePlatformAdapter):
                     except Exception:
                         pass
 
+            def _on_tool_progress(event_type, name=None, preview=None, args=None, **kwargs):
+                """Forward SUBAGENT activity so a ``delegate_task`` batch isn't silent.
+
+                ``run_agent`` fires ``tool_progress_callback`` side-by-side with the
+                structured ``tool_start``/``tool_complete`` callbacks for the parent's
+                OWN tools, so forwarding ``tool.started``/``tool.completed`` here would
+                double-emit what ``_on_tool_start``/``_on_tool_complete`` already put on
+                the wire.  Subagent events (``subagent.*``) have no other channel:
+                without them a multi-minute ``delegate_task`` batch streams nothing, so
+                a client disconnect (the stop button) isn't observed until the 30s SSE
+                keepalive.  Forward only those.
+                """
+                if not isinstance(event_type, str) or not event_type.startswith("subagent"):
+                    return
+                progress = {"tool": name, "status": event_type, "preview": preview}
+                for key in ("subagent_id", "parent_id", "depth", "task_index",
+                            "task_count", "goal", "tool_count"):
+                    if key in kwargs:
+                        progress[key] = kwargs[key]
+                _stream_q.put(("__tool_progress__", progress))
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             #
-            # ``tool_progress_callback`` is intentionally not wired here:
-            # it would duplicate every emit because ``run_agent`` fires it
-            # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
-            # The structured callbacks are strictly richer (they carry the
-            # tool_call id), so they own the chat-completions SSE channel.
+            # ``tool_progress_callback`` is wired to ``_on_tool_progress`` above,
+            # which forwards ONLY ``subagent.*`` events.  The parent's own tools
+            # arrive on this callback too (``tool.started``/``tool.completed``,
+            # fired side-by-side with the structured callbacks), so the filter
+            # avoids double-emitting what ``_on_tool_start``/``_on_tool_complete`` own.
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -1969,6 +1990,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 reasoning_callback=_on_reasoning,
+                tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,

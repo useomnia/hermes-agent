@@ -1150,6 +1150,93 @@ class TestChatCompletionsEndpoint:
                 assert "Here are the files." in body
 
     @pytest.mark.asyncio
+    async def test_stream_forwards_subagent_progress(self, adapter):
+        """subagent.* events (a child's activity, relayed up while
+        delegate_task blocks) surface on the tool-progress channel, so the
+        stream isn't silent during a delegation batch."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                tp_cb = kwargs.get("tool_progress_callback")
+                cb = kwargs.get("stream_delta_callback")
+                if tp_cb:
+                    tp_cb(
+                        "subagent.tool",
+                        "web_search",
+                        'web_search("docs")',
+                        {"query": "docs"},
+                        subagent_id="s1",
+                        task_index=0,
+                    )
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("Delegated and done.")
+                return (
+                    {"final_response": "Delegated and done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "delegate this"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "event: hermes.tool.progress" in body
+                assert '"status": "subagent.tool"' in body
+                assert '"tool": "web_search"' in body
+                assert '"subagent_id": "s1"' in body
+
+    @pytest.mark.asyncio
+    async def test_stream_subagent_filter_drops_toplevel_tool_progress(self, adapter):
+        """The parent's own tools arrive on tool_progress_callback too
+        (side-by-side with the structured tool_start/tool_complete callbacks),
+        so forwarding tool.* here would double-emit. The subagent-only filter
+        drops them; the structured callbacks own that channel."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                tp_cb = kwargs.get("tool_progress_callback")
+                cb = kwargs.get("stream_delta_callback")
+                # Top-level lifecycle on the progress channel only; the
+                # structured tool_start_callback is deliberately NOT fired here.
+                if tp_cb:
+                    tp_cb("tool.started", "terminal", "terminal(ls)", {"command": "ls"})
+                    tp_cb("tool.completed", "terminal", None, "ok")
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("Done.")
+                return (
+                    {"final_response": "Done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "run a tool"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                # Filter dropped the tool.* events and the structured callback
+                # wasn't fired, so no progress event reaches the wire.
+                assert "event: hermes.tool.progress" not in body
+                assert "Done." in body
+
+    @pytest.mark.asyncio
     async def test_stream_emits_reasoning_content(self, adapter):
         """reasoning_callback deltas surface as delta.reasoning_content chunks,
         ordered before the visible answer and never mixed into delta.content."""
