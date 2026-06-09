@@ -9,7 +9,8 @@ promptly instead of only at the 30s SSE keepalive.
 
 This also covers the live per-subagent trace: each child streams its reasoning
 and its response up as ``subagent.reasoning`` / ``subagent.response`` events,
-whose ``preview`` carries the running (tail-capped) text.
+whose ``preview`` carries an incremental delta (the new text since the last
+event, not the running cumulative string); the client appends them.
 
 Like the reasoning probe, this validates *shape when present* and skips when the
 backend produces no subagent activity: whether a model chooses to delegate for a
@@ -100,10 +101,11 @@ def test_subagent_progress_shape(gateway):
 def test_subagent_reasoning_and_response_streamed(gateway):
     """Each subagent streams its reasoning / response up as a live trace.
 
-    ``subagent.reasoning`` and ``subagent.response`` carry the child's running,
-    tail-capped text in ``preview``. Like the rest of this probe it's presence-
-    gated: a model that delegates but emits no reasoning/response stream (or no
-    delegation at all) skips rather than fails.
+    ``subagent.reasoning`` and ``subagent.response`` carry the child's text as
+    incremental deltas in ``preview`` (new chars since the last event, not the
+    cumulative string). Like the rest of this probe it's presence-gated: a model
+    that delegates but emits no reasoning/response stream (or no delegation at
+    all) skips rather than fails.
     """
     progress = _collect_subagent_progress(gateway)
     if not progress:

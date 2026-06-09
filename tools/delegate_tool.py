@@ -776,8 +776,9 @@ def _build_child_progress_callback(
 
         # Streamed reasoning / response relayed up from the child agent (the
         # spawn site wires child.reasoning_callback / stream_delta_callback to
-        # fire these with the running, tail-capped text). Pass them straight
-        # through so the gateway can stream a live per-subagent trace.
+        # fire these with incremental delta text — the new chars since the last
+        # relay, not the cumulative string). Pass them straight through so the
+        # gateway can stream a live per-subagent trace that the client appends.
         if event_type in ("subagent.reasoning", "subagent.response"):
             _relay(event_type, preview=preview, **kwargs)
             return
@@ -1159,30 +1160,33 @@ def _build_child_agent(
     # Stream the child's reasoning and response up to the parent as
     # subagent.reasoning / subagent.response, so the chat can show a live trace
     # per subagent (the child's first-line teaser was all that surfaced before).
-    # We relay the running, tail-capped text, throttled by a growth step to bound
-    # SSE traffic / re-renders; _omnio_stream_flush emits the final tail on
-    # completion. The child runs the streaming path because these callbacks make
-    # _has_stream_consumers() true.
+    # We relay incremental DELTAS — each event carries only the new text since
+    # the last relay, never the running cumulative string — so traffic is O(n)
+    # and the client appends without a length cap (long reasoning/response are no
+    # longer truncated to a 4000-char tail). Deltas are coalesced by a growth
+    # step so we don't emit per token; _omnio_stream_flush emits the final
+    # buffered delta on completion. This mirrors the parent agent, which streams
+    # true delta.reasoning_content / delta.content. The child runs the streaming
+    # path because these callbacks make _has_stream_consumers() true.
     if child_progress_cb:
-        _STREAM_CAP = 4000  # keep only the tail — reasoning/response can be long
-        _STREAM_STEP = 48  # relay once this many new chars have accumulated
+        _STREAM_STEP = 48  # coalesce deltas until this many new chars, then relay
 
         def _make_stream_relay(event_name, _cb=child_progress_cb):
-            chunks = []
-            sent_len = [0]
+            # Buffer incoming deltas and emit the buffered DELTA (new text only)
+            # once it reaches _STREAM_STEP chars, or on flush — never the running
+            # cumulative text. The client reconstructs the full string by
+            # appending, so nothing is dropped and there is no tail cap.
+            pending = []
 
             def _relay(text="", *, flush=False):
                 if text:
-                    chunks.append(text)
-                acc = "".join(chunks)
-                if len(acc) > _STREAM_CAP:
-                    acc = acc[-_STREAM_CAP:]
-                    chunks[:] = [acc]
-                if not acc or (not flush and len(acc) - sent_len[0] < _STREAM_STEP):
+                    pending.append(text)
+                buffered = "".join(pending)
+                if not buffered or (not flush and len(buffered) < _STREAM_STEP):
                     return
-                sent_len[0] = len(acc)
+                pending.clear()
                 try:
-                    _cb(event_name, preview=acc)
+                    _cb(event_name, preview=buffered)
                 except Exception as exc:
                     logger.debug("%s relay failed: %s", event_name, exc)
 
