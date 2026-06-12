@@ -4235,6 +4235,43 @@ class APIServerAdapter(BasePlatformAdapter):
             "recorded": recorded,
         })
 
+    async def _handle_mcp_reload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/mcp/reload — reconnect MCP servers so a tool connected (or
+        disconnected) mid-conversation is picked up without restarting the gateway.
+
+        Re-reads config.yaml and re-fetches each server's tools/list — the same
+        shutdown+discover the ``/reload-mcp`` slash command runs. The chat path
+        builds a fresh agent per turn from the live registry (``_create_agent``),
+        so the next turn in any conversation on this gateway sees the updated tool
+        set — no ``/new``, no restart, no history loss. Used by Omnia after a
+        brand connects/disconnects a connector.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        loop = asyncio.get_running_loop()
+        try:
+            from tools.mcp_tool import _lock, _servers, discover_mcp_tools, shutdown_mcp_servers
+
+            with _lock:
+                old_servers = set(_servers.keys())
+            await loop.run_in_executor(None, shutdown_mcp_servers)
+            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+            with _lock:
+                connected = set(_servers.keys())
+        except Exception as exc:
+            logger.exception("[api_server] MCP reload failed")
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        return web.json_response({
+            "object": "hermes.mcp.reload",
+            "servers": sorted(connected),
+            "added": sorted(connected - old_servers),
+            "removed": sorted(old_servers - connected),
+            "tools": len(new_tools),
+        })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -4362,6 +4399,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
             # Omnia non-blocking connector-write approval (see _handle_omnio_tool_approval).
             self._app.router.add_post("/v1/omnio/tool-approval", self._handle_omnio_tool_approval)
+            # Mid-session MCP reconnect (see _handle_mcp_reload) — Omnia triggers it
+            # after a brand connects/disconnects a connector.
+            self._app.router.add_post("/v1/mcp/reload", self._handle_mcp_reload)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
