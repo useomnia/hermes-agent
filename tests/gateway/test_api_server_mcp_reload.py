@@ -4,6 +4,8 @@ Covers auth and that the endpoint runs the same shutdown+discover the
 /reload-mcp slash command uses, reporting which servers were added/removed.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -72,3 +74,35 @@ async def test_reload_reconnects_and_reports_added_servers(adapter, monkeypatch)
     assert body["added"] == ["connectors"]
     assert body["removed"] == []
     assert body["tools"] == 2
+
+
+@pytest.mark.asyncio
+async def test_reload_nudges_the_conversation_when_a_session_id_is_present(adapter, monkeypatch):
+    monkeypatch.setattr(mcp_tool, "_servers", {})
+    monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", lambda: None)
+    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: [])
+    db = MagicMock()
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: db)
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/v1/mcp/reload", headers={"X-Hermes-Session-Id": "sess-1"})
+        assert resp.status == 200
+
+    db.append_message.assert_called_once()
+    assert db.append_message.call_args.args[0] == "sess-1"
+
+
+@pytest.mark.asyncio
+async def test_reload_does_not_nudge_without_a_session_id(adapter, monkeypatch):
+    monkeypatch.setattr(mcp_tool, "_servers", {})
+    monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", lambda: None)
+    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: [])
+    db = MagicMock()
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: db)
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        await cli.post("/v1/mcp/reload")
+
+    db.append_message.assert_not_called()

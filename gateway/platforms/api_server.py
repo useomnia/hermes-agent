@@ -4264,6 +4264,29 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.exception("[api_server] MCP reload failed")
             return web.json_response(_openai_error(str(exc)), status=500)
 
+        # Best-effort nudge: drop a one-line note into the conversation that
+        # triggered the reload (its X-Hermes-Session-Id) so the agent knows its
+        # tools changed — not just that they silently appeared. Appended at the
+        # end of the transcript; the tool-schema change already invalidated the
+        # prompt-cache prefix, so the position adds no extra cache cost. Mirrors
+        # the /reload-mcp slash command's reload note.
+        session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if session_id:
+            try:
+                db = self._ensure_session_db()
+                if db is not None:
+                    db.append_message(
+                        session_id,
+                        "user",
+                        content=(
+                            "[Your connected data sources just changed — your available "
+                            "tools have been updated accordingly. Re-check what you can "
+                            "do before telling the user a source isn't connected.]"
+                        ),
+                    )
+            except Exception:
+                logger.debug("[api_server] MCP reload nudge append failed", exc_info=True)
+
         return web.json_response({
             "object": "hermes.mcp.reload",
             "servers": sorted(connected),
