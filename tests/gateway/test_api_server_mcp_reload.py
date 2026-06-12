@@ -77,7 +77,11 @@ async def test_reload_reconnects_and_reports_added_servers(adapter, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_reload_nudges_the_conversation_when_a_session_id_is_present(adapter, monkeypatch):
+async def test_reload_does_not_append_a_session_db_nudge(adapter, monkeypatch):
+    # The only caller (Omnia's OpenAI chat path) is client-authoritative for
+    # history, so a session-DB nudge would never reach its agent — the awareness
+    # is injected client-side instead. The reload must therefore NOT touch the
+    # session DB, even when a session id is present.
     monkeypatch.setattr(mcp_tool, "_servers", {})
     monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", lambda: None)
     monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: [])
@@ -88,21 +92,5 @@ async def test_reload_nudges_the_conversation_when_a_session_id_is_present(adapt
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.post("/v1/mcp/reload", headers={"X-Hermes-Session-Id": "sess-1"})
         assert resp.status == 200
-
-    db.append_message.assert_called_once()
-    assert db.append_message.call_args.args[0] == "sess-1"
-
-
-@pytest.mark.asyncio
-async def test_reload_does_not_nudge_without_a_session_id(adapter, monkeypatch):
-    monkeypatch.setattr(mcp_tool, "_servers", {})
-    monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", lambda: None)
-    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: [])
-    db = MagicMock()
-    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: db)
-
-    app = _create_app(adapter)
-    async with TestClient(TestServer(app)) as cli:
-        await cli.post("/v1/mcp/reload")
 
     db.append_message.assert_not_called()
