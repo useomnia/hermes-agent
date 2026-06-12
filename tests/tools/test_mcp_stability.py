@@ -476,8 +476,10 @@ class TestMCPInitialConnectionRetry:
 
         asyncio.get_event_loop().run_until_complete(_run())
 
-    def test_initial_connect_gives_up_after_max_retries(self):
-        """Server gives up after _MAX_INITIAL_CONNECT_RETRIES failures."""
+    def test_initial_connect_unblocks_startup_but_keeps_retrying(self):
+        """After the fast retries, the server stops blocking startup (error set,
+        _ready fired) but does NOT give up — it keeps retrying in the background
+        so a startup transient can self-heal."""
         from tools.mcp_tool import MCPServerTask, _MAX_INITIAL_CONNECT_RETRIES
 
         call_count = 0
@@ -495,13 +497,73 @@ class TestMCPInitialConnectionRetry:
                 task = asyncio.ensure_future(server.run({"command": "fake"}))
                 await server._ready.wait()
 
-                # Should have an error after exhausting retries
+                # Startup is unblocked with the error surfaced, after exactly the
+                # fast-retry budget (1 initial + N retries).
                 assert server._error is not None
                 assert "DNS resolution failed" in str(server._error)
-                # 1 initial + N retries = _MAX_INITIAL_CONNECT_RETRIES + 1 total attempts
                 assert call_count == _MAX_INITIAL_CONNECT_RETRIES + 1
+                # Crucially: the task is still alive, retrying in the background —
+                # it did not give up for good.
+                assert not task.done()
 
-                await task
+                # Shutdown interrupts the background backoff promptly.
+                server._shutdown_event.set()
+                await asyncio.wait_for(task, timeout=5)
+
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_discover_tools_registers_live_on_background_recovery(self):
+        """A connect that lands AFTER startup proceeded without the server
+        (background-retry recovery) registers its tools live via a scheduled
+        refresh — the same path /v1/mcp/reload uses."""
+        from tools.mcp_tool import MCPServerTask
+
+        class _FakeTool:
+            name = "do_thing"
+
+        class _FakeResult:
+            tools = [_FakeTool()]
+
+        class _FakeSession:
+            async def list_tools(self):
+                return _FakeResult()
+
+        async def _run():
+            server = MCPServerTask("test-recover")
+            server._ready.set()            # startup already proceeded without us
+            server._registered_tool_names = []   # nothing registered yet
+            server.session = _FakeSession()
+            with patch.object(MCPServerTask, "_schedule_tools_refresh") as mock_refresh:
+                await server._discover_tools()
+                assert server._connected_once is True
+                assert server._error is None
+                assert mock_refresh.called, "recovery connect should register tools live"
+
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_discover_tools_no_recovery_refresh_on_first_connect(self):
+        """The first/normal connect (before _ready) registers via the startup
+        path, so it must NOT schedule a recovery refresh."""
+        from tools.mcp_tool import MCPServerTask
+
+        class _FakeTool:
+            name = "do_thing"
+
+        class _FakeResult:
+            tools = [_FakeTool()]
+
+        class _FakeSession:
+            async def list_tools(self):
+                return _FakeResult()
+
+        async def _run():
+            server = MCPServerTask("test-first")
+            server._registered_tool_names = []   # _ready NOT set: first connect
+            server.session = _FakeSession()
+            with patch.object(MCPServerTask, "_schedule_tools_refresh") as mock_refresh:
+                await server._discover_tools()
+                assert server._connected_once is True
+                assert not mock_refresh.called
 
         asyncio.get_event_loop().run_until_complete(_run())
 

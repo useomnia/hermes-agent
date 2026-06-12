@@ -260,8 +260,12 @@ if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
 _DEFAULT_TOOL_TIMEOUT = 120      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
-_MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
+_MAX_INITIAL_CONNECT_RETRIES = 3 # fast retries before serving without the server
 _MAX_BACKOFF_SECONDS = 60
+# After the fast initial retries are exhausted, a never-connected server keeps
+# retrying at this steady interval in the background (instead of giving up for
+# good), so a startup transient self-heals on a later connect.
+_BACKGROUND_RECONNECT_SECONDS = 30
 
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
@@ -1124,7 +1128,7 @@ class MCPServerTask:
         "_tools", "_error", "_config",
         "_sampling", "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "initialize_result",
+        "initialize_result", "_connected_once",
     )
 
     def __init__(self, name: str):
@@ -1161,6 +1165,11 @@ class MCPServerTask:
         # ``.capabilities.prompts``) instead of assuming every ``ClientSession``
         # method attribute corresponds to a supported server method. See #18051.
         self.initialize_result: Optional[Any] = None
+        # Flips True after the FIRST successful connect+discover. Gates the
+        # run() loop's resilience: while False, a failed connection retries
+        # (fast, then in the background) and never permanently gives up — a
+        # startup transient must not disable the server for the gateway's life.
+        self._connected_once: bool = False
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
@@ -1752,6 +1761,22 @@ class MCPServerTask:
             if hasattr(tools_result, "tools")
             else []
         )
+        # We have a live session with its tool list. If startup already proceeded
+        # without us (the fast retries were exhausted, _ready was set, and our
+        # tools were never registered), this is a BACKGROUND-retry recovery —
+        # register the tools live now, the same path /v1/mcp/reload and
+        # tools/list_changed use. This is what lets a server that hit a transient
+        # at startup self-heal on a later connect. On the first/normal connect
+        # _ready is not set yet here, so this is a no-op.
+        recovered = self._ready.is_set() and not self._registered_tool_names and self._tools
+        self._connected_once = True
+        self._error = None
+        if recovered:
+            logger.info(
+                "MCP server '%s' connected on a background retry; registering "
+                "%d tool(s) live", self.name, len(self._tools),
+            )
+            self._schedule_tools_refresh()
 
     async def run(self, config: dict):
         """Long-lived coroutine: connect, discover tools, wait, disconnect.
@@ -1859,11 +1884,16 @@ class MCPServerTask:
             except Exception as exc:
                 self.session = None
 
-                # If this is the first connection attempt, retry with backoff
-                # before giving up. A transient DNS/network blip at startup
-                # should not permanently kill the server.
-                # (Ported from Kilo Code's MCP resilience fix.)
-                if not self._ready.is_set():
+                # Never successfully connected yet. A transient at startup (a
+                # cold/slow endpoint, a DNS blip, a server still warming up) must
+                # NOT permanently kill the server. Retry FAST a few times for a
+                # quick recovery; once those are exhausted, stop blocking gateway
+                # startup (serve without this server) but keep retrying in the
+                # BACKGROUND at a steady interval until it connects. The eventual
+                # connect registers the tools live (see _discover_tools), so the
+                # server self-heals without a reload/restart.
+                # (Extends Kilo Code's MCP resilience fix.)
+                if not self._connected_once:
                     if _is_auth_error(exc):
                         logger.warning(
                             "MCP server '%s' failed initial OAuth authentication, "
@@ -1875,29 +1905,48 @@ class MCPServerTask:
                         return
 
                     initial_retries += 1
-                    if initial_retries > _MAX_INITIAL_CONNECT_RETRIES:
+                    if initial_retries <= _MAX_INITIAL_CONNECT_RETRIES:
                         logger.warning(
-                            "MCP server '%s' failed initial connection after "
-                            "%d attempts, giving up: %s",
-                            self.name, _MAX_INITIAL_CONNECT_RETRIES, exc,
+                            "MCP server '%s' initial connection failed "
+                            "(attempt %d/%d), retrying in %.0fs: %s",
+                            self.name, initial_retries,
+                            _MAX_INITIAL_CONNECT_RETRIES, backoff, exc,
                         )
-                        self._error = exc
-                        self._ready.set()
-                        return
+                        delay = backoff
+                        backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
+                    else:
+                        # Fast retries exhausted. Unblock startup ONCE (serve
+                        # without this server), then retry quietly in the
+                        # background — don't give up for good.
+                        if not self._ready.is_set():
+                            logger.warning(
+                                "MCP server '%s' not up after %d attempts; serving "
+                                "without it and retrying every %.0fs in the "
+                                "background until it connects: %s",
+                                self.name, _MAX_INITIAL_CONNECT_RETRIES,
+                                _BACKGROUND_RECONNECT_SECONDS, exc,
+                            )
+                            self._error = exc
+                            self._ready.set()
+                        else:
+                            logger.debug(
+                                "MCP server '%s' still unreachable, retrying in "
+                                "%.0fs: %s",
+                                self.name, _BACKGROUND_RECONNECT_SECONDS, exc,
+                            )
+                        delay = _BACKGROUND_RECONNECT_SECONDS
 
-                    logger.warning(
-                        "MCP server '%s' initial connection failed "
-                        "(attempt %d/%d), retrying in %.0fs: %s",
-                        self.name, initial_retries,
-                        _MAX_INITIAL_CONNECT_RETRIES, backoff, exc,
-                    )
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
-
-                    # Check if shutdown was requested during the sleep
+                    # Interruptible backoff: a shutdown wakes us immediately
+                    # rather than after `delay` (critical for the 30s background
+                    # interval — shutdown must not block on it).
+                    try:
+                        await asyncio.wait_for(self._shutdown_event.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        pass
                     if self._shutdown_event.is_set():
-                        self._error = exc
-                        self._ready.set()
+                        if not self._ready.is_set():
+                            self._error = exc
+                            self._ready.set()
                         return
                     continue
 
