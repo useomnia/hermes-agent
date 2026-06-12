@@ -1937,41 +1937,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                completed = {
+                _stream_q.put(("__tool_progress__", {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
-                }
-                # A gated connector WRITE tool that lacks approval returns an
-                # ``approval_required`` result carrying an interaction (the tool did
-                # NOT run). Surface that interaction on the same event request_input
-                # prompts ride, so the Omnia chat renders the approval control. The
-                # per-kind shape lives in the frontend, so we forward it verbatim.
-                pending_interaction = None
-                if isinstance(function_result, str):
+                }))
+                # request_input is non-blocking and turn-ending: stop the agent loop
+                # now so the SSE stream closes and the user's answer becomes the next
+                # turn. interrupt() makes the loop return cleanly (the streaming writer
+                # still finalizes finish_reason="stop"), unlike a raised error. (The
+                # connector write-tool approval does NOT end the turn — it blocks the
+                # worker thread inside the guard and resumes the same call inline.)
+                if function_name == "request_input" and agent_ref[0] is not None:
                     try:
-                        _parsed_result = json.loads(function_result)
-                    except (ValueError, TypeError):
-                        _parsed_result = None
-                    if (
-                        isinstance(_parsed_result, dict)
-                        and _parsed_result.get("status") == "approval_required"
-                        and isinstance(_parsed_result.get("interaction"), dict)
-                    ):
-                        pending_interaction = _parsed_result["interaction"]
-                if pending_interaction is not None:
-                    completed["interaction"] = pending_interaction
-                _stream_q.put(("__tool_progress__", completed))
-                # request_input and the tool-approval guard are both non-blocking and
-                # turn-ending: stop the agent loop now so the SSE stream closes and the
-                # user's answer becomes the next turn. interrupt() makes the loop return
-                # cleanly (the streaming writer still finalizes finish_reason="stop"),
-                # unlike a raised error.
-                if (
-                    function_name == "request_input" or pending_interaction is not None
-                ) and agent_ref[0] is not None:
-                    try:
-                        agent_ref[0].interrupt("awaiting user interaction")
+                        agent_ref[0].interrupt("awaiting user interaction (request_input)")
                     except Exception:
                         pass
 
@@ -1996,6 +1975,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         progress[key] = kwargs[key]
                 _stream_q.put(("__tool_progress__", progress))
 
+            # Connector write-tool approval: the guard blocks the agent worker
+            # thread and pushes the approval card onto this stream via this
+            # notify; the user's resolve (POST /v1/omnio/tool-approval) unblocks
+            # it and the SAME tool call runs inline. The card rides the tool's
+            # "running" lifecycle (same toolCallId), so the client renders it in
+            # place. _stream_q is a thread-safe queue.Queue, so the guard thread
+            # can enqueue directly. Keyed by session_id (== the conversation's
+            # X-Hermes-Session-Id), which the resolve endpoint also uses.
+            def _approval_notify(event: "Dict[str, Any]") -> None:
+                try:
+                    _stream_q.put(("__tool_progress__", event))
+                except Exception:
+                    pass
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             #
@@ -2018,6 +2011,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 response_format=response_format,
+                approval_session_key=session_id,
+                approval_notify=_approval_notify,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -3611,6 +3606,8 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
+        approval_session_key: Optional[str] = None,
+        approval_notify: Optional[Any] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3622,41 +3619,66 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
+
+        ``approval_session_key`` + ``approval_notify`` arm the connector
+        write-tool approval gate: the key is bound for the worker thread (so the
+        guard's ``get_current_session_key()`` matches) and the notify (which
+        pushes the approval card onto this run's stream) is registered for the
+        duration of the run. Omit them for non-interactive callers — a gated
+        write then fails closed instead of blocking.
         """
         loop = asyncio.get_running_loop()
 
         def _run():
-            agent = self._create_agent(
-                ephemeral_system_prompt=ephemeral_system_prompt,
-                session_id=session_id,
-                stream_delta_callback=stream_delta_callback,
-                reasoning_callback=reasoning_callback,
-                tool_progress_callback=tool_progress_callback,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                gateway_session_key=gateway_session_key,
-                response_format=response_format,
+            from tools.approval import reset_current_session_key, set_current_session_key
+            from tools.tool_approval import (
+                register_tool_approval_notify,
+                unregister_tool_approval_notify,
             )
-            if agent_ref is not None:
-                agent_ref[0] = agent
-            effective_task_id = session_id or str(uuid.uuid4())
-            result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id=effective_task_id,
-            )
-            usage = {
-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-            }
-            # Include the effective session ID in the result so callers
-            # (e.g. X-Hermes-Session-Id header) can track compression-
-            # triggered session rotations. (#16938)
-            _eff_sid = getattr(agent, "session_id", session_id)
-            if isinstance(_eff_sid, str) and _eff_sid:
-                result["session_id"] = _eff_sid
-            return result, usage
+
+            approval_token = None
+            if approval_session_key:
+                approval_token = set_current_session_key(approval_session_key)
+                if approval_notify is not None:
+                    register_tool_approval_notify(approval_session_key, approval_notify)
+            try:
+                agent = self._create_agent(
+                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    session_id=session_id,
+                    stream_delta_callback=stream_delta_callback,
+                    reasoning_callback=reasoning_callback,
+                    tool_progress_callback=tool_progress_callback,
+                    tool_start_callback=tool_start_callback,
+                    tool_complete_callback=tool_complete_callback,
+                    gateway_session_key=gateway_session_key,
+                    response_format=response_format,
+                )
+                if agent_ref is not None:
+                    agent_ref[0] = agent
+                effective_task_id = session_id or str(uuid.uuid4())
+                result = agent.run_conversation(
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    task_id=effective_task_id,
+                )
+                usage = {
+                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                }
+                # Include the effective session ID in the result so callers
+                # (e.g. X-Hermes-Session-Id header) can track compression-
+                # triggered session rotations. (#16938)
+                _eff_sid = getattr(agent, "session_id", session_id)
+                if isinstance(_eff_sid, str) and _eff_sid:
+                    result["session_id"] = _eff_sid
+                return result, usage
+            finally:
+                if approval_session_key:
+                    if approval_notify is not None:
+                        unregister_tool_approval_notify(approval_session_key)
+                    if approval_token is not None:
+                        reset_current_session_key(approval_token)
 
         return await loop.run_in_executor(None, _run)
 

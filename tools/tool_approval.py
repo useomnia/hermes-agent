@@ -10,13 +10,21 @@ never drifts from what the connectors MCP route actually exposes). A tool is
 gated when its registered MCP name (``mcp_<server>_<slug>``) resolves to one of
 those slugs.
 
-Unlike ``tools.approval`` (the dangerous-shell-command gate, which BLOCKS the
-agent thread), this gate is NON-BLOCKING and turn-ending: the guard returns an
-``approval_required`` result, the api_server seam renders the prompt and ends
-the turn, and the user's choice is recorded here via ``resolve_tool_approval``
-before the agent re-issues the call. State is module-level and keyed by the
-approval session key (stable per conversation), matching ``tools.approval``'s
-shape so a session reset clears both.
+This gate is **blocking** — like ``tools.approval`` (the dangerous-shell-command
+gate). When the agent calls a gated write, the guard surfaces the approval card
+on the chat stream and BLOCKS the agent worker thread until the user resolves it
+(or a timeout). On approval the SAME tool call proceeds inline and the agent
+gets the real result; on deny it gets a denial. This is deliberately not the
+non-blocking "return a prompt, ask the agent to re-issue" pattern: an MCP tool
+result is wrapped as untrusted data the model is told to ignore, so it cannot be
+used to instruct a re-call — and the agent would confabulate success instead of
+re-issuing. Blocking keeps the result trustworthy and the agent honest.
+
+The chat surface registers a per-session notify callback
+(``register_tool_approval_notify``) that pushes the interaction onto the chat
+stream; the resolve endpoint (``resolve_tool_approval``) unblocks the waiter.
+State is module-level, keyed by the approval session key (stable per
+conversation), matching ``tools.approval``'s shape so a session reset clears it.
 """
 
 from __future__ import annotations
@@ -25,7 +33,8 @@ import json
 import logging
 import os
 import threading
-from typing import Optional
+import time
+from typing import Callable, Optional
 
 from tools.approval import get_current_session_key
 from tools.mcp_tool import sanitize_mcp_name_component
@@ -37,6 +46,10 @@ logger = logging.getLogger(__name__)
 _ENV_WRITE_TOOLS = "OMNIO_CONNECTORS_WRITE_TOOLS"
 # Killswitch: when truthy, no tool is gated (every write runs ungated).
 _ENV_DISABLED = "OMNIO_TOOL_APPROVAL_DISABLED"
+# How long (seconds) the agent blocks waiting for the user to resolve. Mirrors
+# tools/approval.py's gateway_timeout default; the chat keepalive holds the SSE.
+_ENV_TIMEOUT = "OMNIO_TOOL_APPROVAL_TIMEOUT"
+_DEFAULT_TIMEOUT_S = 300
 
 # User-facing option labels and the scope each one grants. Index-aligned so the
 # Omnia frontend can map a chosen label back to its scope.
@@ -47,8 +60,21 @@ APPROVAL_SCOPES = frozenset({"once", "session", "deny"})
 _lock = threading.Lock()
 # session_key -> tool names approved for the whole conversation.
 _session_approved: dict[str, set[str]] = {}
-# session_key -> tool names with a pending single-use ("once") grant.
-_once_approved: dict[str, set[str]] = {}
+# session_key -> per-session notify callback (bridges guard thread → chat stream).
+_notify_cbs: dict[str, Callable[[dict], None]] = {}
+# session_key -> FIFO of blocked approval waiters.
+_waits: dict[str, list["_ApprovalWait"]] = {}
+
+
+class _ApprovalWait:
+    """One blocked tool call awaiting the user's decision."""
+
+    __slots__ = ("event", "tool", "result")
+
+    def __init__(self, tool: str) -> None:
+        self.event = threading.Event()
+        self.tool = tool
+        self.result: Optional[str] = None  # "once" | "session" | "deny"
 
 
 def _parse_gated_slugs(raw: str) -> frozenset[str]:
@@ -76,6 +102,13 @@ _DISABLED_FROZEN: bool = env_var_enabled(_ENV_DISABLED)
 _GATED_SLUGS_FROZEN: frozenset[str] = _parse_gated_slugs(os.environ.get(_ENV_WRITE_TOOLS, ""))
 
 
+def _approval_timeout() -> int:
+    try:
+        return int(os.environ.get(_ENV_TIMEOUT, "") or _DEFAULT_TIMEOUT_S)
+    except (ValueError, TypeError):
+        return _DEFAULT_TIMEOUT_S
+
+
 def is_gated_tool(function_name: str) -> bool:
     """Whether *function_name* is a connector write action that needs approval.
 
@@ -98,43 +131,125 @@ def is_gated_tool(function_name: str) -> bool:
 
 
 def is_tool_approved(session_key: str, function_name: str) -> bool:
-    """True when the tool is approved for this session, consuming a once-grant."""
+    """True when the tool is approved for the whole session (`session` scope)."""
     with _lock:
-        if function_name in _session_approved.get(session_key, set()):
-            return True
-        once = _once_approved.get(session_key)
-        if once and function_name in once:
-            once.discard(function_name)
-            if not once:
-                _once_approved.pop(session_key, None)
-            return True
-    return False
+        return function_name in _session_approved.get(session_key, set())
 
 
-def record_tool_approval(session_key: str, function_name: str, scope: str) -> None:
-    """Record the user's choice. 'deny' records nothing (the agent was told)."""
+def record_session_approval(session_key: str, function_name: str) -> None:
+    """Grant a tool for the rest of the session (the `session` scope)."""
     with _lock:
-        if scope == "session":
-            _session_approved.setdefault(session_key, set()).add(function_name)
-        elif scope == "once":
-            _once_approved.setdefault(session_key, set()).add(function_name)
+        _session_approved.setdefault(session_key, set()).add(function_name)
+
+
+def register_tool_approval_notify(session_key: str, cb: Callable[[dict], None]) -> None:
+    """Register the chat surface's per-session callback that pushes an approval
+    interaction onto the stream. Called once per chat run around the agent."""
+    if not session_key:
+        return
+    with _lock:
+        _notify_cbs[session_key] = cb
+
+
+def unregister_tool_approval_notify(session_key: str) -> None:
+    """Drop the notify callback AND release any still-blocked waiters for this
+    session (so a finished/interrupted run can't leave a thread parked)."""
+    if not session_key:
+        return
+    with _lock:
+        _notify_cbs.pop(session_key, None)
+        waiters = _waits.pop(session_key, [])
+    for entry in waiters:
+        entry.event.set()  # result stays None → guard fails closed (deny)
+
+
+def _drop_wait(session_key: str, entry: "_ApprovalWait") -> None:
+    with _lock:
+        queue = _waits.get(session_key)
+        if queue and entry in queue:
+            queue.remove(entry)
+        if queue is not None and not queue:
+            _waits.pop(session_key, None)
+
+
+def await_tool_approval(session_key: str, function_name: str, interaction_event: dict) -> Optional[str]:
+    """Surface the approval card and block until the user resolves it.
+
+    Returns the chosen scope (``once`` / ``session`` / ``deny``), or ``None``
+    when there is no chat surface registered (non-interactive caller) or the
+    wait times out — in both cases the caller MUST fail closed (not execute).
+    """
+    with _lock:
+        cb = _notify_cbs.get(session_key)
+        if cb is None:
+            return None  # no interactive surface → caller denies the write
+        entry = _ApprovalWait(function_name)
+        _waits.setdefault(session_key, []).append(entry)
+
+    try:
+        cb(interaction_event)
+    except Exception:
+        logger.warning("tool-approval notify failed", exc_info=True)
+        _drop_wait(session_key, entry)
+        return None
+
+    # Block in short slices so we can heartbeat the inactivity tracker — without
+    # it the gateway watchdog would kill the agent while the user is deciding.
+    try:
+        from tools.environments.base import touch_activity_if_due
+    except Exception:  # pragma: no cover
+        touch_activity_if_due = None
+
+    now = time.monotonic()
+    deadline = now + max(_approval_timeout(), 0)
+    activity = {"last_touch": now, "start": now}
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if entry.event.wait(timeout=min(1.0, remaining)):
+            break
+        if touch_activity_if_due is not None:
+            touch_activity_if_due(activity, "waiting for tool approval")
+
+    _drop_wait(session_key, entry)
+    return entry.result
 
 
 def resolve_tool_approval(session_key: str, function_name: str, scope: str) -> bool:
-    """Apply a resolution posted from the Omnia chat. Returns False if invalid."""
-    if not session_key or not function_name or scope not in APPROVAL_SCOPES:
+    """Apply a decision posted from the Omnia chat: unblock the waiting tool
+    call and, for ``session`` scope, remember it for the rest of the chat.
+
+    Returns False only for a malformed request. A decision that arrives before
+    the guard blocked (or after it timed out) still records the grant so the
+    next call sees it — so the result is True as long as the input is valid.
+    """
+    if not session_key or scope not in APPROVAL_SCOPES:
         return False
-    record_tool_approval(session_key, function_name, scope)
+    if scope == "session" and function_name:
+        record_session_approval(session_key, function_name)
+
+    with _lock:
+        queue = _waits.get(session_key)
+        entry = queue.pop(0) if queue else None
+        if queue is not None and not queue:
+            _waits.pop(session_key, None)
+    if entry is not None:
+        entry.result = scope
+        entry.event.set()
     return True
 
 
 def clear_session(session_key: str) -> None:
-    """Drop all approvals for a session (called on conversation reset)."""
+    """Drop all approval state for a session (called on conversation reset)."""
     if not session_key:
         return
     with _lock:
         _session_approved.pop(session_key, None)
-        _once_approved.pop(session_key, None)
+        _notify_cbs.pop(session_key, None)
+        waiters = _waits.pop(session_key, [])
+    for entry in waiters:
+        entry.event.set()
 
 
 def _readable_tool(function_name: str) -> str:
@@ -151,44 +266,65 @@ def _readable_tool(function_name: str) -> str:
     return name.replace("_", " ").strip().capitalize() or function_name
 
 
+def _denial_result(choice: Optional[str]) -> str:
+    """A tool result telling the agent the write did NOT happen. This is status
+    data (not an instruction), so it's safe even wrapped as an untrusted result."""
+    if choice == "deny":
+        reason = "The user declined this action."
+    else:
+        reason = "This action needs the user's approval, which wasn't granted (no response)."
+    return json.dumps(
+        {
+            "error": (
+                f"{reason} It was NOT performed. Do not retry it or tell the user it "
+                "succeeded; let them know it needs their approval."
+            )
+        },
+        ensure_ascii=False,
+    )
+
+
 def maybe_require_tool_approval(
     function_name: str,
     tool_call_id: str = "",
 ) -> Optional[str]:
-    """Gate a connector write tool behind user approval.
+    """Gate a connector write tool behind a blocking user approval.
 
-    Returns ``None`` when the call may proceed (read tool, gating disabled, or
-    already approved). Otherwise returns a JSON ``approval_required`` result
-    carrying the interaction the api_server seam renders; execution is skipped
-    and the turn ends until the user responds.
+    Returns ``None`` when the call may proceed (read tool, gating disabled,
+    already approved for the session, or just approved). Otherwise BLOCKS until
+    the user resolves the prompt and returns a denial tool-result string (the
+    write must not execute) on deny / timeout / no-surface.
     """
     if not is_gated_tool(function_name):
         return None
     session_key = get_current_session_key()
     if is_tool_approved(session_key, function_name):
-        return None
+        return None  # approved for the whole session earlier
 
-    interaction = {
-        "kind": "approval",
-        "question": (
-            f'Allow Omnio to use "{_readable_tool(function_name)}"? '
-            "It will act on your connected account."
-        ),
-        "options": list(APPROVAL_OPTIONS),
-        "approval": {
-            "tool": function_name,
-            "tool_call_id": tool_call_id or "",
-            "option_scopes": list(APPROVAL_OPTION_SCOPES),
+    interaction_event = {
+        "tool": function_name,
+        "toolCallId": tool_call_id or "",
+        "status": "running",
+        "interaction": {
+            "kind": "approval",
+            "question": (
+                f'Allow Omnio to use "{_readable_tool(function_name)}"? '
+                "It will act on your connected account."
+            ),
+            "options": list(APPROVAL_OPTIONS),
+            "approval": {
+                "tool": function_name,
+                "tool_call_id": tool_call_id or "",
+                "option_scopes": list(APPROVAL_OPTION_SCOPES),
+            },
         },
     }
-    return json.dumps(
-        {
-            "status": "approval_required",
-            "interaction": interaction,
-            "message": (
-                "This action needs your approval. I've asked you in the chat — "
-                "approve it there and I'll continue."
-            ),
-        },
-        ensure_ascii=False,
-    )
+
+    choice = await_tool_approval(session_key, function_name, interaction_event)
+    if choice == "session":
+        # resolve_tool_approval already recorded it; proceed.
+        return None
+    if choice == "once":
+        return None  # this call proceeds; the next one prompts again
+    # deny / timeout / no interactive surface → fail closed.
+    return _denial_result(choice)
