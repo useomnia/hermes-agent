@@ -1035,6 +1035,23 @@ def handle_function_call(
             if function_name in {"write_file", "patch"}:
                 return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
 
+        # Connector WRITE tools (Omnia/Omnio) require a per-call user approval
+        # rendered as a control in the chat. Non-blocking: an unapproved write
+        # returns the approval-required result; the api_server seam renders the
+        # prompt and ends the turn, and the user's choice is recorded via
+        # resolve_tool_approval before the agent re-issues the call. Fails OPEN
+        # on guard error (matching the pre_tool_call hook above) — the gated
+        # actions are non-destructive (draft/create), so a guard bug degrades to
+        # the existing nudge-based safety rather than blocking all connectors.
+        try:
+            from tools.tool_approval import maybe_require_tool_approval
+
+            approval_required = maybe_require_tool_approval(function_name, tool_call_id or "")
+            if approval_required is not None:
+                return approval_required
+        except Exception as _tool_approval_err:
+            logger.warning("tool approval guard error: %s", _tool_approval_err)
+
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
         if function_name not in _READ_SEARCH_TOOLS:

@@ -1937,18 +1937,41 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put(("__tool_progress__", {
+                completed = {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
-                }))
-                # request_input is non-blocking and turn-ending: stop the agent loop
-                # now so the SSE stream closes and the user's answer becomes the next
-                # turn. interrupt() makes the loop return cleanly (the streaming
-                # writer still finalizes finish_reason="stop"), unlike a raised error.
-                if function_name == "request_input" and agent_ref[0] is not None:
+                }
+                # A gated connector WRITE tool that lacks approval returns an
+                # ``approval_required`` result carrying an interaction (the tool did
+                # NOT run). Surface that interaction on the same event request_input
+                # prompts ride, so the Omnia chat renders the approval control. The
+                # per-kind shape lives in the frontend, so we forward it verbatim.
+                pending_interaction = None
+                if isinstance(function_result, str):
                     try:
-                        agent_ref[0].interrupt("awaiting user interaction (request_input)")
+                        _parsed_result = json.loads(function_result)
+                    except (ValueError, TypeError):
+                        _parsed_result = None
+                    if (
+                        isinstance(_parsed_result, dict)
+                        and _parsed_result.get("status") == "approval_required"
+                        and isinstance(_parsed_result.get("interaction"), dict)
+                    ):
+                        pending_interaction = _parsed_result["interaction"]
+                if pending_interaction is not None:
+                    completed["interaction"] = pending_interaction
+                _stream_q.put(("__tool_progress__", completed))
+                # request_input and the tool-approval guard are both non-blocking and
+                # turn-ending: stop the agent loop now so the SSE stream closes and the
+                # user's answer becomes the next turn. interrupt() makes the loop return
+                # cleanly (the streaming writer still finalizes finish_reason="stop"),
+                # unlike a raised error.
+                if (
+                    function_name == "request_input" or pending_interaction is not None
+                ) and agent_ref[0] is not None:
+                    try:
+                        agent_ref[0].interrupt("awaiting user interaction")
                     except Exception:
                         pass
 
@@ -4155,6 +4178,63 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_omnio_tool_approval(self, request: "web.Request") -> "web.Response":
+        """POST /v1/omnio/tool-approval — record a user's decision on a gated
+        connector WRITE tool.
+
+        Non-blocking counterpart to /v1/runs/{run_id}/approval: the turn that
+        raised the prompt has already ended, so there is no live run to resolve
+        against. The decision is keyed by the conversation's session id — the
+        ``X-Hermes-Session-Id`` header (which the proxy derives from the source
+        id, the same value the guard scoped its prompt to), so the next turn's
+        guard sees the recorded approval.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        tool = str(body.get("tool", "")).strip()
+        scope = str(body.get("scope", "")).strip().lower()
+        if not tool:
+            return web.json_response(
+                _openai_error("Missing 'tool'", code="approval_missing_tool"), status=400
+            )
+
+        session_key = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if not session_key:
+            return web.json_response(
+                _openai_error("Missing X-Hermes-Session-Id", code="approval_no_session"),
+                status=400,
+            )
+
+        try:
+            from tools.tool_approval import APPROVAL_SCOPES, resolve_tool_approval
+
+            if scope not in APPROVAL_SCOPES:
+                return web.json_response(
+                    _openai_error(
+                        f"Invalid scope; expected one of: {', '.join(sorted(APPROVAL_SCOPES))}",
+                        code="invalid_approval_scope",
+                    ),
+                    status=400,
+                )
+            recorded = resolve_tool_approval(session_key, tool, scope)
+        except Exception as exc:
+            logger.exception("[api_server] tool approval resolution failed")
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        return web.json_response({
+            "object": "omnio.tool_approval_response",
+            "tool": tool,
+            "scope": scope,
+            "recorded": recorded,
+        })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -4280,6 +4360,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Omnia non-blocking connector-write approval (see _handle_omnio_tool_approval).
+            self._app.router.add_post("/v1/omnio/tool-approval", self._handle_omnio_tool_approval)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
