@@ -4,10 +4,12 @@ import json
 
 import pytest
 
+import tools.tool_approval as tool_approval
 from tools.approval import reset_current_session_key, set_current_session_key
 from tools.tool_approval import (
     APPROVAL_OPTION_SCOPES,
     APPROVAL_OPTIONS,
+    _parse_gated_slugs,
     _session_approved,
     _once_approved,
     clear_session,
@@ -18,16 +20,17 @@ from tools.tool_approval import (
     resolve_tool_approval,
 )
 
-WRITE_ENV = "OMNIO_CONNECTORS_WRITE_TOOLS"
 GATED = "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT"
 READ = "mcp_connectors_GOOGLE_ANALYTICS_RUN_REPORT"
 
 
 @pytest.fixture(autouse=True)
 def _clean_state(monkeypatch):
-    # A single connector write is gated for every test unless overridden.
-    monkeypatch.setenv(WRITE_ENV, json.dumps(["GMAIL_CREATE_EMAIL_DRAFT"]))
-    monkeypatch.delenv("OMNIO_TOOL_APPROVAL_DISABLED", raising=False)
+    # A single connector write is gated for every test unless overridden. The
+    # gated set + killswitch are frozen at import (hardening against in-process
+    # bypass), so tests patch the frozen module attrs rather than os.environ.
+    monkeypatch.setattr(tool_approval, "_GATED_SLUGS_FROZEN", frozenset({"gmail_create_email_draft"}))
+    monkeypatch.setattr(tool_approval, "_DISABLED_FROZEN", False)
     token = set_current_session_key("sess-1")
     _session_approved.clear()
     _once_approved.clear()
@@ -38,26 +41,32 @@ def _clean_state(monkeypatch):
 
 
 class TestIsGatedTool:
-    def test_should_gate_a_connector_write_tool_when_its_slug_is_in_the_env_list(self):
+    def test_should_gate_a_connector_write_tool_when_its_slug_is_in_the_list(self):
         assert is_gated_tool(GATED) is True
+
+    def test_should_gate_case_insensitively_when_the_advertised_name_is_lower_cased(self):
+        # Defends against a casing divergence between the action slug and the
+        # MCP-advertised tool name — a security gate must not fail OPEN on case.
+        assert is_gated_tool("mcp_connectors_gmail_create_email_draft") is True
 
     def test_should_not_gate_a_connector_read_tool(self):
         assert is_gated_tool(READ) is False
 
     def test_should_not_gate_when_the_write_list_is_empty(self, monkeypatch):
-        monkeypatch.setenv(WRITE_ENV, "[]")
+        monkeypatch.setattr(tool_approval, "_GATED_SLUGS_FROZEN", frozenset())
         assert is_gated_tool(GATED) is False
 
     def test_should_not_gate_when_the_killswitch_is_set(self, monkeypatch):
-        monkeypatch.setenv("OMNIO_TOOL_APPROVAL_DISABLED", "1")
+        monkeypatch.setattr(tool_approval, "_DISABLED_FROZEN", True)
         assert is_gated_tool(GATED) is False
 
     def test_should_not_gate_a_non_mcp_tool(self):
         assert is_gated_tool("terminal") is False
 
-    def test_should_not_gate_when_the_env_is_malformed(self, monkeypatch):
-        monkeypatch.setenv(WRITE_ENV, "not json")
-        assert is_gated_tool(GATED) is False
+    def test_should_parse_no_slugs_from_malformed_env(self):
+        assert _parse_gated_slugs("not json") == frozenset()
+        assert _parse_gated_slugs("") == frozenset()
+        assert _parse_gated_slugs('{"not": "a list"}') == frozenset()
 
 
 class TestMaybeRequireToolApproval:

@@ -16336,6 +16336,20 @@ class GatewayRunner:
                 )
 
         try:
+            from tools.tool_approval import clear_session as _clear_tool_approval_session
+        except Exception:
+            _clear_tool_approval_session = None
+        if _clear_tool_approval_session is not None:
+            try:
+                _clear_tool_approval_session(session_key)
+            except Exception as e:
+                logger.debug(
+                    "Failed to clear connector-write approval state for session boundary %s: %s",
+                    session_key,
+                    e,
+                )
+
+        try:
             from tools.approval import clear_session as _clear_approval_session
         except Exception:
             return

@@ -51,19 +51,29 @@ _session_approved: dict[str, set[str]] = {}
 _once_approved: dict[str, set[str]] = {}
 
 
-def _gated_tool_slugs() -> set[str]:
-    """Sanitized write-action slugs, matched as a suffix of the registered name."""
-    raw = os.environ.get(_ENV_WRITE_TOOLS, "")
+def _parse_gated_slugs(raw: str) -> frozenset[str]:
+    """Sanitized, lower-cased write-action slugs from the env JSON list."""
     if not raw:
-        return set()
+        return frozenset()
     try:
         slugs = json.loads(raw)
     except (ValueError, TypeError):
         logger.warning("Malformed %s; gating no tools", _ENV_WRITE_TOOLS)
-        return set()
+        return frozenset()
     if not isinstance(slugs, list):
-        return set()
-    return {sanitize_mcp_name_component(s) for s in slugs if isinstance(s, str) and s}
+        return frozenset()
+    return frozenset(
+        sanitize_mcp_name_component(s).lower() for s in slugs if isinstance(s, str) and s
+    )
+
+
+# Frozen at import — same rationale as tools/approval.py's _YOLO_MODE_FROZEN:
+# reading these live on every call would let in-process skill/plugin code flip
+# the killswitch or clear the gated set mid-run and bypass the gate (a
+# prompt-injection escalation path). The env is process-constant (set per gateway
+# at spawn), so a snapshot loses nothing. Tests patch these module attrs.
+_DISABLED_FROZEN: bool = env_var_enabled(_ENV_DISABLED)
+_GATED_SLUGS_FROZEN: frozenset[str] = _parse_gated_slugs(os.environ.get(_ENV_WRITE_TOOLS, ""))
 
 
 def is_gated_tool(function_name: str) -> bool:
@@ -71,15 +81,18 @@ def is_gated_tool(function_name: str) -> bool:
 
     Matches the sanitized slug as a suffix of the registered MCP name
     (``mcp_<server>_<slug>``) so the check is independent of the connectors
-    server name. The slugs are specific Composio action names, so a suffix match
-    cannot collide with an unrelated tool.
+    server name. The match is case-insensitive: the gated set is the Composio
+    action slug (upper-case) but the advertised tool name could differ in case,
+    and a security gate must not fail OPEN on a casing divergence. Slugs are
+    specific action names, so a suffix match cannot collide with an unrelated tool.
     """
-    if env_var_enabled(_ENV_DISABLED):
+    if _DISABLED_FROZEN or not _GATED_SLUGS_FROZEN:
         return False
     if not function_name or not function_name.startswith("mcp_"):
         return False
-    for slug in _gated_tool_slugs():
-        if function_name == slug or function_name.endswith("_" + slug):
+    name = function_name.lower()
+    for slug in _GATED_SLUGS_FROZEN:
+        if name == slug or name.endswith("_" + slug):
             return True
     return False
 
