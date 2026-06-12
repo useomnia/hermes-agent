@@ -1649,11 +1649,14 @@ class TestReconnection:
 
         asyncio.run(_test())
 
-    def test_no_reconnect_on_initial_failure(self):
-        """First connection failure retries up to _MAX_INITIAL_CONNECT_RETRIES times.
+    def test_initial_failure_retries_then_serves_without_giving_up(self):
+        """A never-connected server retries the initial connection, then unblocks
+        startup (surfaces the error, sets _ready) and keeps retrying in the
+        BACKGROUND instead of permanently returning.
 
-        Before the MCP resilience fix, initial failures gave up immediately.
-        Now they retry with backoff to handle transient DNS/network blips.
+        Before the resilience extension run() returned after the retries; now it
+        stays alive, so the test drives it to the unblock point and stops it via
+        shutdown rather than awaiting completion.
         """
         from tools.mcp_tool import MCPServerTask, _MAX_INITIAL_CONNECT_RETRIES
 
@@ -1667,7 +1670,19 @@ class TestReconnection:
             run_count += 1
             if target_server is not self_srv:
                 return await original_run_stdio(self_srv, config)
+            # Once the fast retries are exhausted and startup is being unblocked,
+            # ask the loop to stop so the test terminates deterministically
+            # instead of retrying in the background forever.
+            if run_count > _MAX_INITIAL_CONNECT_RETRIES:
+                self_srv._shutdown_event.set()
             raise ConnectionError("cannot connect")
+
+        # The backoff now waits on the shutdown event with a timeout (interruptible
+        # sleep). Make it instant: consume the coroutine and raise the timeout.
+        async def _instant_wait(awaitable, timeout=None):
+            if asyncio.iscoroutine(awaitable):
+                awaitable.close()
+            raise asyncio.TimeoutError
 
         async def _test():
             nonlocal target_server
@@ -1675,11 +1690,13 @@ class TestReconnection:
             target_server = server
 
             with patch.object(MCPServerTask, "_run_stdio", patched_run_stdio), \
-                 patch("asyncio.sleep", new_callable=AsyncMock):
+                 patch("asyncio.wait_for", _instant_wait):
                 await server.run({"command": "test"})
 
-            # Now retries up to _MAX_INITIAL_CONNECT_RETRIES before giving up
+            # MAX fast retries + the first background attempt (which set shutdown).
             assert run_count == _MAX_INITIAL_CONNECT_RETRIES + 1
+            # Startup was unblocked with the error surfaced — not a silent give-up.
+            assert server._ready.is_set()
             assert server._error is not None
             assert "cannot connect" in str(server._error)
 
