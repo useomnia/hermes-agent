@@ -1128,7 +1128,7 @@ class MCPServerTask:
         "_tools", "_error", "_config",
         "_sampling", "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "initialize_result", "_connected_once",
+        "initialize_result", "_connected_once", "_serving_degraded",
     )
 
     def __init__(self, name: str):
@@ -1170,6 +1170,14 @@ class MCPServerTask:
         # (fast, then in the background) and never permanently gives up — a
         # startup transient must not disable the server for the gateway's life.
         self._connected_once: bool = False
+        # True once a never-connected server exhausts its fast retries and
+        # switches to background retry: it is "serving" the gateway (without its
+        # tools) but still trying to connect. Distinguishes that recoverable
+        # degraded state from a permanent failure (initial auth error), so
+        # start() returns normally — and the caller records the task in
+        # _servers — instead of raising and orphaning a live background task.
+        # Cleared once the server actually connects.
+        self._serving_degraded: bool = False
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
@@ -1771,6 +1779,7 @@ class MCPServerTask:
         recovered = self._ready.is_set() and not self._registered_tool_names and self._tools
         self._connected_once = True
         self._error = None
+        self._serving_degraded = False
         if recovered:
             logger.info(
                 "MCP server '%s' connected on a background retry; registering "
@@ -1894,10 +1903,24 @@ class MCPServerTask:
                 # server self-heals without a reload/restart.
                 # (Extends Kilo Code's MCP resilience fix.)
                 if not self._connected_once:
+                    # Non-retryable initial failures fail PERMANENTLY (run() exits,
+                    # start() raises) instead of degrade-and-retry-forever, because
+                    # retrying cannot fix them:
+                    #  - an OAuth auth error (credentials rejected), and
+                    #  - a structural config error (no command/url, blocked
+                    #    package), surfaced as a ValueError from the transports.
                     if _is_auth_error(exc):
                         logger.warning(
                             "MCP server '%s' failed initial OAuth authentication, "
                             "not retrying automatically: %s",
+                            self.name, exc,
+                        )
+                        self._error = exc
+                        self._ready.set()
+                        return
+                    if isinstance(exc, ValueError):
+                        logger.warning(
+                            "MCP server '%s' has an invalid config, not retrying: %s",
                             self.name, exc,
                         )
                         self._error = exc
@@ -1926,6 +1949,10 @@ class MCPServerTask:
                                 self.name, _MAX_INITIAL_CONNECT_RETRIES,
                                 _BACKGROUND_RECONNECT_SECONDS, exc,
                             )
+                            # Degraded-but-serving: start() must RETURN (so the
+                            # caller records this still-running task in _servers,
+                            # reachable by shutdown / reload) rather than raise.
+                            self._serving_degraded = True
                             self._error = exc
                             self._ready.set()
                         else:
@@ -1983,10 +2010,19 @@ class MCPServerTask:
                 self.session = None
 
     async def start(self, config: dict):
-        """Create the background Task and wait until ready (or failed)."""
+        """Create the background Task and wait until ready (or failed).
+
+        Raises ``_error`` only for a PERMANENT failure (e.g. an initial OAuth
+        auth error), where run() has already exited. A never-connected server
+        that merely exhausted its fast retries is ``_serving_degraded``: its
+        task keeps retrying in the background, so start() returns normally and
+        the caller records it in ``_servers`` — otherwise that live task would be
+        untracked (leaking, and invisible to shutdown / reload). It self-heals
+        via _discover_tools on a later connect.
+        """
         self._task = asyncio.ensure_future(self.run(config))
         await self._ready.wait()
-        if self._error:
+        if self._error and not self._serving_degraded:
             raise self._error
 
     async def shutdown(self):

@@ -4204,12 +4204,15 @@ class APIServerAdapter(BasePlatformAdapter):
         """POST /v1/omnio/tool-approval — record a user's decision on a gated
         connector WRITE tool.
 
-        Non-blocking counterpart to /v1/runs/{run_id}/approval: the turn that
-        raised the prompt has already ended, so there is no live run to resolve
-        against. The decision is keyed by the conversation's session id — the
-        ``X-Hermes-Session-Id`` header (which the proxy derives from the source
-        id, the same value the guard scoped its prompt to), so the next turn's
-        guard sees the recorded approval.
+        The guard is BLOCKING: the agent worker is parked on this exact call
+        waiting for the decision. The request is keyed by the conversation's
+        session id (the ``X-Hermes-Session-Id`` header the proxy derives from the
+        source id — the value the guard scoped its prompt to) AND the tool's call
+        id, so resolution unblocks THIS specific call (approve → it proceeds
+        inline; deny → a denial) rather than whichever waiter is at the queue
+        head — which is what keeps two writes pending in one turn from
+        cross-talking. A `session`-scope decision is also remembered so later
+        calls of the same tool skip the prompt.
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -4222,6 +4225,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         tool = str(body.get("tool", "")).strip()
         scope = str(body.get("scope", "")).strip().lower()
+        tool_call_id = str(body.get("toolCallId", "") or body.get("tool_call_id", "")).strip()
         if not tool:
             return web.json_response(
                 _openai_error("Missing 'tool'", code="approval_missing_tool"), status=400
@@ -4245,7 +4249,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=400,
                 )
-            recorded = resolve_tool_approval(session_key, tool, scope)
+            recorded = resolve_tool_approval(session_key, tool, scope, tool_call_id)
         except Exception as exc:
             logger.exception("[api_server] tool approval resolution failed")
             return web.json_response(_openai_error(str(exc)), status=500)

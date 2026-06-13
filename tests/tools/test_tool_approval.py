@@ -1,17 +1,22 @@
 """Tests for tools/tool_approval.py — blocking per-call approval for WRITE tools."""
 
+import threading
+
 import pytest
 
 import tools.tool_approval as tool_approval
 from tools.approval import reset_current_session_key, set_current_session_key
+from tools.interrupt import set_interrupt
 from tools.tool_approval import (
     APPROVAL_OPTION_SCOPES,
     APPROVAL_OPTIONS,
+    _ApprovalWait,
     _parse_gated_slugs,
     _notify_cbs,
     _session_approved,
     _waits,
     clear_session,
+    fail_closed_denial,
     is_gated_tool,
     is_tool_approved,
     maybe_require_tool_approval,
@@ -148,6 +153,113 @@ class TestResolveToolApproval:
     def test_should_scope_grants_per_session(self):
         resolve_tool_approval(SESSION, GATED, "session")
         assert is_tool_approved("other-session", GATED) is False
+
+    def test_should_resolve_the_matching_call_id_not_the_queue_head(self):
+        # Two writes blocked in one turn: resolving by call id must release the
+        # one the user decided on, not whichever is first in the FIFO.
+        first = _ApprovalWait(GATED, "call-A")
+        second = _ApprovalWait(GATED, "call-B")
+        _waits[SESSION] = [first, second]
+
+        assert resolve_tool_approval(SESSION, GATED, "once", "call-B") is True
+
+        assert second.result == "once" and second.event.is_set()
+        assert first.result is None and not first.event.is_set()
+
+    def test_should_fall_back_to_fifo_head_when_no_call_id_is_given(self):
+        first = _ApprovalWait(GATED, "call-A")
+        second = _ApprovalWait(GATED, "call-B")
+        _waits[SESSION] = [first, second]
+
+        assert resolve_tool_approval(SESSION, GATED, "deny") is True
+
+        assert first.result == "deny" and first.event.is_set()
+        assert second.result is None and not second.event.is_set()
+
+
+class TestConcurrentApproval:
+    """Two gated writes blocked in one turn must resolve independently — a
+    decision on one card must not release the other (the cross-talk bug)."""
+
+    def test_a_decision_on_one_call_does_not_release_a_different_pending_call(self):
+        results: dict[str, object] = {}
+        both_blocked = threading.Event()
+        captured: list[str] = []
+
+        def notify(event):
+            captured.append(event["interaction"]["approval"]["tool_call_id"])
+            if len(captured) == 2:
+                both_blocked.set()
+
+        register_tool_approval_notify(SESSION, notify)
+
+        def worker(call_id):
+            # A raw thread doesn't inherit the session-key contextvar (the real
+            # tool executor propagates it); bind it so the guard scopes to SESSION.
+            set_current_session_key(SESSION)
+            results[call_id] = maybe_require_tool_approval(GATED, call_id)
+
+        thread_a = threading.Thread(target=worker, args=("call-A",))
+        thread_b = threading.Thread(target=worker, args=("call-B",))
+        thread_a.start()
+        thread_b.start()
+        assert both_blocked.wait(timeout=3), "both writes should be blocked on their cards"
+
+        # Approve ONLY call-B for the session; call-A must stay blocked.
+        resolve_tool_approval(SESSION, GATED, "session", "call-B")
+        thread_b.join(timeout=3)
+
+        assert results.get("call-B") is None, "approved call proceeds"
+        assert thread_a.is_alive(), "call-A must NOT be released by call-B's decision"
+
+        # Release call-A so the test doesn't leak a thread.
+        resolve_tool_approval(SESSION, GATED, "deny", "call-A")
+        thread_a.join(timeout=3)
+        assert results.get("call-A") is not None, "denied call returns a denial"
+
+
+class TestInterruptRelease:
+    """An interrupt (user stop / chat disconnect) must release a blocked wait
+    and fail closed — not park the worker for the full timeout."""
+
+    def test_interrupt_releases_a_blocked_wait_and_denies(self):
+        result: dict[str, object] = {}
+        blocked = threading.Event()
+        register_tool_approval_notify(SESSION, lambda event: blocked.set())
+
+        def worker():
+            set_current_session_key(SESSION)  # raw thread: bind the session-key contextvar
+            result["choice"] = maybe_require_tool_approval(GATED, "call-1")
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        assert blocked.wait(timeout=3), "the card surfaced; the guard is blocking"
+
+        # The gateway interrupts this worker thread on SSE disconnect / stop.
+        set_interrupt(True, thread.ident)
+        try:
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "interrupt must release the wait, not park for the timeout"
+            assert result["choice"] is not None, "interrupted wait fails closed (denial)"
+        finally:
+            set_interrupt(False, thread.ident)
+
+
+class TestFailClosedDenial:
+    def test_should_deny_a_gated_write(self):
+        result = fail_closed_denial(GATED)
+        assert result is not None
+        assert "approval" in result.lower()
+
+    def test_should_allow_an_ungated_read(self):
+        assert fail_closed_denial(READ) is None
+
+    def test_should_deny_when_classification_itself_raises(self, monkeypatch):
+        def boom(_name):
+            raise RuntimeError("cannot classify")
+
+        monkeypatch.setattr(tool_approval, "is_gated_tool", boom)
+        assert fail_closed_denial(GATED) is not None
 
 
 class TestClearSession:

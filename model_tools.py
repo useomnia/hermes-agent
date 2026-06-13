@@ -1035,22 +1035,33 @@ def handle_function_call(
             if function_name in {"write_file", "patch"}:
                 return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
 
-        # Connector WRITE tools (Omnia/Omnio) require a per-call user approval
-        # rendered as a control in the chat. Non-blocking: an unapproved write
-        # returns the approval-required result; the api_server seam renders the
-        # prompt and ends the turn, and the user's choice is recorded via
-        # resolve_tool_approval before the agent re-issues the call. Fails OPEN
-        # on guard error (matching the pre_tool_call hook above) — the gated
-        # actions are non-destructive (draft/create), so a guard bug degrades to
-        # the existing nudge-based safety rather than blocking all connectors.
+        # Connector WRITE tools (Omnia/Omnio) require a BLOCKING per-call user
+        # approval rendered as a card in the chat: the guard parks this worker
+        # until the user resolves it; on approval the SAME call proceeds inline,
+        # on deny/timeout/interrupt it returns a denial. The gate must FAIL
+        # CLOSED — a guard error on a gated write denies it rather than running
+        # it unapproved (mirrors the ACP write_file/patch deny above).
         try:
-            from tools.tool_approval import maybe_require_tool_approval
-
-            approval_required = maybe_require_tool_approval(function_name, tool_call_id or "")
+            from tools.tool_approval import fail_closed_denial, maybe_require_tool_approval
+        except Exception as _tool_approval_imp_err:
+            # The approval module itself failed to load — gating is entirely
+            # absent (the connectors MCP wouldn't be wired either), so there is
+            # no gated write to protect; log and continue rather than block.
+            logger.error(
+                "tool approval module import failed; gate skipped: %s",
+                _tool_approval_imp_err, exc_info=True,
+            )
+        else:
+            try:
+                approval_required = maybe_require_tool_approval(function_name, tool_call_id or "")
+            except Exception as _tool_approval_err:
+                logger.error(
+                    "tool approval guard error; failing closed for gated tools: %s",
+                    _tool_approval_err, exc_info=True,
+                )
+                approval_required = fail_closed_denial(function_name)
             if approval_required is not None:
                 return approval_required
-        except Exception as _tool_approval_err:
-            logger.warning("tool approval guard error: %s", _tool_approval_err)
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).

@@ -69,11 +69,12 @@ _waits: dict[str, list["_ApprovalWait"]] = {}
 class _ApprovalWait:
     """One blocked tool call awaiting the user's decision."""
 
-    __slots__ = ("event", "tool", "result")
+    __slots__ = ("event", "tool", "tool_call_id", "result")
 
-    def __init__(self, tool: str) -> None:
+    def __init__(self, tool: str, tool_call_id: str = "") -> None:
         self.event = threading.Event()
         self.tool = tool
+        self.tool_call_id = tool_call_id
         self.result: Optional[str] = None  # "once" | "session" | "deny"
 
 
@@ -172,18 +173,25 @@ def _drop_wait(session_key: str, entry: "_ApprovalWait") -> None:
             _waits.pop(session_key, None)
 
 
-def await_tool_approval(session_key: str, function_name: str, interaction_event: dict) -> Optional[str]:
+def await_tool_approval(
+    session_key: str,
+    function_name: str,
+    interaction_event: dict,
+    tool_call_id: str = "",
+) -> Optional[str]:
     """Surface the approval card and block until the user resolves it.
 
     Returns the chosen scope (``once`` / ``session`` / ``deny``), or ``None``
-    when there is no chat surface registered (non-interactive caller) or the
-    wait times out — in both cases the caller MUST fail closed (not execute).
+    when there is no chat surface registered (non-interactive caller), the wait
+    times out, or the agent is interrupted (the user stopped the turn, or the
+    chat disconnected). In every ``None`` case the caller MUST fail closed (not
+    execute the write).
     """
     with _lock:
         cb = _notify_cbs.get(session_key)
         if cb is None:
             return None  # no interactive surface → caller denies the write
-        entry = _ApprovalWait(function_name)
+        entry = _ApprovalWait(function_name, tool_call_id)
         _waits.setdefault(session_key, []).append(entry)
 
     try:
@@ -199,6 +207,15 @@ def await_tool_approval(session_key: str, function_name: str, interaction_event:
         from tools.environments.base import touch_activity_if_due
     except Exception:  # pragma: no cover
         touch_activity_if_due = None
+    # A disconnect/stop reaches this worker as a thread interrupt: on SSE
+    # disconnect the gateway calls agent.interrupt(), which fans the interrupt
+    # bit out to the tool-worker thread running this guard. Observe it and
+    # release — otherwise the worker parks here for the full timeout while the
+    # run can't unwind (its notify cleanup only runs once this returns).
+    try:
+        from tools.interrupt import is_interrupted
+    except Exception:  # pragma: no cover
+        is_interrupted = None
 
     now = time.monotonic()
     deadline = now + max(_approval_timeout(), 0)
@@ -209,6 +226,8 @@ def await_tool_approval(session_key: str, function_name: str, interaction_event:
             break
         if entry.event.wait(timeout=min(1.0, remaining)):
             break
+        if is_interrupted is not None and is_interrupted():
+            break  # result stays None → fail closed (deny)
         if touch_activity_if_due is not None:
             touch_activity_if_due(activity, "waiting for tool approval")
 
@@ -216,9 +235,19 @@ def await_tool_approval(session_key: str, function_name: str, interaction_event:
     return entry.result
 
 
-def resolve_tool_approval(session_key: str, function_name: str, scope: str) -> bool:
+def resolve_tool_approval(
+    session_key: str,
+    function_name: str,
+    scope: str,
+    tool_call_id: str = "",
+) -> bool:
     """Apply a decision posted from the Omnia chat: unblock the waiting tool
     call and, for ``session`` scope, remember it for the rest of the chat.
+
+    When ``tool_call_id`` is given, the MATCHING waiter is resolved — not the
+    queue head — so two writes blocked in one turn can't cross-talk (the user's
+    decision on one card releasing the other). Falls back to FIFO only when no
+    id is supplied (a legacy / single-call caller).
 
     Returns False only for a malformed request. A decision that arrives before
     the guard blocked (or after it timed out) still records the grant so the
@@ -231,7 +260,15 @@ def resolve_tool_approval(session_key: str, function_name: str, scope: str) -> b
 
     with _lock:
         queue = _waits.get(session_key)
-        entry = queue.pop(0) if queue else None
+        entry = None
+        if queue:
+            if tool_call_id:
+                for index, candidate in enumerate(queue):
+                    if candidate.tool_call_id == tool_call_id:
+                        entry = queue.pop(index)
+                        break
+            else:
+                entry = queue.pop(0)
         if queue is not None and not queue:
             _waits.pop(session_key, None)
     if entry is not None:
@@ -284,6 +321,18 @@ def _denial_result(choice: Optional[str]) -> str:
     )
 
 
+def fail_closed_denial(function_name: str) -> Optional[str]:
+    """Denial result for a call site whose approval guard raised — so a gated
+    write never runs unapproved on a guard error. Returns ``None`` for an
+    ungated tool (it may proceed). Treats an unclassifiable tool as gated, so the
+    write gate stays fail-closed even when classification itself fails."""
+    try:
+        gated = is_gated_tool(function_name)
+    except Exception:
+        gated = True  # can't classify → a write gate fails closed
+    return _denial_result(None) if gated else None
+
+
 def maybe_require_tool_approval(
     function_name: str,
     tool_call_id: str = "",
@@ -320,7 +369,9 @@ def maybe_require_tool_approval(
         },
     }
 
-    choice = await_tool_approval(session_key, function_name, interaction_event)
+    choice = await_tool_approval(
+        session_key, function_name, interaction_event, tool_call_id or ""
+    )
     if choice == "session":
         # resolve_tool_approval already recorded it; proceed.
         return None
