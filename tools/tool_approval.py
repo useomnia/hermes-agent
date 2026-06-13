@@ -37,7 +37,7 @@ import time
 from typing import Callable, Optional
 
 from tools.approval import get_current_session_key
-from tools.mcp_tool import sanitize_mcp_name_component
+from tools.mcp_tool import mcp_tool_is_write, sanitize_mcp_name_component
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,11 @@ _ENV_DISABLED = "OMNIO_TOOL_APPROVAL_DISABLED"
 # tools/approval.py's gateway_timeout default; the chat keepalive holds the SSE.
 _ENV_TIMEOUT = "OMNIO_TOOL_APPROVAL_TIMEOUT"
 _DEFAULT_TIMEOUT_S = 300
+
+# Registered MCP names for the per-brand connectors server are
+# ``mcp_connectors_<slug>``. The dynamic write overlay is scoped to this prefix
+# so only connector tools are gated through the connector-approval card.
+_CONNECTORS_TOOL_PREFIX = "mcp_connectors_"
 
 # User-facing option labels and the scope each one grants. Index-aligned so the
 # Omnia frontend can map a chosen label back to its scope.
@@ -113,14 +118,17 @@ def _approval_timeout() -> int:
 def is_gated_tool(function_name: str) -> bool:
     """Whether *function_name* is a connector write action that needs approval.
 
-    Matches the sanitized slug as a suffix of the registered MCP name
-    (``mcp_<server>_<slug>``) so the check is independent of the connectors
-    server name. The match is case-insensitive: the gated set is the Composio
-    action slug (upper-case) but the advertised tool name could differ in case,
-    and a security gate must not fail OPEN on a casing divergence. Slugs are
-    specific action names, so a suffix match cannot collide with an unrelated tool.
+    Two sources, OR'd:
+    1. The provision-time frozen allowlist (``OMNIO_CONNECTORS_WRITE_TOOLS``) —
+       matched as a sanitized slug suffix of the registered MCP name
+       (``mcp_<server>_<slug>``), case-insensitively (a security gate must not
+       fail OPEN on a casing divergence). This is the defense-in-depth FLOOR.
+    2. A dynamic overlay: a connectors-server tool the route advertised as NOT
+       read-only (MCP ``readOnlyHint=False``). This tracks the LIVE allowlist, so
+       a write added after this sprite was provisioned is gated the moment the
+       route serves it — closing the drift the frozen snapshot alone would leave.
     """
-    if _DISABLED_FROZEN or not _GATED_SLUGS_FROZEN:
+    if _DISABLED_FROZEN:
         return False
     if not function_name or not function_name.startswith("mcp_"):
         return False
@@ -128,6 +136,8 @@ def is_gated_tool(function_name: str) -> bool:
     for slug in _GATED_SLUGS_FROZEN:
         if name == slug or name.endswith("_" + slug):
             return True
+    if function_name.startswith(_CONNECTORS_TOOL_PREFIX) and mcp_tool_is_write(function_name):
+        return True
     return False
 
 

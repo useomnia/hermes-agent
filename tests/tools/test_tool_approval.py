@@ -4,6 +4,7 @@ import threading
 
 import pytest
 
+import tools.mcp_tool as mcp_tool
 import tools.tool_approval as tool_approval
 from tools.approval import reset_current_session_key, set_current_session_key
 from tools.interrupt import set_interrupt
@@ -40,10 +41,12 @@ def _clean_state(monkeypatch):
     _session_approved.clear()
     _notify_cbs.clear()
     _waits.clear()
+    mcp_tool._mcp_tool_read_only_hints.clear()
     yield
     _session_approved.clear()
     _notify_cbs.clear()
     _waits.clear()
+    mcp_tool._mcp_tool_read_only_hints.clear()
     reset_current_session_key(token)
 
 
@@ -82,6 +85,35 @@ class TestIsGatedTool:
         assert _parse_gated_slugs("not json") == frozenset()
         assert _parse_gated_slugs("") == frozenset()
         assert _parse_gated_slugs('{"not": "a list"}') == frozenset()
+
+
+class TestDynamicWriteGate:
+    """The annotation overlay gates a connectors WRITE tool advertised with
+    readOnlyHint=False even when it's absent from the frozen env (the drift case),
+    and is scoped to the connectors server."""
+
+    # A connectors write NOT in the fixture's frozen set ({gmail_create_email_draft}).
+    NEW_WRITE = "mcp_connectors_GMAIL_SEND_EMAIL"
+    READ = "mcp_connectors_GMAIL_FETCH_EMAILS"
+    NON_CONNECTOR = "mcp_other_DO_SOMETHING"
+
+    def test_should_gate_a_connectors_write_marked_by_annotation_not_in_the_frozen_set(self):
+        assert is_gated_tool(self.NEW_WRITE) is False  # not advertised yet
+        mcp_tool._track_mcp_tool_read_only(self.NEW_WRITE, False)
+        assert is_gated_tool(self.NEW_WRITE) is True
+
+    def test_should_not_gate_a_connectors_read_marked_read_only(self):
+        mcp_tool._track_mcp_tool_read_only(self.READ, True)
+        assert is_gated_tool(self.READ) is False
+
+    def test_should_not_gate_a_non_connectors_tool_even_if_marked_write(self):
+        mcp_tool._track_mcp_tool_read_only(self.NON_CONNECTOR, False)
+        assert is_gated_tool(self.NON_CONNECTOR) is False
+
+    def test_overlay_still_gates_when_the_frozen_set_is_empty(self, monkeypatch):
+        monkeypatch.setattr(tool_approval, "_GATED_SLUGS_FROZEN", frozenset())
+        mcp_tool._track_mcp_tool_read_only(self.NEW_WRITE, False)
+        assert is_gated_tool(self.NEW_WRITE) is True
 
 
 class TestMaybeRequireToolApproval:

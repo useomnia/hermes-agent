@@ -2448,6 +2448,12 @@ _parallel_safe_servers: set = set()
 # guessing.
 _mcp_tool_server_names: Dict[str, str] = {}
 
+# Per-tool MCP ``readOnlyHint`` annotation captured at registration (None when
+# the server didn't advertise one). The connector write-tool approval gate reads
+# this via ``mcp_tool_is_write`` so its gated set tracks the LIVE advertised
+# tools rather than a provision-time snapshot. Protected by _lock.
+_mcp_tool_read_only_hints: Dict[str, Optional[bool]] = {}
+
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
@@ -3356,10 +3362,27 @@ def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
         _mcp_tool_server_names[tool_name] = safe_server_name
 
 
+def _track_mcp_tool_read_only(tool_name: str, read_only_hint: Optional[bool]) -> None:
+    """Record a tool's MCP ``readOnlyHint`` annotation (None if unadvertised)."""
+    with _lock:
+        _mcp_tool_read_only_hints[tool_name] = read_only_hint
+
+
 def _forget_mcp_tool_server(tool_name: str) -> None:
-    """Forget MCP server provenance for a deregistered tool."""
+    """Forget MCP provenance (server + read-only hint) for a deregistered tool."""
     with _lock:
         _mcp_tool_server_names.pop(tool_name, None)
+        _mcp_tool_read_only_hints.pop(tool_name, None)
+
+
+def mcp_tool_is_write(tool_name: str) -> bool:
+    """True when *tool_name*'s MCP annotation explicitly marks it NOT read-only.
+
+    A missing hint returns False — only an explicit ``readOnlyHint=False`` counts
+    as a write, so this never over-gates tools whose server left them unannotated.
+    """
+    with _lock:
+        return _mcp_tool_read_only_hints.get(tool_name) is False
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -3497,6 +3520,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             description=schema["description"],
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
+        _track_mcp_tool_read_only(
+            tool_name_prefixed,
+            getattr(getattr(mcp_tool, "annotations", None), "readOnlyHint", None),
+        )
         registered_names.append(tool_name_prefixed)
 
     # Register MCP Resources & Prompts utility tools, filtered by config and
