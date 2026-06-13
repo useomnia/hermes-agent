@@ -2450,7 +2450,7 @@ _mcp_tool_server_names: Dict[str, str] = {}
 
 # Per-tool MCP ``readOnlyHint`` annotation captured at registration (None when
 # the server didn't advertise one). The connector write-tool approval gate reads
-# this via ``mcp_tool_is_write`` so its gated set tracks the LIVE advertised
+# this via ``mcp_tool_is_read_only`` so its gated set tracks the LIVE advertised
 # tools rather than a provision-time snapshot. Protected by _lock.
 _mcp_tool_read_only_hints: Dict[str, Optional[bool]] = {}
 
@@ -3375,14 +3375,15 @@ def _forget_mcp_tool_server(tool_name: str) -> None:
         _mcp_tool_read_only_hints.pop(tool_name, None)
 
 
-def mcp_tool_is_write(tool_name: str) -> bool:
-    """True when *tool_name*'s MCP annotation explicitly marks it NOT read-only.
+def mcp_tool_is_read_only(tool_name: str) -> bool:
+    """True only when *tool_name*'s MCP annotation explicitly marks it read-only
+    (``readOnlyHint=True``).
 
-    A missing hint returns False — only an explicit ``readOnlyHint=False`` counts
-    as a write, so this never over-gates tools whose server left them unannotated.
+    A missing or False hint returns False, so a caller gating "unless read-only"
+    fails CLOSED on an un-advertised tool rather than treating it as a safe read.
     """
     with _lock:
-        return _mcp_tool_read_only_hints.get(tool_name) is False
+        return _mcp_tool_read_only_hints.get(tool_name) is True
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:

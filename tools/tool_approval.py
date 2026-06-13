@@ -4,11 +4,12 @@ Reads run ungated. WRITE actions on a customer's connected third-party SaaS
 (e.g. drafting an email, creating a doc) require an explicit per-call user
 approval rendered as a control in the Omnia chat.
 
-The gated set comes from ``OMNIO_CONNECTORS_WRITE_TOOLS`` — a JSON list of
-Composio action slugs injected by Omnia from its allowlist (so the gated set
-never drifts from what the connectors MCP route actually exposes). A tool is
-gated when its registered MCP name (``mcp_<server>_<slug>``) resolves to one of
-those slugs.
+A tool is gated when the connectors MCP route advertised it as NOT read-only
+(MCP ``readOnlyHint=False``). The route derives that from its own write allowlist
+and stamps it per tool, so the gated set tracks exactly what the route exposes —
+it can't drift from a provision-time snapshot. The gate FAILS CLOSED: a
+connectors tool with no read-only hint (e.g. an old route that hasn't advertised
+it yet) is gated rather than run as an ungated write.
 
 This gate is **blocking** — like ``tools.approval`` (the dangerous-shell-command
 gate). When the agent calls a gated write, the guard surfaces the approval card
@@ -37,13 +38,11 @@ import time
 from typing import Callable, Optional
 
 from tools.approval import get_current_session_key
-from tools.mcp_tool import mcp_tool_is_write, sanitize_mcp_name_component
+from tools.mcp_tool import mcp_tool_is_read_only
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
 
-# Env carrying the JSON list of gated write-action slugs (Omnia → sprite).
-_ENV_WRITE_TOOLS = "OMNIO_CONNECTORS_WRITE_TOOLS"
 # Killswitch: when truthy, no tool is gated (every write runs ungated).
 _ENV_DISABLED = "OMNIO_TOOL_APPROVAL_DISABLED"
 # How long (seconds) the agent blocks waiting for the user to resolve. Mirrors
@@ -52,8 +51,8 @@ _ENV_TIMEOUT = "OMNIO_TOOL_APPROVAL_TIMEOUT"
 _DEFAULT_TIMEOUT_S = 300
 
 # Registered MCP names for the per-brand connectors server are
-# ``mcp_connectors_<slug>``. The dynamic write overlay is scoped to this prefix
-# so only connector tools are gated through the connector-approval card.
+# ``mcp_connectors_<slug>``. The write gate is scoped to this prefix so only
+# connector tools are gated through the connector-approval card.
 _CONNECTORS_TOOL_PREFIX = "mcp_connectors_"
 
 # User-facing option labels and the scope each one grants. Index-aligned so the
@@ -83,29 +82,12 @@ class _ApprovalWait:
         self.result: Optional[str] = None  # "once" | "session" | "deny"
 
 
-def _parse_gated_slugs(raw: str) -> frozenset[str]:
-    """Sanitized, lower-cased write-action slugs from the env JSON list."""
-    if not raw:
-        return frozenset()
-    try:
-        slugs = json.loads(raw)
-    except (ValueError, TypeError):
-        logger.warning("Malformed %s; gating no tools", _ENV_WRITE_TOOLS)
-        return frozenset()
-    if not isinstance(slugs, list):
-        return frozenset()
-    return frozenset(
-        sanitize_mcp_name_component(s).lower() for s in slugs if isinstance(s, str) and s
-    )
-
-
 # Frozen at import — same rationale as tools/approval.py's _YOLO_MODE_FROZEN:
-# reading these live on every call would let in-process skill/plugin code flip
-# the killswitch or clear the gated set mid-run and bypass the gate (a
-# prompt-injection escalation path). The env is process-constant (set per gateway
-# at spawn), so a snapshot loses nothing. Tests patch these module attrs.
+# reading the killswitch live on every call would let in-process skill/plugin
+# code flip it mid-run and bypass the gate (a prompt-injection escalation path).
+# The env is process-constant (set per gateway at spawn), so a snapshot loses
+# nothing. Tests patch this module attr.
 _DISABLED_FROZEN: bool = env_var_enabled(_ENV_DISABLED)
-_GATED_SLUGS_FROZEN: frozenset[str] = _parse_gated_slugs(os.environ.get(_ENV_WRITE_TOOLS, ""))
 
 
 def _approval_timeout() -> int:
@@ -116,29 +98,20 @@ def _approval_timeout() -> int:
 
 
 def is_gated_tool(function_name: str) -> bool:
-    """Whether *function_name* is a connector write action that needs approval.
+    """Whether *function_name* is a connector WRITE that needs approval.
 
-    Two sources, OR'd:
-    1. The provision-time frozen allowlist (``OMNIO_CONNECTORS_WRITE_TOOLS``) —
-       matched as a sanitized slug suffix of the registered MCP name
-       (``mcp_<server>_<slug>``), case-insensitively (a security gate must not
-       fail OPEN on a casing divergence). This is the defense-in-depth FLOOR.
-    2. A dynamic overlay: a connectors-server tool the route advertised as NOT
-       read-only (MCP ``readOnlyHint=False``). This tracks the LIVE allowlist, so
-       a write added after this sprite was provisioned is gated the moment the
-       route serves it — closing the drift the frozen snapshot alone would leave.
+    Gates a connectors-server tool (``mcp_connectors_<slug>``) unless the route
+    advertised it as read-only (MCP ``readOnlyHint=True``). The route stamps that
+    per tool from its write allowlist, so the gated set tracks exactly what the
+    route exposes — no provision-time snapshot to drift. FAILS CLOSED: a
+    connectors tool with no read-only hint (e.g. a route that hasn't advertised
+    it yet) is gated rather than run as an ungated write.
     """
     if _DISABLED_FROZEN:
         return False
-    if not function_name or not function_name.startswith("mcp_"):
+    if not function_name or not function_name.startswith(_CONNECTORS_TOOL_PREFIX):
         return False
-    name = function_name.lower()
-    for slug in _GATED_SLUGS_FROZEN:
-        if name == slug or name.endswith("_" + slug):
-            return True
-    if function_name.startswith(_CONNECTORS_TOOL_PREFIX) and mcp_tool_is_write(function_name):
-        return True
-    return False
+    return not mcp_tool_is_read_only(function_name)
 
 
 def is_tool_approved(session_key: str, function_name: str) -> bool:

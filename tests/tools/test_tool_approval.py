@@ -12,7 +12,6 @@ from tools.tool_approval import (
     APPROVAL_OPTION_SCOPES,
     APPROVAL_OPTIONS,
     _ApprovalWait,
-    _parse_gated_slugs,
     _notify_cbs,
     _session_approved,
     _waits,
@@ -33,15 +32,18 @@ SESSION = "sess-1"
 
 @pytest.fixture(autouse=True)
 def _clean_state(monkeypatch):
-    # The gated set + killswitch are frozen at import (hardening against
-    # in-process bypass), so patch the frozen module attrs rather than os.environ.
-    monkeypatch.setattr(tool_approval, "_GATED_SLUGS_FROZEN", frozenset({"gmail_create_email_draft"}))
+    # The killswitch is frozen at import (hardening against in-process bypass), so
+    # patch the module attr rather than os.environ.
     monkeypatch.setattr(tool_approval, "_DISABLED_FROZEN", False)
     token = set_current_session_key(SESSION)
     _session_approved.clear()
     _notify_cbs.clear()
     _waits.clear()
     mcp_tool._mcp_tool_read_only_hints.clear()
+    # Model the connectors route having advertised its tools: the write is NOT
+    # read-only (gated), the read IS (ungated). Gating reads the live annotation.
+    mcp_tool._track_mcp_tool_read_only(GATED, False)
+    mcp_tool._track_mcp_tool_read_only(READ, True)
     yield
     _session_approved.clear()
     _notify_cbs.clear()
@@ -61,59 +63,29 @@ def _resolving_notify(scope):
 
 
 class TestIsGatedTool:
+    """Gating is driven by the live MCP ``readOnlyHint`` the route advertised: a
+    connectors tool is gated unless it's explicitly read-only (fail closed)."""
+
     def test_should_gate_a_connector_write_tool(self):
         assert is_gated_tool(GATED) is True
-
-    def test_should_gate_case_insensitively_when_the_name_is_lower_cased(self):
-        assert is_gated_tool("mcp_connectors_gmail_create_email_draft") is True
 
     def test_should_not_gate_a_connector_read_tool(self):
         assert is_gated_tool(READ) is False
 
-    def test_should_not_gate_when_the_write_list_is_empty(self, monkeypatch):
-        monkeypatch.setattr(tool_approval, "_GATED_SLUGS_FROZEN", frozenset())
-        assert is_gated_tool(GATED) is False
+    def test_should_gate_an_unadvertised_connectors_tool_fail_closed(self):
+        # No readOnlyHint recorded (e.g. the route hasn't advertised it yet) →
+        # gate rather than risk running a write ungated.
+        assert is_gated_tool("mcp_connectors_SOME_NEW_ACTION") is True
 
     def test_should_not_gate_when_the_killswitch_is_set(self, monkeypatch):
         monkeypatch.setattr(tool_approval, "_DISABLED_FROZEN", True)
         assert is_gated_tool(GATED) is False
 
-    def test_should_not_gate_a_non_mcp_tool(self):
+    def test_should_not_gate_a_non_connectors_tool(self):
         assert is_gated_tool("terminal") is False
-
-    def test_should_parse_no_slugs_from_malformed_env(self):
-        assert _parse_gated_slugs("not json") == frozenset()
-        assert _parse_gated_slugs("") == frozenset()
-        assert _parse_gated_slugs('{"not": "a list"}') == frozenset()
-
-
-class TestDynamicWriteGate:
-    """The annotation overlay gates a connectors WRITE tool advertised with
-    readOnlyHint=False even when it's absent from the frozen env (the drift case),
-    and is scoped to the connectors server."""
-
-    # A connectors write NOT in the fixture's frozen set ({gmail_create_email_draft}).
-    NEW_WRITE = "mcp_connectors_GMAIL_SEND_EMAIL"
-    READ = "mcp_connectors_GMAIL_FETCH_EMAILS"
-    NON_CONNECTOR = "mcp_other_DO_SOMETHING"
-
-    def test_should_gate_a_connectors_write_marked_by_annotation_not_in_the_frozen_set(self):
-        assert is_gated_tool(self.NEW_WRITE) is False  # not advertised yet
-        mcp_tool._track_mcp_tool_read_only(self.NEW_WRITE, False)
-        assert is_gated_tool(self.NEW_WRITE) is True
-
-    def test_should_not_gate_a_connectors_read_marked_read_only(self):
-        mcp_tool._track_mcp_tool_read_only(self.READ, True)
-        assert is_gated_tool(self.READ) is False
-
-    def test_should_not_gate_a_non_connectors_tool_even_if_marked_write(self):
-        mcp_tool._track_mcp_tool_read_only(self.NON_CONNECTOR, False)
-        assert is_gated_tool(self.NON_CONNECTOR) is False
-
-    def test_overlay_still_gates_when_the_frozen_set_is_empty(self, monkeypatch):
-        monkeypatch.setattr(tool_approval, "_GATED_SLUGS_FROZEN", frozenset())
-        mcp_tool._track_mcp_tool_read_only(self.NEW_WRITE, False)
-        assert is_gated_tool(self.NEW_WRITE) is True
+        # Another MCP server's write hint is NOT routed through the connector gate.
+        mcp_tool._track_mcp_tool_read_only("mcp_other_DO_THING", False)
+        assert is_gated_tool("mcp_other_DO_THING") is False
 
 
 class TestMaybeRequireToolApproval:
