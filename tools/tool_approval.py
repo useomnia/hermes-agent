@@ -57,13 +57,18 @@ _CONNECTORS_TOOL_PREFIX = "mcp_connectors_"
 
 # User-facing option labels and the scope each one grants. Index-aligned so the
 # Omnia frontend can map a chosen label back to its scope.
-APPROVAL_OPTIONS = ["Allow once", "Allow for this chat", "Deny"]
-APPROVAL_OPTION_SCOPES = ["once", "session", "deny"]
-APPROVAL_SCOPES = frozenset({"once", "session", "deny"})
+APPROVAL_OPTIONS = ["Allow once", "Allow for this chat", "Allow always", "Deny"]
+APPROVAL_OPTION_SCOPES = ["once", "session", "always", "deny"]
+APPROVAL_SCOPES = frozenset({"once", "session", "always", "deny"})
 
 _lock = threading.Lock()
 # session_key -> tool names approved for the whole conversation.
 _session_approved: dict[str, set[str]] = {}
+# Tool names approved for EVERY conversation on this gateway (the `always` scope).
+# Gateway-wide, not session-keyed, so it spans chats — and deliberately NOT cleared
+# by clear_session: it lives for the gateway's life and resets only on reprovision/
+# restart. (A durable cross-reprovision grant would need a persistent store.)
+_always_approved: set[str] = set()
 # session_key -> per-session notify callback (bridges guard thread → chat stream).
 _notify_cbs: dict[str, Callable[[dict], None]] = {}
 # session_key -> FIFO of blocked approval waiters.
@@ -79,7 +84,7 @@ class _ApprovalWait:
         self.event = threading.Event()
         self.tool = tool
         self.tool_call_id = tool_call_id
-        self.result: Optional[str] = None  # "once" | "session" | "deny"
+        self.result: Optional[str] = None  # "once" | "session" | "always" | "deny"
 
 
 # Frozen at import — same rationale as tools/approval.py's _YOLO_MODE_FROZEN:
@@ -124,6 +129,19 @@ def record_session_approval(session_key: str, function_name: str) -> None:
     """Grant a tool for the rest of the session (the `session` scope)."""
     with _lock:
         _session_approved.setdefault(session_key, set()).add(function_name)
+
+
+def is_always_approved(function_name: str) -> bool:
+    """True when the tool is approved for every conversation on this gateway
+    (the `always` scope), until the gateway restarts/reprovisions."""
+    with _lock:
+        return function_name in _always_approved
+
+
+def record_always_approval(function_name: str) -> None:
+    """Grant a tool for every conversation on this gateway (the `always` scope)."""
+    with _lock:
+        _always_approved.add(function_name)
 
 
 def register_tool_approval_notify(session_key: str, cb: Callable[[dict], None]) -> None:
@@ -240,6 +258,8 @@ def resolve_tool_approval(
         return False
     if scope == "session" and function_name:
         record_session_approval(session_key, function_name)
+    if scope == "always" and function_name:
+        record_always_approval(function_name)
 
     with _lock:
         queue = _waits.get(session_key)
@@ -330,6 +350,8 @@ def maybe_require_tool_approval(
     if not is_gated_tool(function_name):
         return None
     session_key = get_current_session_key()
+    if is_always_approved(function_name):
+        return None  # granted for every conversation on this gateway
     if is_tool_approved(session_key, function_name):
         return None  # approved for the whole session earlier
 
@@ -355,8 +377,8 @@ def maybe_require_tool_approval(
     choice = await_tool_approval(
         session_key, function_name, interaction_event, tool_call_id or ""
     )
-    if choice == "session":
-        # resolve_tool_approval already recorded it; proceed.
+    if choice in ("session", "always"):
+        # resolve_tool_approval already recorded the grant; proceed.
         return None
     if choice == "once":
         return None  # this call proceeds; the next one prompts again

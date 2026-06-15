@@ -12,11 +12,13 @@ from tools.tool_approval import (
     APPROVAL_OPTION_SCOPES,
     APPROVAL_OPTIONS,
     _ApprovalWait,
+    _always_approved,
     _notify_cbs,
     _session_approved,
     _waits,
     clear_session,
     fail_closed_denial,
+    is_always_approved,
     is_gated_tool,
     is_tool_approved,
     maybe_require_tool_approval,
@@ -37,6 +39,7 @@ def _clean_state(monkeypatch):
     monkeypatch.setattr(tool_approval, "_DISABLED_FROZEN", False)
     token = set_current_session_key(SESSION)
     _session_approved.clear()
+    _always_approved.clear()
     _notify_cbs.clear()
     _waits.clear()
     mcp_tool._mcp_tool_read_only_hints.clear()
@@ -46,6 +49,7 @@ def _clean_state(monkeypatch):
     mcp_tool._track_mcp_tool_read_only(READ, True)
     yield
     _session_approved.clear()
+    _always_approved.clear()
     _notify_cbs.clear()
     _waits.clear()
     mcp_tool._mcp_tool_read_only_hints.clear()
@@ -143,6 +147,35 @@ class TestMaybeRequireToolApproval:
         assert it["options"] == APPROVAL_OPTIONS
         assert it["approval"]["tool"] == GATED
         assert it["approval"]["option_scopes"] == APPROVAL_OPTION_SCOPES
+
+
+class TestAlwaysScope:
+    """`always` grants a tool for EVERY conversation on this gateway (not just the
+    current chat) and survives clear_session — it resets only on gateway restart."""
+
+    def test_should_record_an_always_grant(self):
+        assert resolve_tool_approval(SESSION, GATED, "always") is True
+        assert is_always_approved(GATED) is True
+
+    def test_always_is_not_a_session_grant(self):
+        # Stored gateway-wide, so another session sees no SESSION grant for it,
+        # yet the always grant still lets that session's call proceed.
+        resolve_tool_approval(SESSION, GATED, "always")
+        assert is_tool_approved("another-session", GATED) is False
+        assert is_always_approved(GATED) is True
+
+    def test_always_grant_survives_clear_session(self):
+        resolve_tool_approval(SESSION, GATED, "always")
+        clear_session(SESSION)
+        assert is_always_approved(GATED) is True
+        assert maybe_require_tool_approval(GATED) is None
+
+    def test_should_proceed_and_persist_when_the_user_allows_always(self):
+        register_tool_approval_notify(SESSION, _resolving_notify("always"))
+        assert maybe_require_tool_approval(GATED, "call-1") is None
+        # The grant carried to the next call without any interactive surface.
+        unregister_tool_approval_notify(SESSION)
+        assert maybe_require_tool_approval(GATED) is None
 
 
 class TestResolveToolApproval:
