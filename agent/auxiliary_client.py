@@ -45,6 +45,7 @@ import logging
 import os
 import threading
 import time
+from contextvars import ContextVar
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -4925,6 +4926,102 @@ def _build_call_kwargs(
     return kwargs
 
 
+# --- Auxiliary LLM cost accounting (Omnio) -----------------------------------
+# Auxiliary calls (vision, the web_extract summarizer, compression, title-gen,
+# etc.) spend real tokens that never pass through the main agent loop's cost path
+# (conversation_loop), so their cost is invisible to anything reading
+# `sessions.estimated_cost_usd`. We attribute it to the CURRENT session HERE:
+# call_llm / async_call_llm stash the resolved (provider, model, base_url,
+# api_key) for the in-flight request in `_AUX_COST_CTX`, and
+# `_validate_llm_response` — the single point every return funnels through —
+# prices the response and adds the cost to that session's state.db row (the same
+# column + delta-add the main loop uses, so a reader summing the session tree
+# sees agent + auxiliary cost together). Best-effort and isolated: accounting
+# NEVER breaks an auxiliary call, and it's a no-op outside a gateway session
+# (CLI/cron set no session id).
+_AUX_COST_CTX: ContextVar[Optional[Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]]] = (
+    ContextVar("_aux_llm_cost_ctx", default=None)
+)
+
+_aux_cost_session_db: Any = None
+
+
+def _get_aux_cost_session_db() -> Any:
+    """Lazily open (once per process) a SessionDB on the default state.db — the
+    same per-profile DB the gateway agent writes, since both resolve it from
+    get_hermes_home(). Returns None if the store can't be opened."""
+    global _aux_cost_session_db
+    if _aux_cost_session_db is None:
+        try:
+            from hermes_state import SessionDB
+            _aux_cost_session_db = SessionDB()
+        except Exception:  # noqa: BLE001 — no store ⇒ accounting silently disabled
+            return None
+    return _aux_cost_session_db
+
+
+def _account_auxiliary_cost(response: Any) -> None:
+    """Price an auxiliary LLM response and add its cost to the current session's
+    `estimated_cost_usd` in state.db. Reads the in-flight (provider, model,
+    base_url, api_key) from `_AUX_COST_CTX` and the active session from the
+    gateway session context. Entirely best-effort: any failure (no context, no
+    session, no usage, no price, no store) is swallowed — cost accounting must
+    never break the call it is observing."""
+    try:
+        ctx = _AUX_COST_CTX.get()
+        if not ctx:
+            return
+        ctx_provider, ctx_model, ctx_base_url, ctx_api_key = ctx
+
+        from gateway.session_context import get_session_env
+        session_id = get_session_env("HERMES_SESSION_ID", "")
+        if not session_id:
+            return  # CLI/cron: no gateway session to attribute the cost to
+
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return
+        # The API's reported model is the most accurate for pricing — it reflects
+        # any heal/fallback retry that changed the requested model; fall back to
+        # the resolved model.
+        model_name = getattr(response, "model", None) or ctx_model
+        if not model_name:
+            return
+
+        from agent.usage_pricing import estimate_usage_cost, normalize_usage
+        canonical = normalize_usage(usage, provider=ctx_provider)
+        cost = estimate_usage_cost(
+            model_name,
+            canonical,
+            provider=ctx_provider,
+            base_url=ctx_base_url,
+            api_key=ctx_api_key,
+        )
+        if cost.amount_usd is None or cost.amount_usd <= 0:
+            return  # unknown price or subscription-included ⇒ nothing to add
+
+        db = _get_aux_cost_session_db()
+        if db is None:
+            return
+        # Delta-add to the session's totals, exactly like the main loop's per-call
+        # write in conversation_loop (absolute=False ⇒ increment, never overwrite).
+        db.update_token_counts(
+            session_id,
+            input_tokens=canonical.input_tokens,
+            output_tokens=canonical.output_tokens,
+            cache_read_tokens=canonical.cache_read_tokens,
+            cache_write_tokens=canonical.cache_write_tokens,
+            reasoning_tokens=canonical.reasoning_tokens,
+            estimated_cost_usd=float(cost.amount_usd),
+            cost_status=cost.status,
+            cost_source=cost.source,
+            model=model_name,
+            api_call_count=1,
+        )
+    except Exception:  # noqa: BLE001 — cost accounting must never break a call
+        logger.debug("auxiliary cost accounting failed", exc_info=True)
+
+
 def _validate_llm_response(response: Any, task: str = None) -> Any:
     """Validate that an LLM response has the expected .choices[0].message shape.
 
@@ -4953,6 +5050,9 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
             f"Expected object with .choices[0].message — check provider "
             f"adapter or custom endpoint compatibility."
         ) from exc
+    # Single chokepoint every call_llm / async_call_llm return funnels through —
+    # account this auxiliary call's cost against the current session (Omnio).
+    _account_auxiliary_cost(response)
     return response
 
 
@@ -5080,6 +5180,11 @@ def call_llm(
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    # Stash the resolved request identity for cost accounting in
+    # _validate_llm_response (the single return chokepoint below). Set right
+    # before the create so retries that re-enter the chokepoint reuse it.
+    _AUX_COST_CTX.set((resolved_provider, final_model, _client_base or resolved_base_url, resolved_api_key))
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
@@ -5549,6 +5654,11 @@ async def async_call_llm(
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    # Stash the resolved request identity for cost accounting in
+    # _validate_llm_response (the single return chokepoint below). Set right
+    # before the create so retries that re-enter the chokepoint reuse it.
+    _AUX_COST_CTX.set((resolved_provider, final_model, _client_base or resolved_base_url, resolved_api_key))
 
     try:
         return _validate_llm_response(
