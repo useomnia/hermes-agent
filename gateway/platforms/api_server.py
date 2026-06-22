@@ -740,6 +740,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Live chat-completions agents keyed by X-Hermes-Session-Id, so an
+        # out-of-band POST /v1/omnio/steer can reach the agent mid-turn and inject
+        # a steer. Holds the same mutable [agent] container the SSE writer uses;
+        # set when a streaming turn starts, popped when it finishes.
+        self._chat_agents: Dict[str, list] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
@@ -2095,9 +2100,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 approval_session_key=session_id,
                 approval_notify=_approval_notify,
             ))
+            # Register the live agent under its session id so an out-of-band
+            # POST /v1/omnio/steer can reach it mid-turn; drop it when the turn
+            # ends. Keyed by session_id, so only continued sessions (the proxy
+            # always sends X-Hermes-Session-Id) are steerable — anonymous chats
+            # have no stable key and simply aren't.
+            if session_id:
+                self._chat_agents[session_id] = agent_ref
+
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
-            agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+            def _on_agent_done(_fut: "asyncio.Future") -> None:
+                if session_id:
+                    self._chat_agents.pop(session_id, None)
+                _stream_q.put(None)
+
+            agent_task.add_done_callback(_on_agent_done)
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
@@ -4281,6 +4299,48 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_omnio_steer(self, request: "web.Request") -> "web.Response":
+        """POST /v1/omnio/steer — inject a queued user message into the running
+        turn's NEXT tool result without interrupting it (AIAgent.steer).
+
+        Keyed by ``X-Hermes-Session-Id`` (the value the proxy derives from the
+        source id). Returns ``{"accepted": true}`` when a live turn for that
+        session received the steer, or ``{"accepted": false, "reason": ...}`` when
+        no turn is running — the client then falls back to queueing the message
+        for the next turn (steer is best-effort and lands at the next tool-call
+        boundary, so a turn that's already finishing simply isn't steerable).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        text = str(body.get("text", "") or "").strip()
+        if not text:
+            return web.json_response(
+                _openai_error("Missing 'text'", code="steer_missing_text"), status=400
+            )
+
+        session_key = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if not session_key:
+            return web.json_response(
+                _openai_error("Missing X-Hermes-Session-Id", code="steer_no_session"), status=400
+            )
+
+        agent_ref = self._chat_agents.get(session_key)
+        agent = agent_ref[0] if agent_ref else None
+        if agent is None:
+            # No turn streaming for this session (finished, or the agent hasn't
+            # been constructed yet): not steerable — the client re-queues.
+            return web.json_response({"accepted": False, "reason": "no_active_turn"})
+
+        accepted = bool(agent.steer(text))
+        return web.json_response({"accepted": accepted})
+
     async def _handle_omnio_tool_approval(self, request: "web.Request") -> "web.Response":
         """POST /v1/omnio/tool-approval — record a user's decision on a gated
         connector WRITE tool.
@@ -4516,6 +4576,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
             # Omnia non-blocking connector-write approval (see _handle_omnio_tool_approval).
             self._app.router.add_post("/v1/omnio/tool-approval", self._handle_omnio_tool_approval)
+            # Mid-turn steer: inject a queued message into the running turn's next
+            # tool result without interrupting it (see _handle_omnio_steer).
+            self._app.router.add_post("/v1/omnio/steer", self._handle_omnio_steer)
             # Mid-session MCP reconnect (see _handle_mcp_reload) — Omnia triggers it
             # after a brand connects/disconnects a connector.
             self._app.router.add_post("/v1/mcp/reload", self._handle_mcp_reload)
