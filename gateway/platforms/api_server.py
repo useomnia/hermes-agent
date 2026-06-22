@@ -2084,22 +2084,35 @@ class APIServerAdapter(BasePlatformAdapter):
             # fired side-by-side with the structured callbacks), so the filter
             # avoids double-emitting what ``_on_tool_start``/``_on_tool_complete`` own.
             agent_ref = [None]
-            agent_task = asyncio.ensure_future(self._run_agent(
-                user_message=user_message,
-                conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
-                session_id=session_id,
-                stream_delta_callback=_on_delta,
-                reasoning_callback=_on_reasoning,
-                tool_progress_callback=_on_tool_progress,
-                tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete,
-                agent_ref=agent_ref,
-                gateway_session_key=gateway_session_key,
-                response_format=response_format,
-                approval_session_key=session_id,
-                approval_notify=_approval_notify,
-            ))
+
+            # Run the turn, re-delivering a leftover /steer as a follow-up turn
+            # (see _run_with_steer_redelivery). The same agent_ref + callbacks are
+            # reused across re-deliveries, so an out-of-band POST /v1/omnio/steer
+            # keeps reaching the live agent and every turn streams into this one
+            # SSE response.
+            async def _one_turn(turn_message, turn_history):
+                return await self._run_agent(
+                    user_message=turn_message,
+                    conversation_history=turn_history,
+                    ephemeral_system_prompt=system_prompt,
+                    session_id=session_id,
+                    stream_delta_callback=_on_delta,
+                    reasoning_callback=_on_reasoning,
+                    tool_progress_callback=_on_tool_progress,
+                    tool_start_callback=_on_tool_start,
+                    tool_complete_callback=_on_tool_complete,
+                    agent_ref=agent_ref,
+                    gateway_session_key=gateway_session_key,
+                    response_format=response_format,
+                    approval_session_key=session_id,
+                    approval_notify=_approval_notify,
+                )
+
+            agent_task = asyncio.ensure_future(
+                self._run_with_steer_redelivery(
+                    _one_turn, user_message, history, session_id=session_id
+                )
+            )
             # Register the live agent under its session id so an out-of-band
             # POST /v1/omnio/steer can reach it mid-turn; drop it when the turn
             # ends. Keyed by session_id, so only continued sessions (the proxy
@@ -3780,6 +3793,65 @@ class APIServerAdapter(BasePlatformAdapter):
                         reset_current_session_key(approval_token)
 
         return await loop.run_in_executor(None, _run)
+
+    # A /steer that arrives after the agent's final tool batch (e.g. during the
+    # closing API call) has no tool result to absorb it, so run_conversation hands
+    # it back as result["pending_steer"] rather than dropping it. Re-deliver it as
+    # a follow-up user turn — bounded so a turn that keeps ending on a fresh steer
+    # can't spin forever.
+    _MAX_STEER_REDELIVERY = 3
+
+    async def _run_with_steer_redelivery(
+        self,
+        one_turn,
+        user_message: Any,
+        conversation_history: List[Dict[str, str]],
+        *,
+        session_id: Optional[str] = None,
+    ) -> tuple:
+        """Run a chat turn, re-delivering a leftover /steer as a follow-up turn.
+
+        ``one_turn(user_message, conversation_history)`` runs a single agent turn
+        and returns ``(result_dict, usage_dict)`` — typically a thin wrapper over
+        ``_run_agent`` carrying the SSE callbacks, so every re-delivered turn
+        streams into the same response.
+
+        When the finished turn carries ``result["pending_steer"]`` (a steer landed
+        after the last tool batch, with no tool result to absorb it), the turn is
+        run again with that text as the user message and the just-finished
+        transcript (``result["messages"]``) as history. Passing the prior
+        transcript as history is what makes the re-run persist only the new turn —
+        ``_flush_messages_to_session_db`` skips ``len(conversation_history)``
+        already-stored messages. Usage is summed across turns; the final result is
+        returned.
+        """
+        total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        next_message: Any = user_message
+        next_history = conversation_history
+        result: Optional[Dict[str, Any]] = None
+        for attempt in range(self._MAX_STEER_REDELIVERY + 1):
+            result, usage = await one_turn(next_message, next_history)
+            if isinstance(usage, dict):
+                for key in total_usage:
+                    total_usage[key] += usage.get(key, 0) or 0
+            leftover = result.get("pending_steer") if isinstance(result, dict) else None
+            # An interrupt (stop button, request_input) supersedes a pending steer:
+            # clear_interrupt already dropped it, so this guard is belt-and-braces.
+            if not leftover or result.get("interrupted"):
+                break
+            logger.info(
+                "Re-delivering leftover /steer as a follow-up turn for session %s (attempt %d)",
+                session_id or "?", attempt + 1,
+            )
+            next_message = leftover
+            next_history = result.get("messages") or next_history
+        else:
+            if isinstance(result, dict) and result.get("pending_steer"):
+                logger.warning(
+                    "Steer re-delivery cap (%d) reached for session %s; dropping leftover steer",
+                    self._MAX_STEER_REDELIVERY, session_id or "?",
+                )
+        return result, total_usage
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
