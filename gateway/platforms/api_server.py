@@ -741,6 +741,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Serializes /v1/mcp/reload so two quick connector toggles can't race the
+        # global teardown/rebuild (the second reload would otherwise hit the
+        # "nothing to shut down" fast path and stop the MCP loop while the first
+        # is still rebuilding, corrupting the server registry). Lazily created on
+        # the running loop the first time a reload is handled.
+        self._mcp_reload_lock: Optional["asyncio.Lock"] = None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -4277,15 +4283,24 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         loop = asyncio.get_running_loop()
+        # Lazily create the reload lock on the running loop (instances are built
+        # before the event loop exists, so we can't bind it in __init__).
+        if self._mcp_reload_lock is None:
+            self._mcp_reload_lock = asyncio.Lock()
         try:
             from tools.mcp_tool import _lock, _servers, discover_mcp_tools, shutdown_mcp_servers
 
-            with _lock:
-                old_servers = set(_servers.keys())
-            await loop.run_in_executor(None, shutdown_mcp_servers)
-            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
-            with _lock:
-                connected = set(_servers.keys())
+            # Serialize the teardown+rebuild: a concurrent reload must wait for
+            # this one to finish rather than race shutdown_mcp_servers() /
+            # discover_mcp_tools() and corrupt _servers or stop the MCP loop
+            # mid-rebuild.
+            async with self._mcp_reload_lock:
+                with _lock:
+                    old_servers = set(_servers.keys())
+                await loop.run_in_executor(None, shutdown_mcp_servers)
+                new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+                with _lock:
+                    connected = set(_servers.keys())
         except Exception as exc:
             logger.exception("[api_server] MCP reload failed")
             return web.json_response(_openai_error(str(exc)), status=500)
