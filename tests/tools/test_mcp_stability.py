@@ -647,3 +647,90 @@ class TestMCPInitialConnectionRetry:
                 await task
 
         asyncio.get_event_loop().run_until_complete(_run())
+
+
+# ---------------------------------------------------------------------------
+# Fix: reconnect-retry budget resets on a healthy connection
+# (consecutive failures, not a lifetime tally)
+# ---------------------------------------------------------------------------
+
+class TestMCPReconnectBudgetReset:
+    """A drop that follows a healthy connection resets the reconnect budget, so
+    _MAX_RECONNECT_RETRIES means "failures in a row", not a lifetime count that
+    eventually kills a long-lived server after enough spread-out transients."""
+
+    def test_discover_tools_flags_reconnect_succeeded(self):
+        """_discover_tools marks the server viable again so run()'s loop can
+        reset its retry budget on the next drop."""
+        from tools.mcp_tool import MCPServerTask
+
+        class _FakeResult:
+            tools = []
+
+        class _FakeSession:
+            async def list_tools(self):
+                return _FakeResult()
+
+        async def _run():
+            server = MCPServerTask("test-flag")
+            server.session = _FakeSession()
+            assert server._reconnect_succeeded is False
+            await server._discover_tools()
+            assert server._reconnect_succeeded is True
+
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_reconnect_budget_resets_after_healthy_connection(self):
+        """Surviving MORE than _MAX_RECONNECT_RETRIES drops must NOT make the
+        server give up, as long as each drop followed a successful connect.
+
+        Regression guard: the counter used to accumulate over the connection's
+        whole life, so a long session with a handful of spread-out transients
+        would exhaust the cap and the server would die until a reload/restart.
+        """
+        from tools.mcp_tool import MCPServerTask, _MAX_RECONNECT_RETRIES
+
+        total_drops = _MAX_RECONNECT_RETRIES + 3  # well past the old lifetime cap
+        call_count = 0
+        _orig_sleep = asyncio.sleep
+
+        async def _instant_sleep(*_a, **_k):
+            # Yield to the loop without waiting out the (reset) backoff.
+            await _orig_sleep(0)
+
+        async def fake_run_stdio(self_inner, config):
+            nonlocal call_count
+            call_count += 1
+            # Model a healthy connect (what _discover_tools would do) ...
+            self_inner._connected_once = True
+            self_inner._reconnect_succeeded = True
+            self_inner._ready.set()
+            if call_count <= total_drops:
+                # ... then the transport drops.
+                raise ConnectionError("transient drop")
+            # Final attempt: stay connected until shutdown.
+            await self_inner._shutdown_event.wait()
+
+        async def _run():
+            server = MCPServerTask("test-budget-reset")
+            with patch.object(MCPServerTask, "_run_stdio", fake_run_stdio), \
+                    patch("tools.mcp_tool.asyncio.sleep", _instant_sleep):
+                task = asyncio.ensure_future(server.run({"command": "fake"}))
+                # Let the loop weather every drop and reach the final
+                # stay-connected attempt (or die early if it gave up).
+                for _ in range(10000):
+                    if task.done() or call_count > total_drops:
+                        break
+                    await _orig_sleep(0)
+
+                assert not task.done(), (
+                    "server gave up after spread-out drops — the reconnect "
+                    "budget is accumulating over the connection's lifetime "
+                    "instead of resetting on each healthy reconnect"
+                )
+                assert call_count == total_drops + 1
+
+                server._shutdown_event.set()
+                await asyncio.wait_for(task, timeout=5)
+
+        asyncio.get_event_loop().run_until_complete(_run())

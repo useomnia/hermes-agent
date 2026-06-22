@@ -1129,6 +1129,7 @@ class MCPServerTask:
         "_sampling", "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
         "initialize_result", "_connected_once", "_serving_degraded",
+        "_reconnect_succeeded",
     )
 
     def __init__(self, name: str):
@@ -1178,6 +1179,14 @@ class MCPServerTask:
         # _servers — instead of raising and orphaning a live background task.
         # Cleared once the server actually connects.
         self._serving_degraded: bool = False
+        # Flips True on every successful connect+discover (see _discover_tools)
+        # and back to False the next time run()'s reconnect loop consumes it.
+        # Lets a connection drop that follows a healthy connection RESET the
+        # reconnect-retry budget instead of counting toward it forever — so the
+        # _MAX_RECONNECT_RETRIES cap is consecutive failures, not lifetime ones.
+        # Mirrors the circuit-breaker's "a successful reconnect means the server
+        # is viable again" contract (see _reset_server_error / #fix-2).
+        self._reconnect_succeeded: bool = False
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
@@ -1780,6 +1789,11 @@ class MCPServerTask:
         self._connected_once = True
         self._error = None
         self._serving_degraded = False
+        # We have a live, initialized session with its tool list — the server is
+        # viable again. Signal run()'s reconnect loop to reset its retry budget
+        # so a later transient drop doesn't count toward a give-up that was meant
+        # to mean "5 failures in a row", not "5 failures over the gateway's life".
+        self._reconnect_succeeded = True
         if recovered:
             logger.info(
                 "MCP server '%s' connected on a background retry; registering "
@@ -1984,6 +1998,17 @@ class MCPServerTask:
                         self.name, exc,
                     )
                     return
+
+                # A drop that follows a healthy connection resets the retry
+                # budget: _MAX_RECONNECT_RETRIES is meant as "failures in a row",
+                # not a lifetime tally. Without this reset, a long-lived server
+                # that weathers a few spread-out transients eventually exhausts
+                # the cap and gives up for good — even though every prior drop
+                # had recovered. (Set in _discover_tools on each good connect.)
+                if self._reconnect_succeeded:
+                    retries = 0
+                    backoff = 1.0
+                    self._reconnect_succeeded = False
 
                 retries += 1
                 if retries > _MAX_RECONNECT_RETRIES:
