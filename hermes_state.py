@@ -3213,6 +3213,50 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def delete_messages_from(self, session_id: str, from_id: int) -> int:
+        """Delete messages with ``id >= from_id`` for a session, keeping the
+        earlier rows untouched (surgical truncate-after). Returns the number of
+        rows deleted.
+
+        Unlike :meth:`clear_messages` (which wipes the whole transcript), this
+        preserves the full-fidelity prefix — used to truncate a conversation at
+        an edited turn without losing the reasoning / tool history of the turns
+        before it. Counters are recomputed from the surviving rows so
+        message_count / tool_call_count stay accurate (mirrors the recount in
+        :meth:`replace_messages`).
+
+        A ``from_id`` that matches no rows (already truncated, or past the last
+        id) is an idempotent no-op returning 0 — callers resolve ``from_id`` from
+        this session's own message ids (``id`` is a global autoincrement).
+        """
+        def _do(conn):
+            deleted = conn.execute(
+                "DELETE FROM messages WHERE session_id = ? AND id >= ?",
+                (session_id, from_id),
+            ).rowcount
+            message_count = 0
+            tool_call_count = 0
+            for row in conn.execute(
+                "SELECT tool_calls FROM messages WHERE session_id = ?",
+                (session_id,),
+            ):
+                message_count += 1
+                raw_tool_calls = row["tool_calls"]
+                if not raw_tool_calls:
+                    continue
+                try:
+                    parsed = json.loads(raw_tool_calls)
+                except (json.JSONDecodeError, TypeError):
+                    tool_call_count += 1
+                else:
+                    tool_call_count += len(parsed) if isinstance(parsed, list) else 1
+            conn.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                (message_count, tool_call_count, session_id),
+            )
+            return deleted
+        return self._execute_write(_do)
+
     @staticmethod
     def _remove_session_files(sessions_dir: Optional[Path], session_id: str) -> None:
         """Remove on-disk transcript files for a session.

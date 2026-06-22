@@ -1200,6 +1200,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
+                "session_messages_replace": {"method": "PUT", "path": "/api/sessions/{session_id}/messages"},
+                "session_messages_truncate": {"method": "DELETE", "path": "/api/sessions/{session_id}/messages"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
@@ -1494,6 +1496,85 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "session_id": session_id,
             "data": [self._message_response(m) for m in messages],
+        })
+
+    async def _handle_replace_session_messages(self, request: "web.Request") -> "web.Response":
+        """PUT /api/sessions/{session_id}/messages — idempotently replace the
+        session's full message list with the supplied transcript.
+
+        Creates the session row if it doesn't exist yet: this is the cold-seed
+        path (a fresh state.db after a reprovision has no row), and PUT is
+        create-or-replace by contract. Mirrors the get_messages -> replace_messages
+        round-trip the fork endpoint uses, so a transcript read from
+        GET .../messages PUTs back verbatim — full fidelity (reasoning, tool
+        calls) preserved.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return web.json_response(_openai_error("'messages' must be a list", code="invalid_messages"), status=400)
+        if not all(isinstance(m, dict) and isinstance(m.get("role"), str) for m in messages):
+            return web.json_response(
+                _openai_error("each message must be an object with a string 'role'", code="invalid_messages"),
+                status=400,
+            )
+        if re.search(r'[\r\n\x00]', session_id):
+            return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+        if not db.get_session(session_id):
+            # Cold-seed path: a fresh state.db after a reprovision has no row.
+            # Log it so a flood of typo'd ids minting junk sessions is traceable.
+            logger.info("PUT session messages: cold-seeding new session row %s", session_id)
+            db.create_session(session_id, "api_server")
+        db.replace_messages(session_id, messages)
+        return web.json_response({
+            "object": "hermes.session.messages",
+            "session_id": session_id,
+            "count": len(messages),
+        })
+
+    async def _handle_delete_session_messages(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/sessions/{session_id}/messages?from=<id> — surgically
+        delete messages with id >= from (truncate-after), keeping the
+        full-fidelity prefix. Used to truncate a conversation at an edited turn
+        without rewriting the earlier transcript.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        raw_from = request.query.get("from")
+        if raw_from is None:
+            return web.json_response(_openai_error("Missing required 'from' query parameter", code="invalid_from"), status=400)
+        try:
+            from_id = int(raw_from)
+        except (TypeError, ValueError):
+            return web.json_response(_openai_error("'from' must be an integer message id", code="invalid_from"), status=400)
+        # Message ids are positive autoincrements; a from < 1 would match every row
+        # and silently wipe the whole transcript (use DELETE /api/sessions/{id} for that).
+        if from_id < 1:
+            return web.json_response(_openai_error("'from' must be a positive message id", code="invalid_from"), status=400)
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+        deleted = db.delete_messages_from(session_id, from_id)
+        return web.json_response({
+            "object": "hermes.session.messages.truncated",
+            "session_id": session_id,
+            "deleted": deleted,
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
@@ -4409,6 +4490,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_patch("/api/sessions/{session_id}", self._handle_patch_session)
             self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
             self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_session_messages)
+            self._app.router.add_put("/api/sessions/{session_id}/messages", self._handle_replace_session_messages)
+            self._app.router.add_delete("/api/sessions/{session_id}/messages", self._handle_delete_session_messages)
             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)

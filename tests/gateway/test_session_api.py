@@ -45,6 +45,8 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
+    app.router.add_put("/api/sessions/{session_id}/messages", adapter._handle_replace_session_messages)
+    app.router.add_delete("/api/sessions/{session_id}/messages", adapter._handle_delete_session_messages)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
@@ -366,3 +368,185 @@ async def test_session_header_rejected_without_api_key(adapter, session_db):
         assert resp.status == 403
         data = await resp.json()
         assert "X-Hermes-Session-Key requires API key" in data["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_put_messages_seeds_a_missing_session(adapter, session_db):
+    """PUT creates the session row when absent (the cold-seed path after a fresh
+    state.db) and stores the supplied transcript."""
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.put(
+            "/api/sessions/cold-seed/messages",
+            json={"messages": [
+                {"role": "user", "content": "restored question"},
+                {"role": "assistant", "content": "restored answer"},
+            ]},
+        )
+        assert resp.status == 200, await resp.text()
+        assert await resp.json() == {
+            "object": "hermes.session.messages",
+            "session_id": "cold-seed",
+            "count": 2,
+        }
+
+    assert session_db.get_session("cold-seed") is not None
+    assert [m["content"] for m in session_db.get_messages("cold-seed")] == [
+        "restored question",
+        "restored answer",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_put_messages_preserves_reasoning_and_tool_calls_round_trip(adapter, session_db):
+    """A transcript PUT back carries assistant reasoning + tool calls verbatim —
+    the full-fidelity property the cold-seed relies on."""
+    session_id = session_db.create_session("fidelity", "api_server")
+    transcript = [
+        {"role": "user", "content": "search please"},
+        {
+            "role": "assistant",
+            "content": "calling search",
+            "reasoning_content": "the user wants a search",
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "web_search", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "content": "results", "tool_call_id": "call_1", "tool_name": "web_search"},
+        {"role": "assistant", "content": "here you go"},
+    ]
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.put(f"/api/sessions/{session_id}/messages", json={"messages": transcript})
+        assert resp.status == 200, await resp.text()
+
+    restored = session_db.get_messages_as_conversation(session_id)
+    assert [m["role"] for m in restored] == ["user", "assistant", "tool", "assistant"]
+    assert restored[1]["reasoning_content"] == "the user wants a search"
+    assert restored[1]["tool_calls"][0]["function"]["name"] == "web_search"
+    assert restored[2]["tool_call_id"] == "call_1"
+
+
+@pytest.mark.asyncio
+async def test_put_messages_replaces_the_existing_transcript(adapter, session_db):
+    """PUT is idempotent set — the prior transcript is wiped, not appended to."""
+    session_id = session_db.create_session("replace-me", "api_server")
+    session_db.append_message(session_id, "user", "old one")
+    session_db.append_message(session_id, "assistant", "old two")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.put(
+            f"/api/sessions/{session_id}/messages",
+            json={"messages": [{"role": "user", "content": "only this"}]},
+        )
+        assert resp.status == 200
+
+    assert [m["content"] for m in session_db.get_messages(session_id)] == ["only this"]
+
+
+@pytest.mark.asyncio
+async def test_put_messages_rejects_a_non_list_body(adapter, session_db):
+    session_id = session_db.create_session("bad-body", "api_server")
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.put(f"/api/sessions/{session_id}/messages", json={"messages": "nope"})
+        assert resp.status == 400
+        assert (await resp.json())["error"]["code"] == "invalid_messages"
+
+
+@pytest.mark.asyncio
+async def test_delete_messages_truncates_from_id_keeping_the_prefix(adapter, session_db):
+    """DELETE ?from=<id> removes that message and everything after it, leaving
+    the earlier rows untouched and the counters recomputed."""
+    session_id = session_db.create_session("truncate", "api_server")
+    for i in range(4):
+        session_db.append_message(session_id, "user" if i % 2 == 0 else "assistant", f"msg {i}")
+    boundary_id = session_db.get_messages(session_id)[2]["id"]
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.delete(f"/api/sessions/{session_id}/messages?from={boundary_id}")
+        assert resp.status == 200, await resp.text()
+        assert await resp.json() == {
+            "object": "hermes.session.messages.truncated",
+            "session_id": session_id,
+            "deleted": 2,
+        }
+
+    assert [m["content"] for m in session_db.get_messages(session_id)] == ["msg 0", "msg 1"]
+    assert session_db.get_session(session_id)["message_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_delete_messages_requires_the_from_param(adapter, session_db):
+    session_id = session_db.create_session("no-from", "api_server")
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.delete(f"/api/sessions/{session_id}/messages")
+        assert resp.status == 400
+        assert (await resp.json())["error"]["code"] == "invalid_from"
+
+
+@pytest.mark.asyncio
+async def test_delete_messages_rejects_a_non_integer_from(adapter, session_db):
+    session_id = session_db.create_session("bad-from", "api_server")
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.delete(f"/api/sessions/{session_id}/messages?from=abc")
+        assert resp.status == 400
+        assert (await resp.json())["error"]["code"] == "invalid_from"
+
+
+@pytest.mark.asyncio
+async def test_delete_messages_404_when_session_missing(adapter):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.delete("/api/sessions/ghost/messages?from=1")
+        assert resp.status == 404
+        assert (await resp.json())["error"]["code"] == "session_not_found"
+
+
+@pytest.mark.asyncio
+async def test_message_writes_require_auth_when_key_configured(auth_adapter, session_db):
+    session_id = session_db.create_session("guarded", "api_server")
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        put_resp = await cli.put(f"/api/sessions/{session_id}/messages", json={"messages": []})
+        assert put_resp.status == 401
+        del_resp = await cli.delete(f"/api/sessions/{session_id}/messages?from=1")
+        assert del_resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_delete_messages_rejects_a_non_positive_from(adapter, session_db):
+    """from < 1 would match every row (ids are positive autoincrements) and
+    silently wipe the transcript — it must be rejected, not run."""
+    session_id = session_db.create_session("floor", "api_server")
+    session_db.append_message(session_id, "user", "keep me")
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        for bad in ("0", "-1"):
+            resp = await cli.delete(f"/api/sessions/{session_id}/messages?from={bad}")
+            assert resp.status == 400, await resp.text()
+            assert (await resp.json())["error"]["code"] == "invalid_from"
+    # The transcript is untouched by a rejected request.
+    assert [m["content"] for m in session_db.get_messages(session_id)] == ["keep me"]
+
+
+@pytest.mark.asyncio
+async def test_delete_messages_from_beyond_range_is_an_idempotent_noop(adapter, session_db):
+    """A from_id past the last message deletes nothing and returns 0 — the
+    idempotent-retry contract the edit-resend flow relies on."""
+    session_id = session_db.create_session("idempotent", "api_server")
+    session_db.append_message(session_id, "user", "one")
+    session_db.append_message(session_id, "assistant", "two")
+    beyond = session_db.get_messages(session_id)[-1]["id"] + 1000
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.delete(f"/api/sessions/{session_id}/messages?from={beyond}")
+        assert resp.status == 200, await resp.text()
+        assert (await resp.json())["deleted"] == 0
+
+    assert [m["content"] for m in session_db.get_messages(session_id)] == ["one", "two"]
