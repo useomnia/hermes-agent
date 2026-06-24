@@ -1345,17 +1345,24 @@ class APIServerAdapter(BasePlatformAdapter):
         the model. Mirrors what the gateway/CLI surfaces through
         ``/skills list``, but as a deterministic JSON payload.
 
-        Returns the same skill metadata (name, description, category) the
-        skills hub uses internally. Disabled skills are excluded so the
-        listing matches what the agent actually loads.
+        Returns the skill metadata (name, description, category) the skills hub
+        uses internally, plus the ``command`` slug a client sends to invoke the
+        skill (``/<command>`` on this same endpoint). ``command`` is ``null``
+        when the name reduces to an empty slug. Disabled skills are excluded so
+        the listing matches what the agent actually loads.
         """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         try:
+            from agent.skill_commands import slugify_skill_name
             from tools.skills_tool import _find_all_skills, _sort_skills
             skills = _sort_skills(_find_all_skills(skip_disabled=False))
+            data = [
+                {**skill, "command": slugify_skill_name(skill.get("name", "")) or None}
+                for skill in skills
+            ]
         except Exception:
             logger.exception("GET /v1/skills failed")
             return web.json_response(
@@ -1365,7 +1372,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({
             "object": "list",
-            "data": skills,
+            "data": data,
         })
 
     async def _handle_toolsets(self, request: "web.Request") -> "web.Response":
