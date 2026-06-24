@@ -2218,8 +2218,17 @@ class APIServerAdapter(BasePlatformAdapter):
             # can enqueue directly. Keyed by session_id (== the conversation's
             # X-Hermes-Session-Id), which the resolve endpoint also uses.
             def _approval_notify(event: "Dict[str, Any]") -> None:
+                # Redact any command before it enters the SSE event stream so a
+                # secret-bearing approval prompt can't reach the API/desktop
+                # client (same egress guard as the /v1/runs notify and
+                # gateway/run.py:_approval_notify_sync).
+                event = dict(event or {})
+                if "command" in event:
+                    from gateway.run import _redact_approval_command
+
+                    event["command"] = _redact_approval_command(event.get("command"))
                 try:
-                    _stream_q.put(("__tool_progress__", event))
+                    _stream_q.put_nowait(("__tool_progress__", event))
                 except Exception:
                     pass
 

@@ -47,6 +47,12 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 AUTHOR_MAP = {
     "miguel@mff.io": "miguelff",
     "pablopazosp3@gmail.com": "ppazosp",
+    # Upstream contributors new since the last sync (PR #15, NousResearch 89540d592):
+    "SJWATTS89@OUTLOOK.COM": "lEWFkRAD",
+    "daniel.laforce@argobox.com": "KeyArgo",
+    "konsisumer@users.noreply.github.com": "konsisumer",
+    "naqerl@users.noreply.github.com": "naqerl",
+    "poli.koltsova@gmail.com": "wnuuee1",
     "145739220+wgu9@users.noreply.github.com": "wgu9",  # PR #51468 salvage (WSL/no-systemd orphan gateway tracking, #51325)
     "165020384+uperLu@users.noreply.github.com": "uperLu",  # PR #50958 salvage (rename plugins/cron → plugins/cron_providers; #50872)
     "277269729+yusekiotacode@users.noreply.github.com": "yusekiotacode",  # PR #48706 salvage (anthropic OAuth login token endpoint → platform.claude.com; #45250/#49821)
