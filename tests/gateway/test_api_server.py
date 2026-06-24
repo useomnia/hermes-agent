@@ -848,6 +848,27 @@ class TestSkillsEndpoint:
                     assert set(entry.keys()) >= {"name", "description", "category"}
 
     @pytest.mark.asyncio
+    async def test_skills_command_is_validated_against_the_registry(self, adapter):
+        # "Site Audit" slugifies to a registered command; "Orphan" does not, so
+        # its command must be null (a non-null command is guaranteed to resolve).
+        fake_skills = [
+            {"name": "Site Audit", "description": "Audit", "category": "omnio"},
+            {"name": "Orphan", "description": "Unregistered", "category": "omnio"},
+        ]
+        with (
+            patch("tools.skills_tool._find_all_skills", return_value=list(fake_skills)),
+            patch("agent.skill_commands.get_skill_commands", return_value={"/site-audit": {}}),
+        ):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/skills")
+                assert resp.status == 200
+                data = await resp.json()
+                by_name = {s["name"]: s for s in data["data"]}
+                assert by_name["Site Audit"]["command"] == "site-audit"
+                assert by_name["Orphan"]["command"] is None
+
+    @pytest.mark.asyncio
     async def test_skills_handles_enumeration_failure(self, adapter):
         with patch(
             "tools.skills_tool._find_all_skills",
