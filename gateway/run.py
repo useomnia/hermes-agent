@@ -16350,6 +16350,20 @@ class GatewayRunner:
                 )
 
         try:
+            from tools.user_input import clear_session as _clear_user_input_session
+        except Exception:
+            _clear_user_input_session = None
+        if _clear_user_input_session is not None:
+            try:
+                _clear_user_input_session(session_key)
+            except Exception as e:
+                logger.debug(
+                    "Failed to clear request_user_input state for session boundary %s: %s",
+                    session_key,
+                    e,
+                )
+
+        try:
             from tools.approval import clear_session as _clear_approval_session
         except Exception:
             return
