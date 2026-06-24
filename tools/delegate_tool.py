@@ -885,6 +885,13 @@ def _build_child_progress_callback(
             _relay("subagent.text", preview=preview)
             return
 
+        if event_type == "subagent.reasoning":
+            # Omnio: the child's REAL streamed reasoning (delta.reasoning_content),
+            # relayed verbatim so the web chat shows the child's live thinking —
+            # distinct from subagent.thinking (the decorative spinner below).
+            _relay("subagent.reasoning", preview=preview)
+            return
+
         # Normalise legacy strings, new-style "delegate.*" strings, and
         # DelegateEvent enum values all to a single DelegateEvent.  The
         # original implementation only accepted the five legacy strings;
@@ -1654,6 +1661,27 @@ def _run_single_child(
                 child_progress_cb("subagent.text", preview=delta)
             except Exception as e:
                 logger.debug("Child text relay failed: %s", e)
+
+        def _relay_child_reasoning(delta: str) -> None:
+            # Forward the child's REAL streamed reasoning (the model's
+            # ``delta.reasoning_content`` chain-of-thought) up as
+            # ``subagent.reasoning`` so the chat shows the child's live thinking.
+            # This is distinct from ``subagent.thinking``, which carries only the
+            # decorative spinner status (kaomoji + verb, e.g. "cogitating…") fired
+            # by ``thinking_callback`` — NOT the model's reasoning. Omnio's web UI
+            # renders ``subagent.reasoning``; the CLI/TUI keep ``subagent.thinking``
+            # for the animated spinner.
+            if not delta or not child_progress_cb:
+                return
+            try:
+                child_progress_cb("subagent.reasoning", preview=delta)
+            except Exception as e:
+                logger.debug("Child reasoning relay failed: %s", e)
+
+        # Tap the child's reasoning side-channel (it already streams because
+        # run_conversation wires a stream_callback below; this is independent of
+        # the thinking_callback spinner that feeds subagent.thinking).
+        child.reasoning_callback = _relay_child_reasoning
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
