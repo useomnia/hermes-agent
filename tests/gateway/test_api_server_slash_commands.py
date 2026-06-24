@@ -51,10 +51,19 @@ class TestNoExpansion:
         with patches[0], patches[1], patches[2], patches[3]:
             assert _adapter()._maybe_expand_skill_command("/Users/pablo/notes", SESSION_ID) is None
 
-    def test_skill_resolves_but_build_returns_none_passes_through(self):
+    def test_skill_resolves_but_build_returns_none_passes_through_and_logs(self, caplog):
+        # A command that resolves to a real skill but builds no payload is a
+        # failure, not a non-match: it still passes through, but loudly.
         patches = _patch_skills(skill_key="/site-audit", skill_msg=None, bundle_key=None)
-        with patches[0], patches[1], patches[2], patches[3]:
+        with caplog.at_level("ERROR"), patches[0], patches[1], patches[2], patches[3]:
             assert _adapter()._maybe_expand_skill_command("/site-audit", SESSION_ID) is None
+        assert any("resolved but built no payload" in record.message for record in caplog.records)
+
+    def test_bundle_resolves_but_build_returns_none_passes_through_and_logs(self, caplog):
+        patches = _patch_skills(skill_key=None, bundle_key="/research", bundle_result=None)
+        with caplog.at_level("ERROR"), patches[0], patches[1], patches[2], patches[3]:
+            assert _adapter()._maybe_expand_skill_command("/research", SESSION_ID) is None
+        assert any("resolved but built no payload" in record.message for record in caplog.records)
 
     def test_resolver_exception_passes_through(self):
         with patch("agent.skill_bundles.resolve_bundle_command_key", return_value=None), \

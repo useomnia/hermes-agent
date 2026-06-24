@@ -1356,13 +1356,22 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         try:
-            from agent.skill_commands import slugify_skill_name
+            from agent.skill_commands import get_skill_commands, slugify_skill_name
             from tools.skills_tool import _find_all_skills, _sort_skills
+
             skills = _sort_skills(_find_all_skills(skip_disabled=False))
-            data = [
-                {**skill, "command": slugify_skill_name(skill.get("name", "")) or None}
-                for skill in skills
-            ]
+            # Validate each derived command against the live command registry so a
+            # non-null `command` is GUARANTEED to resolve on the chat path: this
+            # rejects any slug that doesn't round-trip (e.g. a name truncated for
+            # display, or a skill disabled/incompatible for this platform and thus
+            # absent from the registry), reporting it as command=null rather than a
+            # command that silently fails to invoke.
+            registry = get_skill_commands()
+            data = []
+            for skill in skills:
+                slug = slugify_skill_name(skill.get("name", ""))
+                command = slug if slug and f"/{slug}" in registry else None
+                data.append({**skill, "command": command})
         except Exception:
             logger.exception("GET /v1/skills failed")
             return web.json_response(
@@ -1964,6 +1973,11 @@ class APIServerAdapter(BasePlatformAdapter):
         carries general prose, so a message that merely starts with ``/`` (a path
         like ``/Users/x``, a question about ``/etc``) must pass through: only a
         confirmed bundle/skill match is intercepted.
+
+        Only plain-text turns expand: a multimodal turn (text + image) arrives as
+        a content list, not a ``str``, so a ``/skill`` typed alongside an
+        attachment is forwarded as-is rather than expanded. Acceptable because the
+        palette's skills are text-instruction driven.
         """
         if not isinstance(user_message, str):
             return None
@@ -1991,18 +2005,21 @@ class APIServerAdapter(BasePlatformAdapter):
             return None
 
         # Bundles take precedence over single skills (matches gateway dispatch order).
+        # A command that RESOLVES to a real bundle/skill but then fails to BUILD a
+        # payload (e.g. a SKILL.md removed or unreadable on disk) is a genuine
+        # failure, not a non-match — log it loudly instead of silently forwarding
+        # the raw "/foo" to the model, which would look like the skill "did nothing".
         try:
             bundle_key = resolve_bundle_command_key(command)
             if bundle_key is not None:
                 bundle_result = build_bundle_invocation_message(
                     bundle_key, user_instruction, task_id=session_id
                 )
-                if bundle_result:
-                    msg, _loaded, _missing = bundle_result
-                    if msg:
-                        return msg
-        except Exception as exc:
-            logger.warning("Bundle command expansion failed for /%s: %s", command, exc)
+                if bundle_result and bundle_result[0]:
+                    return bundle_result[0]
+                logger.error("Bundle /%s resolved but built no payload; forwarding raw text", command)
+        except Exception:
+            logger.exception("Bundle command expansion failed for /%s", command)
 
         try:
             cmd_key = resolve_skill_command_key(command)
@@ -2010,8 +2027,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 msg = build_skill_invocation_message(cmd_key, user_instruction, task_id=session_id)
                 if msg:
                     return msg
-        except Exception as exc:
-            logger.warning("Skill command expansion failed for /%s: %s", command, exc)
+                logger.error("Skill /%s resolved but built no payload; forwarding raw text", command)
+        except Exception:
+            logger.exception("Skill command expansion failed for /%s", command)
 
         return None
 
