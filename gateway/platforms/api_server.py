@@ -1939,6 +1939,75 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
+    def _maybe_expand_skill_command(self, user_message: Any, session_id: str) -> Optional[str]:
+        """Expand a leading ``/skill-name`` into its full skill-invocation payload.
+
+        Mirrors how every other Hermes surface (CLI/TUI/messaging gateway, see
+        ``gateway/run.py``) dispatches slash commands: a message of the form
+        ``/<command> [instruction]`` is resolved against the installed skill
+        bundles (which take precedence) and skills, and on a match the user turn
+        is replaced with the payload built by ``build_skill_invocation_message``
+        (activation note + skill content + skill-dir + config + the trailing
+        instruction). The unmodified builder output is returned so the memory
+        layer's invocation markers stay intact.
+
+        Returns the expanded message, or ``None`` when the message is not a
+        recognized skill command — in which case the caller forwards the original
+        text untouched. Unlike the messaging gateway, the chat-completions API
+        carries general prose, so a message that merely starts with ``/`` (a path
+        like ``/Users/x``, a question about ``/etc``) must pass through: only a
+        confirmed bundle/skill match is intercepted.
+        """
+        if not isinstance(user_message, str):
+            return None
+        text = user_message.lstrip()
+        if not text.startswith("/"):
+            return None
+        # "/command rest of the instruction" -> ("command", "rest of the instruction")
+        parts = text[1:].split(None, 1)
+        if not parts:
+            return None
+        command = parts[0]
+        user_instruction = parts[1].strip() if len(parts) > 1 else ""
+
+        try:
+            from agent.skill_bundles import (
+                build_bundle_invocation_message,
+                resolve_bundle_command_key,
+            )
+            from agent.skill_commands import (
+                build_skill_invocation_message,
+                resolve_skill_command_key,
+            )
+        except Exception as exc:
+            logger.warning("Skill command modules unavailable; forwarding /%s as-is: %s", command, exc)
+            return None
+
+        # Bundles take precedence over single skills (matches gateway dispatch order).
+        try:
+            bundle_key = resolve_bundle_command_key(command)
+            if bundle_key is not None:
+                bundle_result = build_bundle_invocation_message(
+                    bundle_key, user_instruction, task_id=session_id
+                )
+                if bundle_result:
+                    msg, _loaded, _missing = bundle_result
+                    if msg:
+                        return msg
+        except Exception as exc:
+            logger.warning("Bundle command expansion failed for /%s: %s", command, exc)
+
+        try:
+            cmd_key = resolve_skill_command_key(command)
+            if cmd_key is not None:
+                msg = build_skill_invocation_message(cmd_key, user_instruction, task_id=session_id)
+                if msg:
+                    return msg
+        except Exception as exc:
+            logger.warning("Skill command expansion failed for /%s: %s", command, exc)
+
+        return None
+
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         auth_err = self._check_auth(request)
@@ -2067,6 +2136,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
+
+        # Honor "/skill-name" slash commands on the OpenAI chat path the same way
+        # the CLI/TUI/messaging surfaces do: a recognized command is expanded into
+        # its skill-invocation payload before the agent runs; anything else (incl.
+        # an unrecognized "/...") is forwarded untouched.
+        expanded_command = self._maybe_expand_skill_command(user_message, session_id)
+        if expanded_command is not None:
+            user_message = expanded_command
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
