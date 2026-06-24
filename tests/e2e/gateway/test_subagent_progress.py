@@ -8,7 +8,7 @@ isn't silent on the wire, and a client disconnect (the stop button) is noticed
 promptly instead of only at the 30s SSE keepalive.
 
 This also covers the live per-subagent trace: each child streams its reasoning
-and its response up as ``subagent.reasoning`` / ``subagent.response`` events,
+and its response up as ``subagent.thinking`` / ``subagent.text`` events,
 whose ``preview`` carries an incremental delta (the new text since the last
 event, not the running cumulative string); the client appends them.
 
@@ -98,10 +98,10 @@ def test_subagent_progress_shape(gateway):
                 assert isinstance(ev[key], str), f"{key} must be a str, got {ev[key]!r}"
 
 
-def test_subagent_reasoning_and_response_streamed(gateway):
+def test_subagent_thinking_and_text_streamed(gateway):
     """Each subagent streams its reasoning / response up as a live trace.
 
-    ``subagent.reasoning`` and ``subagent.response`` carry the child's text as
+    ``subagent.thinking`` and ``subagent.text`` carry the child's text as
     incremental deltas in ``preview`` (new chars since the last event, not the
     cumulative string). Like the rest of this probe it's presence-gated: a model
     that delegates but emits no reasoning/response stream (or no delegation at
@@ -115,12 +115,12 @@ def test_subagent_reasoning_and_response_streamed(gateway):
         )
 
     streamed = [
-        ev for ev in progress if ev.get("status") in ("subagent.reasoning", "subagent.response")
+        ev for ev in progress if ev.get("status") in ("subagent.thinking", "subagent.text")
     ]
     if not streamed:
         pytest.skip(
-            f"{gateway.provider.id} delegated but streamed no subagent.reasoning/"
-            "subagent.response events (model emitted no reasoning/response stream)"
+            f"{gateway.provider.id} delegated but streamed no subagent.thinking/"
+            "subagent.text events (model emitted no reasoning/response stream)"
         )
 
     for ev in streamed:
