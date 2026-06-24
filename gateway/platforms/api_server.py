@@ -2130,16 +2130,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     "toolCallId": tool_call_id,
                     "status": "running",
                 }
-                # Omnia structured-interaction protocol: the request_input tool
-                # (shipped by the omnio_interaction plugin) carries its prompt args
-                # so the Omnia chat can render a proper form control. We forward the
-                # args verbatim under "interaction" — the per-kind shape lives in the
-                # plugin schema and the Omnia frontend, so new kinds need no change
-                # here. Gated on the tool name so no other tool's args reach the
-                # wire; request_input never receives a secret as an arg (it asks FOR
-                # one), so nothing sensitive crosses the wire. The turn is ended in
-                # _on_tool_complete (non-blocking); the user's answer is the next turn.
-                if function_name == "request_input" and isinstance(function_args, dict):
+                # Omnia structured-interaction protocol: the request_user_input
+                # tool (shipped by the omnio_interaction plugin) carries its prompt
+                # args so the Omnia chat can render a proper form control. We forward
+                # the args verbatim under "interaction" — the per-kind shape lives in
+                # the plugin schema and the Omnia frontend, so new kinds need no
+                # change here. Gated on the tool name so no other tool's args reach
+                # the wire; request_user_input never receives a secret as an arg (it
+                # asks FOR one), so nothing sensitive crosses the wire. The tool then
+                # BLOCKS in its plugin worker (tools/user_input) until the user
+                # answers the card rendered here; the answer becomes the tool result
+                # inline, so the turn stays alive (see _on_tool_complete).
+                if function_name == "request_user_input" and isinstance(function_args, dict):
                     progress["interaction"] = function_args
                 _stream_q.put(("__tool_progress__", progress))
 
@@ -2153,20 +2155,36 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put(("__tool_progress__", {
+                completed = {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
-                }))
-                # request_input is non-blocking and turn-ending: stop the agent loop
-                # now so the SSE stream closes and the user's answer becomes the next
-                # turn. interrupt() makes the loop return cleanly (the streaming writer
-                # still finalizes finish_reason="stop"), unlike a raised error. (The
-                # connector write-tool approval does NOT end the turn — it blocks the
-                # worker thread inside the guard and resumes the same call inline.)
-                if function_name == "request_input" and agent_ref[0] is not None:
+                }
+                # request_user_input returns one of two result shapes; the plugin
+                # owns which, and we honor it here:
+                #  - status "answered": the worker blocked and the user's answer IS
+                #    the result. Surface it on the completed event under
+                #    `interaction.answered` so the proxy can persist it on the
+                #    tool_calls entry (the card rehydrates as answered on reload) and
+                #    the client can show the answered state. Secret kinds never carry
+                #    the secret here — their result is a "saved" ack, not the value.
+                #  - status "presented": a turn-ending sentinel (connect_suggestion
+                #    offer, killswitch fallback, or no surface) — end the turn now
+                #    (legacy behavior; the loop returns finish_reason="stop") so the
+                #    user's answer, if any, is the next turn.
+                turn_ending = False
+                if function_name == "request_user_input":
                     try:
-                        agent_ref[0].interrupt("awaiting user interaction (request_input)")
+                        parsed = json.loads(function_result or "{}")
+                    except Exception:
+                        parsed = {}
+                    if parsed.get("status") == "answered":
+                        completed["interaction"] = {"answered": parsed.get("response", "")}
+                    turn_ending = parsed.get("status") == "presented"
+                _stream_q.put(("__tool_progress__", completed))
+                if turn_ending and agent_ref[0] is not None:
+                    try:
+                        agent_ref[0].interrupt("awaiting user interaction (request_user_input)")
                     except Exception:
                         pass
 
@@ -3991,6 +4009,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 approval_token = set_current_session_key(approval_session_key)
                 if approval_notify is not None:
                     register_tool_approval_notify(approval_session_key, approval_notify)
+                    # Mark this session as having an interactive chat surface so a
+                    # blocking request_user_input fails fast on non-chat paths (no
+                    # approval_notify) instead of parking for the full timeout.
+                    try:
+                        from tools.user_input import register_user_input_session
+
+                        register_user_input_session(approval_session_key)
+                    except Exception:
+                        pass
             tokens = self._bind_api_server_session(
                 chat_id=session_id or "",
                 session_key=gateway_session_key or session_id or "",
@@ -4033,6 +4060,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 if approval_session_key:
                     if approval_notify is not None:
                         unregister_tool_approval_notify(approval_session_key)
+                    # Drop the interactive-surface mark AND release any
+                    # request_user_input call still parked on this session, so a
+                    # finished/interrupted run never leaves a worker thread blocked
+                    # (its answer stays None → "no answer" result).
+                    try:
+                        from tools.user_input import unregister_user_input_session
+
+                        unregister_user_input_session(approval_session_key)
+                    except Exception:
+                        pass
                     if approval_token is not None:
                         reset_current_session_key(approval_token)
 
@@ -4626,6 +4663,56 @@ class APIServerAdapter(BasePlatformAdapter):
             "recorded": recorded,
         })
 
+    async def _handle_omnio_user_input(self, request: "web.Request") -> "web.Response":
+        """POST /v1/omnio/user-input — deliver the user's answer to a blocked
+        ``request_user_input`` call.
+
+        The tool is BLOCKING: the agent worker is parked on this exact call
+        waiting for the answer. The request is keyed by the conversation's session
+        id (the ``X-Hermes-Session-Id`` header the proxy derives from the source
+        id — the value the plugin scoped its wait to); ``toolCallId`` refines the
+        match (only one input blocks per session, so the queue head is normally
+        the right one). The answer becomes the tool's result inline and the turn
+        resumes. ``resolved: false`` means no call was waiting (already answered,
+        timed out, or the turn ended) — the chat treats that as a stale card.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        response = body.get("response")
+        if not isinstance(response, str):
+            return web.json_response(
+                _openai_error("Missing 'response' string", code="user_input_missing_response"),
+                status=400,
+            )
+        tool_call_id = str(body.get("toolCallId", "") or body.get("tool_call_id", "")).strip()
+
+        session_key = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if not session_key:
+            return web.json_response(
+                _openai_error("Missing X-Hermes-Session-Id", code="user_input_no_session"),
+                status=400,
+            )
+
+        try:
+            from tools.user_input import resolve_user_input
+
+            resolved = resolve_user_input(session_key, response, tool_call_id)
+        except Exception as exc:
+            logger.exception("[api_server] user input resolution failed")
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        return web.json_response({
+            "object": "omnio.user_input_response",
+            "resolved": resolved,
+        })
+
     async def _handle_mcp_reload(self, request: "web.Request") -> "web.Response":
         """POST /v1/mcp/reload — reconnect MCP servers so a tool connected (or
         disconnected) mid-conversation is picked up without restarting the gateway.
@@ -4812,8 +4899,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
-            # Omnia non-blocking connector-write approval (see _handle_omnio_tool_approval).
+            # Omnia connector-write approval (see _handle_omnio_tool_approval).
             self._app.router.add_post("/v1/omnio/tool-approval", self._handle_omnio_tool_approval)
+            # Omnia blocking request_user_input answer delivery (see _handle_omnio_user_input).
+            self._app.router.add_post("/v1/omnio/user-input", self._handle_omnio_user_input)
             # Mid-session MCP reconnect (see _handle_mcp_reload) — Omnia triggers it
             # after a brand connects/disconnects a connector.
             self._app.router.add_post("/v1/mcp/reload", self._handle_mcp_reload)

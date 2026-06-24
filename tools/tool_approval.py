@@ -204,19 +204,30 @@ def await_tool_approval(
 
     # Block in short slices so we can heartbeat the inactivity tracker — without
     # it the gateway watchdog would kill the agent while the user is deciding.
+    # Import into a temp and assign to an optional-typed local so the None fallback
+    # is a type-clean assignment (importing the name directly would declare it as
+    # the function type, which `None` then can't be assigned to).
+    touch_activity_if_due: Callable[..., None] | None = None
     try:
-        from tools.environments.base import touch_activity_if_due
+        from tools.environments.base import (
+            touch_activity_if_due as _touch_activity_if_due,
+        )
+
+        touch_activity_if_due = _touch_activity_if_due
     except Exception:  # pragma: no cover
-        touch_activity_if_due = None
+        pass
     # A disconnect/stop reaches this worker as a thread interrupt: on SSE
     # disconnect the gateway calls agent.interrupt(), which fans the interrupt
     # bit out to the tool-worker thread running this guard. Observe it and
     # release — otherwise the worker parks here for the full timeout while the
     # run can't unwind (its notify cleanup only runs once this returns).
+    is_interrupted: Callable[[], bool] | None = None
     try:
-        from tools.interrupt import is_interrupted
+        from tools.interrupt import is_interrupted as _is_interrupted
+
+        is_interrupted = _is_interrupted
     except Exception:  # pragma: no cover
-        is_interrupted = None
+        pass
 
     now = time.monotonic()
     deadline = now + max(_approval_timeout(), 0)
@@ -312,7 +323,9 @@ def _denial_result(choice: Optional[str]) -> str:
     if choice == "deny":
         reason = "The user declined this action."
     else:
-        reason = "This action needs the user's approval, which wasn't granted (no response)."
+        reason = (
+            "This action needs the user's approval, which wasn't granted (no response)."
+        )
     return json.dumps(
         {
             "error": (
