@@ -387,8 +387,14 @@ class ChatCompletionsTransport(ProviderTransport):
         base_url = params.get("base_url")
 
         provider_prefs = params.get("provider_preferences")
-        if provider_prefs and is_openrouter:
-            extra_body["provider"] = provider_prefs
+        if is_openrouter:
+            # Pin cheapest-provider routing for Omnio — parity with the profile
+            # path in plugins/model-providers/openrouter/__init__.py (this branch
+            # only runs when the OpenRouter profile isn't loaded). A caller's
+            # sort/order wins (setdefault).
+            _prefs = dict(provider_prefs or {})
+            _prefs.setdefault("sort", "price")
+            extra_body["provider"] = _prefs
 
         # OpenRouter usage accounting — response `usage.cost` carries the REAL
         # charged cost (credits are 1:1 USD). Parity with the profile path in

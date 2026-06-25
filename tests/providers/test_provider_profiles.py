@@ -100,7 +100,14 @@ class TestOpenRouterProfile:
     def test_extra_body_with_prefs(self):
         p = get_provider_profile("openrouter")
         body = p.build_extra_body(provider_preferences={"allow": ["anthropic"]})
-        assert body["provider"] == {"allow": ["anthropic"]}
+        # Caller prefs are honored AND cheapest-provider routing is layered in
+        # (sort:"price" via setdefault — a caller-supplied sort would win).
+        assert body["provider"] == {"allow": ["anthropic"], "sort": "price"}
+
+    def test_extra_body_caller_sort_wins(self):
+        p = get_provider_profile("openrouter")
+        body = p.build_extra_body(provider_preferences={"sort": "throughput"})
+        assert body["provider"] == {"sort": "throughput"}
 
     def test_extra_body_session_id(self):
         p = get_provider_profile("openrouter")
@@ -110,9 +117,9 @@ class TestOpenRouterProfile:
     def test_extra_body_no_prefs(self):
         p = get_provider_profile("openrouter")
         body = p.build_extra_body()
-        # Usage accounting is always requested (real provider-reported cost);
-        # nothing else should appear without prefs/session.
-        assert body == {"usage": {"include": True}}
+        # Always-on for Omnio: usage accounting (real provider-reported cost)
+        # + cheapest-provider routing. Nothing else without prefs/session.
+        assert body == {"usage": {"include": True}, "provider": {"sort": "price"}}
 
     def test_pareto_min_coding_score_emitted_for_pareto_model(self):
         """min_coding_score → plugins block when model is openrouter/pareto-code."""

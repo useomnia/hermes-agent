@@ -79,9 +79,16 @@ class OpenRouterProfile(ProviderProfile):
         body: dict[str, Any] = {}
         if session_id:
             body["session_id"] = session_id
-        prefs = context.get("provider_preferences")
-        if prefs:
-            body["provider"] = prefs
+        # Provider routing: pin to the cheapest provider. Omnio runs on
+        # OpenRouter multi-provider models (e.g. DeepSeek V4 Pro spans a ~4x
+        # price range across 16 providers), and OpenRouter's default routing is
+        # price-weighted-but-load-balanced (Auto-Exacto for tool calls) — so it
+        # lands on pricier providers. sort:"price" turns that off and routes
+        # cheapest, falling back to next-cheapest only on failure. A
+        # caller-supplied sort/order wins (setdefault).
+        prefs = dict(context.get("provider_preferences") or {})
+        prefs.setdefault("sort", "price")
+        body["provider"] = prefs
 
         # Usage accounting — makes OpenRouter return the REAL cost it charged
         # in the response `usage.cost` field (credits are 1:1 USD), instead of

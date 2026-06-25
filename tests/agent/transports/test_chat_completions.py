@@ -196,7 +196,9 @@ class TestChatCompletionsBuildKwargs:
             provider_profile=profile,
             provider_preferences={"only": ["openai"]},
         )
-        assert kw["extra_body"]["provider"] == {"only": ["openai"]}
+        # Caller prefs honored + cheapest-provider routing layered in (sort:price
+        # via setdefault — a caller-supplied sort would win).
+        assert kw["extra_body"]["provider"] == {"only": ["openai"], "sort": "price"}
 
     def test_openrouter_pareto_min_coding_score(self, transport):
         """Profile path: model=openrouter/pareto-code + score → plugins block."""
