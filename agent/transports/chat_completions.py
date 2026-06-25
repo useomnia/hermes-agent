@@ -388,19 +388,16 @@ class ChatCompletionsTransport(ProviderTransport):
 
         provider_prefs = params.get("provider_preferences")
         if is_openrouter:
-            # Pin cheapest-provider routing for Omnio — parity with the profile
-            # path in plugins/model-providers/openrouter/__init__.py (this branch
-            # only runs when the OpenRouter profile isn't loaded). A caller's
-            # sort/order wins (setdefault).
+            # OpenRouter request shaping for Omnio — parity with the profile path
+            # in plugins/model-providers/openrouter/__init__.py (this branch only
+            # runs when the OpenRouter profile isn't loaded):
+            #  - usage:{include:true} so the response carries the REAL charged
+            #    cost in usage.cost (credits are 1:1 USD), and
+            #  - provider:{sort:"price"} to route to the cheapest provider (a
+            #    caller-supplied sort/order wins, via setdefault).
             _prefs = dict(provider_prefs or {})
             _prefs.setdefault("sort", "price")
             extra_body["provider"] = _prefs
-
-        # OpenRouter usage accounting — response `usage.cost` carries the REAL
-        # charged cost (credits are 1:1 USD). Parity with the profile path in
-        # plugins/model-providers/openrouter/__init__.py; this branch only runs
-        # when the OpenRouter profile isn't loaded.
-        if is_openrouter:
             extra_body["usage"] = {"include": True}
 
         # Pareto Code router plugin — model-gated. Same shape as the

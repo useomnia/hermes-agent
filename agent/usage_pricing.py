@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -893,11 +894,8 @@ def _finite_nonneg_number(value: Any) -> Optional[float]:
     number (int/float, not bool); otherwise None."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    if f != f or f in (float("inf"), float("-inf")) or f < 0:
+    f = float(value)
+    if not math.isfinite(f) or f < 0:
         return None
     return f
 
