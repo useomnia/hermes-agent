@@ -1955,24 +1955,31 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
-    def _maybe_expand_skill_command(self, user_message: Any, session_id: str) -> Optional[str]:
-        """Expand a leading ``/skill-name`` into its full skill-invocation payload.
+    def _maybe_expand_slash_command(self, user_message: Any, session_id: str) -> Optional[str]:
+        """Expand a leading ``/command`` into the message the agent should process.
 
         Mirrors how every other Hermes surface (CLI/TUI/messaging gateway, see
-        ``gateway/run.py``) dispatches slash commands: a message of the form
-        ``/<command> [instruction]`` is resolved against the installed skill
-        bundles (which take precedence) and skills, and on a match the user turn
-        is replaced with the payload built by ``build_skill_invocation_message``
-        (activation note + skill content + skill-dir + config + the trailing
-        instruction). The unmodified builder output is returned so the memory
-        layer's invocation markers stay intact.
+        ``gateway/run.py``) dispatches slash commands. Two cases expand:
+
+        - ``/<skill-or-bundle> [instruction]`` — resolved against the installed
+          bundles (which take precedence) and skills; the turn is replaced with
+          the payload built by ``build_skill_invocation_message`` (activation note
+          + skill content + skill-dir + config + the trailing instruction).
+        - ``/learn [what to learn from]`` — the one built-in command that makes
+          sense on the chat path (no Omnia-UI equivalent): rewritten to the
+          standards-guided ``build_learn_prompt`` that drives the agent to author
+          a skill via ``skill_manage``. Side-effecting built-ins (``/new``,
+          ``/yolo``, …) are deliberately NOT handled here.
+
+        The unmodified builder output is returned so the memory layer's invocation
+        markers stay intact.
 
         Returns the expanded message, or ``None`` when the message is not a
-        recognized skill command — in which case the caller forwards the original
-        text untouched. Unlike the messaging gateway, the chat-completions API
-        carries general prose, so a message that merely starts with ``/`` (a path
-        like ``/Users/x``, a question about ``/etc``) must pass through: only a
-        confirmed bundle/skill match is intercepted.
+        recognized command — in which case the caller forwards the original text
+        untouched. Unlike the messaging gateway, the chat-completions API carries
+        general prose, so a message that merely starts with ``/`` (a path like
+        ``/Users/x``, a question about ``/etc``) must pass through: only a
+        confirmed match is intercepted.
 
         Only plain-text turns expand: a multimodal turn (text + image) arrives as
         a content list, not a ``str``, so a ``/skill`` typed alongside an
@@ -1990,6 +1997,17 @@ class APIServerAdapter(BasePlatformAdapter):
             return None
         command = parts[0]
         user_instruction = parts[1].strip() if len(parts) > 1 else ""
+
+        # Built-in /learn (a message-expansion command) before skills/bundles —
+        # it rewrites the turn to a prompt that has the agent author a skill.
+        if command == "learn":
+            try:
+                from agent.learn_prompt import build_learn_prompt
+
+                return build_learn_prompt(user_instruction)
+            except Exception:
+                logger.exception("Failed to build the /learn prompt")
+                return None
 
         try:
             from agent.skill_bundles import (
@@ -2162,11 +2180,11 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
-        # Honor "/skill-name" slash commands on the OpenAI chat path the same way
-        # the CLI/TUI/messaging surfaces do: a recognized command is expanded into
-        # its skill-invocation payload before the agent runs; anything else (incl.
-        # an unrecognized "/...") is forwarded untouched.
-        expanded_command = self._maybe_expand_skill_command(user_message, session_id)
+        # Honor slash commands on the OpenAI chat path the same way the
+        # CLI/TUI/messaging surfaces do: a recognized /skill, /bundle, or /learn
+        # is expanded before the agent runs; anything else (incl. an unrecognized
+        # "/...") is forwarded untouched.
+        expanded_command = self._maybe_expand_slash_command(user_message, session_id)
         if expanded_command is not None:
             user_message = expanded_command
 
