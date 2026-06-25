@@ -1345,17 +1345,45 @@ class APIServerAdapter(BasePlatformAdapter):
         the model. Mirrors what the gateway/CLI surfaces through
         ``/skills list``, but as a deterministic JSON payload.
 
-        Returns the same skill metadata (name, description, category) the
-        skills hub uses internally. Disabled skills are excluded so the
-        listing matches what the agent actually loads.
+        Returns the skill metadata (name, description, category) the skills hub
+        uses internally, plus the ``command`` slug a client sends to invoke the
+        skill (``/<command>`` on this same endpoint). ``command`` is ``null``
+        when the name reduces to an empty slug. Disabled skills are excluded so
+        the listing matches what the agent actually loads.
         """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         try:
+            from agent.skill_commands import get_skill_commands, slugify_skill_name
             from tools.skills_tool import _find_all_skills, _sort_skills
+
             skills = _sort_skills(_find_all_skills(skip_disabled=False))
+            # Validate each derived command against the live command registry so a
+            # non-null `command` is GUARANTEED to resolve on the chat path: this
+            # rejects any slug that doesn't round-trip (e.g. a name truncated for
+            # display, or a skill disabled/incompatible for this platform and thus
+            # absent from the registry), reporting it as command=null rather than a
+            # command that silently fails to invoke.
+            registry = get_skill_commands()
+            data = []
+            for skill in skills:
+                slug = slugify_skill_name(skill.get("name", ""))
+                command = slug if slug and f"/{slug}" in registry else None
+                data.append({**skill, "command": command})
+            # Surface the user-facing built-in commands the palette offers (just
+            # /learn today) from this same endpoint, so the client lists them from
+            # the sprite rather than hardcoding them — the palette is empty until
+            # the gateway responds, instead of showing commands while it's cold.
+            # category "command" buckets them separately client-side; the chat path
+            # expands /learn via build_learn_prompt.
+            data.append({
+                "name": "learn",
+                "description": "Learn a reusable skill from a description, files, URLs, or this chat",
+                "category": "command",
+                "command": "learn",
+            })
         except Exception:
             logger.exception("GET /v1/skills failed")
             return web.json_response(
@@ -1365,7 +1393,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({
             "object": "list",
-            "data": skills,
+            "data": data,
         })
 
     async def _handle_toolsets(self, request: "web.Request") -> "web.Response":
@@ -1939,6 +1967,102 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
+    def _maybe_expand_slash_command(self, user_message: Any, session_id: str) -> Optional[str]:
+        """Expand a leading ``/command`` into the message the agent should process.
+
+        Mirrors how every other Hermes surface (CLI/TUI/messaging gateway, see
+        ``gateway/run.py``) dispatches slash commands. Two cases expand:
+
+        - ``/<skill-or-bundle> [instruction]`` — resolved against the installed
+          bundles (which take precedence) and skills; the turn is replaced with
+          the payload built by ``build_skill_invocation_message`` (activation note
+          + skill content + skill-dir + config + the trailing instruction).
+        - ``/learn [what to learn from]`` — the one built-in command that makes
+          sense on the chat path (no Omnia-UI equivalent): rewritten to the
+          standards-guided ``build_learn_prompt`` that drives the agent to author
+          a skill via ``skill_manage``. Side-effecting built-ins (``/new``,
+          ``/yolo``, …) are deliberately NOT handled here.
+
+        The unmodified builder output is returned so the memory layer's invocation
+        markers stay intact.
+
+        Returns the expanded message, or ``None`` when the message is not a
+        recognized command — in which case the caller forwards the original text
+        untouched. Unlike the messaging gateway, the chat-completions API carries
+        general prose, so a message that merely starts with ``/`` (a path like
+        ``/Users/x``, a question about ``/etc``) must pass through: only a
+        confirmed match is intercepted.
+
+        Only plain-text turns expand: a multimodal turn (text + image) arrives as
+        a content list, not a ``str``, so a ``/skill`` typed alongside an
+        attachment is forwarded as-is rather than expanded. Acceptable because the
+        palette's skills are text-instruction driven.
+        """
+        if not isinstance(user_message, str):
+            return None
+        text = user_message.lstrip()
+        if not text.startswith("/"):
+            return None
+        # "/command rest of the instruction" -> ("command", "rest of the instruction")
+        parts = text[1:].split(None, 1)
+        if not parts:
+            return None
+        command = parts[0]
+        user_instruction = parts[1].strip() if len(parts) > 1 else ""
+
+        # Built-in /learn (a message-expansion command) before skills/bundles —
+        # it rewrites the turn to a prompt that has the agent author a skill.
+        if command == "learn":
+            try:
+                from agent.learn_prompt import build_learn_prompt
+
+                return build_learn_prompt(user_instruction)
+            except Exception:
+                logger.exception("Failed to build the /learn prompt")
+                return None
+
+        try:
+            from agent.skill_bundles import (
+                build_bundle_invocation_message,
+                resolve_bundle_command_key,
+            )
+            from agent.skill_commands import (
+                build_skill_invocation_message,
+                resolve_skill_command_key,
+            )
+        except Exception as exc:
+            logger.warning("Skill command modules unavailable; forwarding /%s as-is: %s", command, exc)
+            return None
+
+        # Bundles take precedence over single skills (matches gateway dispatch order).
+        # A command that RESOLVES to a real bundle/skill but then fails to BUILD a
+        # payload (e.g. a SKILL.md removed or unreadable on disk) is a genuine
+        # failure, not a non-match — log it loudly instead of silently forwarding
+        # the raw "/foo" to the model, which would look like the skill "did nothing".
+        try:
+            bundle_key = resolve_bundle_command_key(command)
+            if bundle_key is not None:
+                bundle_result = build_bundle_invocation_message(
+                    bundle_key, user_instruction, task_id=session_id
+                )
+                if bundle_result and bundle_result[0]:
+                    return bundle_result[0]
+                logger.error("Bundle /%s resolved but built no payload; forwarding raw text", command)
+        except Exception:
+            logger.exception("Bundle command expansion failed for /%s", command)
+
+        try:
+            cmd_key = resolve_skill_command_key(command)
+            if cmd_key is not None:
+                msg = build_skill_invocation_message(cmd_key, user_instruction, task_id=session_id)
+                if msg:
+                    return msg
+                logger.error("Skill /%s resolved but built no payload; forwarding raw text", command)
+        except Exception:
+            logger.exception("Skill command expansion failed for /%s", command)
+
+        return None
+
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         auth_err = self._check_auth(request)
@@ -2067,6 +2191,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
+
+        # Honor slash commands on the OpenAI chat path the same way the
+        # CLI/TUI/messaging surfaces do: a recognized /skill, /bundle, or /learn
+        # is expanded before the agent runs; anything else (incl. an unrecognized
+        # "/...") is forwarded untouched.
+        expanded_command = self._maybe_expand_slash_command(user_message, session_id)
+        if expanded_command is not None:
+            user_message = expanded_command
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)

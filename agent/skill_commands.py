@@ -26,6 +26,21 @@ _skill_commands_platform: Optional[str] = None
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
 
+
+def slugify_skill_name(name: str) -> str:
+    """Reduce a skill's display name to its slash-command slug (no leading slash).
+
+    Lowercase, spaces/underscores to hyphens, drop everything outside ``[a-z0-9-]``
+    (so ``+`` / ``/`` can't produce invalid downstream command names), collapse
+    runs of hyphens, and trim leading/trailing ones. Returns ``""`` when nothing
+    usable remains. This is the single source of truth for the slug: both the
+    command registry (``scan_skill_commands``) and the ``GET /v1/skills`` listing
+    derive the command from it, so a slug shown to a client always resolves.
+    """
+    slug = name.lower().replace(" ", "-").replace("_", "-")
+    slug = _SKILL_INVALID_CHARS.sub("", slug)
+    return _SKILL_MULTI_HYPHEN.sub("-", slug).strip("-")
+
 # ---------------------------------------------------------------------------
 # Skill-scaffolding markers and the canonical extractor.
 #
@@ -394,12 +409,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                                 description = line[:80]
                                 break
                     seen_names.add(name)
-                    # Normalize to hyphen-separated slug, stripping
-                    # non-alnum chars (e.g. +, /) to avoid invalid
-                    # Telegram command names downstream.
-                    cmd_name = name.lower().replace(' ', '-').replace('_', '-')
-                    cmd_name = _SKILL_INVALID_CHARS.sub('', cmd_name)
-                    cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
+                    cmd_name = slugify_skill_name(name)
                     if not cmd_name:
                         continue
                     _skill_commands[f"/{cmd_name}"] = {
