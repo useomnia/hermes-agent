@@ -843,9 +843,22 @@ class TestSkillsEndpoint:
                 data = await resp.json()
                 assert data["object"] == "list"
                 names = sorted(s["name"] for s in data["data"])
-                assert names == ["ascii-art", "github"]
+                # Skills, plus the always-appended /learn built-in command entry.
+                assert names == ["ascii-art", "github", "learn"]
                 for entry in data["data"]:
                     assert set(entry.keys()) >= {"name", "description", "category"}
+
+    @pytest.mark.asyncio
+    async def test_skills_includes_the_learn_command(self, adapter):
+        with patch("tools.skills_tool._find_all_skills", return_value=[]):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/skills")
+                data = await resp.json()
+                learn = next(s for s in data["data"] if s["command"] == "learn")
+                # Displayed as the command itself, bucketed as a command (not a skill).
+                assert learn["name"] == "learn"
+                assert learn["category"] == "command"
 
     @pytest.mark.asyncio
     async def test_skills_command_is_validated_against_the_registry(self, adapter):
