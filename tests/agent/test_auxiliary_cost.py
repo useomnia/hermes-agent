@@ -18,15 +18,18 @@ import pytest
 import agent.auxiliary_client as ac
 
 
-def _response(*, model="google/gemini-3.1-flash-lite", usage=True):
+def _response(*, model="google/gemini-3.1-flash-lite", usage=True, cost=None):
     """A minimal OpenAI-shaped response with the .choices[0].message shape the
-    validator requires, plus optional .usage / .model for pricing."""
+    validator requires, plus optional .usage / .model for pricing. Pass `cost`
+    to simulate OpenRouter's usage-accounting `usage.cost` (provider-reported)."""
     resp = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))],
         model=model,
     )
     if usage:
         resp.usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
+        if cost is not None:
+            resp.usage.cost = cost
     return resp
 
 
@@ -71,10 +74,33 @@ def test_should_add_priced_cost_to_the_current_session():
     call = db.update_token_counts.call_args
     assert call.args[0] == "sess-1"  # attributed to the active session
     assert call.kwargs["estimated_cost_usd"] == pytest.approx(0.0012)
+    # No provider-reported cost on this response, so actual_cost_usd carries the
+    # ESTIMATE — keeping the row's billable total complete for the proxy's per-row
+    # COALESCE(actual, estimated) — while cost_status stays "estimated".
+    assert call.kwargs["actual_cost_usd"] == pytest.approx(0.0012)
+    assert call.kwargs["cost_status"] == "estimated"
     assert call.kwargs["input_tokens"] == 10
     assert call.kwargs["output_tokens"] == 5
     assert call.kwargs["api_call_count"] == 1
     assert call.kwargs["model"] == "google/gemini-3.1-flash-lite"
+
+
+def test_should_prefer_reported_cost_over_estimate_for_actual():
+    # When OpenRouter reports a real usage.cost, actual_cost_usd is the REPORTED
+    # figure (not the estimate) and cost_status flips to actual.
+    ac._AUX_COST_CTX.set(("openrouter", "google/gemini-3.1-flash-lite", "https://openrouter.ai/api/v1", "k"))
+    db = MagicMock()
+    norm, est = _patch_pricing(Decimal("0.0012"))
+    with norm, est, \
+        patch("gateway.session_context.get_session_env", return_value="sess-1"), \
+        patch.object(ac, "_get_aux_cost_session_db", return_value=db):
+        ac._account_auxiliary_cost(_response(cost=0.0033))
+
+    call = db.update_token_counts.call_args
+    assert call.kwargs["actual_cost_usd"] == pytest.approx(0.0033)
+    assert call.kwargs["estimated_cost_usd"] == pytest.approx(0.0012)
+    assert call.kwargs["cost_status"] == "actual"
+    assert call.kwargs["cost_source"] == "provider_cost_api"
 
 
 def test_should_noop_when_no_request_context_is_set():

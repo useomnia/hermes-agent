@@ -1910,6 +1910,21 @@ def run_conversation(
                             agent.model, agent.session_id,
                         )
 
+                    # Billable per-call cost = provider-reported when present,
+                    # else the estimate. Persisted into actual_cost_usd so the
+                    # row stays COMPLETE even when a call reports no cost —
+                    # otherwise the proxy's per-row COALESCE(actual, estimated)
+                    # would prefer a PARTIAL actual and drop the unreported
+                    # calls' spend (under-billing). cost_status stays honest:
+                    # "actual" only when the figure is truly provider-reported.
+                    _est_cost_usd = (
+                        float(cost_result.amount_usd)
+                        if cost_result.amount_usd is not None else None
+                    )
+                    _billable_cost_usd = (
+                        reported_cost_usd if reported_cost_usd is not None else _est_cost_usd
+                    )
+
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI
                     # sessions (gateway, cron, delegated runs) cannot lose
@@ -1934,12 +1949,11 @@ def run_conversation(
                                 cache_read_tokens=canonical_usage.cache_read_tokens,
                                 cache_write_tokens=canonical_usage.cache_write_tokens,
                                 reasoning_tokens=canonical_usage.reasoning_tokens,
-                                estimated_cost_usd=float(cost_result.amount_usd)
-                                if cost_result.amount_usd is not None else None,
-                                # Provider-reported per-call cost delta. NULL
-                                # (not 0) when the provider reported nothing —
-                                # the SQL CASE keeps actual_cost_usd untouched.
-                                actual_cost_usd=reported_cost_usd,
+                                estimated_cost_usd=_est_cost_usd,
+                                # Complete billable delta (reported, else
+                                # estimate); NULL only when pricing is unknown,
+                                # where the SQL CASE keeps actual_cost_usd as-is.
+                                actual_cost_usd=_billable_cost_usd,
                                 cost_status="actual"
                                 if reported_cost_usd is not None else cost_result.status,
                                 cost_source="provider_cost_api"

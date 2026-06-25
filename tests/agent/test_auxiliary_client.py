@@ -1872,6 +1872,45 @@ class TestAuxiliaryFallbackLayering:
 
         assert main_client.chat.completions.create.called
 
+    def test_fallback_repoints_cost_ctx_at_the_fallback_provider(self, monkeypatch):
+        """P2: cost accounting must name the FALLBACK provider/model/base_url, not
+        the failed primary — otherwise the successful fallback response is priced
+        against the wrong route. Captures _AUX_COST_CTX at the validate call."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        import agent.auxiliary_client as _ac
+
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_payment_err()
+
+        fb_client = MagicMock()
+        fb_client.base_url = "https://openrouter.ai/api/v1"
+        fb_client.api_key = "fb-key"
+        fb_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from fallback"))
+        ])
+
+        captured = {}
+
+        def _capture(resp, _task):
+            captured["ctx"] = _ac._AUX_COST_CTX.get()
+            return resp
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "glm-4v-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("glm", "glm-4v-flash", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fb_client, "gpt-4o-mini", "fallback_chain[0](openai)")), \
+             patch("agent.auxiliary_client._validate_llm_response", side_effect=_capture):
+            call_llm(task="vision", messages=[{"role": "user", "content": "hi"}])
+
+        assert captured.get("ctx") is not None, "ctx was never set on the fallback path"
+        provider, model, base_url, api_key = captured["ctx"]
+        assert provider == "fallback_chain[0](openai)"
+        assert model == "gpt-4o-mini"
+        assert base_url == "https://openrouter.ai/api/v1"
+        assert api_key == "fb-key"
+
     def test_warning_emitted_when_all_fallbacks_exhausted(self, monkeypatch, caplog):
         """When chain AND main model both fail, a user-visible warning fires before re-raise."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
