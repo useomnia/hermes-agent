@@ -1372,6 +1372,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 slug = slugify_skill_name(skill.get("name", ""))
                 command = slug if slug and f"/{slug}" in registry else None
                 data.append({**skill, "command": command})
+            # Surface the user-facing built-in commands the palette offers (just
+            # /learn today) from this same endpoint, so the client lists them from
+            # the sprite rather than hardcoding them — the palette is empty until
+            # the gateway responds, instead of showing commands while it's cold.
+            # category "command" buckets them separately client-side; the chat path
+            # expands /learn via build_learn_prompt.
+            data.append({
+                "name": "learn",
+                "description": "Learn a reusable skill from a description, files, URLs, or this chat",
+                "category": "command",
+                "command": "learn",
+            })
         except Exception:
             logger.exception("GET /v1/skills failed")
             return web.json_response(
