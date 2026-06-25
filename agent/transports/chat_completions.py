@@ -390,6 +390,13 @@ class ChatCompletionsTransport(ProviderTransport):
         if provider_prefs and is_openrouter:
             extra_body["provider"] = provider_prefs
 
+        # OpenRouter usage accounting — response `usage.cost` carries the REAL
+        # charged cost (credits are 1:1 USD). Parity with the profile path in
+        # plugins/model-providers/openrouter/__init__.py; this branch only runs
+        # when the OpenRouter profile isn't loaded.
+        if is_openrouter:
+            extra_body["usage"] = {"include": True}
+
         # Pareto Code router plugin — model-gated. Same shape as the
         # profile path in plugins/model-providers/openrouter/__init__.py;
         # this branch only runs when the OpenRouter profile isn't loaded.

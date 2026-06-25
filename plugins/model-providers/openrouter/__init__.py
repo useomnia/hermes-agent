@@ -83,6 +83,13 @@ class OpenRouterProfile(ProviderProfile):
         if prefs:
             body["provider"] = prefs
 
+        # Usage accounting — makes OpenRouter return the REAL cost it charged
+        # in the response `usage.cost` field (credits are 1:1 USD), instead of
+        # Hermes having to estimate from a pricing table. Captured by
+        # agent.usage_pricing.extract_provider_cost_usd in the conversation
+        # loop. https://openrouter.ai/docs/use-cases/usage-accounting
+        body["usage"] = {"include": True}
+
         # Pareto Code router — model-gated. The plugins block is only
         # meaningful for openrouter/pareto-code; sending it on any other
         # model has no documented effect and would be confusing in logs.

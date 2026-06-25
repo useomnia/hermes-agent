@@ -651,6 +651,8 @@ class AIAgent:
         self.session_reasoning_tokens = 0
         self.session_api_calls = 0
         self.session_estimated_cost_usd = 0.0
+        # Provider-REPORTED cost only — None means "nothing reported".
+        self.session_actual_cost_usd = None
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
         

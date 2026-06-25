@@ -57,7 +57,11 @@ from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import (
+    estimate_usage_cost,
+    extract_provider_cost_usd,
+    normalize_usage,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -1876,6 +1880,19 @@ def run_conversation(
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
 
+                    # ── Real provider-REPORTED cost (never estimated) ──
+                    # OpenRouter usage accounting returns ``usage.cost`` on the
+                    # response when the request carries usage:{include:true}
+                    # (added on OpenRouter routes). When the provider reports
+                    # nothing, this stays None — absent, NOT zero — so cost
+                    # displays hide instead of showing a fabricated $0.00.
+                    reported_cost_usd = extract_provider_cost_usd(response.usage)
+                    if reported_cost_usd is not None:
+                        _prev_actual = getattr(agent, "session_actual_cost_usd", None)
+                        agent.session_actual_cost_usd = (_prev_actual or 0.0) + reported_cost_usd
+                        agent.session_cost_status = "actual"
+                        agent.session_cost_source = "provider_cost_api"
+
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI
                     # sessions (gateway, cron, delegated runs) cannot lose
@@ -1902,8 +1919,14 @@ def run_conversation(
                                 reasoning_tokens=canonical_usage.reasoning_tokens,
                                 estimated_cost_usd=float(cost_result.amount_usd)
                                 if cost_result.amount_usd is not None else None,
-                                cost_status=cost_result.status,
-                                cost_source=cost_result.source,
+                                # Provider-reported per-call cost delta. NULL
+                                # (not 0) when the provider reported nothing —
+                                # the SQL CASE keeps actual_cost_usd untouched.
+                                actual_cost_usd=reported_cost_usd,
+                                cost_status="actual"
+                                if reported_cost_usd is not None else cost_result.status,
+                                cost_source="provider_cost_api"
+                                if reported_cost_usd is not None else cost_result.source,
                                 billing_provider=agent.provider,
                                 billing_base_url=agent.base_url,
                                 billing_mode="subscription_included"
