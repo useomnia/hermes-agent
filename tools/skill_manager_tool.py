@@ -1070,6 +1070,23 @@ def skill_manage(
             clear_skills_system_prompt_cache(clear_snapshot=True)
         except Exception:
             pass
+        # create/edit/patch/delete change the skill set or a skill's name, so the
+        # cached slash-command registry (agent.skill_commands._skill_commands) is now
+        # stale. Rescan it so the new/renamed/removed command is immediately invocable
+        # as /<command> and reflected by GET /v1/skills — without it, a just-created
+        # skill comes back command=null and can't be invoked until the gateway
+        # restarts. (write_file/remove_file touch only supporting files, not names.)
+        if action in {"create", "edit", "patch", "delete"}:
+            try:
+                from agent.skill_commands import scan_skill_commands
+                scan_skill_commands()
+            except Exception:
+                logger.warning(
+                    "skill_manage(%s): failed to rescan the slash-command registry; "
+                    "the new/changed skill may not be invocable until reload",
+                    action,
+                    exc_info=True,
+                )
         # Curator telemetry: bump patch_count on edit/patch/write_file (the actions
         # that mutate an existing skill's guidance), drop the record on delete.
         # Only mark a skill as agent-created when the background self-improvement

@@ -1028,3 +1028,68 @@ class TestDeleteSkillRmtreeGuard:
         assert result["success"] is False
         assert "skills root" in result["error"].lower()
         assert outside.exists()
+
+
+# ---------------------------------------------------------------------------
+# Slash-command registry refresh on skill_manage success
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _registry_scans(tmp_path):
+    """Point BOTH the writer (skill_manage's SKILLS_DIR) and the slash-command
+    scanner (which `scan_skill_commands` pulls from `tools.skills_tool`) at the
+    temp dir, so a create/delete shows up in get_skill_commands() — the registry
+    the chat path and GET /v1/skills resolve ``/<command>`` against."""
+    with _skill_dir(tmp_path), \
+         patch("tools.skills_tool.SKILLS_DIR", tmp_path), \
+         patch("agent.skill_utils.get_external_skills_dirs", return_value=[]), \
+         patch("tools.skills_tool._get_disabled_skill_names", return_value=set()):
+        yield
+
+
+class TestRegistryRefreshOnMutation:
+    """A skill created/deleted mid-session must be immediately invocable as
+    ``/<command>``. skill_manage rescans the cached slash-command registry,
+    which otherwise only refreshes on /reload-skills or a gateway restart — so
+    without this a just-created skill comes back command=null and can't be run."""
+
+    def test_create_makes_the_command_invocable(self, tmp_path):
+        from agent.skill_commands import get_skill_commands, scan_skill_commands
+
+        with _registry_scans(tmp_path):
+            scan_skill_commands()
+            assert "/test-skill" not in get_skill_commands()
+
+            raw = skill_manage(action="create", name="test-skill", content=VALID_SKILL_CONTENT)
+            assert json.loads(raw)["success"] is True
+
+            # The fix: the create rescanned the registry, so it resolves now.
+            assert "/test-skill" in get_skill_commands()
+
+    def test_delete_drops_the_command(self, tmp_path):
+        from agent.skill_commands import get_skill_commands
+
+        with _registry_scans(tmp_path):
+            skill_manage(action="create", name="test-skill", content=VALID_SKILL_CONTENT)
+            assert "/test-skill" in get_skill_commands()
+
+            raw = skill_manage(action="delete", name="test-skill")
+            assert json.loads(raw)["success"] is True
+
+            assert "/test-skill" not in get_skill_commands()
+
+    def test_supporting_file_write_does_not_rescan(self, tmp_path):
+        # write_file/remove_file touch only supporting files, not a skill's name,
+        # so they must NOT trigger the (relatively costly) registry rescan.
+        with _registry_scans(tmp_path):
+            skill_manage(action="create", name="test-skill", content=VALID_SKILL_CONTENT)
+            with patch("agent.skill_commands.scan_skill_commands") as mock_scan:
+                raw = skill_manage(
+                    action="write_file",
+                    name="test-skill",
+                    file_path="references/extra.md",
+                    file_content="# Extra\n",
+                )
+                assert json.loads(raw)["success"] is True
+                assert not mock_scan.called
