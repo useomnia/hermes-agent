@@ -198,7 +198,9 @@ class TestNousTagsScoping:
             messages=[{"role": "user", "content": "hi"}],
         )
 
-        assert "extra_body" not in kwargs
+        # OpenRouter aux calls carry usage accounting + cheapest-provider routing,
+        # but the nous portal tags must NOT leak onto a non-nous (openrouter) call.
+        assert "tags" not in (kwargs.get("extra_body") or {})
 
 
 class TestNormalizeAuxProvider:

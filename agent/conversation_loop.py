@@ -1888,10 +1888,27 @@ def run_conversation(
                     # displays hide instead of showing a fabricated $0.00.
                     reported_cost_usd = extract_provider_cost_usd(response.usage)
                     if reported_cost_usd is not None:
-                        _prev_actual = getattr(agent, "session_actual_cost_usd", None)
-                        agent.session_actual_cost_usd = (_prev_actual or 0.0) + reported_cost_usd
+                        agent.session_actual_cost_usd = (
+                            agent.session_actual_cost_usd or 0.0
+                        ) + reported_cost_usd
                         agent.session_cost_status = "actual"
                         agent.session_cost_source = "provider_cost_api"
+                    elif (
+                        (agent.provider == "openrouter" or agent._is_openrouter_url())
+                        and not getattr(agent, "_warned_missing_provider_cost", False)
+                    ):
+                        # OpenRouter requests carry usage:{include:true}, so a
+                        # missing usage.cost is unexpected. We still fall back to
+                        # the estimate, but leave one breadcrumb per session so a
+                        # provider/SDK regression that kills real-cost capture is
+                        # diagnosable instead of silently under-billing forever.
+                        agent._warned_missing_provider_cost = True
+                        logger.warning(
+                            "OpenRouter response carried no usage.cost; falling back to "
+                            "estimated cost (model=%s session=%s). Real-cost metering is "
+                            "degraded for this session.",
+                            agent.model, agent.session_id,
+                        )
 
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI

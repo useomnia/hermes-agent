@@ -87,3 +87,46 @@ class TestOpenRouterUsageParam:
             is_openrouter=False,
         )
         assert "usage" not in (kwargs.get("extra_body") or {})
+
+
+# ── Auxiliary path requests usage accounting too (compression/vision/etc.) ───
+
+
+class TestAuxUsageParam:
+    def test_aux_openrouter_request_requests_usage_and_price_routing(self):
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kw = _build_call_kwargs(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert kw["extra_body"]["usage"] == {"include": True}
+        assert kw["extra_body"]["provider"] == {"sort": "price"}
+
+    def test_aux_non_openrouter_does_not_request_usage(self):
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kw = _build_call_kwargs(
+            provider="anthropic",
+            model="claude-haiku-4-5",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert "usage" not in (kw.get("extra_body") or {})
+
+
+# ── SDK contract: OpenRouter's usage.cost survives the OpenAI SDK model ──────
+
+
+class TestSDKModelExposesCost:
+    def test_openai_completion_usage_exposes_cost_extra_field(self):
+        # extract_provider_cost_usd relies on the OpenAI SDK keeping extra="allow"
+        # so OpenRouter's `cost` extra field is readable via getattr on the real
+        # CompletionUsage model. If a future SDK pin flips this, cost capture
+        # silently no-ops to the estimate — this fails loudly instead.
+        from openai.types import CompletionUsage
+
+        usage = CompletionUsage.model_validate(
+            {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 1.23}
+        )
+        assert extract_provider_cost_usd(usage) == pytest.approx(1.23)

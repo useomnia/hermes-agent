@@ -5229,6 +5229,17 @@ def _build_call_kwargs(
     merged_extra = dict(extra_body or {})
     if provider == "nous":
         merged_extra.setdefault("tags", []).extend(_nous_portal_tags())
+    # OpenRouter usage accounting + cheapest-provider routing on aux calls too,
+    # in parity with the main path (transport + openrouter plugin). The usage
+    # flag is load-bearing for billing: it makes the response carry usage.cost,
+    # which _account_auxiliary_cost captures into actual_cost_usd. Without it the
+    # session row's actual cost would be main-loop-only, and the Omnia reader's
+    # per-row COALESCE(actual, estimated) would silently drop the aux cost.
+    if provider == "openrouter" or base_url_host_matches(str(base_url or ""), "openrouter.ai"):
+        merged_extra["usage"] = {"include": True}
+        _or_prefs = dict(merged_extra.get("provider") or {})
+        _or_prefs.setdefault("sort", "price")
+        merged_extra["provider"] = _or_prefs
     if merged_extra:
         kwargs["extra_body"] = merged_extra
 
@@ -5297,8 +5308,17 @@ def _account_auxiliary_cost(response: Any) -> None:
         if not model_name:
             return
 
-        from agent.usage_pricing import estimate_usage_cost, normalize_usage
+        from agent.usage_pricing import (
+            estimate_usage_cost,
+            extract_provider_cost_usd,
+            normalize_usage,
+        )
         canonical = normalize_usage(usage, provider=ctx_provider)
+        # Real provider-REPORTED cost (OpenRouter usage.cost), captured exactly
+        # like the main loop so the session row's actual_cost_usd is COMPLETE
+        # (main + aux) — otherwise the Omnia reader's per-row COALESCE(actual,
+        # estimated) would drop this aux cost once the main loop reports actual.
+        reported_cost_usd = extract_provider_cost_usd(usage)
         cost = estimate_usage_cost(
             model_name,
             canonical,
@@ -5306,14 +5326,21 @@ def _account_auxiliary_cost(response: Any) -> None:
             base_url=ctx_base_url,
             api_key=ctx_api_key,
         )
-        if cost.amount_usd is None or cost.amount_usd <= 0:
-            return  # unknown price or subscription-included ⇒ nothing to add
+        estimated = (
+            float(cost.amount_usd)
+            if cost.amount_usd is not None and cost.amount_usd > 0
+            else None
+        )
+        if reported_cost_usd is None and estimated is None:
+            return  # neither a real cost nor a usable estimate ⇒ nothing to add
 
         db = _get_aux_cost_session_db()
         if db is None:
             return
         # Delta-add to the session's totals, exactly like the main loop's per-call
         # write in conversation_loop (absolute=False ⇒ increment, never overwrite).
+        # actual_cost_usd is the per-call delta (NULL when the provider reported
+        # nothing — the CASE SQL leaves the column untouched).
         db.update_token_counts(
             session_id,
             input_tokens=canonical.input_tokens,
@@ -5321,9 +5348,10 @@ def _account_auxiliary_cost(response: Any) -> None:
             cache_read_tokens=canonical.cache_read_tokens,
             cache_write_tokens=canonical.cache_write_tokens,
             reasoning_tokens=canonical.reasoning_tokens,
-            estimated_cost_usd=float(cost.amount_usd),
-            cost_status=cost.status,
-            cost_source=cost.source,
+            estimated_cost_usd=estimated,
+            actual_cost_usd=reported_cost_usd,
+            cost_status="actual" if reported_cost_usd is not None else cost.status,
+            cost_source="provider_cost_api" if reported_cost_usd is not None else cost.source,
             model=model_name,
             api_call_count=1,
         )
