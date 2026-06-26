@@ -2313,6 +2313,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     if parsed.get("status") == "answered":
                         completed["interaction"] = {"answered": parsed.get("response", "")}
                     turn_ending = parsed.get("status") == "presented"
+                # Omnia task-list tracker: the `todo` tool returns the full current
+                # list ({"todos": [{id, content, status}], "summary": {...}}) on every
+                # call. Forward the `todos` array on the completed event so the Omnia
+                # chat can render a live plan tracker, mirroring the interaction forward
+                # above. The list is the source of truth (the client derives the
+                # done/total counts) and todo items never carry secrets. A malformed,
+                # empty, or error result simply omits the field — a plain completed
+                # event, so non-todo tools and todo-unaware clients are unaffected.
+                elif function_name == "todo":
+                    try:
+                        parsed = json.loads(function_result or "{}")
+                    except Exception:
+                        parsed = {}
+                    todos = parsed.get("todos") if isinstance(parsed, dict) else None
+                    if isinstance(todos, list):
+                        completed["todos"] = todos
                 _stream_q.put(("__tool_progress__", completed))
                 if turn_ending and agent_ref[0] is not None:
                     try:

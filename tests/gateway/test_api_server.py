@@ -1577,6 +1577,128 @@ class TestChatCompletionsEndpoint:
             assert pairs[1] == ("completed", "call_terminal_1"), pairs
 
     @pytest.mark.asyncio
+    async def test_stream_forwards_todo_list_on_completed(self, adapter):
+        """The `todo` tool's task list reaches the Omnia plan tracker.
+
+        The tool returns the full list on every call; the gateway forwards the
+        `todos` array on the tool's `completed` event (mirroring the
+        request_user_input interaction forward) so the chat can render a live
+        tracker. The `running` event carries no list.
+        """
+        import asyncio
+        import json as _json
+
+        todo_result = _json.dumps(
+            {
+                "todos": [
+                    {"id": "1", "content": "Research competitors", "status": "completed"},
+                    {"id": "2", "content": "Draft the page", "status": "in_progress"},
+                ],
+                "summary": {
+                    "total": 2,
+                    "pending": 0,
+                    "in_progress": 1,
+                    "completed": 1,
+                    "cancelled": 0,
+                },
+            }
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_todo_1", "todo", {"todos": []})
+                if tc_cb:
+                    tc_cb("call_todo_1", "todo", {"todos": []}, todo_result)
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "plan"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        events: list[tuple[str | None, object]] = []
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() != "event: hermes.tool.progress":
+                continue
+            for follow in lines[i + 1: i + 4]:
+                if follow.startswith("data: "):
+                    payload = _json.loads(follow[len("data: "):])
+                    if payload.get("tool") == "todo":
+                        events.append((payload.get("status"), payload.get("todos")))
+                    break
+
+        assert {status for status, _ in events} == {"running", "completed"}, events
+        running_todos = next(todos for status, todos in events if status == "running")
+        completed_todos = next(todos for status, todos in events if status == "completed")
+        # Only the completed event carries the list; running carries none.
+        assert running_todos is None, events
+        assert completed_todos == [
+            {"id": "1", "content": "Research competitors", "status": "completed"},
+            {"id": "2", "content": "Draft the page", "status": "in_progress"},
+        ], events
+
+    @pytest.mark.asyncio
+    async def test_stream_todo_malformed_result_omits_todos(self, adapter):
+        """A malformed `todo` result degrades to a plain completed event with no
+        `todos` field — the stream never crashes, and todo-unaware clients are
+        unaffected."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_todo_1", "todo", {})
+                if tc_cb:
+                    tc_cb("call_todo_1", "todo", {}, "not json")
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "plan"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        # The todo tool's lifecycle still streams (running + completed), but no
+        # event carries a `todos` field from the unparseable result.
+        assert '"tool": "todo"' in body
+        assert '"todos"' not in body
+
+    @pytest.mark.asyncio
     async def test_stream_tool_lifecycle_skips_internal_and_orphan_completes(self, adapter):
         """Internal tools (``_thinking``-style) and ``completed`` events
         without a prior matching ``running`` must produce no lifecycle
