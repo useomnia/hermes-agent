@@ -391,12 +391,21 @@ class ChatCompletionsTransport(ProviderTransport):
             # OpenRouter request shaping for Omnio — parity with the profile path
             # in plugins/model-providers/openrouter/__init__.py (this branch only
             # runs when the OpenRouter profile isn't loaded):
+            #  - provider routing: prefer DeepSeek first-party (it parses its own
+            #    DSML tool-call format; cheap third-party V4 hosts leak it), then
+            #    cheapest of the rest, restricted to providers that accept our
+            #    params, and never fall back off DeepSeek on tool turns; and
             #  - usage:{include:true} so the response carries the REAL charged
-            #    cost in usage.cost (credits are 1:1 USD), and
-            #  - provider:{sort:"price"} to route to the cheapest provider (a
-            #    caller-supplied sort/order wins, via setdefault).
+            #    cost in usage.cost (credits are 1:1 USD).
+            # See the profile path for the full rationale. A caller-supplied
+            # value wins for each key (setdefault).
             _prefs = dict(provider_prefs or {})
+            if "only" not in _prefs:
+                _prefs.setdefault("order", ["deepseek"])
             _prefs.setdefault("sort", "price")
+            _prefs.setdefault("require_parameters", True)
+            if tools:
+                _prefs.setdefault("allow_fallbacks", False)
             extra_body["provider"] = _prefs
             extra_body["usage"] = {"include": True}
 
@@ -557,6 +566,7 @@ class ChatCompletionsTransport(ProviderTransport):
             base_url=params.get("base_url"),
             reasoning_config=reasoning_config,
             openrouter_min_coding_score=params.get("openrouter_min_coding_score"),
+            has_tools=bool(tools),
         )
         if profile_body:
             extra_body.update(profile_body)

@@ -100,14 +100,68 @@ class TestOpenRouterProfile:
     def test_extra_body_with_prefs(self):
         p = get_provider_profile("openrouter")
         body = p.build_extra_body(provider_preferences={"allow": ["anthropic"]})
-        # Caller prefs are honored AND cheapest-provider routing is layered in
-        # (sort:"price" via setdefault — a caller-supplied sort would win).
-        assert body["provider"] == {"allow": ["anthropic"], "sort": "price"}
+        # Caller prefs honored AND the Omnio routing defaults layered in:
+        # DeepSeek-first (order) + cheapest fallback (sort) + tool-capable
+        # providers only (require_parameters), all via setdefault.
+        assert body["provider"] == {
+            "allow": ["anthropic"],
+            "order": ["deepseek"],
+            "sort": "price",
+            "require_parameters": True,
+        }
 
     def test_extra_body_caller_sort_wins(self):
         p = get_provider_profile("openrouter")
         body = p.build_extra_body(provider_preferences={"sort": "throughput"})
-        assert body["provider"] == {"sort": "throughput"}
+        # Caller's sort wins; DeepSeek-first + require_parameters still layered.
+        assert body["provider"] == {
+            "sort": "throughput",
+            "order": ["deepseek"],
+            "require_parameters": True,
+        }
+
+    def test_extra_body_caller_order_wins(self):
+        p = get_provider_profile("openrouter")
+        body = p.build_extra_body(provider_preferences={"order": ["anthropic"]})
+        # Caller's explicit order wins over the DeepSeek-first default.
+        assert body["provider"]["order"] == ["anthropic"]
+
+    def test_extra_body_only_skips_order(self):
+        p = get_provider_profile("openrouter")
+        body = p.build_extra_body(provider_preferences={"only": ["openai"]})
+        # An explicit "only" set constrains routing; don't inject a contradictory
+        # DeepSeek order. sort + require_parameters still apply.
+        assert body["provider"] == {
+            "only": ["openai"],
+            "sort": "price",
+            "require_parameters": True,
+        }
+
+    def test_extra_body_tool_turn_pins_deepseek(self):
+        p = get_provider_profile("openrouter")
+        body = p.build_extra_body(has_tools=True)
+        # Tool turns must not silently fall back off DeepSeek to a provider that
+        # can't parse V4 DSML → allow_fallbacks:false.
+        assert body["provider"] == {
+            "order": ["deepseek"],
+            "sort": "price",
+            "require_parameters": True,
+            "allow_fallbacks": False,
+        }
+
+    def test_extra_body_non_tool_turn_allows_fallback(self):
+        p = get_provider_profile("openrouter")
+        body = p.build_extra_body(has_tools=False)
+        # No tools → cheapest fallback stays enabled (no allow_fallbacks key).
+        assert "allow_fallbacks" not in body["provider"]
+
+    def test_extra_body_caller_allow_fallbacks_wins(self):
+        p = get_provider_profile("openrouter")
+        body = p.build_extra_body(
+            provider_preferences={"allow_fallbacks": True}, has_tools=True
+        )
+        # Caller can opt back into fallback even on tool turns.
+        assert body["provider"]["allow_fallbacks"] is True
 
     def test_extra_body_session_id(self):
         p = get_provider_profile("openrouter")
@@ -118,8 +172,16 @@ class TestOpenRouterProfile:
         p = get_provider_profile("openrouter")
         body = p.build_extra_body()
         # Always-on for Omnio: usage accounting (real provider-reported cost)
-        # + cheapest-provider routing. Nothing else without prefs/session.
-        assert body == {"usage": {"include": True}, "provider": {"sort": "price"}}
+        # + DeepSeek-first routing, cheapest fallback, tool-capable providers
+        # only. No allow_fallbacks here (no tools signalled).
+        assert body == {
+            "usage": {"include": True},
+            "provider": {
+                "order": ["deepseek"],
+                "sort": "price",
+                "require_parameters": True,
+            },
+        }
 
     def test_pareto_min_coding_score_emitted_for_pareto_model(self):
         """min_coding_score → plugins block when model is openrouter/pareto-code."""
