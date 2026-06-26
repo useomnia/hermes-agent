@@ -79,36 +79,9 @@ class OpenRouterProfile(ProviderProfile):
         body: dict[str, Any] = {}
         if session_id:
             body["session_id"] = session_id
-        # Provider routing for Omnio (OpenRouter multi-provider models, e.g.
-        # DeepSeek V4 Pro spans a ~4x price range across 16 providers):
-        #
-        #   1. order:["deepseek"] — prefer DeepSeek first-party. It parses its
-        #      own DSML tool-call format into clean tool_calls; the cheap
-        #      third-party V4 hosts that sort:"price" alone would land on leak
-        #      raw DSML special tokens into the content stream, corrupting the
-        #      tool call (and the agent then confabulates "done"). Skipped if
-        #      the caller already constrained the set with "only".
-        #   2. sort:"price" — cheapest among the remaining providers. Without it
-        #      OpenRouter's default is price-weighted-but-load-balanced
-        #      (Auto-Exacto for tool calls), which lands on pricier providers.
-        #   3. require_parameters:true — only route to providers that accept the
-        #      params we send (tools, response_format), so a fallback turn can't
-        #      land on a provider that 400s the request. NB: this gates on
-        #      *accepting* tools, not on parsing V4 DSML correctly — hence (1)
-        #      and the tool-turn fallback guard below.
-        #   4. allow_fallbacks:false on tool turns — never silently degrade off
-        #      DeepSeek to a provider that botches DSML. Fail loud instead of
-        #      fabricating success.
-        #
-        # A caller-supplied value wins for each key (setdefault).
-        prefs = dict(context.get("provider_preferences") or {})
-        if "only" not in prefs:
-            prefs.setdefault("order", ["deepseek"])
-        prefs.setdefault("sort", "price")
-        prefs.setdefault("require_parameters", True)
-        if context.get("has_tools"):
-            prefs.setdefault("allow_fallbacks", False)
-        body["provider"] = prefs
+        prefs = context.get("provider_preferences")
+        if prefs:
+            body["provider"] = prefs
 
         # Usage accounting — makes OpenRouter return the REAL cost it charged
         # in the response `usage.cost` field (credits are 1:1 USD), instead of

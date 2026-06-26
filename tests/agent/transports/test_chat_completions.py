@@ -196,30 +196,7 @@ class TestChatCompletionsBuildKwargs:
             provider_profile=profile,
             provider_preferences={"only": ["openai"]},
         )
-        # Caller's "only" honored (and suppresses the DeepSeek-first order);
-        # cheapest fallback + tool-capable filtering still layered via setdefault.
-        assert kw["extra_body"]["provider"] == {
-            "only": ["openai"],
-            "sort": "price",
-            "require_parameters": True,
-        }
-
-    def test_openrouter_tool_turn_pins_deepseek(self, transport):
-        from providers import get_provider_profile
-        profile = get_provider_profile("openrouter")
-        msgs = [{"role": "user", "content": "Hi"}]
-        tools = [{"type": "function", "function": {"name": "t", "parameters": {}}}]
-        kw = transport.build_kwargs(
-            model="deepseek/deepseek-v4-pro", messages=msgs,
-            tools=tools, provider_profile=profile,
-        )
-        # DeepSeek-first, and no silent fallback off it on a tool turn.
-        assert kw["extra_body"]["provider"] == {
-            "order": ["deepseek"],
-            "sort": "price",
-            "require_parameters": True,
-            "allow_fallbacks": False,
-        }
+        assert kw["extra_body"]["provider"] == {"only": ["openai"]}
 
     def test_openrouter_pareto_min_coding_score(self, transport):
         """Profile path: model=openrouter/pareto-code + score → plugins block."""

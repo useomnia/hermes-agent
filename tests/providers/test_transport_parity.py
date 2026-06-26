@@ -154,14 +154,7 @@ class TestOpenRouterParity:
             provider_profile=get_provider_profile("openrouter"),
             provider_preferences=prefs,
         )
-        # Caller prefs honored; DeepSeek-first + tool-capable filtering layered
-        # in via setdefault. No allow_fallbacks (tools=None).
-        assert kw["extra_body"]["provider"] == {
-            "allow": ["anthropic"],
-            "sort": "price",
-            "order": ["deepseek"],
-            "require_parameters": True,
-        }
+        assert kw["extra_body"]["provider"] == prefs
 
     def test_reasoning_passes_full_config(self, transport):
         """OpenRouter passes the FULL reasoning_config dict, not just effort."""
