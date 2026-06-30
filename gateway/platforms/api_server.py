@@ -809,6 +809,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # is still rebuilding, corrupting the server registry). Lazily created on
         # the running loop the first time a reload is handled.
         self._mcp_reload_lock: Optional["asyncio.Lock"] = None
+        # Serializes /v1/skills/reload: scan_skill_commands() resets and repopulates
+        # the shared slash-command registry, so two overlapping rescans could
+        # interleave and leave it half-populated. Lazily created on the running loop.
+        self._skills_reload_lock: Optional["asyncio.Lock"] = None
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -4924,6 +4928,38 @@ class APIServerAdapter(BasePlatformAdapter):
             "tools": len(new_tools),
         })
 
+    async def _handle_skills_reload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/skills/reload — rescan the skills directory so a skill added,
+        removed, enabled, or disabled on disk becomes (un)invocable without
+        restarting the gateway.
+
+        Re-runs the same rescan as the ``/reload-skills`` slash command
+        (``agent.skill_commands.reload_skills``), refreshing the slash-command
+        registry. The chat path builds a fresh agent per turn from the live
+        registry, so the next turn on any conversation here sees the updated skill
+        set — no restart, no history loss. Used by Omnia after a brand deletes,
+        enables, disables, or imports a learned skill: the proxy mutates the live
+        ``skills/`` tree, then calls this so the change bites immediately.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        loop = asyncio.get_running_loop()
+        # Lazily create the reload lock on the running loop (see _mcp_reload_lock).
+        if self._skills_reload_lock is None:
+            self._skills_reload_lock = asyncio.Lock()
+        try:
+            from agent.skill_commands import reload_skills
+
+            async with self._skills_reload_lock:
+                diff = await loop.run_in_executor(None, reload_skills)
+        except Exception as exc:
+            logger.exception("[api_server] skills reload failed")
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        return web.json_response({"object": "hermes.skills.reload", **diff})
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -5063,6 +5099,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # Mid-session MCP reconnect (see _handle_mcp_reload) — Omnia triggers it
             # after a brand connects/disconnects a connector.
             self._app.router.add_post("/v1/mcp/reload", self._handle_mcp_reload)
+            # Mid-session skills rescan (see _handle_skills_reload) — Omnia triggers it
+            # after a brand deletes/enables/disables/imports a learned skill so the
+            # live tree change becomes (un)invocable without a gateway restart.
+            self._app.router.add_post("/v1/skills/reload", self._handle_skills_reload)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
