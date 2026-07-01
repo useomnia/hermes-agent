@@ -1086,6 +1086,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        tool_gen_callback=None,
         gateway_session_key: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
     ) -> Any:
@@ -1142,6 +1143,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            tool_gen_callback=tool_gen_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -2231,6 +2233,36 @@ class APIServerAdapter(BasePlatformAdapter):
                 if text:
                     _stream_q.put(("__reasoning__", text))
 
+            def _on_tool_gen(function_name):
+                """Emit an early ``status: generating`` progress event.
+
+                Fires the instant the model commits to a tool call — the tool
+                NAME arrives in the first tool_call delta (OpenAI spec), long
+                before the full arguments JSON has streamed. For a large
+                payload (a multi-question ``request_user_input`` form, a 45 KB
+                ``write_file``) that generation gap is otherwise silent on the
+                wire, so the Omnia chat shows a frozen turn until the
+                ``running`` event lands.  This event lets the client paint a
+                "working on X…" indicator during the gap.
+
+                It carries no ``toolCallId`` or args (neither exists yet), so
+                the client renders it as a transient, message-level hint that
+                the subsequent ``running`` event (and any tool-progress event)
+                supersedes — no correlation id is needed.  Internal tools
+                (leading ``_``) stay off the wire, matching ``_on_tool_start``.
+                Fires once per tool call (see ``_fire_tool_gen_started``); a
+                dropped/deduped tool call just leaves a hint the next event
+                clears.
+                """
+                if not isinstance(function_name, str) or function_name.startswith("_"):
+                    return
+                from agent.display import get_tool_emoji
+                _stream_q.put(("__tool_progress__", {
+                    "tool": function_name,
+                    "emoji": get_tool_emoji(function_name),
+                    "status": "generating",
+                }))
+
             # Track which tool_call_ids we've emitted a "running" lifecycle
             # event for, so a "completed" event without a matching "running"
             # (e.g. internal/filtered tools) is silently dropped instead of
@@ -2399,6 +2431,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                tool_gen_callback=_on_tool_gen,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 response_format=response_format,
@@ -4127,6 +4160,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        tool_gen_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
@@ -4189,6 +4223,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=tool_progress_callback,
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
+                    tool_gen_callback=tool_gen_callback,
                     gateway_session_key=gateway_session_key,
                     response_format=response_format,
                 )

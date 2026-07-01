@@ -1297,6 +1297,62 @@ class TestChatCompletionsEndpoint:
                 assert "Here are the files." in body
 
     @pytest.mark.asyncio
+    async def test_stream_emits_tool_gen_generating(self, adapter):
+        """tool_gen_callback fires the instant the model commits to a tool call
+        — before its arguments have streamed — producing an early
+        ``status: generating`` ``hermes.tool.progress`` event so the client can
+        show a "working on X…" indicator during the otherwise-silent
+        arg-generation gap. It carries no toolCallId (none exists yet), and
+        internal tools (leading ``_``) are dropped, matching _on_tool_start."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                tg_cb = kwargs.get("tool_gen_callback")
+                cb = kwargs.get("stream_delta_callback")
+                if tg_cb:
+                    tg_cb("_thinking")          # internal → dropped
+                    tg_cb("request_user_input")  # real tool → emitted
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("Done.")
+                return (
+                    {"final_response": "Done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "ask me"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "event: hermes.tool.progress" in body
+                assert '"status": "generating"' in body
+
+                import json as _json
+                gen_events = []
+                for line in body.splitlines():
+                    if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                        try:
+                            chunk = _json.loads(line[len("data: "):])
+                        except _json.JSONDecodeError:
+                            continue
+                        if isinstance(chunk, dict) and chunk.get("status") == "generating":
+                            gen_events.append(chunk)
+                # Only the real tool emits; the internal ``_thinking`` is dropped.
+                assert len(gen_events) == 1
+                assert gen_events[0]["tool"] == "request_user_input"
+                # Transient hint — no correlation id, no args on the wire yet.
+                assert "toolCallId" not in gen_events[0]
+
+    @pytest.mark.asyncio
     async def test_stream_forwards_subagent_progress(self, adapter):
         """subagent.* events (a child's activity, relayed up while
         delegate_task blocks) surface on the tool-progress channel, so the
