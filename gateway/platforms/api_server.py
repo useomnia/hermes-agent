@@ -2254,7 +2254,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 dropped/deduped tool call just leaves a hint the next event
                 clears.
                 """
-                if not isinstance(function_name, str) or function_name.startswith("_"):
+                if not isinstance(function_name, str) or not function_name or function_name.startswith("_"):
                     return
                 from agent.display import get_tool_emoji
                 _stream_q.put(("__tool_progress__", {
