@@ -2310,9 +2310,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 #    turn-ending: the card stays open in the chat, and the user's late
                 #    answer becomes the next turn's user message rather than a stale
                 #    inline result. No no-surface carve-out is needed here (unlike the
-                #    approval gate's approval_error): this callback only runs on the
-                #    interactive chat path, and a headless caller fails fast in
-                #    await_user_input before a no_response ever reaches a result.
+                #    approval gate's approval_error): this closure is only wired as the
+                #    tool_complete_callback for this interactive chat handler, so a
+                #    headless /v1/runs task's request_user_input calls never reach it.
                 turn_ending = False
                 interrupt_message = "awaiting user interaction (request_user_input)"
                 if function_name == "request_user_input":
@@ -2330,14 +2330,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         "presented",
                         "no_response",
                     )
-                # Connector write-approval gate (tools/tool_approval.py): a gated
-                # write times out when the user was away to resolve the card. Like
-                # request_user_input's "no_response" above, this ends the turn. The
-                # Omnia chat renders the unresolved card as expired (timed out) —
-                # the user re-asks in chat when they want the action, getting a
-                # fresh approval prompt while they're present. An explicit deny
-                # is NOT turn-ending — that's today's inline denial-and-continue
-                # behavior, unchanged.
+                # Connector write-approval gate (tools/tool_approval.py): the wait
+                # for the approval card ended unresolved (timeout, or an
+                # interrupt/stop releasing the waiter) while a real approval
+                # surface was registered. Like request_user_input's "no_response"
+                # above, this ends the turn, so a late decision lands as the next
+                # turn rather than trying to resume a call the agent has moved on
+                # from. An explicit deny is NOT turn-ending — that's today's
+                # inline denial-and-continue behavior, unchanged.
                 elif function_name.startswith(CONNECTORS_TOOL_PREFIX):
                     try:
                         parsed = json.loads(function_result or "{}")
