@@ -53,13 +53,21 @@ _DEFAULT_TIMEOUT_S = 300
 # Registered MCP names for the per-brand connectors server are
 # ``mcp_connectors_<slug>``. The write gate is scoped to this prefix so only
 # connector tools are gated through the connector-approval card.
-_CONNECTORS_TOOL_PREFIX = "mcp_connectors_"
+CONNECTORS_TOOL_PREFIX = "mcp_connectors_"
 
 # User-facing option labels and the scope each one grants. Index-aligned so the
 # Omnia frontend can map a chosen label back to its scope.
 APPROVAL_OPTIONS = ["Allow once", "Allow for this chat", "Allow always", "Deny"]
 APPROVAL_OPTION_SCOPES = ["once", "session", "always", "deny"]
 APPROVAL_SCOPES = frozenset({"once", "session", "always", "deny"})
+
+# Sentinel returned by ``await_tool_approval`` when there is no interactive
+# surface registered at all (e.g. a proactive /v1/runs headless task with
+# nobody to show the card to). Distinct from a genuine timeout (``None``) so
+# ``maybe_require_tool_approval`` can route it to a non-turn-ending denial:
+# interrupting a headless task on its first gated write would be wrong, since
+# there was never anyone who could have answered in time.
+_NO_SURFACE = "__no_surface__"
 
 _lock = threading.Lock()
 # session_key -> tool names approved for the whole conversation.
@@ -114,7 +122,7 @@ def is_gated_tool(function_name: str) -> bool:
     """
     if _DISABLED_FROZEN:
         return False
-    if not function_name or not function_name.startswith(_CONNECTORS_TOOL_PREFIX):
+    if not function_name or not function_name.startswith(CONNECTORS_TOOL_PREFIX):
         return False
     return not mcp_tool_is_read_only(function_name)
 
@@ -182,16 +190,19 @@ def await_tool_approval(
 ) -> Optional[str]:
     """Surface the approval card and block until the user resolves it.
 
-    Returns the chosen scope (``once`` / ``session`` / ``deny``), or ``None``
-    when there is no chat surface registered (non-interactive caller), the wait
-    times out, or the agent is interrupted (the user stopped the turn, or the
-    chat disconnected). In every ``None`` case the caller MUST fail closed (not
-    execute the write).
+    Returns the chosen scope (``once`` / ``session`` / ``deny``); ``None`` when
+    the wait genuinely timed out or the agent was interrupted (the user
+    stopped the turn, or the chat disconnected) while a real surface was
+    registered; or the ``_NO_SURFACE`` sentinel when there was no chat surface
+    registered at all (non-interactive caller). The caller MUST fail closed
+    (not execute the write) for both ``None`` and ``_NO_SURFACE`` — the two are
+    kept distinct only so it can pick the right (turn-ending vs not) denial
+    status.
     """
     with _lock:
         cb = _notify_cbs.get(session_key)
         if cb is None:
-            return None  # no interactive surface → caller denies the write
+            return _NO_SURFACE  # no interactive surface → caller denies the write
         entry = _ApprovalWait(function_name, tool_call_id)
         _waits.setdefault(session_key, []).append(entry)
 
@@ -317,21 +328,37 @@ def _readable_tool(function_name: str) -> str:
     return name.replace("_", " ").strip().capitalize() or function_name
 
 
-def _denial_result(choice: Optional[str]) -> str:
+def _denial_result(choice: Optional[str], *, status: Optional[str] = None) -> str:
     """A tool result telling the agent the write did NOT happen. This is status
-    data (not an instruction), so it's safe even wrapped as an untrusted result."""
+    data (not an instruction), so it's safe even wrapped as an untrusted result.
+
+    Also carries a machine-readable ``status`` field for the api_server seam to
+    key its turn-ending decision on, alongside the human-readable ``error``
+    text (unchanged):
+      - ``choice == "deny"`` -> ``"approval_denied"`` (explicit denial; NOT
+        turn-ending, the agent continues and reports it inline).
+      - otherwise (a genuine timeout with a real approval surface that the user
+        just didn't respond to) -> ``"approval_no_response"`` (turn-ending).
+      - ``status`` overrides both defaults — used for paths that are neither of
+        the above and must NOT be turn-ending: a guard error
+        (``fail_closed_denial``) or no interactive surface at all
+        (``maybe_require_tool_approval``'s no-surface branch).
+    """
     if choice == "deny":
         reason = "The user declined this action."
+        default_status = "approval_denied"
     else:
         reason = (
             "This action needs the user's approval, which wasn't granted (no response)."
         )
+        default_status = "approval_no_response"
     return json.dumps(
         {
+            "status": status or default_status,
             "error": (
                 f"{reason} It was NOT performed. Do not retry it or tell the user it "
                 "succeeded; let them know it needs their approval."
-            )
+            ),
         },
         ensure_ascii=False,
     )
@@ -341,12 +368,17 @@ def fail_closed_denial(function_name: str) -> Optional[str]:
     """Denial result for a call site whose approval guard raised — so a gated
     write never runs unapproved on a guard error. Returns ``None`` for an
     ungated tool (it may proceed). Treats an unclassifiable tool as gated, so the
-    write gate stays fail-closed even when classification itself fails."""
+    write gate stays fail-closed even when classification itself fails.
+
+    Status is ``"approval_error"``, NOT ``"approval_no_response"``: the user may
+    well be present, this is a guard malfunction, so the turn must not end —
+    the agent should continue and report the error inline.
+    """
     try:
         gated = is_gated_tool(function_name)
     except Exception:
         gated = True  # can't classify → a write gate fails closed
-    return _denial_result(None) if gated else None
+    return _denial_result(None, status="approval_error") if gated else None
 
 
 def maybe_require_tool_approval(
@@ -395,5 +427,12 @@ def maybe_require_tool_approval(
         return None
     if choice == "once":
         return None  # this call proceeds; the next one prompts again
-    # deny / timeout / no interactive surface → fail closed.
+    if choice == _NO_SURFACE:
+        # No interactive surface at all (e.g. a proactive /v1/runs task) — fail
+        # closed, but NOT turn-ending: there was never anyone who could have
+        # answered, so interrupting a headless run would be wrong.
+        return _denial_result(None, status="approval_error")
+    # deny (choice == "deny") / a genuine timeout with a real surface
+    # (choice is None) → fail closed; timeout is turn-ending via
+    # "approval_no_response", deny is not.
     return _denial_result(choice)

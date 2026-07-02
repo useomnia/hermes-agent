@@ -2286,13 +2286,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
+                from tools.tool_approval import CONNECTORS_TOOL_PREFIX
                 _started_tool_call_ids.discard(tool_call_id)
                 completed = {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
                 }
-                # request_user_input returns one of two result shapes; the plugin
+                # request_user_input returns one of three result shapes; the plugin
                 # owns which, and we honor it here:
                 #  - status "answered": the worker blocked and the user's answer IS
                 #    the result. Surface it on the completed event under
@@ -2304,7 +2305,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 #    offer, killswitch fallback, or no surface) — end the turn now
                 #    (legacy behavior; the loop returns finish_reason="stop") so the
                 #    user's answer, if any, is the next turn.
+                #  - status "no_response": the blocking wait timed out — the user
+                #    wasn't there to answer within the window. Also turn-ending: the
+                #    card stays open in the chat, and the user's late answer becomes
+                #    the next turn's user message rather than a stale inline result.
                 turn_ending = False
+                interrupt_message = "awaiting user interaction (request_user_input)"
                 if function_name == "request_user_input":
                     try:
                         parsed = json.loads(function_result or "{}")
@@ -2312,7 +2318,23 @@ class APIServerAdapter(BasePlatformAdapter):
                         parsed = {}
                     if parsed.get("status") == "answered":
                         completed["interaction"] = {"answered": parsed.get("response", "")}
-                    turn_ending = parsed.get("status") == "presented"
+                    turn_ending = parsed.get("status") in ("presented", "no_response")
+                # Connector write-approval gate (tools/tool_approval.py): a gated
+                # write times out when the user was away to resolve the card. Like
+                # request_user_input's "no_response" above, this ends the turn. The
+                # Omnia chat renders the unresolved card as expired (timed out) —
+                # the user re-asks in chat when they want the action, getting a
+                # fresh approval prompt while they're present. An explicit deny
+                # is NOT turn-ending — that's today's inline denial-and-continue
+                # behavior, unchanged.
+                elif function_name.startswith(CONNECTORS_TOOL_PREFIX):
+                    try:
+                        parsed = json.loads(function_result or "{}")
+                    except Exception:
+                        parsed = {}
+                    if isinstance(parsed, dict) and parsed.get("status") == "approval_no_response":
+                        turn_ending = True
+                        interrupt_message = "awaiting user approval (tool approval timed out)"
                 # Omnia task-list tracker: the `todo` tool returns the full current
                 # list ({"todos": [{id, content, status}], "summary": {...}}) on every
                 # call. Forward the `todos` array on the completed event so the Omnia
@@ -2332,7 +2354,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _stream_q.put(("__tool_progress__", completed))
                 if turn_ending and agent_ref[0] is not None:
                     try:
-                        agent_ref[0].interrupt("awaiting user interaction (request_user_input)")
+                        agent_ref[0].interrupt(interrupt_message)
                     except Exception:
                         pass
 

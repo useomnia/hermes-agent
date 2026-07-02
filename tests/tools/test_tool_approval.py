@@ -1,5 +1,6 @@
 """Tests for tools/tool_approval.py — blocking per-call approval for WRITE tools."""
 
+import json
 import threading
 
 import pytest
@@ -105,6 +106,9 @@ class TestMaybeRequireToolApproval:
         result = maybe_require_tool_approval(GATED, "call-1")
         assert result is not None
         assert "not performed" in result.lower()
+        # Machine-readable status: an explicit deny is NOT turn-ending — the
+        # agent continues and reports the denial inline.
+        assert json.loads(result)["status"] == "approval_denied"
 
     def test_should_remember_a_session_grant_so_the_next_call_doesnt_prompt(self):
         register_tool_approval_notify(SESSION, _resolving_notify("session"))
@@ -126,12 +130,18 @@ class TestMaybeRequireToolApproval:
         result = maybe_require_tool_approval(GATED, "call-1")
         assert result is not None
         assert "approval" in result.lower()
+        # No surface at all → NOT the turn-ending status: interrupting a
+        # headless run on its first gated write would be wrong (there was
+        # never anyone who could have answered in time).
+        assert json.loads(result)["status"] != "approval_no_response"
 
     def test_should_fail_closed_on_timeout(self, monkeypatch):
         monkeypatch.setenv("OMNIO_TOOL_APPROVAL_TIMEOUT", "0")
         register_tool_approval_notify(SESSION, lambda event: None)  # never resolves
         result = maybe_require_tool_approval(GATED, "call-1")
         assert result is not None
+        # A genuine timeout with a real interactive surface IS turn-ending.
+        assert json.loads(result)["status"] == "approval_no_response"
 
     def test_should_surface_the_interaction_with_options_and_scopes(self):
         captured = {}
@@ -287,6 +297,9 @@ class TestFailClosedDenial:
         result = fail_closed_denial(GATED)
         assert result is not None
         assert "approval" in result.lower()
+        # A guard-error path: the user may well be present, so this must NOT
+        # be the turn-ending status — the agent continues and reports it.
+        assert json.loads(result)["status"] != "approval_no_response"
 
     def test_should_allow_an_ungated_read(self):
         assert fail_closed_denial(READ) is None
@@ -296,7 +309,9 @@ class TestFailClosedDenial:
             raise RuntimeError("cannot classify")
 
         monkeypatch.setattr(tool_approval, "is_gated_tool", boom)
-        assert fail_closed_denial(GATED) is not None
+        result = fail_closed_denial(GATED)
+        assert result is not None
+        assert json.loads(result)["status"] != "approval_no_response"
 
 
 class TestClearSession:

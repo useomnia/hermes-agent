@@ -6,7 +6,12 @@ form — rendered as a card in the Omnia chat. This BLOCKS the agent worker thre
 until the user answers (or a timeout) and returns the answer as the tool's
 result, so the answer becomes part of the SAME turn — the way the write-tool
 approval gate (``tools/tool_approval.py``) resumes a gated call inline, rather
-than the older "end the turn, the answer is the next message" shape.
+than the older "end the turn, the answer is the next message" shape. That
+inline-resume shape holds only when the user answers before the timeout: a
+timeout now ENDS the turn (mirroring the "presented" sentinel below) instead
+of letting the agent keep working with a "no_response" result — the card
+stays open and answerable in the chat, and a late answer arrives as the next
+turn's user message.
 
 The card itself rides the tool's ``running`` lifecycle event, emitted by the
 api_server seam (``_on_tool_start``) with the tool's args under ``interaction``,
@@ -42,11 +47,14 @@ logger = logging.getLogger(__name__)
 _ENV_DISABLED = "OMNIO_USER_INPUT_BLOCKING_DISABLED"
 BLOCKING_DISABLED: bool = env_var_enabled(_ENV_DISABLED)
 
-# How long (seconds) the agent blocks waiting for the user to answer. Higher than
-# the approval gate's 300s default: a multi-question form takes longer to fill
-# than a yes/no approval. The chat keepalive holds the SSE open meanwhile.
+# How long (seconds) the agent blocks waiting for the user to answer. Matches
+# the approval gate's 300s default. On timeout the turn ends (see api_server's
+# _on_tool_complete) rather than letting the agent keep working with a
+# "no_response" result — the card stays open and answerable in the chat, and
+# the user's late answer arrives as the next turn's user message. The chat
+# keepalive holds the SSE open while the worker is parked.
 _ENV_TIMEOUT = "OMNIO_USER_INPUT_TIMEOUT"
-_DEFAULT_TIMEOUT_S = 600
+_DEFAULT_TIMEOUT_S = 300
 
 _lock = threading.Lock()
 # session_key -> FIFO of blocked input waiters.

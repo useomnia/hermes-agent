@@ -1747,6 +1747,150 @@ class TestChatCompletionsEndpoint:
             assert '"status": "running"' not in body
             assert '"status": "completed"' not in body
 
+    async def _run_tool_complete_scenario(self, adapter, function_name, function_result):
+        """Shared harness: drive a single tool_start/tool_complete pair through
+        the chat-completions streaming path, with a fake agent installed on
+        ``agent_ref`` so ``interrupt()`` calls can be observed, and return
+        the fake agent for assertions."""
+        import asyncio
+
+        class _FakeAgent:
+            def __init__(self):
+                self.interrupt_calls = []
+
+            def interrupt(self, message):
+                self.interrupt_calls.append(message)
+
+        fake_agent = _FakeAgent()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                agent_ref = kwargs.get("agent_ref")
+                if agent_ref is not None:
+                    agent_ref[0] = fake_agent
+                if ts_cb:
+                    ts_cb("call_1", function_name, {})
+                if tc_cb:
+                    tc_cb("call_1", function_name, {}, function_result)
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                await resp.text()
+
+        return fake_agent
+
+    @pytest.mark.asyncio
+    async def test_stream_request_user_input_presented_ends_turn(self, adapter):
+        """A ``request_user_input`` result with status "presented" is the
+        legacy turn-ending sentinel — the agent must be interrupted."""
+        import json as _json
+
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter, "request_user_input", _json.dumps({"status": "presented"})
+        )
+        assert fake_agent.interrupt_calls == [
+            "awaiting user interaction (request_user_input)"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stream_request_user_input_no_response_ends_turn(self, adapter):
+        """A ``request_user_input`` timeout (status "no_response") must also
+        end the turn — the card stays open in the chat and the user's late
+        answer becomes the next turn's user message, rather than the agent
+        continuing to work on a "no answer" result."""
+        import json as _json
+
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter, "request_user_input", _json.dumps({"status": "no_response"})
+        )
+        assert fake_agent.interrupt_calls == [
+            "awaiting user interaction (request_user_input)"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stream_request_user_input_answered_does_not_end_turn(self, adapter):
+        """A ``request_user_input`` result with status "answered" resumes the
+        SAME turn inline — must NOT interrupt the agent."""
+        import json as _json
+
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter,
+            "request_user_input",
+            _json.dumps({"status": "answered", "response": "Tuesday"}),
+        )
+        assert fake_agent.interrupt_calls == []
+
+    @pytest.mark.asyncio
+    async def test_stream_connector_approval_timeout_ends_turn(self, adapter):
+        """A connector write tool's approval-gate timeout (status
+        "approval_no_response") must end the turn — the user was away, and
+        the approval card stays open for a late decision."""
+        import json as _json
+
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter,
+            "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT",
+            _json.dumps({"status": "approval_no_response", "error": "no response"}),
+        )
+        assert fake_agent.interrupt_calls == [
+            "awaiting user approval (tool approval timed out)"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stream_connector_approval_denied_does_not_end_turn(self, adapter):
+        """An explicit deny (status "approval_denied") keeps today's inline
+        denial-and-continue behavior — must NOT interrupt the agent."""
+        import json as _json
+
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter,
+            "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT",
+            _json.dumps({"status": "approval_denied", "error": "declined"}),
+        )
+        assert fake_agent.interrupt_calls == []
+
+    @pytest.mark.asyncio
+    async def test_stream_connector_approval_error_does_not_end_turn(self, adapter):
+        """A guard-error / no-surface denial (status "approval_error") must
+        NOT end the turn — the user may well be present (guard error) or
+        there was never anyone to answer (headless caller)."""
+        import json as _json
+
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter,
+            "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT",
+            _json.dumps({"status": "approval_error", "error": "guard failed"}),
+        )
+        assert fake_agent.interrupt_calls == []
+
+    @pytest.mark.asyncio
+    async def test_stream_connector_non_json_result_does_not_end_turn(self, adapter):
+        """A non-JSON connector tool result must not crash the parse and must
+        not be treated as turn-ending."""
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter, "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT", "not json"
+        )
+        assert fake_agent.interrupt_calls == []
+
     @pytest.mark.asyncio
     async def test_no_user_message_returns_400(self, adapter):
         app = _create_app(adapter)
