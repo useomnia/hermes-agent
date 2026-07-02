@@ -143,6 +143,18 @@ class TestMaybeRequireToolApproval:
         # A genuine timeout with a real interactive surface IS turn-ending.
         assert json.loads(result)["status"] == "approval_no_response"
 
+    def test_notify_raising_is_a_plumbing_error_not_a_user_timeout(self):
+        # The notify callback raising means the card was never actually shown
+        # (chat stream write failed etc.) — the user may still be present, so
+        # this must NOT look like a genuine no-response timeout.
+        def raising_notify(event):
+            raise RuntimeError("stream write failed")
+
+        register_tool_approval_notify(SESSION, raising_notify)
+        result = maybe_require_tool_approval(GATED, "call-1")
+        assert result is not None
+        assert json.loads(result)["status"] == "approval_error"
+
     def test_should_surface_the_interaction_with_options_and_scopes(self):
         captured = {}
         register_tool_approval_notify(
@@ -164,7 +176,9 @@ class TestAlwaysScope:
     current chat) and survives clear_session — it resets only on gateway restart."""
 
     def test_should_record_an_always_grant(self):
-        assert resolve_tool_approval(SESSION, GATED, "always") is True
+        # No waiter pending here, so the call itself returns False (nothing
+        # released) even though the always grant is recorded for next time.
+        assert resolve_tool_approval(SESSION, GATED, "always") is False
         assert is_always_approved(GATED) is True
 
     def test_always_is_not_a_session_grant(self):
@@ -193,9 +207,26 @@ class TestResolveToolApproval:
         assert resolve_tool_approval(SESSION, GATED, "forever") is False
 
     def test_should_record_a_session_grant_even_with_no_pending_wait(self):
-        # Resolve arriving before the guard blocked still records the grant.
-        assert resolve_tool_approval(SESSION, GATED, "session") is True
+        # Resolve arriving before the guard blocked (or after it timed out)
+        # still records the grant for the NEXT call — but returns False since
+        # no waiter was actually released for THIS decision.
+        assert resolve_tool_approval(SESSION, GATED, "session") is False
         assert is_tool_approved(SESSION, GATED) is True
+
+    def test_no_waiter_once_records_nothing_and_returns_false(self):
+        assert resolve_tool_approval(SESSION, GATED, "once") is False
+        assert is_tool_approved(SESSION, GATED) is False
+        assert is_always_approved(GATED) is False
+
+    def test_no_waiter_session_records_grant_but_returns_false(self):
+        assert resolve_tool_approval(SESSION, GATED, "session") is False
+        assert is_tool_approved(SESSION, GATED) is True
+
+    def test_waiter_present_once_returns_true(self):
+        entry = _ApprovalWait(GATED, "call-A")
+        _waits[SESSION] = [entry]
+        assert resolve_tool_approval(SESSION, GATED, "once", "call-A") is True
+        assert entry.result == "once" and entry.event.is_set()
 
     def test_should_scope_grants_per_session(self):
         resolve_tool_approval(SESSION, GATED, "session")

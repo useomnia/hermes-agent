@@ -1892,6 +1892,75 @@ class TestChatCompletionsEndpoint:
         assert fake_agent.interrupt_calls == []
 
     @pytest.mark.asyncio
+    async def test_stream_request_user_input_non_dict_json_does_not_end_turn(self, adapter):
+        """A JSON-valid but non-dict result (e.g. a bare string or array) must
+        not raise AttributeError on `.get` and must not be treated as
+        turn-ending — mirrors the connector branch's isinstance guard."""
+        import json as _json
+
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter, "request_user_input", _json.dumps(["unexpected", "shape"])
+        )
+        assert fake_agent.interrupt_calls == []
+
+    @pytest.mark.asyncio
+    async def test_stream_turn_ending_interrupt_failure_is_logged(self, adapter, caplog):
+        """If ``agent.interrupt()`` itself raises on a turn-ending completion,
+        the failure must be logged loudly (not silently swallowed) — the UI
+        already shows a hard timed-out state, so a silent failure here would
+        leave the agent running underneath it with nothing telling us."""
+        import json as _json
+        import logging
+
+        class _RaisingAgent:
+            def interrupt(self, message):
+                raise RuntimeError("interrupt plumbing broke")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                agent_ref = kwargs.get("agent_ref")
+                if agent_ref is not None:
+                    agent_ref[0] = _RaisingAgent()
+                if ts_cb:
+                    ts_cb("call_1", "request_user_input", {})
+                if tc_cb:
+                    tc_cb(
+                        "call_1",
+                        "request_user_input",
+                        {},
+                        _json.dumps({"status": "no_response"}),
+                    )
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                with caplog.at_level(logging.WARNING):
+                    resp = await cli.post(
+                        "/v1/chat/completions",
+                        json={
+                            "model": "test",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": True,
+                        },
+                    )
+                    assert resp.status == 200
+                    await resp.text()
+
+        assert any(
+            "call_1" in record.getMessage() and "request_user_input" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
     async def test_no_user_message_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:

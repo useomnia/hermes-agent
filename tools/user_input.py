@@ -8,7 +8,7 @@ result, so the answer becomes part of the SAME turn — the way the write-tool
 approval gate (``tools/tool_approval.py``) resumes a gated call inline, rather
 than the older "end the turn, the answer is the next message" shape. That
 inline-resume shape holds only when the user answers before the timeout: a
-timeout now ENDS the turn (mirroring the "presented" sentinel below) instead
+timeout now ENDS the turn (mirroring the plugin's "presented" sentinel) instead
 of letting the agent keep working with a "no_response" result — the card
 stays open and answerable in the chat, and a late answer arrives as the next
 turn's user message.
@@ -119,8 +119,9 @@ def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
 
     Returns the user's answer string, or ``None`` when the wait times out or the
     agent is interrupted (the user stopped the turn, or the chat disconnected).
-    The caller (the plugin) maps ``None`` to a "no answer" tool result so the
-    model continues gracefully rather than confabulating an answer.
+    The caller (the plugin) maps ``None`` to a "no_response" tool result, which
+    the api_server seam treats as turn-ending — the card stays answerable in the
+    chat and a late answer arrives as the next turn's user message.
     """
     if not session_key:
         # No conversation surface to receive an answer on — don't park forever.

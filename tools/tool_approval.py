@@ -209,9 +209,15 @@ def await_tool_approval(
     try:
         cb(interaction_event)
     except Exception:
+        # The notify callback raising is a plumbing malfunction (e.g. the chat
+        # stream write failed) — the card was never actually shown, so the user
+        # may still be present and simply never got a chance to answer. Treat
+        # this the same as "no interactive surface": _NO_SURFACE routes to the
+        # non-turn-ending `approval_error` status, not a genuine `None` timeout
+        # (which would end the turn via `approval_no_response`).
         logger.warning("tool-approval notify failed", exc_info=True)
         _drop_wait(session_key, entry)
-        return None
+        return _NO_SURFACE
 
     # Block in short slices so we can heartbeat the inactivity tracker — without
     # it the gateway watchdog would kill the agent while the user is deciding.
@@ -272,9 +278,15 @@ def resolve_tool_approval(
     decision on one card releasing the other). Falls back to FIFO only when no
     id is supplied (a legacy / single-call caller).
 
-    Returns False only for a malformed request. A decision that arrives before
-    the guard blocked (or after it timed out) still records the grant so the
-    next call sees it — so the result is True as long as the input is valid.
+    Returns True only when a blocked waiter was actually found and released —
+    i.e. the tool call that showed the card is still live to receive the
+    decision. When no waiter matches (the wait already timed out and the guard
+    moved on to its own denial), the write already didn't happen: returning
+    True here would make the client show the card as granted while nothing
+    ran. `session`/`always` grants are still recorded in that case — they
+    legitimately help the NEXT call of the same tool skip the prompt — but the
+    call itself reports False so the caller can tell the user their decision
+    arrived too late to affect this write.
     """
     if not session_key or scope not in APPROVAL_SCOPES:
         return False
@@ -299,7 +311,8 @@ def resolve_tool_approval(
     if entry is not None:
         entry.result = scope
         entry.event.set()
-    return True
+        return True
+    return False
 
 
 def clear_session(session_key: str) -> None:
@@ -337,8 +350,10 @@ def _denial_result(choice: Optional[str], *, status: Optional[str] = None) -> st
     text (unchanged):
       - ``choice == "deny"`` -> ``"approval_denied"`` (explicit denial; NOT
         turn-ending, the agent continues and reports it inline).
-      - otherwise (a genuine timeout with a real approval surface that the user
-        just didn't respond to) -> ``"approval_no_response"`` (turn-ending).
+      - otherwise (the wait ended unresolved with a real approval surface — a
+        timeout, or an interrupt/stop releasing the waiter) ->
+        ``"approval_no_response"`` (turn-ending; for the interrupt case the turn
+        is already ending, so the extra interrupt is a no-op).
       - ``status`` overrides both defaults — used for paths that are neither of
         the above and must NOT be turn-ending: a guard error
         (``fail_closed_denial``) or no interactive surface at all
@@ -432,7 +447,7 @@ def maybe_require_tool_approval(
         # closed, but NOT turn-ending: there was never anyone who could have
         # answered, so interrupting a headless run would be wrong.
         return _denial_result(None, status="approval_error")
-    # deny (choice == "deny") / a genuine timeout with a real surface
-    # (choice is None) → fail closed; timeout is turn-ending via
-    # "approval_no_response", deny is not.
+    # deny (choice == "deny") / an unresolved wait with a real surface —
+    # timeout or interrupt (choice is None) → fail closed; the unresolved wait
+    # is turn-ending via "approval_no_response", deny is not.
     return _denial_result(choice)

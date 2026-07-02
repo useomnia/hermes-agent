@@ -2305,10 +2305,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 #    offer, killswitch fallback, or no surface) — end the turn now
                 #    (legacy behavior; the loop returns finish_reason="stop") so the
                 #    user's answer, if any, is the next turn.
-                #  - status "no_response": the blocking wait timed out — the user
-                #    wasn't there to answer within the window. Also turn-ending: the
-                #    card stays open in the chat, and the user's late answer becomes
-                #    the next turn's user message rather than a stale inline result.
+                #  - status "no_response": the blocking wait ended without an answer
+                #    (timed out, or the wait was released by a stop/disconnect). Also
+                #    turn-ending: the card stays open in the chat, and the user's late
+                #    answer becomes the next turn's user message rather than a stale
+                #    inline result. No no-surface carve-out is needed here (unlike the
+                #    approval gate's approval_error): this callback only runs on the
+                #    interactive chat path, and a headless caller fails fast in
+                #    await_user_input before a no_response ever reaches a result.
                 turn_ending = False
                 interrupt_message = "awaiting user interaction (request_user_input)"
                 if function_name == "request_user_input":
@@ -2316,9 +2320,16 @@ class APIServerAdapter(BasePlatformAdapter):
                         parsed = json.loads(function_result or "{}")
                     except Exception:
                         parsed = {}
-                    if parsed.get("status") == "answered":
+                    # A JSON-valid but non-dict result (e.g. the tool somehow
+                    # returned a bare string/array) has no `.get` shape to read —
+                    # guard it the same way the connector-approval branch below
+                    # does, rather than letting a malformed result raise here.
+                    if isinstance(parsed, dict) and parsed.get("status") == "answered":
                         completed["interaction"] = {"answered": parsed.get("response", "")}
-                    turn_ending = parsed.get("status") in ("presented", "no_response")
+                    turn_ending = isinstance(parsed, dict) and parsed.get("status") in (
+                        "presented",
+                        "no_response",
+                    )
                 # Connector write-approval gate (tools/tool_approval.py): a gated
                 # write times out when the user was away to resolve the card. Like
                 # request_user_input's "no_response" above, this ends the turn. The
@@ -2356,7 +2367,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     try:
                         agent_ref[0].interrupt(interrupt_message)
                     except Exception:
-                        pass
+                        # The UI already shows a hard "timed out" / "expired"
+                        # state for this card (request_user_input no_response,
+                        # or a connector-approval timeout) — if the interrupt
+                        # itself fails, the agent keeps running underneath that
+                        # UI with nothing telling us. Log loudly so this isn't
+                        # silent; don't re-raise, the tool-complete event must
+                        # still ship.
+                        logger.warning(
+                            "[api_server] failed to interrupt agent for turn-ending "
+                            "tool completion (tool_call_id=%s, function_name=%s)",
+                            tool_call_id,
+                            function_name,
+                            exc_info=True,
+                        )
 
             def _on_tool_progress(event_type, name=None, preview=None, args=None, **kwargs):
                 """Forward SUBAGENT activity so a ``delegate_task`` batch isn't silent.
@@ -4794,6 +4818,13 @@ class APIServerAdapter(BasePlatformAdapter):
         head — which is what keeps two writes pending in one turn from
         cross-talking. A `session`-scope decision is also remembered so later
         calls of the same tool skip the prompt.
+
+        The response's ``recorded`` field is True only when a blocked waiter
+        was actually released by this call — i.e. the write is still live and
+        will proceed/deny per ``choice``. False means the wait already ended
+        (timed out, or the turn moved on) before this decision arrived: the
+        card in the UI is stale and the write did not run, even for a
+        `session`/`always` scope that still got persisted for next time.
         """
         auth_err = self._check_auth(request)
         if auth_err:
