@@ -4932,9 +4932,10 @@ class APIServerAdapter(BasePlatformAdapter):
         The tool is BLOCKING: the agent worker is parked on this exact call
         waiting for the answer. The request is keyed by the conversation's session
         id (the ``X-Hermes-Session-Id`` header the proxy derives from the source
-        id — the value the plugin scoped its wait to); ``toolCallId`` refines the
-        match (only one input blocks per session, so the queue head is normally
-        the right one). The answer becomes the tool's result inline and the turn
+        id — the value the plugin scoped its wait to); ``toolCallId`` selects the
+        matching waiter (a waiter registered with an id is released only by an
+        id match; only legacy id-less waiters fall back to the queue head). The
+        answer becomes the tool's result inline and the turn
         resumes. ``resolved: false`` means no call was waiting (already answered,
         timed out, or the turn ended) — the chat treats that as a stale card.
         """

@@ -18,9 +18,10 @@ api_server seam (``_on_tool_start``) with the tool's args under ``interaction``,
 so this module owns only the BLOCK and its release: a per-session FIFO of
 waiters, each parked on a ``threading.Event``, released by ``resolve_user_input``
 when the user's answer arrives on the loopback endpoint
-(``POST /v1/omnio/user-input``). Exactly one ``request_user_input`` blocks per
-session at a time — the worker is parked on it — so a single FIFO per session
-key is sufficient (``tool_call_id`` only refines the match defensively).
+(``POST /v1/omnio/user-input``). Exactly one blocking call parks the worker per
+session at a time, so a single FIFO per session key is sufficient; waiters
+registered with a ``tool_call_id`` are released only by an id match, so an
+answer for one card can never release a different blocked call.
 
 State is module-level, keyed by the session key (== the conversation's
 ``X-Hermes-Session-Id``), matching ``tools/tool_approval.py`` so a session reset
@@ -73,6 +74,17 @@ def register_user_input_session(session_key: str) -> None:
         return
     with _lock:
         _active_sessions.add(session_key)
+
+
+def has_user_input_surface(session_key: str) -> bool:
+    """True when the session has an interactive chat surface registered — the
+    same check ``await_user_input`` fails fast on. Lets a fire-and-forget
+    frontend tool report "not presented" instead of claiming success on a
+    headless run (e.g. a proactive /v1/runs task)."""
+    if not session_key:
+        return False
+    with _lock:
+        return session_key in _active_sessions
 
 
 def unregister_user_input_session(session_key: str) -> None:
@@ -192,10 +204,13 @@ def resolve_user_input(session_key: str, answer: str, tool_call_id: str = "") ->
     """Apply the user's answer posted from the Omnia chat: unblock the waiting
     ``request_user_input`` call.
 
-    When ``tool_call_id`` is given the MATCHING waiter is released; otherwise (or
-    if no match) the queue head (FIFO). Since exactly one input blocks per
-    session, FIFO is the normal path. Returns ``False`` only for a malformed
-    request (no session key) or when no call is currently waiting.
+    When ``tool_call_id`` is given the MATCHING waiter is released. Otherwise
+    (or if no match) the first waiter registered WITHOUT a tool_call_id is
+    released (FIFO among legacy waiters) — a waiter registered WITH an id may
+    only be released by an id match, an interrupt, or session unregister/clear,
+    so a stale answer for a different card can never release it with the wrong
+    payload. Returns ``False`` for a malformed request (no session key) or when
+    no releasable call is waiting.
     """
     if not session_key:
         return False
@@ -209,7 +224,10 @@ def resolve_user_input(session_key: str, answer: str, tool_call_id: str = "") ->
                         entry = queue.pop(index)
                         break
             if entry is None:
-                entry = queue.pop(0)
+                for index, candidate in enumerate(queue):
+                    if not candidate.tool_call_id:
+                        entry = queue.pop(index)
+                        break
         if queue is not None and not queue:
             _waits.pop(session_key, None)
     if entry is None:
