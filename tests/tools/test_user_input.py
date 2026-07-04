@@ -116,6 +116,35 @@ class TestAwaitAndResolve:
             set_interrupt(False, thread.ident)
 
 
+class TestTimeoutOverride:
+    def test_timeout_s_overrides_the_env_default(self, monkeypatch):
+        # A short explicit budget must win over a long env/default timeout.
+        monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "600")
+        start = time.monotonic()
+        assert await_user_input(SESSION, "call-1", timeout_s=0) is None
+        assert time.monotonic() - start < 2.0, "timeout_s=0 must not park for the env timeout"
+        assert SESSION not in _waits, "a timed-out wait must not leak a waiter"
+
+    def test_timeout_s_none_keeps_the_env_default(self, monkeypatch):
+        monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "0")
+        assert await_user_input(SESSION, "call-1", timeout_s=None) is None
+
+    def test_resolve_delivers_the_answer_within_a_timeout_s_window(self):
+        result: dict[str, object] = {}
+
+        def worker():
+            result["answer"] = await_user_input(SESSION, "call-1", timeout_s=30)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        assert _wait_until_blocked(), "the worker should be parked on the wait"
+
+        assert resolve_user_input(SESSION, '{"route": "/monitor"}', "call-1") is True
+        thread.join(timeout=3)
+        assert not thread.is_alive(), "resolve must release the wait"
+        assert result["answer"] == '{"route": "/monitor"}'
+
+
 class TestResolveUserInput:
     def test_returns_false_without_a_session_key(self):
         assert resolve_user_input("", "hi", "call-1") is False

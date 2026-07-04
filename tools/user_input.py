@@ -114,7 +114,11 @@ def _drop_wait(session_key: str, entry: "_InputWait") -> None:
             _waits.pop(session_key, None)
 
 
-def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
+def await_user_input(
+    session_key: str,
+    tool_call_id: str = "",
+    timeout_s: float | None = None,
+) -> Optional[str]:
     """Block until the user answers the ``request_user_input`` card, or a timeout.
 
     Returns the user's answer string, or ``None`` when the wait times out or the
@@ -122,6 +126,10 @@ def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
     The caller (the plugin) maps ``None`` to a "no_response" tool result, which
     the api_server seam treats as turn-ending — the card stays answerable in the
     chat and a late answer arrives as the next turn's user message.
+
+    ``timeout_s`` overrides the wait budget for callers whose answer either
+    arrives promptly or not at all (e.g. a frontend tool answered by the
+    dashboard rather than a human); ``None`` keeps the env/default timeout.
     """
     if not session_key:
         # No conversation surface to receive an answer on — don't park forever.
@@ -162,7 +170,8 @@ def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
         pass
 
     now = time.monotonic()
-    deadline = now + max(_input_timeout(), 0)
+    timeout = _input_timeout() if timeout_s is None else timeout_s
+    deadline = now + max(timeout, 0)
     activity = {"last_touch": now, "start": now}
     while True:
         remaining = deadline - time.monotonic()

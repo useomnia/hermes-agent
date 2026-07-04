@@ -751,6 +751,10 @@ try:
 except Exception:  # pragma: no cover - scanner is optional hardening
     _scan_cron_prompt = None
 
+# Frontend tools: the browser executes these against the dashboard UI, so their
+# call args ride the tool's `running` progress event under a `frontend` key.
+FRONTEND_TOOLS = {"annotate_ui", "read_screen"}
+
 
 class APIServerAdapter(BasePlatformAdapter):
     """
@@ -2311,6 +2315,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 # inline, so the turn stays alive (see _on_tool_complete).
                 if function_name == "request_user_input" and isinstance(function_args, dict):
                     progress["interaction"] = function_args
+                # Omnia frontend-tool protocol: the browser executes these tools
+                # against the dashboard, so the call rides here under "frontend"
+                # (tool name + args verbatim). Completed events stay generic; a
+                # blocking frontend tool (read_screen) parks in tools/user_input
+                # and the browser answers through the same interaction-answer
+                # path as request_user_input. Gated on FRONTEND_TOOLS so no
+                # other tool's args reach the wire.
+                if function_name in FRONTEND_TOOLS and isinstance(function_args, dict):
+                    progress["frontend"] = {"tool": function_name, "args": function_args}
                 _stream_q.put(("__tool_progress__", progress))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
