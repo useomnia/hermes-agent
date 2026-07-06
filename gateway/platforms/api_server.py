@@ -751,6 +751,10 @@ try:
 except Exception:  # pragma: no cover - scanner is optional hardening
     _scan_cron_prompt = None
 
+# Frontend tools: the browser executes these against the dashboard UI, so their
+# call args ride the tool's `running` progress event under a `frontend` key.
+FRONTEND_TOOLS = {"annotate_ui", "read_screen"}
+
 
 class APIServerAdapter(BasePlatformAdapter):
     """
@@ -2311,6 +2315,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 # inline, so the turn stays alive (see _on_tool_complete).
                 if function_name == "request_user_input" and isinstance(function_args, dict):
                     progress["interaction"] = function_args
+                # Omnia frontend-tool protocol: the browser executes these tools
+                # against the dashboard, so the call rides here under "frontend"
+                # (tool name + args verbatim). Completed events stay generic; a
+                # blocking frontend tool (read_screen) parks in tools/user_input
+                # and the browser answers through the same interaction-answer
+                # path as request_user_input. Gated on FRONTEND_TOOLS so no
+                # other tool's args reach the wire.
+                if function_name in FRONTEND_TOOLS and isinstance(function_args, dict):
+                    progress["frontend"] = {"tool": function_name, "args": function_args}
                 _stream_q.put(("__tool_progress__", progress))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
@@ -4919,9 +4932,10 @@ class APIServerAdapter(BasePlatformAdapter):
         The tool is BLOCKING: the agent worker is parked on this exact call
         waiting for the answer. The request is keyed by the conversation's session
         id (the ``X-Hermes-Session-Id`` header the proxy derives from the source
-        id — the value the plugin scoped its wait to); ``toolCallId`` refines the
-        match (only one input blocks per session, so the queue head is normally
-        the right one). The answer becomes the tool's result inline and the turn
+        id — the value the plugin scoped its wait to); ``toolCallId`` selects the
+        matching waiter (a waiter registered with an id is released only by an
+        id match; only legacy id-less waiters fall back to the queue head). The
+        answer becomes the tool's result inline and the turn
         resumes. ``resolved: false`` means no call was waiting (already answered,
         timed out, or the turn ended) — the chat treats that as a stale card.
         """

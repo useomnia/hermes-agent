@@ -13,6 +13,7 @@ from tools.user_input import (
     _waits,
     await_user_input,
     clear_session,
+    has_user_input_surface,
     register_user_input_session,
     resolve_user_input,
     unregister_user_input_session,
@@ -116,6 +117,35 @@ class TestAwaitAndResolve:
             set_interrupt(False, thread.ident)
 
 
+class TestTimeoutOverride:
+    def test_timeout_s_overrides_the_env_default(self, monkeypatch):
+        # A short explicit budget must win over a long env/default timeout.
+        monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "600")
+        start = time.monotonic()
+        assert await_user_input(SESSION, "call-1", timeout_s=0) is None
+        assert time.monotonic() - start < 2.0, "timeout_s=0 must not park for the env timeout"
+        assert SESSION not in _waits, "a timed-out wait must not leak a waiter"
+
+    def test_timeout_s_none_keeps_the_env_default(self, monkeypatch):
+        monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "0")
+        assert await_user_input(SESSION, "call-1", timeout_s=None) is None
+
+    def test_resolve_delivers_the_answer_within_a_timeout_s_window(self):
+        result: dict[str, object] = {}
+
+        def worker():
+            result["answer"] = await_user_input(SESSION, "call-1", timeout_s=30)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        assert _wait_until_blocked(), "the worker should be parked on the wait"
+
+        assert resolve_user_input(SESSION, '{"route": "/monitor"}', "call-1") is True
+        thread.join(timeout=3)
+        assert not thread.is_alive(), "resolve must release the wait"
+        assert result["answer"] == '{"route": "/monitor"}'
+
+
 class TestResolveUserInput:
     def test_returns_false_without_a_session_key(self):
         assert resolve_user_input("", "hi", "call-1") is False
@@ -134,9 +164,11 @@ class TestResolveUserInput:
         assert second.answer == "answer-B" and second.event.is_set()
         assert first.answer is None and not first.event.is_set()
 
-    def test_falls_back_to_fifo_head_when_no_call_id(self):
-        first = _InputWait("call-A")
-        second = _InputWait("call-B")
+    def test_falls_back_to_fifo_head_of_legacy_waiters_when_no_call_id(self):
+        # Waiters registered without a tool_call_id (an older plugin) keep the
+        # legacy FIFO release when the answer carries no id.
+        first = _InputWait()
+        second = _InputWait()
         _waits[SESSION] = [first, second]
 
         assert resolve_user_input(SESSION, "answer", "") is True
@@ -144,12 +176,49 @@ class TestResolveUserInput:
         assert first.answer == "answer" and first.event.is_set()
         assert second.answer is None and not second.event.is_set()
 
-    def test_falls_back_to_fifo_when_call_id_does_not_match(self):
-        only = _InputWait("call-A")
-        _waits[SESSION] = [only]
+    def test_falls_back_to_a_legacy_waiter_when_call_id_does_not_match(self):
+        legacy = _InputWait()
+        _waits[SESSION] = [legacy]
 
         assert resolve_user_input(SESSION, "answer", "call-NOPE") is True
-        assert only.answer == "answer" and only.event.is_set()
+        assert legacy.answer == "answer" and legacy.event.is_set()
+
+    def test_does_not_release_an_id_registered_waiter_on_a_mismatched_id(self):
+        # A stale card's answer (a different toolCallId) must never release a
+        # call parked under its own id — the wrong payload would become that
+        # tool's result (e.g. a human answer returned as read_screen's "screen").
+        parked = _InputWait("call-A")
+        _waits[SESSION] = [parked]
+
+        assert resolve_user_input(SESSION, "stale answer", "call-NOPE") is False
+        assert parked.answer is None and not parked.event.is_set()
+
+    def test_does_not_release_an_id_registered_waiter_when_no_call_id(self):
+        parked = _InputWait("call-A")
+        _waits[SESSION] = [parked]
+
+        assert resolve_user_input(SESSION, "answer", "") is False
+        assert parked.answer is None and not parked.event.is_set()
+
+    def test_mixed_queue_fallback_skips_id_waiters_and_releases_the_legacy_one(self):
+        id_registered = _InputWait("call-A")
+        legacy = _InputWait()
+        _waits[SESSION] = [id_registered, legacy]
+
+        assert resolve_user_input(SESSION, "answer", "call-NOPE") is True
+
+        assert legacy.answer == "answer" and legacy.event.is_set()
+        assert id_registered.answer is None and not id_registered.event.is_set()
+
+    def test_mixed_queue_id_match_still_wins_over_the_legacy_fallback(self):
+        legacy = _InputWait()
+        id_registered = _InputWait("call-B")
+        _waits[SESSION] = [legacy, id_registered]
+
+        assert resolve_user_input(SESSION, "answer-B", "call-B") is True
+
+        assert id_registered.answer == "answer-B" and id_registered.event.is_set()
+        assert legacy.answer is None and not legacy.event.is_set()
 
     def test_scopes_waiters_per_session(self):
         mine = _InputWait("call-A")
@@ -179,6 +248,22 @@ class TestClearSession:
     def test_is_a_noop_without_a_session_key(self):
         # Should not raise and should not touch state.
         clear_session("")
+
+
+class TestHasUserInputSurface:
+    def test_true_for_a_registered_session(self):
+        assert has_user_input_surface(SESSION) is True
+
+    def test_false_for_an_unregistered_session(self):
+        # e.g. a headless /v1/runs task: no chat surface can render the card.
+        assert has_user_input_surface("headless-run") is False
+
+    def test_false_without_a_session_key(self):
+        assert has_user_input_surface("") is False
+
+    def test_flips_false_after_unregister(self):
+        unregister_user_input_session(SESSION)
+        assert has_user_input_surface(SESSION) is False
 
 
 class TestSurfaceRegistry:

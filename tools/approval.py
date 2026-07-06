@@ -107,6 +107,16 @@ def reset_current_observability_context(
     _approval_turn_id.reset(turn_token)
 
 
+def get_current_tool_call_id(default: str = "") -> str:
+    """Return the tool_call_id bound to the current tool dispatch.
+
+    Bound per dispatch via ``set_current_observability_context`` (model_tools.py),
+    so a blocking tool can scope its wait to its own call. Returns ``default``
+    outside a tool dispatch (CLI, cron, tests).
+    """
+    return _approval_tool_call_id.get() or default
+
+
 def get_current_session_key(default: str = "default") -> str:
     """Return the active session key, preferring context-local state.
 
