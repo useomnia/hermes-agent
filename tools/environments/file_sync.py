@@ -7,6 +7,7 @@ view) and don't need this.
 """
 
 import hashlib
+import importlib
 import logging
 import os
 import posixpath
@@ -18,12 +19,14 @@ import tempfile
 import threading
 import time
 
+from pathlib import Path
+from typing import Any, Callable
+
+fcntl: Any
 try:
-    import fcntl
+    fcntl = importlib.import_module("fcntl")
 except ImportError:
     fcntl = None  # Windows — file locking skipped
-from pathlib import Path
-from typing import Callable
 
 from hermes_constants import get_hermes_home
 from tools.environments.base import _file_mtime_key
@@ -74,6 +77,32 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
     for entry in iter_cache_files(container_base=container_base):
         files.append((entry["host_path"], entry["container_path"]))
     return files
+
+
+def iter_sprites_sync_files(container_base: str = "/skills") -> list[tuple[str, str]]:
+    """Enumerate files allowed to cross into an Omnio runtime sprite.
+
+    Runtime sprites are secret-free execution targets. They need bundled skill
+    files for script-backed tools, but credential and cache mounts must never
+    cross the harness/runtime boundary.
+    """
+    from tools.credential_files import (
+        get_credential_file_mounts,
+        iter_skills_files,
+    )
+
+    credential_mounts = list(get_credential_file_mounts())
+    if credential_mounts:
+        paths = ", ".join(sorted(entry["host_path"] for entry in credential_mounts))
+        raise RuntimeError(
+            "Sprites backend refuses to sync credential files to the runtime: "
+            f"{paths}"
+        )
+
+    return [
+        (entry["host_path"], entry["container_path"])
+        for entry in iter_skills_files(container_base=container_base)
+    ]
 
 
 def quoted_rm_command(remote_paths: list[str]) -> str:

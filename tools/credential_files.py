@@ -306,7 +306,12 @@ def iter_skills_files(
     hermes_home = _resolve_hermes_home()
     skills_dir = hermes_home / "skills"
     if skills_dir.is_dir():
-        container_root = f"{container_base.rstrip('/')}/skills"
+        stripped_base = container_base.rstrip("/")
+        container_root = (
+            stripped_base
+            if stripped_base == "/skills" or stripped_base.endswith("/skills")
+            else f"{stripped_base}/skills"
+        )
         for item in skills_dir.rglob("*"):
             if item.is_symlink() or not item.is_file():
                 continue
@@ -451,5 +456,4 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-
 

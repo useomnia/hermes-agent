@@ -1090,10 +1090,10 @@ def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
-    env_type = os.getenv("TERMINAL_ENV", "local")
+    env_type = (os.getenv("TERMINAL_ENV", "local").strip().lower() or "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
-    container_backend = env_type in {"docker", "singularity", "modal", "daytona"}
+    container_backend = env_type in {"docker", "singularity", "modal", "daytona", "sprites"}
     docker_backend = env_type == "docker"
 
     # Docker/container-only env vars may be bridged from config.yaml even when
@@ -1127,6 +1127,8 @@ def _get_env_config() -> Dict[str, Any]:
         default_cwd = _safe_getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
+    elif env_type == "sprites":
+        default_cwd = "/brand"
     else:
         default_cwd = "/root"
 
@@ -1148,7 +1150,7 @@ def _get_env_config() -> Dict[str, Any]:
         ):
             host_cwd = candidate
             cwd = "/workspace"
-    elif env_type in {"modal", "docker", "singularity", "daytona"} and cwd:
+    elif env_type in {"modal", "docker", "singularity", "daytona", "sprites"} and cwd:
         # Host paths and relative paths that won't work inside containers
         is_host_path = any(cwd.startswith(p) for p in host_prefixes)
         is_relative = not os.path.isabs(cwd)  # e.g. "." or "src/"
@@ -1166,6 +1168,13 @@ def _get_env_config() -> Dict[str, Any]:
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
+        "sprites_url": os.getenv("TERMINAL_SPRITES_URL", ""),
+        "sprites_bearer": os.getenv("TERMINAL_SPRITES_BEARER", ""),
+        "sprites_brand": (
+            os.getenv("TERMINAL_SPRITES_BRAND")
+            or os.getenv("OMNIO_BRAND_ID")
+            or "default"
+        ),
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -1232,7 +1241,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "ssh"
+            "daytona", "ssh", "sprites"
         image: Docker/Singularity/Modal image name (ignored for local/ssh)
         cwd: Working directory
         timeout: Default command timeout
@@ -1365,10 +1374,21 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             timeout=timeout,
         )
 
+    elif env_type == "sprites":
+        from tools.environments.sprites import SpritesEnvironment as _SpritesEnvironment
+
+        return _SpritesEnvironment(
+            runtime_url=cc.get("sprites_url", ""),
+            bearer_token=cc.get("sprites_bearer", ""),
+            brand=cc.get("sprites_brand", "default"),
+            cwd=cwd,
+            timeout=timeout,
+        )
+
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', 'ssh', or 'sprites'"
         )
 
 
@@ -2010,7 +2030,7 @@ def terminal_tool(
                             }
 
                         container_config = None
-                        if env_type in {"docker", "singularity", "modal", "daytona"}:
+                        if env_type in {"docker", "singularity", "modal", "daytona", "sprites"}:
                             container_config = {
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),
@@ -2025,6 +2045,9 @@ def terminal_tool(
                                 "docker_extra_args": config.get("docker_extra_args", []),
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                                "sprites_url": config.get("sprites_url", ""),
+                                "sprites_bearer": config.get("sprites_bearer", ""),
+                                "sprites_brand": config.get("sprites_brand", "default"),
                             }
 
                         local_config = None
@@ -2613,10 +2636,19 @@ def check_terminal_requirements() -> bool:
             from daytona import Daytona  # noqa: F401 — SDK presence check
             return os.getenv("DAYTONA_API_KEY") is not None
 
+        elif env_type == "sprites":
+            if not config.get("sprites_url") or not config.get("sprites_bearer"):
+                logger.error(
+                    "Sprites backend selected but TERMINAL_SPRITES_URL and "
+                    "TERMINAL_SPRITES_BEARER are not both set."
+                )
+                return False
+            return True
+
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, ssh.",
+                "modal, daytona, ssh, sprites.",
                 env_type,
             )
             return False
@@ -2659,7 +2691,7 @@ if __name__ == "__main__":
     print(
         "  TERMINAL_ENV: "
         f"{os.getenv('TERMINAL_ENV', 'local')} "
-        "(local/docker/singularity/modal/daytona/ssh)"
+        "(local/docker/singularity/modal/daytona/ssh/sprites)"
     )
     print(f"  TERMINAL_DOCKER_IMAGE: {os.getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")

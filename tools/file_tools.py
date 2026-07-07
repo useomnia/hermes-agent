@@ -805,7 +805,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
-            if env_type in {"docker", "singularity", "modal", "daytona"}:
+            if env_type in {"docker", "singularity", "modal", "daytona", "sprites"}:
                 container_config = {
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
@@ -815,6 +815,9 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                     "docker_forward_env": config.get("docker_forward_env", []),
                     "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+                    "sprites_url": config.get("sprites_url", ""),
+                    "sprites_bearer": config.get("sprites_bearer", ""),
+                    "sprites_brand": config.get("sprites_brand", "default"),
                 }
 
             ssh_config = None
@@ -853,7 +856,12 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             logger.info("%s environment ready for task %s", env_type, task_id[:8])
 
     # Build file_ops from the (guaranteed live) environment and cache it
-    file_ops = ShellFileOperations(terminal_env)
+    if type(terminal_env).__name__ == "SpritesEnvironment":
+        from tools.environments.sprites import SpritesFileOperations
+
+        file_ops = SpritesFileOperations(terminal_env)
+    else:
+        file_ops = ShellFileOperations(terminal_env)
     with _file_ops_lock:
         _file_ops_cache[task_id] = file_ops
     return file_ops

@@ -196,6 +196,17 @@ class TestIterSkillsFiles:
         # Symlink should be excluded
         assert not any("evil" in f["container_path"] for f in files)
 
+    def test_runtime_skills_base_should_not_double_prefix_skills(self, tmp_path):
+        hermes_home = tmp_path / ".hermes"
+        skills_dir = hermes_home / "skills" / "demo"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text("# skill")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            files = iter_skills_files(container_base="/skills")
+
+        assert {f["container_path"] for f in files} == {"/skills/demo/SKILL.md"}
+
     def test_empty_when_no_skills_dir(self, tmp_path):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

@@ -859,7 +859,7 @@ WSL_ENVIRONMENT_HINT = (
 # runs. For these backends, host info (Windows/Linux/macOS, $HOME, cwd) is
 # misleading — the agent should only see the machine it can actually touch.
 _REMOTE_TERMINAL_BACKENDS = frozenset({
-    "docker", "singularity", "modal", "daytona", "ssh",
+    "docker", "singularity", "modal", "daytona", "ssh", "sprites",
     "managed_modal",
 })
 
@@ -875,6 +875,7 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "managed_modal": "a managed Modal sandbox (Linux)",
     "daytona": "a Daytona workspace (Linux)",
     "ssh": "a remote host reached over SSH (likely Linux)",
+    "sprites": "an Omnio runtime sprite (Linux)",
 }
 
 
@@ -987,7 +988,7 @@ def build_environment_hints() -> str:
       and a Windows-only note that `terminal` shells out to bash, not
       PowerShell).
     - For **remote / sandbox** terminal backends (docker, singularity,
-      modal, daytona, ssh): host info is **suppressed**
+      modal, daytona, ssh, sprites): host info is **suppressed**
       because the agent's tools can't touch the host — only the backend
       matters. A live probe inside the backend reports its OS, user, $HOME,
       and cwd. Falls back to a static summary if the probe fails.
