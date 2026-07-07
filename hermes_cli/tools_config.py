@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, cast
 
 
 from hermes_cli.config import (
@@ -566,6 +566,17 @@ TOOL_CATEGORIES = {
     },
 }
 
+
+def _category_provider_list(category: object) -> List[Dict]:
+    if not isinstance(category, dict):
+        return []
+    category_map = cast(Dict[str, object], category)
+    providers = category_map.get("providers", [])
+    if not isinstance(providers, list):
+        return []
+    return [provider for provider in providers if isinstance(provider, dict)]
+
+
 # Simple env-var requirements for toolsets NOT in TOOL_CATEGORIES.
 # Used as a fallback for tools like vision/moa that just need an API key.
 TOOLSET_ENV_REQUIREMENTS = {
@@ -905,7 +916,6 @@ def _run_post_setup(post_setup_key: str):
         # Step 1: install the agent-browser npm package into node_modules/
         if not node_modules.exists() and npm_bin:
             _print_info("    Installing Node.js dependencies for browser tools...")
-            import subprocess
             # Use the resolved npm_bin absolute path so subprocess.Popen can
             # execute npm.cmd on Windows (CreateProcessW otherwise rejects
             # batch shims).  On POSIX npm_bin is the plain path — same
@@ -973,7 +983,6 @@ def _run_post_setup(post_setup_key: str):
             return
 
         _print_info("    Installing Chromium (~170MB one-time download)...")
-        import subprocess
         # Prefer the bundled agent-browser install subcommand so the
         # version of Chromium matches the CLI. Fall back to npx shim on
         # setups where the local bin stub isn't present.
@@ -1016,7 +1025,6 @@ def _run_post_setup(post_setup_key: str):
         _npm_bin = shutil.which("npm")
         if not camofox_dir.exists() and _npm_bin:
             _print_info("    Installing Camofox browser server...")
-            import subprocess
             # Absolute npm path so .cmd shim executes on Windows.
             result = subprocess.run(
                 # --workspaces=false avoids resolving apps/desktop. See #38772.
@@ -1248,9 +1256,9 @@ def valid_post_setup_keys() -> Set[str]:
     """
     keys: Set[str] = set()
     for cat in TOOL_CATEGORIES.values():
-        for prov in cat.get("providers", []):
+        for prov in _category_provider_list(cat):
             ps = prov.get("post_setup")
-            if ps:
+            if isinstance(ps, str) and ps:
                 keys.add(ps)
     # Plugin-registered providers can declare their own post_setup hooks.
     for builder in (
@@ -1262,7 +1270,7 @@ def valid_post_setup_keys() -> Set[str]:
         try:
             for prov in builder():
                 ps = prov.get("post_setup")
-                if ps:
+                if isinstance(ps, str) and ps:
                     keys.add(ps)
         except Exception:  # pragma: no cover — defensive; plugins optional
             continue
@@ -1377,6 +1385,32 @@ def _get_platform_tools(
     """Resolve which individual toolset names are enabled for a platform."""
     from toolsets import resolve_toolset, TOOLSETS
 
+    def declared_toolset_tools(ts_name: str, visited: Optional[Set[str]] = None) -> Set[str]:
+        """Resolve a static toolset without registry-registered adjuncts.
+
+        Registry discovery can add check_fn-gated tools to a configurable
+        toolset after startup. Those tools should not stop a platform bundle
+        that declares the base tools from enabling that configurable toolset.
+        The registry check_fn still decides which schemas are advertised.
+        """
+        if visited is None:
+            visited = set()
+        if ts_name in visited:
+            return set()
+        visited.add(ts_name)
+
+        ts_def = TOOLSETS.get(ts_name)
+        if not ts_def:
+            return set(resolve_toolset(ts_name))
+
+        raw_tools = ts_def.get("tools", [])
+        tools = {str(tool) for tool in raw_tools} if isinstance(raw_tools, list) else set()
+        raw_includes = ts_def.get("includes", [])
+        includes = raw_includes if isinstance(raw_includes, list) else []
+        for included in includes:
+            tools.update(declared_toolset_tools(str(included), visited))
+        return tools
+
     platform_toolsets = config.get("platform_toolsets") or {}
     toolset_names = platform_toolsets.get(platform)
 
@@ -1429,7 +1463,7 @@ def _get_platform_tools(
             for ts_key, _, _ in CONFIGURABLE_TOOLSETS:
                 if not _toolset_allowed_for_platform(ts_key, platform):
                     continue
-                ts_tools = set(resolve_toolset(ts_key))
+                ts_tools = declared_toolset_tools(ts_key)
                 if ts_tools and ts_tools.issubset(composite_tools):
                     expanded.add(ts_key)
 
@@ -1452,7 +1486,7 @@ def _get_platform_tools(
         for ts_key, _, _ in CONFIGURABLE_TOOLSETS:
             if not _toolset_allowed_for_platform(ts_key, platform):
                 continue
-            ts_tools = set(resolve_toolset(ts_key))
+            ts_tools = declared_toolset_tools(ts_key)
             if ts_tools and ts_tools.issubset(all_tool_names):
                 enabled_toolsets.add(ts_key)
 
@@ -1674,7 +1708,7 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
 
 def _toolset_has_keys(
     ts_key: str,
-    config: dict = None,
+    config: Optional[dict] = None,
     *,
     force_fresh: bool = False,
 ) -> bool:
@@ -1743,7 +1777,9 @@ def _estimate_tool_tokens() -> Dict[str, int]:
         return _tool_token_cache
 
     try:
-        import tiktoken
+        import importlib
+
+        tiktoken = importlib.import_module("tiktoken")
         enc = tiktoken.get_encoding("cl100k_base")
     except Exception:
         logger.debug("tiktoken unavailable; skipping tool token estimation")
@@ -2559,11 +2595,17 @@ def _configure_imagegen_model(backend_name: str, config: dict) -> None:
     if not backend:
         return
 
-    catalog, default_model = backend["catalog_fn"]()
+    catalog_fn_raw = backend.get("catalog_fn")
+    if not callable(catalog_fn_raw):
+        return
+    catalog_fn = cast(Callable[[], tuple], catalog_fn_raw)
+    catalog, default_model = catalog_fn()
     if not catalog:
         return
 
-    cfg_key = backend["config_key"]
+    cfg_key = backend.get("config_key")
+    if not isinstance(cfg_key, str):
+        return
     cur_cfg = config.setdefault(cfg_key, {})
     if not isinstance(cur_cfg, dict):
         cur_cfg = {}
@@ -2842,7 +2884,7 @@ def _write_provider_config(provider: dict, config: dict, *, managed_feature) -> 
         # User picked a non-gateway provider — find which category this
         # belongs to and clear use_gateway if it was previously set.
         for cat_key, cat in TOOL_CATEGORIES.items():
-            if provider in cat.get("providers", []):
+            if provider in _category_provider_list(cat):
                 section = config.get(cat_key)
                 if isinstance(section, dict) and section.get("use_gateway"):
                     section["use_gateway"] = False
@@ -3017,7 +3059,7 @@ def _configure_provider(
         try:
             _has_managed_sibling = False
             for _cat_key, _cat in TOOL_CATEGORIES.items():
-                _providers = _cat.get("providers", [])
+                _providers = _category_provider_list(_cat)
                 if provider in _providers and any(
                     sib.get("managed_nous_feature") for sib in _providers
                 ):
@@ -3352,7 +3394,7 @@ def _reconfigure_provider(
         section["use_gateway"] = True
     elif not managed_feature:
         for cat_key, cat in TOOL_CATEGORIES.items():
-            if provider in cat.get("providers", []):
+            if provider in _category_provider_list(cat):
                 section = config.get(cat_key)
                 if isinstance(section, dict) and section.get("use_gateway"):
                     section["use_gateway"] = False
@@ -3450,7 +3492,7 @@ def _reconfigure_simple_requirements(ts_key: str):
 
 # ─── Main Entry Point ─────────────────────────────────────────────────────────
 
-def tools_command(args=None, first_install: bool = False, config: dict = None):
+def tools_command(args=None, first_install: bool = False, config: Optional[dict] = None):
     """Entry point for `hermes tools` and `hermes setup tools`.
 
     Args:

@@ -63,6 +63,41 @@ class TestApiServerPlatformConfig:
         assert "api_server" in PLATFORMS
         assert PLATFORMS["api_server"]["default_toolset"] == "hermes-api-server"
 
+    def test_default_api_server_advertises_sprites_terminal_after_tool_discovery(self, monkeypatch):
+        """API server defaults must keep terminal after registry discovery."""
+        monkeypatch.setenv("TERMINAL_ENV", "sprites")
+        monkeypatch.setenv("TERMINAL_SPRITES_URL", "https://runtime.example")
+        monkeypatch.setenv("TERMINAL_SPRITES_BEARER", "pair-secret")
+        monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+
+        import model_tools
+        from hermes_cli.tools_config import _get_platform_tools
+        from tools.registry import invalidate_check_fn_cache
+        from toolsets import resolve_toolset
+
+        invalidate_check_fn_cache()
+        model_tools._clear_tool_defs_cache()
+
+        # Importing model_tools registers read_terminal under the terminal
+        # toolset. That adjunct is desktop-only and must not block terminal.
+        assert "read_terminal" in resolve_toolset("terminal")
+
+        enabled_toolsets = _get_platform_tools(
+            {},
+            "api_server",
+            include_default_mcp_servers=False,
+        )
+        assert "terminal" in enabled_toolsets
+
+        tool_defs = model_tools.get_tool_definitions(
+            enabled_toolsets=sorted(enabled_toolsets),
+            quiet_mode=True,
+        )
+        names = {tool["function"]["name"] for tool in tool_defs}
+
+        assert {"terminal", "process", "read_file", "write_file"}.issubset(names)
+        assert "read_terminal" not in names
+
 
 class TestApiServerAdapterToolset:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
@@ -123,4 +158,5 @@ class TestApiServerAdapterToolset:
             mock_agent_cls.assert_called_once()
             call_kwargs = mock_agent_cls.call_args
             toolsets = call_kwargs.kwargs.get("enabled_toolsets")
+            assert isinstance(toolsets, list)
             assert sorted(toolsets) == ["terminal", "web"]
