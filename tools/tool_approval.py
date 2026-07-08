@@ -35,10 +35,10 @@ import logging
 import os
 import threading
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from tools.approval import get_current_session_key
-from tools.mcp_tool import mcp_tool_is_read_only
+from tools.mcp_tool import mcp_tool_has_read_only_hint, mcp_tool_is_read_only
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,40 @@ _ENV_DISABLED = "OMNIO_TOOL_APPROVAL_DISABLED"
 # tools/approval.py's gateway_timeout default; the chat keepalive holds the SSE.
 _ENV_TIMEOUT = "OMNIO_TOOL_APPROVAL_TIMEOUT"
 _DEFAULT_TIMEOUT_S = 300
+_ARGUMENT_STRING_LIMIT = 200
+_ARGUMENT_TOTAL_LIMIT = 1500
+_ARGUMENT_MAX_FIELDS = 8
+_BODY_ARGUMENT_KEYS = {
+    "body",
+    "body_html",
+    "comment",
+    "content",
+    "description",
+    "document",
+    "html",
+    "markdown",
+    "markdown_text",
+    "message",
+    "message_body",
+    "summary_html",
+    "text",
+}
+_SECRET_ARGUMENT_KEYS = {
+    "api_key",
+    "apikey",
+    "access_token",
+    "accesstoken",
+    "authorization",
+    "bearer_token",
+    "bearertoken",
+    "client_secret",
+    "clientsecret",
+    "password",
+    "refresh_token",
+    "refreshtoken",
+    "secret",
+    "token",
+}
 
 # Registered MCP names for the per-brand connectors server are
 # ``mcp_connectors_<slug>``. The write gate is scoped to this prefix so only
@@ -73,10 +107,12 @@ _lock = threading.Lock()
 # session_key -> tool names approved for the whole conversation.
 _session_approved: dict[str, set[str]] = {}
 # Tool names approved for EVERY conversation on this gateway (the `always` scope).
-# Gateway-wide, not session-keyed, so it spans chats — and deliberately NOT cleared
-# by clear_session: it lives for the gateway's life and resets only on reprovision/
-# restart. (A durable cross-reprovision grant would need a persistent store.)
+# Gateway-wide, not session-keyed, so it spans chats. This is only a bridge for
+# user clicks made since the last Omnia refresh; every refresh clears it and
+# replaces _injected_always_approved from the database snapshot.
 _always_approved: set[str] = set()
+# Tool names injected from Omnia's durable per-toolkit grants.
+_injected_always_approved: set[str] = set()
 # session_key -> per-session notify callback (bridges guard thread → chat stream).
 _notify_cbs: dict[str, Callable[[dict], None]] = {}
 # session_key -> FIFO of blocked approval waiters.
@@ -143,13 +179,35 @@ def is_always_approved(function_name: str) -> bool:
     """True when the tool is approved for every conversation on this gateway
     (the `always` scope), until the gateway restarts/reprovisions."""
     with _lock:
-        return function_name in _always_approved
+        return (
+            function_name in _always_approved
+            or function_name in _injected_always_approved
+        )
 
 
 def record_always_approval(function_name: str) -> None:
     """Grant a tool for every conversation on this gateway (the `always` scope)."""
     with _lock:
         _always_approved.add(function_name)
+
+
+def replace_injected_always_approvals(function_names: list[str]) -> None:
+    """Replace the durable Omnia grant snapshot and clear local bridge grants.
+
+    Local ``always`` approvals are only a bridge between the user's click and the
+    next authoritative DB refresh. A reload means the DB snapshot has spoken; on
+    failure the caller passes an empty list so stale grants fail closed.
+    """
+    exact_names = {
+        name.strip()
+        for name in function_names
+        if isinstance(name, str)
+        and _is_recordable_tool_name(name.strip(), require_hint=False)
+    }
+    with _lock:
+        _always_approved.clear()
+        _injected_always_approved.clear()
+        _injected_always_approved.update(exact_names)
 
 
 def register_tool_approval_notify(session_key: str, cb: Callable[[dict], None]) -> None:
@@ -269,6 +327,7 @@ def resolve_tool_approval(
     function_name: str,
     scope: str,
     tool_call_id: str = "",
+    tools: list[str] | None = None,
 ) -> bool:
     """Apply a decision posted from the Omnia chat: unblock the waiting tool
     call and, for ``session`` scope, remember it for the rest of the chat.
@@ -290,10 +349,13 @@ def resolve_tool_approval(
     """
     if not session_key or scope not in APPROVAL_SCOPES:
         return False
-    if scope == "session" and function_name:
-        record_session_approval(session_key, function_name)
-    if scope == "always" and function_name:
-        record_always_approval(function_name)
+    approved_tools = _approved_tool_names(function_name, tools)
+    if scope == "session":
+        for tool_name in approved_tools:
+            record_session_approval(session_key, tool_name)
+    if scope == "always":
+        for tool_name in approved_tools:
+            record_always_approval(tool_name)
 
     with _lock:
         queue = _waits.get(session_key)
@@ -339,6 +401,99 @@ def _readable_tool(function_name: str) -> str:
         parts = name.split("_", 2)
         name = parts[2] if len(parts) == 3 else name
     return name.replace("_", " ").strip().capitalize() or function_name
+
+
+def _approved_tool_names(function_name: str, tools: list[str] | None) -> set[str]:
+    approved: set[str] = set()
+    current_name = function_name.strip() if isinstance(function_name, str) else ""
+    if current_name and _is_recordable_tool_name(current_name, require_hint=True):
+        approved.add(current_name)
+
+    for name in tools or []:
+        if not isinstance(name, str):
+            continue
+        candidate = name.strip()
+        if not candidate or candidate == current_name:
+            continue
+        if _is_recordable_tool_name(candidate, require_hint=True):
+            approved.add(candidate)
+    return approved
+
+
+def _is_recordable_tool_name(function_name: str, *, require_hint: bool) -> bool:
+    if not function_name.startswith(CONNECTORS_TOOL_PREFIX):
+        return False
+    if require_hint and not mcp_tool_has_read_only_hint(function_name):
+        return False
+    try:
+        return is_gated_tool(function_name)
+    except Exception:
+        return False
+
+
+def _is_secret_argument_key(key: str) -> bool:
+    normalized = key.strip().lower().replace("-", "_")
+    compact = normalized.replace("_", "")
+    return (
+        normalized in _SECRET_ARGUMENT_KEYS
+        or compact in _SECRET_ARGUMENT_KEYS
+        or normalized.endswith("_secret")
+        or normalized.endswith("_token")
+        or normalized.endswith("_api_key")
+    )
+
+
+def _summarize_string(key: str, value: str) -> tuple[str, bool]:
+    compact = " ".join(value.split())
+    if key.strip().lower() in _BODY_ARGUMENT_KEYS:
+        return f"[text, {len(value)} chars]", True
+    if len(compact) > _ARGUMENT_STRING_LIMIT:
+        return f"{compact[:_ARGUMENT_STRING_LIMIT]}...", True
+    return compact, False
+
+
+def _summarize_argument_value(key: str, value: Any) -> tuple[Any, bool]:
+    if _is_secret_argument_key(key):
+        return "[redacted]", True
+    if value is None or isinstance(value, (bool, int, float)):
+        return value, False
+    if isinstance(value, str):
+        return _summarize_string(key, value)
+    if isinstance(value, list):
+        return f"[array, {len(value)} items]", True
+    if isinstance(value, dict):
+        return f"[object, {len(value)} keys]", True
+    return f"[{type(value).__name__}]", True
+
+
+def summarize_tool_arguments(arguments: Any) -> Optional[dict[str, Any]]:
+    """Return a compact top-level argument summary for the approval card."""
+    if not isinstance(arguments, dict) or not arguments:
+        return None
+
+    fields: dict[str, Any] = {}
+    truncated = False
+    for key, value in arguments.items():
+        if not isinstance(key, str) or not key.strip():
+            truncated = True
+            continue
+        if len(fields) >= _ARGUMENT_MAX_FIELDS:
+            truncated = True
+            break
+        summary_value, value_truncated = _summarize_argument_value(key, value)
+        fields[key] = summary_value
+        truncated = truncated or value_truncated
+        if (
+            len(json.dumps(fields, ensure_ascii=False, default=str))
+            > _ARGUMENT_TOTAL_LIMIT
+        ):
+            fields.pop(key, None)
+            truncated = True
+            break
+
+    if not fields:
+        return None
+    return {"fields": fields, "truncated": truncated}
 
 
 def _denial_result(choice: Optional[str], *, status: Optional[str] = None) -> str:
@@ -399,6 +554,7 @@ def fail_closed_denial(function_name: str) -> Optional[str]:
 def maybe_require_tool_approval(
     function_name: str,
     tool_call_id: str = "",
+    arguments: Any = None,
 ) -> Optional[str]:
     """Gate a connector write tool behind a blocking user approval.
 
@@ -415,6 +571,15 @@ def maybe_require_tool_approval(
     if is_tool_approved(session_key, function_name):
         return None  # approved for the whole session earlier
 
+    approval = {
+        "tool": function_name,
+        "tool_call_id": tool_call_id or "",
+        "option_scopes": list(APPROVAL_OPTION_SCOPES),
+    }
+    argument_summary = summarize_tool_arguments(arguments)
+    if argument_summary is not None:
+        approval["arguments"] = argument_summary
+
     interaction_event = {
         "tool": function_name,
         "toolCallId": tool_call_id or "",
@@ -426,11 +591,7 @@ def maybe_require_tool_approval(
                 "It will act on your connected account."
             ),
             "options": list(APPROVAL_OPTIONS),
-            "approval": {
-                "tool": function_name,
-                "tool_call_id": tool_call_id or "",
-                "option_scopes": list(APPROVAL_OPTION_SCOPES),
-            },
+            "approval": approval,
         },
     }
 

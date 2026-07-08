@@ -7,13 +7,14 @@ Covers auth and that the endpoint runs the same shutdown+discover the
 import asyncio
 import threading
 import time
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 import tools.mcp_tool as mcp_tool
+import tools.tool_approval as tool_approval
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
@@ -28,7 +29,9 @@ def _make_adapter(api_key: str = "") -> APIServerAdapter:
 
 
 def _create_app(adapter: APIServerAdapter) -> web.Application:
-    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
+    mws = [
+        mw for mw in (cors_middleware, security_headers_middleware) if mw is not None
+    ]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/mcp/reload", adapter._handle_mcp_reload)
@@ -43,6 +46,21 @@ def adapter():
 @pytest.fixture
 def auth_adapter():
     return _make_adapter(api_key="sk-secret")
+
+
+@pytest.fixture(autouse=True)
+def _clean_tool_approvals():
+    tool_approval._always_approved.clear()
+    tool_approval._injected_always_approved.clear()
+    yield
+    tool_approval._always_approved.clear()
+    tool_approval._injected_always_approved.clear()
+
+
+def _stub_mcp_reload(monkeypatch) -> None:
+    monkeypatch.setattr(mcp_tool, "_servers", {})
+    monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", lambda: None)
+    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: [])
 
 
 @pytest.mark.asyncio
@@ -93,10 +111,68 @@ async def test_reload_does_not_append_a_session_db_nudge(adapter, monkeypatch):
 
     app = _create_app(adapter)
     async with TestClient(TestServer(app)) as cli:
-        resp = await cli.post("/v1/mcp/reload", headers={"X-Hermes-Session-Id": "sess-1"})
+        resp = await cli.post(
+            "/v1/mcp/reload", headers={"X-Hermes-Session-Id": "sess-1"}
+        )
         assert resp.status == 200
 
     db.append_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reload_refreshes_injected_connector_toolkit_approvals(
+    adapter, monkeypatch
+):
+    _stub_mcp_reload(monkeypatch)
+    monkeypatch.setenv("OMNIA_BASE_URL", "https://omnia.test")
+    monkeypatch.setenv("OMNIA_API_TOKEN", "agent-token")
+    monkeypatch.setenv("OMNIO_BRAND_ID", "brand-1")
+    tool_approval.record_always_approval("mcp_connectors_GMAIL_SEND_EMAIL")
+    monkeypatch.setattr(
+        adapter,
+        "_fetch_omnio_connector_toolkit_approvals",
+        AsyncMock(return_value=["mcp_connectors_NOTION_CREATE_NOTION_PAGE"]),
+    )
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/v1/mcp/reload")
+        assert resp.status == 200
+
+    assert tool_approval.is_always_approved("mcp_connectors_GMAIL_SEND_EMAIL") is False
+    assert (
+        tool_approval.is_always_approved("mcp_connectors_NOTION_CREATE_NOTION_PAGE")
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_reload_fetch_failure_clears_injected_and_local_always(
+    adapter, monkeypatch
+):
+    _stub_mcp_reload(monkeypatch)
+    monkeypatch.setenv("OMNIA_BASE_URL", "https://omnia.test")
+    monkeypatch.setenv("OMNIA_API_TOKEN", "agent-token")
+    monkeypatch.setenv("OMNIO_BRAND_ID", "brand-1")
+    tool_approval.record_always_approval("mcp_connectors_GMAIL_SEND_EMAIL")
+    tool_approval.replace_injected_always_approvals([
+        "mcp_connectors_NOTION_UPDATE_PAGE"
+    ])
+    monkeypatch.setattr(
+        adapter,
+        "_fetch_omnio_connector_toolkit_approvals",
+        AsyncMock(side_effect=RuntimeError("omnia down")),
+    )
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/v1/mcp/reload")
+        assert resp.status == 200
+
+    assert tool_approval.is_always_approved("mcp_connectors_GMAIL_SEND_EMAIL") is False
+    assert (
+        tool_approval.is_always_approved("mcp_connectors_NOTION_UPDATE_PAGE") is False
+    )
 
 
 @pytest.mark.asyncio

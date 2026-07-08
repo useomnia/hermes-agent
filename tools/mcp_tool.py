@@ -3947,6 +3947,12 @@ def mcp_tool_is_read_only(tool_name: str) -> bool:
         return _mcp_tool_read_only_hints.get(tool_name) is True
 
 
+def mcp_tool_has_read_only_hint(tool_name: str) -> bool:
+    """True when *tool_name* registered an MCP ``readOnlyHint`` annotation."""
+    with _lock:
+        return tool_name in _mcp_tool_read_only_hints
+
+
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
     """Select utility schemas based on config and server capabilities."""
     tools_filter = config.get("tools") or {}
