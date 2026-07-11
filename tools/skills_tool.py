@@ -613,23 +613,18 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """
     from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
     from tools.skill_usage import (
-        _read_bundled_manifest_names,
-        _read_hub_installed_names,
         classify_skill_provenance,
+        read_skill_provenance_names,
     )
 
     skills = []
     seen_names: set = set()
 
     try:
-        manifest_exists = (SKILLS_DIR / ".bundled_manifest").exists()
-        bundled_names = _read_bundled_manifest_names()
-        hub_installed_names = _read_hub_installed_names()
+        provenance_names = read_skill_provenance_names()
     except Exception:
         logger.debug("Failed to load skill provenance metadata", exc_info=True)
-        manifest_exists = False
-        bundled_names = set()
-        hub_installed_names = set()
+        provenance_names = None
 
     # Load disabled set once (not per-skill)
     disabled = set() if skip_disabled else _get_disabled_skill_names()
@@ -681,14 +676,15 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     "description": description,
                     "category": category,
                 }
-                provenance = classify_skill_provenance(
-                    name,
-                    bundled_names=bundled_names,
-                    hub_installed_names=hub_installed_names,
-                    manifest_exists=manifest_exists,
-                )
-                if provenance is not None:
-                    skill["provenance"] = provenance
+                if provenance_names is not None:
+                    bundled_names, hub_installed_names = provenance_names
+                    provenance = classify_skill_provenance(
+                        name,
+                        bundled_names=bundled_names,
+                        hub_installed_names=hub_installed_names,
+                    )
+                    if provenance is not None:
+                        skill["provenance"] = provenance
 
                 seen_names.add(name)
                 skills.append(skill)

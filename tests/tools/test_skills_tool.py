@@ -389,6 +389,33 @@ class TestSkillsList:
         assert "provenance" not in listed
         assert "provenance" not in viewed
 
+    def test_unreadable_manifest_omits_provenance(self, tmp_path):
+        _make_skill(tmp_path, "unknown-skill")
+        (tmp_path / ".bundled_manifest").write_text(
+            "unknown-skill:abc123\n", encoding="utf-8"
+        )
+
+        with patch(
+            "tools.skill_usage._read_bundled_manifest_names",
+            side_effect=OSError("permission denied"),
+        ):
+            listed, viewed = _list_and_view_skill(tmp_path, "unknown-skill")
+
+        assert "provenance" not in listed
+        assert "provenance" not in viewed
+
+    def test_corrupt_hub_lock_omits_provenance(self, tmp_path):
+        _make_skill(tmp_path, "unknown-skill")
+        (tmp_path / ".bundled_manifest").write_text("", encoding="utf-8")
+        hub_dir = tmp_path / ".hub"
+        hub_dir.mkdir()
+        (hub_dir / "lock.json").write_text("{not-json", encoding="utf-8")
+
+        listed, viewed = _list_and_view_skill(tmp_path, "unknown-skill")
+
+        assert "provenance" not in listed
+        assert "provenance" not in viewed
+
     def test_category_filter(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "skill-a", category="devops")

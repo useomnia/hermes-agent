@@ -178,7 +178,7 @@ def activity_count(record: Dict[str, Any]) -> int:
 # Provenance — which skills are agent-created (and thus eligible for curation)
 # ---------------------------------------------------------------------------
 
-def _read_bundled_manifest_names() -> Set[str]:
+def _read_bundled_manifest_names(*, raise_on_error: bool = False) -> Set[str]:
     """Return the set of skill names that were seeded from the bundled repo.
 
     Reads ~/.hermes/skills/.bundled_manifest (format: "name:hash" per line).
@@ -186,6 +186,8 @@ def _read_bundled_manifest_names() -> Set[str]:
     """
     manifest = _skills_dir() / ".bundled_manifest"
     if not manifest.exists():
+        if raise_on_error:
+            raise FileNotFoundError(manifest)
         return set()
     names: Set[str] = set()
     try:
@@ -196,12 +198,14 @@ def _read_bundled_manifest_names() -> Set[str]:
             name = line.split(":", 1)[0].strip()
             if name:
                 names.add(name)
-    except OSError as e:
+    except (OSError, UnicodeError) as e:
         logger.debug("Failed to read bundled manifest: %s", e)
+        if raise_on_error:
+            raise
     return names
 
 
-def _read_hub_installed_names() -> Set[str]:
+def _read_hub_installed_names(*, raise_on_error: bool = False) -> Set[str]:
     """Return the set of skill names installed via the Skills Hub.
 
     Reads ~/.hermes/skills/.hub/lock.json (see tools/skills_hub.py :: HubLockFile).
@@ -234,9 +238,24 @@ def _read_hub_installed_names() -> Set[str]:
                     if skill_md.exists():
                         names.add(_read_skill_name(skill_md, fallback=resolved.name))
                 return names
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, UnicodeError, json.JSONDecodeError) as e:
         logger.debug("Failed to read hub lock file: %s", e)
+        if raise_on_error:
+            raise
     return set()
+
+
+def read_skill_provenance_names() -> Optional[Tuple[Set[str], Set[str]]]:
+    """Load bundled and hub skill names, or return ``None`` if unknowable."""
+    if not (_skills_dir() / ".bundled_manifest").exists():
+        return None
+    try:
+        return (
+            _read_bundled_manifest_names(raise_on_error=True),
+            _read_hub_installed_names(raise_on_error=True),
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
 
 
 def classify_skill_provenance(
@@ -244,7 +263,6 @@ def classify_skill_provenance(
     *,
     bundled_names: Optional[Set[str]] = None,
     hub_installed_names: Optional[Set[str]] = None,
-    manifest_exists: Optional[bool] = None,
 ) -> Optional[str]:
     """Classify a model-visible skill as ``bundled`` or ``learned``.
 
@@ -253,14 +271,11 @@ def classify_skill_provenance(
     Callers that classify several skills can pass preloaded name sets to avoid
     reading the manifest and hub lock for every skill.
     """
-    if manifest_exists is None:
-        manifest_exists = (_skills_dir() / ".bundled_manifest").exists()
-    if not manifest_exists:
-        return None
-    if bundled_names is None:
-        bundled_names = _read_bundled_manifest_names()
-    if hub_installed_names is None:
-        hub_installed_names = _read_hub_installed_names()
+    if bundled_names is None or hub_installed_names is None:
+        provenance_names = read_skill_provenance_names()
+        if provenance_names is None:
+            return None
+        bundled_names, hub_installed_names = provenance_names
     if skill_name in bundled_names or skill_name in hub_installed_names:
         return "bundled"
     return "learned"
