@@ -239,6 +239,33 @@ def _read_hub_installed_names() -> Set[str]:
     return set()
 
 
+def classify_skill_provenance(
+    skill_name: str,
+    *,
+    bundled_names: Optional[Set[str]] = None,
+    hub_installed_names: Optional[Set[str]] = None,
+    manifest_exists: Optional[bool] = None,
+) -> Optional[str]:
+    """Classify a model-visible skill as ``bundled`` or ``learned``.
+
+    The bundled manifest is the source of truth for whether provenance can be
+    classified at all. If it is missing, return ``None`` rather than guessing.
+    Callers that classify several skills can pass preloaded name sets to avoid
+    reading the manifest and hub lock for every skill.
+    """
+    if manifest_exists is None:
+        manifest_exists = (_skills_dir() / ".bundled_manifest").exists()
+    if not manifest_exists:
+        return None
+    if bundled_names is None:
+        bundled_names = _read_bundled_manifest_names()
+    if hub_installed_names is None:
+        hub_installed_names = _read_hub_installed_names()
+    if skill_name in bundled_names or skill_name in hub_installed_names:
+        return "bundled"
+    return "learned"
+
+
 def _prune_builtins_enabled() -> bool:
     """Whether bundled built-in skills are eligible for curator pruning.
 
