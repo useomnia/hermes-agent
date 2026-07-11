@@ -2362,6 +2362,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     # does, rather than letting a malformed result raise here.
                     if isinstance(parsed, dict) and parsed.get("status") == "answered":
                         completed["interaction"] = {"answered": parsed.get("response", "")}
+                    if isinstance(parsed, dict) and parsed.get("status") == "no_response":
+                        completed.setdefault("interaction", {})["timed_out"] = True
                     turn_ending = isinstance(parsed, dict) and parsed.get("status") in (
                         "presented",
                         "no_response",
@@ -2380,6 +2382,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     except Exception:
                         parsed = {}
                     if isinstance(parsed, dict) and parsed.get("status") == "approval_no_response":
+                        completed.setdefault("interaction", {})["timed_out"] = True
                         turn_ending = True
                         interrupt_message = "awaiting user approval (tool approval timed out)"
                 # Omnia task-list tracker: the `todo` tool returns the full current

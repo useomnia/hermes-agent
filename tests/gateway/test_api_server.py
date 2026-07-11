@@ -1880,7 +1880,19 @@ class TestChatCompletionsEndpoint:
                     },
                 )
                 assert resp.status == 200
-                await resp.text()
+                body = await resp.text()
+
+        fake_agent.completed_event = None
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() != "event: hermes.tool.progress":
+                continue
+            for follow in lines[i + 1: i + 4]:
+                if follow.startswith("data: "):
+                    payload = json.loads(follow[len("data: "):])
+                    if payload.get("status") == "completed":
+                        fake_agent.completed_event = payload
+                    break
 
         return fake_agent
 
@@ -1896,6 +1908,7 @@ class TestChatCompletionsEndpoint:
         assert fake_agent.interrupt_calls == [
             "awaiting user interaction (request_user_input)"
         ]
+        assert "interaction" not in fake_agent.completed_event
 
     @pytest.mark.asyncio
     async def test_stream_request_user_input_no_response_ends_turn(self, adapter):
@@ -1911,6 +1924,7 @@ class TestChatCompletionsEndpoint:
         assert fake_agent.interrupt_calls == [
             "awaiting user interaction (request_user_input)"
         ]
+        assert fake_agent.completed_event["interaction"]["timed_out"] is True
 
     @pytest.mark.asyncio
     async def test_stream_request_user_input_answered_does_not_end_turn(self, adapter):
@@ -1924,6 +1938,7 @@ class TestChatCompletionsEndpoint:
             _json.dumps({"status": "answered", "response": "Tuesday"}),
         )
         assert fake_agent.interrupt_calls == []
+        assert fake_agent.completed_event["interaction"] == {"answered": "Tuesday"}
 
     @pytest.mark.asyncio
     async def test_stream_connector_approval_timeout_ends_turn(self, adapter):
@@ -1940,6 +1955,7 @@ class TestChatCompletionsEndpoint:
         assert fake_agent.interrupt_calls == [
             "awaiting user approval (tool approval timed out)"
         ]
+        assert fake_agent.completed_event["interaction"]["timed_out"] is True
 
     @pytest.mark.asyncio
     async def test_stream_connector_approval_denied_does_not_end_turn(self, adapter):
