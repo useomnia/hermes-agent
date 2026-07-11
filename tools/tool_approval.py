@@ -81,6 +81,8 @@ _always_approved: set[str] = set()
 _notify_cbs: dict[str, Callable[[dict], None]] = {}
 # session_key -> FIFO of blocked approval waiters.
 _waits: dict[str, list["_ApprovalWait"]] = {}
+# (session_key, tool_call_id) -> reason for an unresolved completed wait.
+_completion_reasons: dict[tuple[str, str], str] = {}
 
 
 class _ApprovalWait:
@@ -168,6 +170,8 @@ def unregister_tool_approval_notify(session_key: str) -> None:
         return
     with _lock:
         _notify_cbs.pop(session_key, None)
+        for key in [key for key in _completion_reasons if key[0] == session_key]:
+            _completion_reasons.pop(key, None)
         waiters = _waits.pop(session_key, [])
     for entry in waiters:
         entry.event.set()  # result stays None → guard fails closed (deny)
@@ -180,6 +184,17 @@ def _drop_wait(session_key: str, entry: "_ApprovalWait") -> None:
             queue.remove(entry)
         if queue is not None and not queue:
             _waits.pop(session_key, None)
+
+
+def consume_tool_approval_completion_reason(
+    session_key: str,
+    tool_call_id: str,
+) -> Optional[str]:
+    """Return and clear the unresolved wait reason for one approval call."""
+    if not session_key:
+        return None
+    with _lock:
+        return _completion_reasons.pop((session_key, tool_call_id or ""), None)
 
 
 def await_tool_approval(
@@ -203,6 +218,7 @@ def await_tool_approval(
         cb = _notify_cbs.get(session_key)
         if cb is None:
             return _NO_SURFACE  # no interactive surface → caller denies the write
+        _completion_reasons.pop((session_key, tool_call_id or ""), None)
         entry = _ApprovalWait(function_name, tool_call_id)
         _waits.setdefault(session_key, []).append(entry)
 
@@ -249,9 +265,11 @@ def await_tool_approval(
     now = time.monotonic()
     deadline = now + max(_approval_timeout(), 0)
     activity = {"last_touch": now, "start": now}
+    expired = False
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            expired = True
             break
         if entry.event.wait(timeout=min(1.0, remaining)):
             break
@@ -261,6 +279,11 @@ def await_tool_approval(
             touch_activity_if_due(activity, "waiting for tool approval")
 
     _drop_wait(session_key, entry)
+    if entry.result is None:
+        with _lock:
+            _completion_reasons[(session_key, tool_call_id or "")] = (
+                "expired" if expired else "cancelled"
+            )
     return entry.result
 
 
@@ -322,6 +345,8 @@ def clear_session(session_key: str) -> None:
     with _lock:
         _session_approved.pop(session_key, None)
         _notify_cbs.pop(session_key, None)
+        for key in [key for key in _completion_reasons if key[0] == session_key]:
+            _completion_reasons.pop(key, None)
         waiters = _waits.pop(session_key, [])
     for entry in waiters:
         entry.event.set()

@@ -2363,7 +2363,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     if isinstance(parsed, dict) and parsed.get("status") == "answered":
                         completed["interaction"] = {"answered": parsed.get("response", "")}
                     if isinstance(parsed, dict) and parsed.get("status") == "no_response":
-                        completed.setdefault("interaction", {})["timed_out"] = True
+                        try:
+                            from tools.user_input import (
+                                consume_user_input_completion_reason,
+                            )
+
+                            completion_reason = consume_user_input_completion_reason(
+                                session_id
+                            )
+                        except Exception:
+                            completion_reason = None
+                        if completion_reason == "expired":
+                            completed.setdefault("interaction", {})["timed_out"] = True
                     turn_ending = isinstance(parsed, dict) and parsed.get("status") in (
                         "presented",
                         "no_response",
@@ -2382,9 +2393,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     except Exception:
                         parsed = {}
                     if isinstance(parsed, dict) and parsed.get("status") == "approval_no_response":
-                        completed.setdefault("interaction", {})["timed_out"] = True
+                        try:
+                            from tools.tool_approval import (
+                                consume_tool_approval_completion_reason,
+                            )
+
+                            completion_reason = consume_tool_approval_completion_reason(
+                                session_id,
+                                tool_call_id,
+                            )
+                        except Exception:
+                            completion_reason = None
+                        if completion_reason == "expired":
+                            completed.setdefault("interaction", {})["timed_out"] = True
+                            interrupt_message = (
+                                "awaiting user approval (tool approval timed out)"
+                            )
+                        else:
+                            interrupt_message = (
+                                "awaiting user approval (tool approval ended without response)"
+                            )
                         turn_ending = True
-                        interrupt_message = "awaiting user approval (tool approval timed out)"
                 # Omnia task-list tracker: the `todo` tool returns the full current
                 # list ({"todos": [{id, content, status}], "summary": {...}}) on every
                 # call. Forward the `todos` array on the completed event so the Omnia
@@ -2406,13 +2435,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     try:
                         agent_ref[0].interrupt(interrupt_message)
                     except Exception:
-                        # The UI already shows a hard "timed out" / "expired"
-                        # state for this card (request_user_input no_response,
-                        # or a connector-approval timeout) — if the interrupt
-                        # itself fails, the agent keeps running underneath that
-                        # UI with nothing telling us. Log loudly so this isn't
-                        # silent; don't re-raise, the tool-complete event must
-                        # still ship.
+                        # The completed event already tells the UI that this
+                        # interaction ended. If the interrupt fails, the agent
+                        # keeps running underneath that finished card. Log
+                        # loudly so this is not silent; do not re-raise because
+                        # the tool-complete event must still ship.
                         logger.warning(
                             "[api_server] failed to interrupt agent for turn-ending "
                             "tool completion (tool_call_id=%s, function_name=%s)",

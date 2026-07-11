@@ -1833,7 +1833,13 @@ class TestChatCompletionsEndpoint:
             assert '"status": "running"' not in body
             assert '"status": "completed"' not in body
 
-    async def _run_tool_complete_scenario(self, adapter, function_name, function_result):
+    async def _run_tool_complete_scenario(
+        self,
+        adapter,
+        function_name,
+        function_result,
+        completion_reason=None,
+    ):
         """Shared harness: drive a single tool_start/tool_complete pair through
         the chat-completions streaming path, with a fake agent installed on
         ``agent_ref`` so ``interrupt()`` calls can be observed, and return
@@ -1870,7 +1876,17 @@ class TestChatCompletionsEndpoint:
                     {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
                 )
 
-            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                patch(
+                    "tools.user_input.consume_user_input_completion_reason",
+                    return_value=completion_reason,
+                ),
+                patch(
+                    "tools.tool_approval.consume_tool_approval_completion_reason",
+                    return_value=completion_reason,
+                ),
+            ):
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
@@ -1919,12 +1935,32 @@ class TestChatCompletionsEndpoint:
         import json as _json
 
         fake_agent = await self._run_tool_complete_scenario(
-            adapter, "request_user_input", _json.dumps({"status": "no_response"})
+            adapter,
+            "request_user_input",
+            _json.dumps({"status": "no_response"}),
+            completion_reason="expired",
         )
         assert fake_agent.interrupt_calls == [
             "awaiting user interaction (request_user_input)"
         ]
         assert fake_agent.completed_event["interaction"]["timed_out"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_request_user_input_cancelled_ends_turn_unmarked(self, adapter):
+        """A stopped user-input wait ends the turn without claiming timeout."""
+        import json as _json
+
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter,
+            "request_user_input",
+            _json.dumps({"status": "no_response"}),
+            completion_reason="cancelled",
+        )
+
+        assert fake_agent.interrupt_calls == [
+            "awaiting user interaction (request_user_input)"
+        ]
+        assert "interaction" not in fake_agent.completed_event
 
     @pytest.mark.asyncio
     async def test_stream_request_user_input_answered_does_not_end_turn(self, adapter):
@@ -1951,11 +1987,29 @@ class TestChatCompletionsEndpoint:
             adapter,
             "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT",
             _json.dumps({"status": "approval_no_response", "error": "no response"}),
+            completion_reason="expired",
         )
         assert fake_agent.interrupt_calls == [
             "awaiting user approval (tool approval timed out)"
         ]
         assert fake_agent.completed_event["interaction"]["timed_out"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_connector_approval_cancelled_ends_turn_unmarked(self, adapter):
+        """A stopped approval wait ends the turn without claiming timeout."""
+        import json as _json
+
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter,
+            "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT",
+            _json.dumps({"status": "approval_no_response", "error": "no response"}),
+            completion_reason="cancelled",
+        )
+
+        assert fake_agent.interrupt_calls == [
+            "awaiting user approval (tool approval ended without response)"
+        ]
+        assert "interaction" not in fake_agent.completed_event
 
     @pytest.mark.asyncio
     async def test_stream_connector_approval_denied_does_not_end_turn(self, adapter):

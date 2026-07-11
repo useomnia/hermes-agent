@@ -59,6 +59,10 @@ _DEFAULT_TIMEOUT_S = 300
 _lock = threading.Lock()
 # session_key -> FIFO of blocked input waiters.
 _waits: dict[str, list["_InputWait"]] = {}
+# session_key -> reason for the most recently completed unresolved wait.
+# request_user_input is never run concurrently, so one slot per session is
+# sufficient and avoids changing the plugin's Optional[str] return contract.
+_completion_reasons: dict[str, str] = {}
 # Sessions with an interactive chat surface that can render the card and POST an
 # answer back. The api_server chat path registers the session here; a
 # non-interactive caller (e.g. a proactive /v1/runs task) is absent, so the gate
@@ -82,6 +86,7 @@ def unregister_user_input_session(session_key: str) -> None:
         return
     with _lock:
         _active_sessions.discard(session_key)
+        _completion_reasons.pop(session_key, None)
         waiters = _waits.pop(session_key, [])
     for entry in waiters:
         entry.event.set()  # answer stays None → caller maps to "no answer"
@@ -114,6 +119,14 @@ def _drop_wait(session_key: str, entry: "_InputWait") -> None:
             _waits.pop(session_key, None)
 
 
+def consume_user_input_completion_reason(session_key: str) -> Optional[str]:
+    """Return and clear the last unresolved wait reason for a session."""
+    if not session_key:
+        return None
+    with _lock:
+        return _completion_reasons.pop(session_key, None)
+
+
 def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
     """Block until the user answers the ``request_user_input`` card, or a timeout.
 
@@ -132,6 +145,7 @@ def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
             # /v1/runs task): fail fast rather than park for the full timeout
             # with no one to answer. Mirrors the approval gate's no-surface deny.
             return None
+        _completion_reasons.pop(session_key, None)
         entry = _InputWait(tool_call_id)
         _waits.setdefault(session_key, []).append(entry)
 
@@ -164,9 +178,11 @@ def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
     now = time.monotonic()
     deadline = now + max(_input_timeout(), 0)
     activity = {"last_touch": now, "start": now}
+    expired = False
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            expired = True
             break
         if entry.event.wait(timeout=min(1.0, remaining)):
             break
@@ -176,6 +192,9 @@ def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
             touch_activity_if_due(activity, "waiting for user input")
 
     _drop_wait(session_key, entry)
+    if entry.answer is None:
+        with _lock:
+            _completion_reasons[session_key] = "expired" if expired else "cancelled"
     return entry.answer
 
 
@@ -217,6 +236,7 @@ def clear_session(session_key: str) -> None:
     if not session_key:
         return
     with _lock:
+        _completion_reasons.pop(session_key, None)
         waiters = _waits.pop(session_key, [])
     for entry in waiters:
         entry.event.set()

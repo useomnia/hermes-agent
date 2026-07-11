@@ -10,9 +10,11 @@ from tools.interrupt import set_interrupt
 from tools.user_input import (
     _InputWait,
     _active_sessions,
+    _completion_reasons,
     _waits,
     await_user_input,
     clear_session,
+    consume_user_input_completion_reason,
     register_user_input_session,
     resolve_user_input,
     unregister_user_input_session,
@@ -25,10 +27,12 @@ SESSION = "sess-1"
 def _clean_state():
     _waits.clear()
     _active_sessions.clear()
+    _completion_reasons.clear()
     register_user_input_session(SESSION)  # an interactive chat surface is present
     yield
     _waits.clear()
     _active_sessions.clear()
+    _completion_reasons.clear()
 
 
 def _wait_until_blocked(session_key: str = SESSION, timeout: float = 3.0) -> bool:
@@ -77,6 +81,7 @@ class TestAwaitAndResolve:
     def test_returns_none_on_timeout(self, monkeypatch):
         monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "0")
         assert await_user_input(SESSION, "call-1") is None
+        assert consume_user_input_completion_reason(SESSION) == "expired"
 
     def test_timeout_drops_the_waiter(self, monkeypatch):
         monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "0")
@@ -112,6 +117,7 @@ class TestAwaitAndResolve:
                 "interrupt must release the wait, not park for the timeout"
             )
             assert result["answer"] is None, "an interrupted wait yields no answer"
+            assert consume_user_input_completion_reason(SESSION) == "cancelled"
         finally:
             set_interrupt(False, thread.ident)
 

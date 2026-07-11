@@ -14,10 +14,12 @@ from tools.tool_approval import (
     APPROVAL_OPTIONS,
     _ApprovalWait,
     _always_approved,
+    _completion_reasons,
     _notify_cbs,
     _session_approved,
     _waits,
     clear_session,
+    consume_tool_approval_completion_reason,
     fail_closed_denial,
     is_always_approved,
     is_gated_tool,
@@ -43,6 +45,7 @@ def _clean_state(monkeypatch):
     _always_approved.clear()
     _notify_cbs.clear()
     _waits.clear()
+    _completion_reasons.clear()
     mcp_tool._mcp_tool_read_only_hints.clear()
     # Model the connectors route having advertised its tools: the write is NOT
     # read-only (gated), the read IS (ungated). Gating reads the live annotation.
@@ -53,6 +56,7 @@ def _clean_state(monkeypatch):
     _always_approved.clear()
     _notify_cbs.clear()
     _waits.clear()
+    _completion_reasons.clear()
     mcp_tool._mcp_tool_read_only_hints.clear()
     reset_current_session_key(token)
 
@@ -142,6 +146,9 @@ class TestMaybeRequireToolApproval:
         assert result is not None
         # A genuine timeout with a real interactive surface IS turn-ending.
         assert json.loads(result)["status"] == "approval_no_response"
+        assert (
+            consume_tool_approval_completion_reason(SESSION, "call-1") == "expired"
+        )
 
     def test_notify_raising_is_a_plumbing_error_not_a_user_timeout(self):
         # The notify callback raising means the card was never actually shown
@@ -319,6 +326,10 @@ class TestInterruptRelease:
             thread.join(timeout=5)
             assert not thread.is_alive(), "interrupt must release the wait, not park for the timeout"
             assert result["choice"] is not None, "interrupted wait fails closed (denial)"
+            assert (
+                consume_tool_approval_completion_reason(SESSION, "call-1")
+                == "cancelled"
+            )
         finally:
             set_interrupt(False, thread.ident)
 
