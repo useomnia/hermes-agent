@@ -80,11 +80,11 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
 
 
 def iter_sprites_sync_files(container_base: str = "/skills") -> list[tuple[str, str]]:
-    """Enumerate files allowed to cross into an Omnio runtime sprite.
+    """Enumerate files allowed to cross into an Omnio toolbox Sprite.
 
-    Runtime sprites are secret-free execution targets. They need bundled skill
+    Toolbox Sprites are secret-free execution targets. They need bundled skill
     files for script-backed tools, but credential and cache mounts must never
-    cross the harness/runtime boundary.
+    cross the Omnio/toolbox boundary.
     """
     from tools.credential_files import (
         get_credential_file_mounts,

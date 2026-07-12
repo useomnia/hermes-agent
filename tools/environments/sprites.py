@@ -1,9 +1,11 @@
-"""Omnio runtime sprite execution environment."""
+"""Omnio toolbox Sprite execution environment."""
 
 import base64
 import json
 import logging
+import stat
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -23,33 +25,62 @@ from tools.file_operations import (
 
 logger = logging.getLogger(__name__)
 
+_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+_MAX_ERROR_BYTES = 4096
+_MAX_SKILL_FILE_BYTES = 2 * 1024 * 1024
+_MAX_SKILL_BATCH_FILES = 200
+_MAX_SKILL_BATCH_BYTES = 16 * 1024 * 1024
 
-class SpritesRuntimeError(RuntimeError):
-    """Raised when the Omnio runtime API rejects a request."""
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep the pair bearer on the configured toolbox origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_URL_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _normalize_toolbox_url(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("OMNIO_TOOLBOX_URL must be an HTTP(S) origin")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("OMNIO_TOOLBOX_URL must not contain credentials, a query, or a fragment")
+    if parsed.path not in {"", "/"}:
+        raise ValueError("OMNIO_TOOLBOX_URL must not contain a path")
+    if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "::1", "localhost"}:
+        raise ValueError("OMNIO_TOOLBOX_URL must use HTTPS outside loopback")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+class SpritesToolboxError(RuntimeError):
+    """Raised when the Omnio toolbox API rejects a request."""
 
 
 class SpritesEnvironment(BaseEnvironment):
-    """Run commands through the paired Omnio runtime sprite API."""
+    """Run commands through the paired Omnio toolbox Sprite API."""
 
     _stdin_mode = "heredoc"
 
     def __init__(
         self,
-        runtime_url: str,
+        toolbox_url: str,
         bearer_token: str,
         brand: str,
         cwd: str = "/brand",
         timeout: int = 60,
     ):
-        if not runtime_url:
-            raise ValueError("Sprites environment requires TERMINAL_SPRITES_URL")
+        if not toolbox_url:
+            raise ValueError("Sprites environment requires OMNIO_TOOLBOX_URL")
         if not bearer_token:
-            raise ValueError("Sprites environment requires TERMINAL_SPRITES_BEARER")
+            raise ValueError("Sprites environment requires OMNIO_TOOLBOX_BEARER")
         if not brand:
-            raise ValueError("Sprites environment requires TERMINAL_SPRITES_BRAND")
+            raise ValueError("Sprites environment requires OMNIO_TOOLBOX_BRAND")
 
         super().__init__(cwd=cwd, timeout=timeout)
-        self.runtime_url = runtime_url.rstrip("/")
+        self.toolbox_url = _normalize_toolbox_url(toolbox_url)
         self.bearer_token = bearer_token
         self.brand = brand
 
@@ -80,81 +111,108 @@ class SpritesEnvironment(BaseEnvironment):
             headers["Content-Type"] = "application/json"
 
         request = urllib.request.Request(
-            f"{self.runtime_url}{path}",
+            f"{self.toolbox_url}{path}",
             data=data,
             headers=headers,
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
-                body = response.read().decode("utf-8")
+            with _URL_OPENER.open(request, timeout=timeout or self.timeout) as response:
+                raw_body = response.read(_MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
+            body = exc.read(_MAX_ERROR_BYTES).decode("utf-8", errors="replace")
             message = body
             try:
                 parsed = json.loads(body)
                 message = str(parsed.get("error") or parsed.get("detail") or body)
             except json.JSONDecodeError:
                 pass
-            raise SpritesRuntimeError(
-                f"Runtime API {path} failed with HTTP {exc.code}: {message}"
+            raise SpritesToolboxError(
+                f"Toolbox API {path} failed with HTTP {exc.code}: {message}"
             ) from exc
         except urllib.error.URLError as exc:
-            raise SpritesRuntimeError(f"Runtime API {path} is unreachable: {exc}") from exc
+            raise SpritesToolboxError(f"Toolbox API {path} is unreachable: {exc}") from exc
+
+        if len(raw_body) > _MAX_RESPONSE_BYTES:
+            raise SpritesToolboxError(
+                f"Toolbox API {path} response exceeded {_MAX_RESPONSE_BYTES} bytes"
+            )
+        body = raw_body.decode("utf-8")
 
         if not body:
             return {}
         try:
             parsed = json.loads(body)
         except json.JSONDecodeError as exc:
-            raise SpritesRuntimeError(
-                f"Runtime API {path} returned invalid JSON: {body[:200]}"
+            raise SpritesToolboxError(
+                f"Toolbox API {path} returned invalid JSON: {body[:200]}"
             ) from exc
         if not isinstance(parsed, dict):
-            raise SpritesRuntimeError(f"Runtime API {path} returned a non-object response")
+            raise SpritesToolboxError(f"Toolbox API {path} returned a non-object response")
         return parsed
 
     def file_request(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Send a file operation to the runtime sprite."""
+        """Send a file operation to the toolbox Sprite."""
         return self._request_json("/files", payload)
 
     def get_temp_dir(self) -> str:
-        return "/scratch/.hermes-session"
+        return "/tmp/.hermes-session"
 
     def _sprites_upload(self, host_path: str, remote_path: str) -> None:
-        content = base64.b64encode(Path(host_path).read_bytes()).decode("ascii")
+        encoded, _size = self._encoded_skill(host_path, remote_path)
         self.file_request(
             {
                 "operation": "writeSkills",
                 "path": remote_path,
-                "contentBase64": content,
+                "contentBase64": encoded,
                 "encoding": "base64",
             }
         )
 
     def _sprites_bulk_upload(self, files: list[tuple[str, str]]) -> None:
-        if not files:
-            return
-        self.file_request(
-            {
-                "operation": "writeSkills",
-                "files": [
-                    {
-                        "path": remote_path,
-                        "contentBase64": base64.b64encode(Path(host_path).read_bytes()).decode(
-                            "ascii"
-                        ),
-                        "encoding": "base64",
-                    }
-                    for host_path, remote_path in files
-                ],
-            }
-        )
+        batch: list[dict[str, str]] = []
+        batch_bytes = 0
+        for host_path, remote_path in files:
+            encoded, size = self._encoded_skill(host_path, remote_path)
+            if batch and (
+                len(batch) >= _MAX_SKILL_BATCH_FILES
+                or batch_bytes + size > _MAX_SKILL_BATCH_BYTES
+            ):
+                self.file_request({"operation": "writeSkills", "files": batch})
+                batch = []
+                batch_bytes = 0
+            batch.append(
+                {
+                    "path": remote_path,
+                    "contentBase64": encoded,
+                    "encoding": "base64",
+                }
+            )
+            batch_bytes += size
+        if batch:
+            self.file_request({"operation": "writeSkills", "files": batch})
+
+    @staticmethod
+    def _encoded_skill(host_path: str, remote_path: str) -> tuple[str, int]:
+        if remote_path != "/skills" and not remote_path.startswith("/skills/"):
+            raise SpritesToolboxError(
+                f"Sprites skills sync refused non-skills path: {remote_path}"
+            )
+        source = Path(host_path)
+        source_stat = source.lstat()
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise SpritesToolboxError(f"Sprites skills sync refused non-file: {host_path}")
+        if source_stat.st_size > _MAX_SKILL_FILE_BYTES:
+            raise SpritesToolboxError(
+                f"Sprites skill file exceeds {_MAX_SKILL_FILE_BYTES} bytes: {host_path}"
+            )
+        content = source.read_bytes()
+        return base64.b64encode(content).decode("ascii"), len(content)
 
     def _sprites_delete(self, remote_paths: list[str]) -> None:
         for remote_path in remote_paths:
             if remote_path != "/skills" and not remote_path.startswith("/skills/"):
-                raise SpritesRuntimeError(
+                raise SpritesToolboxError(
                     f"Sprites skills sync refused to delete non-skills path: {remote_path}"
                 )
             self.file_request({"operation": "deleteSkills", "path": remote_path, "missingOk": True})
@@ -193,7 +251,7 @@ class SpritesEnvironment(BaseEnvironment):
 
 
 class SpritesFileOperations(ShellFileOperations):
-    """File tools backed by the runtime sprite `/files` endpoint."""
+    """File tools backed by the toolbox Sprite `/files` endpoint."""
 
     def __init__(self, terminal_env: SpritesEnvironment):
         super().__init__(terminal_env)

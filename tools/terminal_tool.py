@@ -1168,13 +1168,9 @@ def _get_env_config() -> Dict[str, Any]:
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
-        "sprites_url": os.getenv("TERMINAL_SPRITES_URL", ""),
-        "sprites_bearer": os.getenv("TERMINAL_SPRITES_BEARER", ""),
-        "sprites_brand": (
-            os.getenv("TERMINAL_SPRITES_BRAND")
-            or os.getenv("OMNIO_BRAND_ID")
-            or "default"
-        ),
+        "sprites_url": os.getenv("OMNIO_TOOLBOX_URL", ""),
+        "sprites_bearer": os.getenv("OMNIO_TOOLBOX_BEARER", ""),
+        "sprites_brand": os.getenv("OMNIO_TOOLBOX_BRAND") or "default",
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -1378,7 +1374,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         from tools.environments.sprites import SpritesEnvironment as _SpritesEnvironment
 
         return _SpritesEnvironment(
-            runtime_url=cc.get("sprites_url", ""),
+            toolbox_url=cc.get("sprites_url", ""),
             bearer_token=cc.get("sprites_bearer", ""),
             brand=cc.get("sprites_brand", "default"),
             cwd=cwd,
@@ -2639,8 +2635,8 @@ def check_terminal_requirements() -> bool:
         elif env_type == "sprites":
             if not config.get("sprites_url") or not config.get("sprites_bearer"):
                 logger.error(
-                    "Sprites backend selected but TERMINAL_SPRITES_URL and "
-                    "TERMINAL_SPRITES_BEARER are not both set."
+                    "Sprites backend selected but OMNIO_TOOLBOX_URL and "
+                    "OMNIO_TOOLBOX_BEARER are not both set."
                 )
                 return False
             return True

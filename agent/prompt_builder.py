@@ -875,7 +875,7 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "managed_modal": "a managed Modal sandbox (Linux)",
     "daytona": "a Daytona workspace (Linux)",
     "ssh": "a remote host reached over SSH (likely Linux)",
-    "sprites": "an Omnio runtime sprite (Linux)",
+    "sprites": "an Omnio toolbox Sprite (Linux)",
 }
 
 

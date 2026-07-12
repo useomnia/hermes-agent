@@ -66,8 +66,8 @@ class TestApiServerPlatformConfig:
     def test_default_api_server_advertises_sprites_terminal_after_tool_discovery(self, monkeypatch):
         """API server defaults must keep terminal after registry discovery."""
         monkeypatch.setenv("TERMINAL_ENV", "sprites")
-        monkeypatch.setenv("TERMINAL_SPRITES_URL", "https://runtime.example")
-        monkeypatch.setenv("TERMINAL_SPRITES_BEARER", "pair-secret")
+        monkeypatch.setenv("OMNIO_TOOLBOX_URL", "https://toolbox.example")
+        monkeypatch.setenv("OMNIO_TOOLBOX_BEARER", "pair-secret")
         monkeypatch.delenv("HERMES_DESKTOP", raising=False)
 
         import model_tools
