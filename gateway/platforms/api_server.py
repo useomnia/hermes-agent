@@ -1980,8 +1980,9 @@ class APIServerAdapter(BasePlatformAdapter):
         Mirrors how every other Hermes surface (CLI/TUI/messaging gateway, see
         ``gateway/run.py``) dispatches slash commands, except the command does
         not have to lead the message: every whitespace-delimited ``/token`` is a
-        candidate, and the first one that confirms as a command expands. Two
-        cases expand:
+        candidate, and the LAST one that confirms as a command expands — one
+        command per message, matching the composer, which clears an earlier
+        chip when a new one is picked. Two cases expand:
 
         - ``/<skill-or-bundle>`` — resolved against the installed bundles (which
           take precedence) and skills; the turn is replaced with the payload
@@ -2015,7 +2016,7 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         if not isinstance(user_message, str):
             return None
-        for command, user_instruction in self._slash_command_candidates(user_message):
+        for command, user_instruction in reversed(self._slash_command_candidates(user_message)):
             expanded = self._expand_slash_command(command, user_instruction, session_id)
             if expanded is not None:
                 return expanded

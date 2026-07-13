@@ -146,10 +146,12 @@ class TestMidMessageExpansion:
             )
         assert out is None
 
-    def test_first_confirmed_candidate_wins_and_earlier_tokens_stay_in_instruction(self):
+    def test_confirmed_candidate_wins_over_earlier_unconfirmed_tokens(self):
+        # Candidates are tried last-first, so /site-audit resolves before /brand
+        # is ever consulted; the unconfirmed token stays in the instruction.
         with (
             patch("agent.skill_bundles.resolve_bundle_command_key", return_value=None),
-            patch("agent.skill_commands.resolve_skill_command_key", side_effect=[None, "/site-audit"]),
+            patch("agent.skill_commands.resolve_skill_command_key", side_effect=["/site-audit"]),
             patch("agent.skill_commands.build_skill_invocation_message", return_value="X") as build,
         ):
             out = _adapter()._maybe_expand_slash_command(
@@ -158,6 +160,24 @@ class TestMidMessageExpansion:
         assert out == "X"
         build.assert_called_once_with(
             "/site-audit", "read /brand first then example.com", task_id=SESSION_ID
+        )
+
+    def test_last_of_two_confirmed_commands_wins(self):
+        # One command per message: the LAST confirmed one runs (matching the
+        # composer, which clears an earlier chip when a new one is picked); the
+        # earlier command survives only as raw text in the instruction.
+        with (
+            patch("agent.skill_bundles.resolve_bundle_command_key", return_value=None),
+            patch("agent.skill_commands.resolve_skill_command_key", side_effect=["/create-pdf"]) as resolve,
+            patch("agent.skill_commands.build_skill_invocation_message", return_value="X") as build,
+        ):
+            out = _adapter()._maybe_expand_slash_command(
+                "/site-audit example.com then /create-pdf it", SESSION_ID
+            )
+        assert out == "X"
+        resolve.assert_called_once_with("create-pdf")
+        build.assert_called_once_with(
+            "/create-pdf", "/site-audit example.com then it", task_id=SESSION_ID
         )
 
     def test_mid_message_learn_is_rewritten(self):
