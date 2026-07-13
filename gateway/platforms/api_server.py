@@ -1974,30 +1974,39 @@ class APIServerAdapter(BasePlatformAdapter):
         return response
 
     def _maybe_expand_slash_command(self, user_message: Any, session_id: str) -> Optional[str]:
-        """Expand a leading ``/command`` into the message the agent should process.
+        """Expand a ``/command`` found anywhere in the message into the message
+        the agent should process.
 
         Mirrors how every other Hermes surface (CLI/TUI/messaging gateway, see
-        ``gateway/run.py``) dispatches slash commands. Two cases expand:
+        ``gateway/run.py``) dispatches slash commands, except the command does
+        not have to lead the message: every whitespace-delimited ``/token`` is a
+        candidate, and the first one that confirms as a command expands. Two
+        cases expand:
 
-        - ``/<skill-or-bundle> [instruction]`` — resolved against the installed
-          bundles (which take precedence) and skills; the turn is replaced with
-          the payload built by ``build_skill_invocation_message`` (activation note
-          + skill content + skill-dir + config + the trailing instruction).
-        - ``/learn [what to learn from]`` — the one built-in command that makes
-          sense on the chat path (no Omnia-UI equivalent): rewritten to the
-          standards-guided ``build_learn_prompt`` that drives the agent to author
-          a skill via ``skill_manage``. Side-effecting built-ins (``/new``,
-          ``/yolo``, …) are deliberately NOT handled here.
+        - ``/<skill-or-bundle>`` — resolved against the installed bundles (which
+          take precedence) and skills; the turn is replaced with the payload
+          built by ``build_skill_invocation_message`` (activation note + skill
+          content + skill-dir + config + the user instruction).
+        - ``/learn`` — the one built-in command that makes sense on the chat
+          path (no Omnia-UI equivalent): rewritten to the standards-guided
+          ``build_learn_prompt`` that drives the agent to author a skill via
+          ``skill_manage``. Side-effecting built-ins (``/new``, ``/yolo``, …)
+          are deliberately NOT handled here.
+
+        The instruction handed to the builder is the message with the matched
+        token spliced out — the prose around the command IS the instruction, so
+        "please /site-audit the pricing page" invokes ``site-audit`` with
+        "please the pricing page".
 
         The unmodified builder output is returned so the memory layer's invocation
         markers stay intact.
 
-        Returns the expanded message, or ``None`` when the message is not a
-        recognized command — in which case the caller forwards the original text
-        untouched. Unlike the messaging gateway, the chat-completions API carries
-        general prose, so a message that merely starts with ``/`` (a path like
-        ``/Users/x``, a question about ``/etc``) must pass through: only a
-        confirmed match is intercepted.
+        Returns the expanded message, or ``None`` when no token confirms as a
+        command — in which case the caller forwards the original text untouched.
+        Unlike the messaging gateway, the chat-completions API carries general
+        prose, so a ``/`` token that resolves to nothing (a path like
+        ``/Users/x``, a mention of ``/etc`` or the ``/brand`` folder) must pass
+        through: only a confirmed match is intercepted.
 
         Only plain-text turns expand: a multimodal turn (text + image) arrives as
         a content list, not a ``str``, so a ``/skill`` typed alongside an
@@ -2006,16 +2015,35 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         if not isinstance(user_message, str):
             return None
-        text = user_message.lstrip()
-        if not text.startswith("/"):
-            return None
-        # "/command rest of the instruction" -> ("command", "rest of the instruction")
-        parts = text[1:].split(None, 1)
-        if not parts:
-            return None
-        command = parts[0]
-        user_instruction = parts[1].strip() if len(parts) > 1 else ""
+        for command, user_instruction in self._slash_command_candidates(user_message):
+            expanded = self._expand_slash_command(command, user_instruction, session_id)
+            if expanded is not None:
+                return expanded
+        return None
 
+    @staticmethod
+    def _slash_command_candidates(text: str) -> "list[tuple[str, str]]":
+        """The ``(command, instruction)`` candidates in ``text``, in order.
+
+        A candidate is any whitespace-delimited ``/token``; ``command`` is the
+        token minus its slash (resolution — including underscore→hyphen
+        normalization — is the resolvers' job). ``instruction`` is the message
+        with that token spliced out: the seam keeps the whitespace that preceded
+        the token and drops what followed it, so a mid-sentence command leaves
+        single spacing and a command on its own line leaves no blank one.
+        """
+        candidates = []
+        for match in re.finditer(r"(?<!\S)/(\S+)", text):
+            before = text[: match.start()]
+            after = text[match.end():]
+            instruction = (before + after.lstrip()).strip() if before.strip() else after.strip()
+            candidates.append((match.group(1), instruction))
+        return candidates
+
+    def _expand_slash_command(
+        self, command: str, user_instruction: str, session_id: str
+    ) -> Optional[str]:
+        """Expand one candidate ``command`` (no slash), or ``None`` on no match."""
         # Built-in /learn (a message-expansion command) before skills/bundles —
         # it rewrites the turn to a prompt that has the agent author a skill.
         if command == "learn":
