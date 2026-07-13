@@ -1839,6 +1839,7 @@ class TestChatCompletionsEndpoint:
         function_name,
         function_result,
         completion_reason=None,
+        decision=None,
     ):
         """Shared harness: drive a single tool_start/tool_complete pair through
         the chat-completions streaming path, with a fake agent installed on
@@ -1885,6 +1886,10 @@ class TestChatCompletionsEndpoint:
                 patch(
                     "tools.tool_approval.consume_tool_approval_completion_reason",
                     return_value=completion_reason,
+                ),
+                patch(
+                    "tools.tool_approval.consume_tool_approval_decision",
+                    return_value=decision,
                 ),
             ):
                 resp = await cli.post(
@@ -2023,6 +2028,36 @@ class TestChatCompletionsEndpoint:
             _json.dumps({"status": "approval_denied", "error": "declined"}),
         )
         assert fake_agent.interrupt_calls == []
+
+    @pytest.mark.asyncio
+    async def test_stream_connector_approval_decision_rides_completed_event(self, adapter):
+        """A resolved decision echoes as ``interaction.answered`` on the gated
+        call's completed event — that is what the proxy's conversation capture
+        persists, so a reloaded card renders granted/denied, not unanswered."""
+        import json as _json
+
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter,
+            "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT",
+            _json.dumps({"status": "ok", "data": {}}),
+            decision="always",
+        )
+        assert fake_agent.interrupt_calls == []
+        assert fake_agent.completed_event["interaction"] == {"answered": "always"}
+
+    @pytest.mark.asyncio
+    async def test_stream_connector_denied_decision_rides_completed_event(self, adapter):
+        """A deny echoes too, so a reloaded denied card reads Denied."""
+        import json as _json
+
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter,
+            "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT",
+            _json.dumps({"status": "approval_denied", "error": "declined"}),
+            decision="deny",
+        )
+        assert fake_agent.interrupt_calls == []
+        assert fake_agent.completed_event["interaction"] == {"answered": "deny"}
 
     @pytest.mark.asyncio
     async def test_stream_connector_approval_error_does_not_end_turn(self, adapter):

@@ -15,12 +15,14 @@ from tools.tool_approval import (
     _ApprovalWait,
     _always_approved,
     _completion_reasons,
+    _decisions,
     _injected_always_approved,
     _notify_cbs,
     _session_approved,
     _waits,
     clear_session,
     consume_tool_approval_completion_reason,
+    consume_tool_approval_decision,
     fail_closed_denial,
     is_always_approved,
     is_gated_tool,
@@ -51,6 +53,7 @@ def _clean_state(monkeypatch):
     _notify_cbs.clear()
     _waits.clear()
     _completion_reasons.clear()
+    _decisions.clear()
     mcp_tool._mcp_tool_read_only_hints.clear()
     # Model the connectors route having advertised its tools: the write is NOT
     # read-only (gated), the read IS (ungated). Gating reads the live annotation.
@@ -64,6 +67,7 @@ def _clean_state(monkeypatch):
     _notify_cbs.clear()
     _waits.clear()
     _completion_reasons.clear()
+    _decisions.clear()
     mcp_tool._mcp_tool_read_only_hints.clear()
     reset_current_session_key(token)
 
@@ -335,6 +339,22 @@ class TestResolveToolApproval:
         _waits[SESSION] = [entry]
         assert resolve_tool_approval(SESSION, GATED, "once", "call-A") is True
         assert entry.result == "once" and entry.event.is_set()
+
+    def test_should_record_the_decision_for_the_completed_event_echo(self):
+        # A released waiter's decision is consumed once by the gateway's
+        # tool-complete callback (interaction.answered on the completed event).
+        entry = _ApprovalWait(GATED, "call-A")
+        _waits[SESSION] = [entry]
+        resolve_tool_approval(SESSION, GATED, "deny", "call-A")
+
+        assert consume_tool_approval_decision(SESSION, "call-A") == "deny"
+        assert consume_tool_approval_decision(SESSION, "call-A") is None
+
+    def test_should_not_record_a_decision_when_no_waiter_was_released(self):
+        # A late decision (the wait already timed out) records the grant but
+        # must not echo answered on a call that already failed closed.
+        assert resolve_tool_approval(SESSION, GATED, "session", "call-A") is False
+        assert consume_tool_approval_decision(SESSION, "call-A") is None
 
     def test_should_scope_grants_per_session(self):
         resolve_tool_approval(SESSION, GATED, "session")

@@ -122,6 +122,10 @@ _notify_cbs: dict[str, Callable[[dict], None]] = {}
 _waits: dict[str, list["_ApprovalWait"]] = {}
 # (session_key, tool_call_id) -> reason for an unresolved completed wait.
 _completion_reasons: dict[tuple[str, str], str] = {}
+# (session_key, tool_call_id) -> the resolved decision (once/session/always/deny)
+# for a released waiter, consumed by the gateway's tool-complete callback to
+# echo `interaction.answered` on the gated call's completed event.
+_decisions: dict[tuple[str, str], str] = {}
 
 
 class _ApprovalWait:
@@ -233,6 +237,8 @@ def unregister_tool_approval_notify(session_key: str) -> None:
         _notify_cbs.pop(session_key, None)
         for key in [key for key in _completion_reasons if key[0] == session_key]:
             _completion_reasons.pop(key, None)
+        for key in [key for key in _decisions if key[0] == session_key]:
+            _decisions.pop(key, None)
         waiters = _waits.pop(session_key, [])
     for entry in waiters:
         entry.event.set()  # result stays None → guard fails closed (deny)
@@ -399,8 +405,26 @@ def resolve_tool_approval(
     if entry is not None:
         entry.result = scope
         entry.event.set()
+        # Remember the decision for the gateway's tool-complete callback, which
+        # attaches it to the gated call's real `completed` event as
+        # ``interaction.answered`` — mirroring request_user_input's answered
+        # echo and the `timed_out` marker — so the persisted turn rehydrates
+        # the card in its granted/denied state instead of "not answered".
+        with _lock:
+            _decisions[(session_key, entry.tool_call_id)] = scope
         return True
     return False
+
+
+def consume_tool_approval_decision(
+    session_key: str, tool_call_id: str = ""
+) -> Optional[str]:
+    """Pop the recorded decision (once/session/always/deny) for a released
+    gated call, or None when the wait ended without one (timeout/interrupt)."""
+    if not session_key:
+        return None
+    with _lock:
+        return _decisions.pop((session_key, tool_call_id or ""), None)
 
 
 def clear_session(session_key: str) -> None:
@@ -412,6 +436,8 @@ def clear_session(session_key: str) -> None:
         _notify_cbs.pop(session_key, None)
         for key in [key for key in _completion_reasons if key[0] == session_key]:
             _completion_reasons.pop(key, None)
+        for key in [key for key in _decisions if key[0] == session_key]:
+            _decisions.pop(key, None)
         waiters = _waits.pop(session_key, [])
     for entry in waiters:
         entry.event.set()

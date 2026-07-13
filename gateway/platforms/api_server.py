@@ -2425,6 +2425,19 @@ class APIServerAdapter(BasePlatformAdapter):
                         parsed = json.loads(function_result or "{}")
                     except Exception:
                         parsed = {}
+                    # A resolved decision (once/session/always/deny) rides the
+                    # gated call's completed event as `interaction.answered` —
+                    # mirroring request_user_input's answered echo — so the
+                    # persisted turn rehydrates the approval card in its
+                    # granted/denied state instead of "not answered".
+                    try:
+                        from tools.tool_approval import consume_tool_approval_decision
+
+                        decision = consume_tool_approval_decision(session_id, tool_call_id)
+                    except Exception:
+                        decision = None
+                    if decision is not None:
+                        completed.setdefault("interaction", {})["answered"] = decision
                     if isinstance(parsed, dict) and parsed.get("status") == "approval_no_response":
                         try:
                             from tools.tool_approval import (
