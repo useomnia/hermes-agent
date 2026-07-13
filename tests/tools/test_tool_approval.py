@@ -211,7 +211,8 @@ class TestMaybeRequireToolApproval:
         args = captured["interaction"]["approval"]["arguments"]
         assert args["fields"]["to"] == "buyer@example.com"
         assert args["fields"]["subject"] == "Launch plan"
-        assert args["fields"]["body"].startswith("[text, ")
+        # The body ships as real, readable text (capped, never a "[text, N]" stub).
+        assert args["fields"]["body"] == ("secret-ish body " * 100).strip()
         assert args["fields"]["metadata"] == "[object, 1 keys]"
         assert args["truncated"] is True
 
@@ -475,9 +476,41 @@ class TestArgumentSummary:
 
         assert summary is not None
         assert summary["fields"]["title"].endswith("...")
-        assert summary["fields"]["content"] == "[text, 10 chars]"
+        assert summary["fields"]["content"] == "short body"
         assert summary["fields"]["items"] == "[array, 3 items]"
         assert summary["fields"]["config"] == "[object, 2 keys]"
+        assert summary["truncated"] is True
+
+    def test_should_ship_a_body_verbatim_with_newlines_intact(self):
+        body = "Dear buyer,\n\nHere is the launch plan.\n\nBest,\nOmnio"
+        summary = summarize_tool_arguments({"body": body})
+
+        assert summary is not None
+        assert summary["fields"]["body"] == body
+        assert summary["truncated"] is False
+
+    def test_should_cap_an_oversized_body_at_its_own_limit(self):
+        summary = summarize_tool_arguments({"body": "x" * 5000})
+
+        assert summary is not None
+        assert summary["fields"]["body"] == "x" * 2000 + "..."
+        assert summary["truncated"] is True
+
+    def test_should_trim_over_total_budget_instead_of_dropping_the_field(self):
+        # Three max-size bodies overflow the total budget; the last one must
+        # survive shortened (with an ellipsis), not vanish from the card.
+        summary = summarize_tool_arguments({
+            "body": "a" * 2000,
+            "content": "b" * 2000,
+            "message": "c" * 2000,
+        })
+
+        assert summary is not None
+        assert summary["fields"]["body"] == "a" * 2000
+        assert summary["fields"]["content"] == "b" * 2000
+        message = summary["fields"]["message"]
+        assert message.endswith("...")
+        assert 40 < len(message) < 2000
         assert summary["truncated"] is True
 
     def test_should_redact_secret_looking_argument_keys(self):

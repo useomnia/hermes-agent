@@ -50,7 +50,10 @@ _ENV_DISABLED = "OMNIO_TOOL_APPROVAL_DISABLED"
 _ENV_TIMEOUT = "OMNIO_TOOL_APPROVAL_TIMEOUT"
 _DEFAULT_TIMEOUT_S = 300
 _ARGUMENT_STRING_LIMIT = 200
-_ARGUMENT_TOTAL_LIMIT = 1500
+# Body-like fields (an email body, a document) carry their real text so the user
+# can read what they are approving — a larger per-field cap than ordinary scalars.
+_ARGUMENT_BODY_LIMIT = 2000
+_ARGUMENT_TOTAL_LIMIT = 6000
 _ARGUMENT_MAX_FIELDS = 8
 _BODY_ARGUMENT_KEYS = {
     "body",
@@ -469,9 +472,14 @@ def _is_secret_argument_key(key: str) -> bool:
 
 
 def _summarize_string(key: str, value: str) -> tuple[str, bool]:
-    compact = " ".join(value.split())
     if key.strip().lower() in _BODY_ARGUMENT_KEYS:
-        return f"[text, {len(value)} chars]", True
+        # Real content, newlines intact (the card clamps long values behind its
+        # own "Read more") — never a "[text, N chars]" stub the user can't read.
+        text = value.strip()
+        if len(text) > _ARGUMENT_BODY_LIMIT:
+            return f"{text[:_ARGUMENT_BODY_LIMIT]}...", True
+        return text, False
+    compact = " ".join(value.split())
     if len(compact) > _ARGUMENT_STRING_LIMIT:
         return f"{compact[:_ARGUMENT_STRING_LIMIT]}...", True
     return compact, False
@@ -508,10 +516,20 @@ def summarize_tool_arguments(arguments: Any) -> Optional[dict[str, Any]]:
         summary_value, value_truncated = _summarize_argument_value(key, value)
         fields[key] = summary_value
         truncated = truncated or value_truncated
-        if (
+        overshoot = (
             len(json.dumps(fields, ensure_ascii=False, default=str))
-            > _ARGUMENT_TOTAL_LIMIT
-        ):
+            - _ARGUMENT_TOTAL_LIMIT
+        )
+        if overshoot > 0:
+            # Over the total budget: trim an oversized string to what fits
+            # (cutting N raw chars shrinks the escaped JSON by at least N, so
+            # one pass suffices) instead of dropping it — an email body must
+            # survive shortened, not vanish from the card.
+            keep = len(summary_value) - overshoot - 3 if isinstance(summary_value, str) else 0
+            if keep > 40:
+                fields[key] = f"{summary_value[:keep]}..."
+                truncated = True
+                continue
             fields.pop(key, None)
             truncated = True
             break
