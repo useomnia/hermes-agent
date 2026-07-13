@@ -608,12 +608,23 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
             filters out disabled skills.
 
     Returns:
-        List of skill metadata dicts (name, description, category).
+        List of skill metadata dicts (name, description, category, and optional
+        provenance).
     """
     from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from tools.skill_usage import (
+        classify_skill_provenance,
+        read_skill_provenance_names,
+    )
 
     skills = []
     seen_names: set = set()
+
+    try:
+        provenance_names = read_skill_provenance_names()
+    except Exception:
+        logger.debug("Failed to load skill provenance metadata", exc_info=True)
+        provenance_names = None
 
     # Load disabled set once (not per-skill)
     disabled = set() if skip_disabled else _get_disabled_skill_names()
@@ -660,12 +671,23 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
                 category = _get_category_from_path(skill_md)
 
-                seen_names.add(name)
-                skills.append({
+                skill = {
                     "name": name,
                     "description": description,
                     "category": category,
-                })
+                }
+                if provenance_names is not None:
+                    bundled_names, hub_installed_names = provenance_names
+                    provenance = classify_skill_provenance(
+                        name,
+                        bundled_names=bundled_names,
+                        hub_installed_names=hub_installed_names,
+                    )
+                    if provenance is not None:
+                        skill["provenance"] = provenance
+
+                seen_names.add(name)
+                skills.append(skill)
 
             except (UnicodeDecodeError, PermissionError) as e:
                 logger.debug("Failed to read skill file %s: %s", skill_md, e)
@@ -696,7 +718,8 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         task_id: Optional task identifier used to probe the active backend
 
     Returns:
-        JSON string with minimal skill info: name, description, category
+        JSON string with minimal skill info: name, description, category, and
+        optional provenance
     """
     try:
         if not SKILLS_DIR.exists():
@@ -1474,6 +1497,20 @@ def skill_view(
             if setup_needed
             else SkillReadinessStatus.AVAILABLE.value,
         }
+
+        try:
+            from tools.skill_usage import classify_skill_provenance
+
+            provenance = classify_skill_provenance(skill_name)
+        except Exception:
+            logger.debug(
+                "Failed to classify provenance for skill %s",
+                skill_name,
+                exc_info=True,
+            )
+            provenance = None
+        if provenance is not None:
+            result["provenance"] = provenance
 
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
         if setup_help:
