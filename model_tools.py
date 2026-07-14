@@ -1120,7 +1120,9 @@ def handle_function_call(
             )
         else:
             try:
-                approval_required = maybe_require_tool_approval(function_name, tool_call_id or "")
+                approval_required = maybe_require_tool_approval(
+                    function_name, tool_call_id or "", function_args
+                )
             except Exception as _tool_approval_err:
                 logger.error(
                     "tool approval guard error; failing closed for gated tools: %s",
