@@ -116,6 +116,12 @@ _session_approved: dict[str, set[str]] = {}
 _always_approved: set[str] = set()
 # Tool names injected from Omnia's durable per-toolkit grants.
 _injected_always_approved: set[str] = set()
+# Fresh server-authoritative check for one exact standing grant. The in-memory
+# sets above are only candidate indexes: they must never authorize a later write
+# by themselves because Omnia can revoke a shared grant while this process stays
+# warm. The API server registers this callback after it has loaded its Omnia
+# authority configuration.
+_always_approval_authority: Callable[[str], bool] | None = None
 # session_key -> per-session notify callback (bridges guard thread → chat stream).
 _notify_cbs: dict[str, Callable[[dict], None]] = {}
 # session_key -> FIFO of blocked approval waiters.
@@ -185,13 +191,45 @@ def record_session_approval(session_key: str, function_name: str) -> None:
 
 
 def is_always_approved(function_name: str) -> bool:
-    """True when the tool is approved for every conversation on this gateway
-    (the `always` scope), until the gateway restarts/reprovisions."""
+    """Return whether Omnia still grants this exact standing approval.
+
+    Local and injected names only identify possible grants. Every positive
+    candidate is checked against the server authority before a later write can
+    skip its prompt. There is deliberately no positive cache: a shared revoke
+    must take effect on every warm gateway without reload or reprovision.
+    """
     with _lock:
-        return (
+        candidate = (
             function_name in _always_approved
             or function_name in _injected_always_approved
         )
+        authority = _always_approval_authority
+    if not candidate:
+        return False
+    if authority is None:
+        logger.warning(
+            "standing tool approval authority unavailable; prompting for %s",
+            function_name,
+        )
+        return False
+    try:
+        return authority(function_name) is True
+    except Exception:
+        logger.warning(
+            "standing tool approval check failed; prompting for %s",
+            function_name,
+            exc_info=True,
+        )
+        return False
+
+
+def register_always_approval_authority(
+    cb: Callable[[str], bool] | None,
+) -> None:
+    """Set the server-authoritative checker used for standing grant candidates."""
+    global _always_approval_authority
+    with _lock:
+        _always_approval_authority = cb
 
 
 def record_always_approval(function_name: str) -> None:
@@ -402,16 +440,16 @@ def resolve_tool_approval(
                 entry = queue.pop(0)
         if queue is not None and not queue:
             _waits.pop(session_key, None)
-    if entry is not None:
-        entry.result = scope
-        entry.event.set()
-        # Remember the decision for the gateway's tool-complete callback, which
-        # attaches it to the gated call's real `completed` event as
-        # ``interaction.answered`` — mirroring request_user_input's answered
-        # echo and the `timed_out` marker — so the persisted turn rehydrates
-        # the card in its granted/denied state instead of "not answered".
-        with _lock:
+        if entry is not None:
+            entry.result = scope
+            # Commit the completed-event outcome before releasing the executor
+            # worker. Once signalled, that worker can finish the tool and consume
+            # this value immediately.
             _decisions[(session_key, entry.tool_call_id)] = scope
+    if entry is not None:
+        # Signal only after the decision is visible to the gateway's
+        # tool-complete callback, which can run as soon as this worker resumes.
+        entry.event.set()
         return True
     return False
 
