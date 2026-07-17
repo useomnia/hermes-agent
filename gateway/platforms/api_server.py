@@ -32,6 +32,7 @@ Requires:
 """
 
 import asyncio
+import copy
 import hashlib
 import hmac
 import json
@@ -92,7 +93,6 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
-
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
     """Parse a listen port without letting malformed env/config values crash startup."""
@@ -2340,6 +2340,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 # inline, so the turn stays alive (see _on_tool_complete).
                 if function_name == "request_user_input" and isinstance(function_args, dict):
                     progress["interaction"] = function_args
+                # Semantic client events: emit_omnio_event may project its call
+                # arguments under ``clientEvent``. The client validates the versioned
+                # envelope independently; Hermes transports it but never defines or
+                # executes the UI effect. Completed events stay generic.
+                if function_name == "emit_omnio_event" and isinstance(function_args, dict):
+                    progress["clientEvent"] = copy.deepcopy(function_args)
                 _stream_q.put(("__tool_progress__", progress))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):

@@ -48,6 +48,7 @@ AUTHOR_MAP = {
     "miguel@mff.io": "miguelff",
     "pablopazosp3@gmail.com": "ppazosp",
     "pablo@useomnia.com": "ppazosp",
+    "uesteibar@gmail.com": "uesteibar",
     # Upstream contributors new since the last sync (PR #15, NousResearch 89540d592):
     "SJWATTS89@OUTLOOK.COM": "lEWFkRAD",
     "daniel.laforce@argobox.com": "KeyArgo",
