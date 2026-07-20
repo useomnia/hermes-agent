@@ -56,6 +56,17 @@ def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Pat
     return external_category
 
 
+def _list_and_view_skill(skills_dir: Path, name: str):
+    """Return model-visible list and view metadata for one isolated skill."""
+    with (
+        patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+        patch("tools.skill_usage._skills_dir", return_value=skills_dir),
+    ):
+        listed = json.loads(skills_list())["skills"][0]
+        viewed = json.loads(skill_view(name))
+    return listed, viewed
+
+
 # ---------------------------------------------------------------------------
 # _parse_frontmatter
 # ---------------------------------------------------------------------------
@@ -330,6 +341,80 @@ class TestSkillsList:
             raw = skills_list()
         result = json.loads(raw)
         assert result["count"] == 2
+
+    def test_bundled_provenance_from_manifest(self, tmp_path):
+        _make_skill(tmp_path, "bundled-skill")
+        (tmp_path / ".bundled_manifest").write_text(
+            "bundled-skill:abc123\n", encoding="utf-8"
+        )
+
+        listed, viewed = _list_and_view_skill(tmp_path, "bundled-skill")
+
+        assert listed["provenance"] == "bundled"
+        assert viewed["provenance"] == "bundled"
+
+    def test_learned_provenance_when_not_installed(self, tmp_path):
+        _make_skill(tmp_path, "learned-skill")
+        (tmp_path / ".bundled_manifest").write_text("", encoding="utf-8")
+
+        listed, viewed = _list_and_view_skill(tmp_path, "learned-skill")
+
+        assert listed["provenance"] == "learned"
+        assert viewed["provenance"] == "learned"
+
+    def test_hub_installed_skill_has_bundled_provenance(self, tmp_path):
+        _make_skill(tmp_path, "hub-skill")
+        (tmp_path / ".bundled_manifest").write_text("", encoding="utf-8")
+        hub_dir = tmp_path / ".hub"
+        hub_dir.mkdir()
+        (hub_dir / "lock.json").write_text(
+            json.dumps({"installed": {"hub-skill": {}}}), encoding="utf-8"
+        )
+
+        listed, viewed = _list_and_view_skill(tmp_path, "hub-skill")
+
+        assert listed["provenance"] == "bundled"
+        assert viewed["provenance"] == "bundled"
+
+    def test_missing_manifest_omits_provenance(self, tmp_path):
+        _make_skill(tmp_path, "unknown-skill")
+        hub_dir = tmp_path / ".hub"
+        hub_dir.mkdir()
+        (hub_dir / "lock.json").write_text(
+            json.dumps({"installed": {"unknown-skill": {}}}), encoding="utf-8"
+        )
+
+        listed, viewed = _list_and_view_skill(tmp_path, "unknown-skill")
+
+        assert "provenance" not in listed
+        assert "provenance" not in viewed
+
+    def test_unreadable_manifest_omits_provenance(self, tmp_path):
+        _make_skill(tmp_path, "unknown-skill")
+        (tmp_path / ".bundled_manifest").write_text(
+            "unknown-skill:abc123\n", encoding="utf-8"
+        )
+
+        with patch(
+            "tools.skill_usage._read_bundled_manifest_names",
+            side_effect=OSError("permission denied"),
+        ):
+            listed, viewed = _list_and_view_skill(tmp_path, "unknown-skill")
+
+        assert "provenance" not in listed
+        assert "provenance" not in viewed
+
+    def test_corrupt_hub_lock_omits_provenance(self, tmp_path):
+        _make_skill(tmp_path, "unknown-skill")
+        (tmp_path / ".bundled_manifest").write_text("", encoding="utf-8")
+        hub_dir = tmp_path / ".hub"
+        hub_dir.mkdir()
+        (hub_dir / "lock.json").write_text("{not-json", encoding="utf-8")
+
+        listed, viewed = _list_and_view_skill(tmp_path, "unknown-skill")
+
+        assert "provenance" not in listed
+        assert "provenance" not in viewed
 
     def test_category_filter(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):

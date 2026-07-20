@@ -14,21 +14,29 @@ from tools.tool_approval import (
     APPROVAL_OPTIONS,
     _ApprovalWait,
     _always_approved,
+    _completion_reasons,
+    _decisions,
+    _injected_always_approved,
     _notify_cbs,
     _session_approved,
     _waits,
     clear_session,
+    consume_tool_approval_completion_reason,
+    consume_tool_approval_decision,
     fail_closed_denial,
     is_always_approved,
     is_gated_tool,
     is_tool_approved,
     maybe_require_tool_approval,
+    register_always_approval_authority,
     register_tool_approval_notify,
+    replace_injected_always_approvals,
     resolve_tool_approval,
     unregister_tool_approval_notify,
 )
 
 GATED = "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT"
+SIBLING = "mcp_connectors_GMAIL_SEND_EMAIL"
 READ = "mcp_connectors_GOOGLE_ANALYTICS_RUN_REPORT"
 SESSION = "sess-1"
 
@@ -41,18 +49,27 @@ def _clean_state(monkeypatch):
     token = set_current_session_key(SESSION)
     _session_approved.clear()
     _always_approved.clear()
+    _injected_always_approved.clear()
     _notify_cbs.clear()
     _waits.clear()
+    _completion_reasons.clear()
+    _decisions.clear()
+    register_always_approval_authority(lambda _function_name: True)
     mcp_tool._mcp_tool_read_only_hints.clear()
     # Model the connectors route having advertised its tools: the write is NOT
     # read-only (gated), the read IS (ungated). Gating reads the live annotation.
     mcp_tool._track_mcp_tool_read_only(GATED, False)
+    mcp_tool._track_mcp_tool_read_only(SIBLING, False)
     mcp_tool._track_mcp_tool_read_only(READ, True)
     yield
     _session_approved.clear()
     _always_approved.clear()
+    _injected_always_approved.clear()
     _notify_cbs.clear()
     _waits.clear()
+    _completion_reasons.clear()
+    _decisions.clear()
+    register_always_approval_authority(None)
     mcp_tool._mcp_tool_read_only_hints.clear()
     reset_current_session_key(token)
 
@@ -142,6 +159,9 @@ class TestMaybeRequireToolApproval:
         assert result is not None
         # A genuine timeout with a real interactive surface IS turn-ending.
         assert json.loads(result)["status"] == "approval_no_response"
+        assert (
+            consume_tool_approval_completion_reason(SESSION, "call-1") == "expired"
+        )
 
     def test_notify_raising_is_a_plumbing_error_not_a_user_timeout(self):
         # The notify callback raising means the card was never actually shown
@@ -159,7 +179,10 @@ class TestMaybeRequireToolApproval:
         captured = {}
         register_tool_approval_notify(
             SESSION,
-            lambda event: (captured.update(event), resolve_tool_approval(SESSION, GATED, "once")),
+            lambda event: (
+                captured.update(event),
+                resolve_tool_approval(SESSION, GATED, "once"),
+            ),
         )
         maybe_require_tool_approval(GATED, "call-9")
 
@@ -170,16 +193,20 @@ class TestMaybeRequireToolApproval:
         assert it["approval"]["tool"] == GATED
         assert it["approval"]["option_scopes"] == APPROVAL_OPTION_SCOPES
 
-
 class TestAlwaysScope:
     """`always` grants a tool for EVERY conversation on this gateway (not just the
-    current chat) and survives clear_session — it resets only on gateway restart."""
+    current chat) and survives clear_session until the next Omnia refresh."""
 
     def test_should_record_an_always_grant(self):
         # No waiter pending here, so the call itself returns False (nothing
         # released) even though the always grant is recorded for next time.
         assert resolve_tool_approval(SESSION, GATED, "always") is False
         assert is_always_approved(GATED) is True
+
+    def test_should_record_all_supplied_tools_for_always(self):
+        assert resolve_tool_approval(SESSION, GATED, "always", tools=[SIBLING]) is False
+        assert is_always_approved(GATED) is True
+        assert is_always_approved(SIBLING) is True
 
     def test_always_is_not_a_session_grant(self):
         # Stored gateway-wide, so another session sees no SESSION grant for it,
@@ -201,6 +228,76 @@ class TestAlwaysScope:
         unregister_tool_approval_notify(SESSION)
         assert maybe_require_tool_approval(GATED) is None
 
+    def test_first_always_call_proceeds_but_later_call_waits_for_persistence(self):
+        register_always_approval_authority(None)
+        register_tool_approval_notify(SESSION, _resolving_notify("always"))
+
+        assert maybe_require_tool_approval(GATED, "call-1") is None
+
+        unregister_tool_approval_notify(SESSION)
+        result = maybe_require_tool_approval(GATED, "call-2")
+        assert json.loads(result)["status"] == "approval_error"
+
+    def test_warm_gateway_rechecks_and_prompts_after_authoritative_revoke(self):
+        replace_injected_always_approvals([GATED])
+        authority_results = iter([True, False])
+        checked: list[str] = []
+
+        def authority(function_name: str) -> bool:
+            checked.append(function_name)
+            return next(authority_results)
+
+        register_always_approval_authority(authority)
+        assert maybe_require_tool_approval(GATED, "call-1") is None
+
+        prompts: list[dict] = []
+
+        def deny_prompt(event: dict) -> None:
+            prompts.append(event)
+            resolve_tool_approval(SESSION, GATED, "deny", "call-2")
+
+        register_tool_approval_notify(SESSION, deny_prompt)
+        result = maybe_require_tool_approval(GATED, "call-2")
+
+        assert json.loads(result)["status"] == "approval_denied"
+        assert prompts[0]["interaction"]["approval"]["tool"] == GATED
+        assert checked == [GATED, GATED]
+
+    def test_authority_outage_prompts_instead_of_using_stale_grant(self):
+        replace_injected_always_approvals([GATED])
+
+        def unavailable(_function_name: str) -> bool:
+            raise TimeoutError("omnia timed out")
+
+        register_always_approval_authority(unavailable)
+        register_tool_approval_notify(SESSION, _resolving_notify("deny"))
+
+        result = maybe_require_tool_approval(GATED, "call-1")
+        assert json.loads(result)["status"] == "approval_denied"
+
+    def test_injected_always_refresh_replaces_local_always(self):
+        resolve_tool_approval(SESSION, GATED, "always")
+        replace_injected_always_approvals([SIBLING])
+
+        assert is_always_approved(GATED) is False
+        assert is_always_approved(SIBLING) is True
+
+        replace_injected_always_approvals([])
+        assert is_always_approved(GATED) is False
+        assert is_always_approved(SIBLING) is False
+
+    def test_revoke_reload_after_in_chat_always_grant_forces_the_next_call_to_prompt(
+        self,
+    ):
+        register_tool_approval_notify(SESSION, _resolving_notify("always"))
+        assert maybe_require_tool_approval(GATED, "call-1") is None
+        unregister_tool_approval_notify(SESSION)
+        assert maybe_require_tool_approval(GATED, "call-2") is None
+
+        replace_injected_always_approvals([])
+
+        assert maybe_require_tool_approval(GATED, "call-3") is not None
+
 
 class TestResolveToolApproval:
     def test_should_reject_an_invalid_scope(self):
@@ -212,6 +309,40 @@ class TestResolveToolApproval:
         # no waiter was actually released for THIS decision.
         assert resolve_tool_approval(SESSION, GATED, "session") is False
         assert is_tool_approved(SESSION, GATED) is True
+
+    def test_should_record_all_supplied_tools_for_session(self):
+        assert (
+            resolve_tool_approval(SESSION, GATED, "session", tools=[SIBLING]) is False
+        )
+        assert is_tool_approved(SESSION, GATED) is True
+        assert is_tool_approved(SESSION, SIBLING) is True
+
+    def test_should_ignore_read_unknown_and_non_connector_tools_from_the_client_list(
+        self,
+    ):
+        assert (
+            resolve_tool_approval(
+                SESSION,
+                GATED,
+                "session",
+                tools=[SIBLING, READ, "mcp_connectors_UNKNOWN_WRITE", "terminal"],
+            )
+            is False
+        )
+
+        assert is_tool_approved(SESSION, GATED) is True
+        assert is_tool_approved(SESSION, SIBLING) is True
+        assert is_tool_approved(SESSION, READ) is False
+        assert is_tool_approved(SESSION, "mcp_connectors_UNKNOWN_WRITE") is False
+        assert is_tool_approved(SESSION, "terminal") is False
+
+    def test_should_not_record_an_unknown_current_tool_name(self):
+        assert (
+            resolve_tool_approval(SESSION, "mcp_connectors_UNKNOWN_WRITE", "session")
+            is False
+        )
+
+        assert is_tool_approved(SESSION, "mcp_connectors_UNKNOWN_WRITE") is False
 
     def test_no_waiter_once_records_nothing_and_returns_false(self):
         assert resolve_tool_approval(SESSION, GATED, "once") is False
@@ -227,6 +358,48 @@ class TestResolveToolApproval:
         _waits[SESSION] = [entry]
         assert resolve_tool_approval(SESSION, GATED, "once", "call-A") is True
         assert entry.result == "once" and entry.event.is_set()
+
+    def test_should_record_the_decision_for_the_completed_event_echo(self):
+        # A released waiter's decision is consumed once by the gateway's
+        # tool-complete callback (interaction.answered on the completed event).
+        entry = _ApprovalWait(GATED, "call-A")
+        _waits[SESSION] = [entry]
+        resolve_tool_approval(SESSION, GATED, "deny", "call-A")
+
+        assert consume_tool_approval_decision(SESSION, "call-A") == "deny"
+        assert consume_tool_approval_decision(SESSION, "call-A") is None
+
+    def test_should_store_the_decision_before_releasing_the_waiter(self):
+        entry = _ApprovalWait(GATED, "call-A")
+        _waits[SESSION] = [entry]
+        consumed = threading.Event()
+        observed: list[str | None] = []
+        signal = entry.event.set
+
+        def signal_then_wait_for_consumer() -> None:
+            signal()
+            assert consumed.wait(timeout=3), "consumer should run after the signal"
+
+        entry.event.set = signal_then_wait_for_consumer
+
+        def consume_after_signal() -> None:
+            assert entry.event.wait(timeout=3), "resolver should release the waiter"
+            observed.append(consume_tool_approval_decision(SESSION, "call-A"))
+            consumed.set()
+
+        consumer = threading.Thread(target=consume_after_signal)
+        consumer.start()
+        assert resolve_tool_approval(SESSION, GATED, "once", "call-A") is True
+        consumer.join(timeout=3)
+
+        assert not consumer.is_alive()
+        assert observed == ["once"]
+
+    def test_should_not_record_a_decision_when_no_waiter_was_released(self):
+        # A late decision (the wait already timed out) records the grant but
+        # must not echo answered on a call that already failed closed.
+        assert resolve_tool_approval(SESSION, GATED, "session", "call-A") is False
+        assert consume_tool_approval_decision(SESSION, "call-A") is None
 
     def test_should_scope_grants_per_session(self):
         resolve_tool_approval(SESSION, GATED, "session")
@@ -281,7 +454,9 @@ class TestConcurrentApproval:
         thread_b = threading.Thread(target=worker, args=("call-B",))
         thread_a.start()
         thread_b.start()
-        assert both_blocked.wait(timeout=3), "both writes should be blocked on their cards"
+        assert both_blocked.wait(timeout=3), (
+            "both writes should be blocked on their cards"
+        )
 
         # Approve ONLY call-B for the session; call-A must stay blocked.
         resolve_tool_approval(SESSION, GATED, "session", "call-B")
@@ -306,7 +481,9 @@ class TestInterruptRelease:
         register_tool_approval_notify(SESSION, lambda event: blocked.set())
 
         def worker():
-            set_current_session_key(SESSION)  # raw thread: bind the session-key contextvar
+            set_current_session_key(
+                SESSION
+            )  # raw thread: bind the session-key contextvar
             result["choice"] = maybe_require_tool_approval(GATED, "call-1")
 
         thread = threading.Thread(target=worker)
@@ -317,8 +494,16 @@ class TestInterruptRelease:
         set_interrupt(True, thread.ident)
         try:
             thread.join(timeout=5)
-            assert not thread.is_alive(), "interrupt must release the wait, not park for the timeout"
-            assert result["choice"] is not None, "interrupted wait fails closed (denial)"
+            assert not thread.is_alive(), (
+                "interrupt must release the wait, not park for the timeout"
+            )
+            assert result["choice"] is not None, (
+                "interrupted wait fails closed (denial)"
+            )
+            assert (
+                consume_tool_approval_completion_reason(SESSION, "call-1")
+                == "cancelled"
+            )
         finally:
             set_interrupt(False, thread.ident)
 

@@ -95,6 +95,18 @@ STAGE_NAME=""
 JSON_OUTPUT=false
 NON_INTERACTIVE=false
 INCLUDE_DESKTOP=false
+# Lean-install knobs (all default to today's full behavior). Aimed at headless
+# / server / sandbox installs that don't use the desktop app, TUI, or voice:
+#   PYTHON_EXTRAS    which [project.optional-dependencies] set `uv sync` /
+#                    the pip fallback tiers install. "all" = the curated
+#                    default; a CSV (e.g. "mcp" or "mcp,web") narrows it;
+#                    "none" installs core dependencies only.
+#   SKIP_FFMPEG      skip the ffmpeg system package (TTS voice messages only).
+#   NODE_WORKSPACES  false = root `npm install --workspaces=false` (keeps the
+#                    browser tools) and skip the TUI dependency install.
+PYTHON_EXTRAS="all"
+SKIP_FFMPEG=false
+NODE_WORKSPACES=true
 
 # Detect non-interactive mode (e.g. curl | bash)
 # When stdin is not a terminal, read -p will fail with EOF,
@@ -152,6 +164,22 @@ while [[ $# -gt 0 ]]; do
             INCLUDE_DESKTOP=true
             shift
             ;;
+        --extras)
+            if [[ ! "$2" =~ ^[A-Za-z0-9_,-]+$ ]]; then
+                echo "Invalid --extras value: '$2' (expected a comma-separated extras list, 'all', or 'none')"
+                exit 1
+            fi
+            PYTHON_EXTRAS="$2"
+            shift 2
+            ;;
+        --skip-ffmpeg)
+            SKIP_FFMPEG=true
+            shift
+            ;;
+        --no-node-workspaces)
+            NODE_WORKSPACES=false
+            shift
+            ;;
         --dir)
             INSTALL_DIR="$2"
             INSTALL_DIR_EXPLICIT=true
@@ -188,6 +216,17 @@ while [[ $# -gt 0 ]]; do
             echo "  --json         Print a JSON result frame for --stage"
             echo "  --non-interactive  Skip stages that require user input"
             echo "  --include-desktop  Also build the desktop app (apps/desktop -> Hermes.app)"
+            echo "  --extras LIST  Python extras to install (default: all)"
+            echo "                   'all' = the curated [all] set from pyproject.toml,"
+            echo "                   a CSV picks specific extras (e.g. --extras mcp,web),"
+            echo "                   'none' = core dependencies only."
+            echo "                   For lean server/sandbox installs; the Termux install"
+            echo "                   path keeps its own curated profiles."
+            echo "  --skip-ffmpeg  Skip the ffmpeg system package (only TTS voice"
+            echo "                   messages need it)"
+            echo "  --no-node-workspaces  Install root Node deps only (browser tools);"
+            echo "                   skip the workspace packages (desktop app, TUI, web UI)."
+            echo "                   'hermes --tui' won't work until they are installed."
             echo "  --dir PATH     Installation directory"
             echo "                   default (non-root):  ~/.hermes/hermes-agent"
             echo "                   default (root, Linux): /usr/local/lib/hermes-agent"
@@ -964,6 +1003,15 @@ install_system_packages() {
         need_ffmpeg=true
     fi
 
+    # Honor --skip-ffmpeg BEFORE the per-distro install branches (including
+    # Termux) so none of them ever adds the package. An explicit
+    # `--ensure ffmpeg` run still installs it — that path doesn't go through
+    # this needs-detection.
+    if [ "$SKIP_FFMPEG" = true ] && [ "$need_ffmpeg" = true ]; then
+        log_info "Skipping ffmpeg install (--skip-ffmpeg) — TTS voice messages will be limited"
+        need_ffmpeg=false
+    fi
+
     # Termux always needs the Android build toolchain for the tested pip path,
     # even when ripgrep/ffmpeg are already present.
     if [ "$DISTRO" = "termux" ]; then
@@ -1399,8 +1447,35 @@ install_deps() {
         fi
     fi
 
-    # Install the main package in editable mode with all extras.
-    #
+    # Install the main package in editable mode with the selected extras
+    # ($PYTHON_EXTRAS — "all" unless the caller narrowed it via --extras).
+    # Both the uv sync tier and the pip fallback tiers below honor it, so a
+    # lean install never silently falls back to a fatter set than requested.
+    local _EXTRAS_LABEL="$PYTHON_EXTRAS"
+    local _UV_EXTRA_ARGS=()
+    local _TIER1_SPEC="."
+    if [ "$PYTHON_EXTRAS" != "none" ]; then
+        local _extras_arr=() _x
+        IFS=',' read -ra _extras_arr <<< "$PYTHON_EXTRAS"
+        for _x in "${_extras_arr[@]}"; do
+            _UV_EXTRA_ARGS+=(--extra "$_x")
+        done
+        _TIER1_SPEC=".[$PYTHON_EXTRAS]"
+    fi
+
+    # Record the extras profile next to the venv so `hermes update` (and the
+    # interrupted-install recovery) reinstalls the SAME set instead of
+    # re-fattening a lean install back to [all]. Written before the install
+    # attempts so an interrupted install recovers to the requested profile
+    # too. Default installs remove it — re-running the installer without
+    # --extras is the documented way back to [all]. See INSTALL_EXTRAS_MARKER
+    # in hermes_cli/main.py.
+    if [ "$PYTHON_EXTRAS" != "all" ]; then
+        printf '%s\n' "$PYTHON_EXTRAS" > "$INSTALL_DIR/.install-extras"
+    else
+        rm -f "$INSTALL_DIR/.install-extras"
+    fi
+
     # Hash-verified install (Tier 0) — when uv.lock is present, prefer
     # `uv sync --locked`. The lockfile records SHA256 hashes for every
     # transitive, so a compromised transitive (different hash than what
@@ -1413,7 +1488,7 @@ install_deps() {
     # extras spec, NOT because they're equivalent in posture.
     if [ -f "uv.lock" ]; then
         log_info "Trying tier: hash-verified (uv.lock) ..."
-        log_info "(this resolves + downloads the curated [all] set — first run on a"
+        log_info "(this resolves + downloads the '$_EXTRAS_LABEL' extras set — first run on a"
         log_info " fresh venv can take 1-5 minutes; uv prints progress below)"
         # Stream uv's progress directly to the user instead of swallowing
         # it with `2>"$(mktemp)"`.  Two reasons:
@@ -1426,17 +1501,18 @@ install_deps() {
         #      uv error message was unreachable — the user just got the
         #      generic "lockfile may be stale" warning.
         #
-        # Critical flag choice: `--extra all`, NOT `--all-extras`.
+        # Critical flag choice: explicit `--extra` flags, NOT `--all-extras`.
         #   --all-extras = every [project.optional-dependencies] key.
         #                  This bypasses the curated `[all]` extra
         #                  entirely and pulls e.g. [matrix] (which
         #                  needs python-olm + make on Windows) and
         #                  [rl] (git+https deps that fail offline).
-        #   --extra all  = install just the `[all]` extra's contents.
+        #   --extra all  = install just the `[all]` extra's contents
+        #                  (the default; --extras swaps in a narrower set).
         #                  This respects the curation in pyproject.toml.
         # uv's own progress UI handles TTY detection and downgrades
         # gracefully when stdout/stderr aren't terminals.
-        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
+        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync ${_UV_EXTRA_ARGS[@]+"${_UV_EXTRA_ARGS[@]}"} --locked; then
             log_success "Main package installed (hash-verified via uv.lock)"
             log_success "All dependencies installed"
             return 0
@@ -1452,8 +1528,9 @@ install_deps() {
     # fresh install all the way down to "core only" — the user should keep
     # everything else they signed up for.
     #
-    # Tier 1: [all] — the curated extra in pyproject.toml.
-    # Tier 2: [all] minus the currently-broken extras list (_BROKEN_EXTRAS).
+    # Tier 1: the requested extras set — the curated [all] extra by default,
+    #         or the narrower --extras selection when one was given.
+    # Tier 2: that same set minus the currently-broken extras list (_BROKEN_EXTRAS).
     #         Edit _BROKEN_EXTRAS below when something on PyPI breaks; this
     #         lets users keep the rest of [all] when one transitive is
     #         unavailable. The list of [all]'s contents is parsed from
@@ -1467,12 +1544,17 @@ install_deps() {
     #         a separate PyPI-only tier had no remaining content.
     local _BROKEN_EXTRAS=()  # populate when an extra becomes unresolvable
 
-    # Parse [project.optional-dependencies].all from pyproject.toml.
-    # tomllib is stdlib on Python 3.11+ which uv's bootstrap guarantees.
-    # Falls back to a hand list if parse fails — defensive only.
+    # Resolve the extras list the broken-extras filter below operates on.
+    # For a caller-narrowed set (--extras) it IS the list; for the default
+    # "all" (or "none"), parse [project.optional-dependencies].all from
+    # pyproject.toml. tomllib is stdlib on Python 3.11+ which uv's bootstrap
+    # guarantees. Falls back to a hand list if parse fails — defensive only.
     local _ALL_EXTRAS_CSV
-    _ALL_EXTRAS_CSV="$(
-        "$PYTHON_PATH" - <<'PY' 2>/dev/null
+    if [ "$PYTHON_EXTRAS" != "all" ]; then
+        [ "$PYTHON_EXTRAS" = "none" ] && _ALL_EXTRAS_CSV="" || _ALL_EXTRAS_CSV="$PYTHON_EXTRAS"
+    else
+        _ALL_EXTRAS_CSV="$(
+            "$PYTHON_PATH" - <<'PY' 2>/dev/null
 import re, sys, tomllib
 try:
     with open("pyproject.toml", "rb") as fh:
@@ -1488,14 +1570,15 @@ except Exception as e:
     print("", file=sys.stderr)
     sys.exit(1)
 PY
-    )"
-    if [ -z "$_ALL_EXTRAS_CSV" ]; then
-        log_warn "Could not parse [all] from pyproject.toml; falling back to .[all] only."
-        _ALL_EXTRAS_CSV=""
+        )"
+        if [ -z "$_ALL_EXTRAS_CSV" ]; then
+            log_warn "Could not parse [all] from pyproject.toml; falling back to .[all] only."
+            _ALL_EXTRAS_CSV=""
+        fi
     fi
 
-    # Build "[all] minus broken" spec by filtering the parsed list.
-    local _SAFE_SPEC=".[all]"
+    # Build "requested extras minus broken" spec by filtering the list.
+    local _SAFE_SPEC="$_TIER1_SPEC"
     if [ -n "$_ALL_EXTRAS_CSV" ] && [ "${#_BROKEN_EXTRAS[@]}" -gt 0 ]; then
         local _SAFE_EXTRAS=()
         local _e _b _skip
@@ -1528,8 +1611,8 @@ PY
         return 1
     }
 
-    install_tier "all" ".[all]" \
-        || install_tier "all minus known-broken (${_BROKEN_EXTRAS[*]:-none})" "$_SAFE_SPEC" \
+    install_tier "$_EXTRAS_LABEL" "$_TIER1_SPEC" \
+        || install_tier "$_EXTRAS_LABEL minus known-broken (${_BROKEN_EXTRAS[*]:-none})" "$_SAFE_SPEC" \
         || install_tier "core only (no extras)" "."
 
     rm -f "$ALL_INSTALL_LOG"
@@ -1537,14 +1620,14 @@ PY
     if [ "$_installed" = false ]; then
         log_error "Package installation failed even with no extras."
         log_info "Check that build tools are installed: sudo apt install build-essential python3-dev"
-        log_info "Then re-run: cd $INSTALL_DIR && uv pip install -e '.[all]'"
+        log_info "Then re-run: cd $INSTALL_DIR && uv pip install -e '$_TIER1_SPEC'"
         exit 1
     fi
 
     if [ "$_tier_name" != "all (with RL/matrix extras)" ]; then
         log_warn "Note: installed via fallback tier ($_tier_name)."
         log_info "Some optional features may be missing. After resolving any"
-        log_info "PyPI/network issue, re-run: $UV_CMD pip install -e '.[all]'"
+        log_info "PyPI/network issue, re-run: $UV_CMD pip install -e '$_TIER1_SPEC'"
     fi
 
     log_success "Main package installed"
@@ -1912,11 +1995,23 @@ install_node_deps() {
     fi
 
     if [ -f "$INSTALL_DIR/package.json" ]; then
-        log_info "Installing Node.js dependencies (browser tools)..."
         cd "$INSTALL_DIR"
-        npm install --silent 2>/dev/null || {
-            log_warn "npm install failed (browser tools may not work)"
-        }
+        # The root package.json declares npm workspaces (apps/*, ui-tui, web),
+        # so a bare `npm install` also materialises the desktop app, TUI, and
+        # web UI dependency trees. Headless/server installs only need the root
+        # deps (the agent-browser tooling): --no-node-workspaces scopes the
+        # install to those with `--workspaces=false`.
+        if [ "$NODE_WORKSPACES" = false ]; then
+            log_info "Installing root Node.js dependencies only (browser tools; --no-node-workspaces)..."
+            npm install --workspaces=false --silent 2>/dev/null || {
+                log_warn "npm install failed (browser tools may not work)"
+            }
+        else
+            log_info "Installing Node.js dependencies (browser tools)..."
+            npm install --silent 2>/dev/null || {
+                log_warn "npm install failed (browser tools may not work)"
+            }
+        fi
         log_success "Node.js dependencies installed"
 
         # Install Playwright browser + system dependencies.
@@ -2012,7 +2107,9 @@ install_node_deps() {
     fi
 
     # Install TUI dependencies
-    if [ -f "$INSTALL_DIR/ui-tui/package.json" ]; then
+    if [ "$NODE_WORKSPACES" = false ]; then
+        log_info "Skipping TUI dependencies (--no-node-workspaces) — 'hermes --tui' needs them"
+    elif [ -f "$INSTALL_DIR/ui-tui/package.json" ]; then
         log_info "Installing TUI dependencies..."
         cd "$INSTALL_DIR/ui-tui"
         npm install --silent 2>/dev/null || {

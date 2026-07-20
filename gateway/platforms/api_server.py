@@ -44,6 +44,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 try:
     from aiohttp import web
@@ -60,6 +62,21 @@ from gateway.platforms.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+_OMNIO_DURABLE_APPROVALS_DISABLED_ENV = "OMNIO_TOOL_APPROVAL_DURABLE_DISABLED"
+_OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS = 5.0
+
+
+def _parse_omnio_connector_toolkit_approval_tools(payload: Any) -> list[str]:
+    """Validate and normalize Omnia's authoritative standing-grant response."""
+    if not isinstance(payload, dict):
+        raise ValueError("approval payload must be an object")
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        raise ValueError("approval payload tools must be an array")
+    if not all(isinstance(item, str) for item in tools):
+        raise ValueError("approval payload tools must contain strings")
+    return [item.strip() for item in tools if item.strip()]
 
 
 def _hermes_version() -> str:
@@ -1974,30 +1991,40 @@ class APIServerAdapter(BasePlatformAdapter):
         return response
 
     def _maybe_expand_slash_command(self, user_message: Any, session_id: str) -> Optional[str]:
-        """Expand a leading ``/command`` into the message the agent should process.
+        """Expand a ``/command`` found anywhere in the message into the message
+        the agent should process.
 
         Mirrors how every other Hermes surface (CLI/TUI/messaging gateway, see
-        ``gateway/run.py``) dispatches slash commands. Two cases expand:
+        ``gateway/run.py``) dispatches slash commands, except the command does
+        not have to lead the message: every whitespace-delimited ``/token`` is a
+        candidate, and the FIRST one that confirms as a command expands — one
+        command per message, matching the composer, which refuses a second chip
+        once one is in the draft. Two cases expand:
 
-        - ``/<skill-or-bundle> [instruction]`` — resolved against the installed
-          bundles (which take precedence) and skills; the turn is replaced with
-          the payload built by ``build_skill_invocation_message`` (activation note
-          + skill content + skill-dir + config + the trailing instruction).
-        - ``/learn [what to learn from]`` — the one built-in command that makes
-          sense on the chat path (no Omnia-UI equivalent): rewritten to the
-          standards-guided ``build_learn_prompt`` that drives the agent to author
-          a skill via ``skill_manage``. Side-effecting built-ins (``/new``,
-          ``/yolo``, …) are deliberately NOT handled here.
+        - ``/<skill-or-bundle>`` — resolved against the installed bundles (which
+          take precedence) and skills; the turn is replaced with the payload
+          built by ``build_skill_invocation_message`` (activation note + skill
+          content + skill-dir + config + the user instruction).
+        - ``/learn`` — the one built-in command that makes sense on the chat
+          path (no Omnia-UI equivalent): rewritten to the standards-guided
+          ``build_learn_prompt`` that drives the agent to author a skill via
+          ``skill_manage``. Side-effecting built-ins (``/new``, ``/yolo``, …)
+          are deliberately NOT handled here.
+
+        The instruction handed to the builder is the message with the matched
+        token spliced out — the prose around the command IS the instruction, so
+        "please /site-audit the pricing page" invokes ``site-audit`` with
+        "please the pricing page".
 
         The unmodified builder output is returned so the memory layer's invocation
         markers stay intact.
 
-        Returns the expanded message, or ``None`` when the message is not a
-        recognized command — in which case the caller forwards the original text
-        untouched. Unlike the messaging gateway, the chat-completions API carries
-        general prose, so a message that merely starts with ``/`` (a path like
-        ``/Users/x``, a question about ``/etc``) must pass through: only a
-        confirmed match is intercepted.
+        Returns the expanded message, or ``None`` when no token confirms as a
+        command — in which case the caller forwards the original text untouched.
+        Unlike the messaging gateway, the chat-completions API carries general
+        prose, so a ``/`` token that resolves to nothing (a path like
+        ``/Users/x``, a mention of ``/etc`` or the ``/brand`` folder) must pass
+        through: only a confirmed match is intercepted.
 
         Only plain-text turns expand: a multimodal turn (text + image) arrives as
         a content list, not a ``str``, so a ``/skill`` typed alongside an
@@ -2006,16 +2033,35 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         if not isinstance(user_message, str):
             return None
-        text = user_message.lstrip()
-        if not text.startswith("/"):
-            return None
-        # "/command rest of the instruction" -> ("command", "rest of the instruction")
-        parts = text[1:].split(None, 1)
-        if not parts:
-            return None
-        command = parts[0]
-        user_instruction = parts[1].strip() if len(parts) > 1 else ""
+        for command, user_instruction in self._slash_command_candidates(user_message):
+            expanded = self._expand_slash_command(command, user_instruction, session_id)
+            if expanded is not None:
+                return expanded
+        return None
 
+    @staticmethod
+    def _slash_command_candidates(text: str) -> "list[tuple[str, str]]":
+        """The ``(command, instruction)`` candidates in ``text``, in order.
+
+        A candidate is any whitespace-delimited ``/token``; ``command`` is the
+        token minus its slash (resolution — including underscore→hyphen
+        normalization — is the resolvers' job). ``instruction`` is the message
+        with that token spliced out: the seam keeps the whitespace that preceded
+        the token and drops what followed it, so a mid-sentence command leaves
+        single spacing and a command on its own line leaves no blank one.
+        """
+        candidates = []
+        for match in re.finditer(r"(?<!\S)/(\S+)", text):
+            before = text[: match.start()]
+            after = text[match.end():]
+            instruction = (before + after.lstrip()).strip() if before.strip() else after.strip()
+            candidates.append((match.group(1), instruction))
+        return candidates
+
+    def _expand_slash_command(
+        self, command: str, user_instruction: str, session_id: str
+    ) -> Optional[str]:
+        """Expand one candidate ``command`` (no slash), or ``None`` on no match."""
         # Built-in /learn (a message-expansion command) before skills/bundles —
         # it rewrites the turn to a prompt that has the agent author a skill.
         if command == "learn":
@@ -2362,6 +2408,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     # does, rather than letting a malformed result raise here.
                     if isinstance(parsed, dict) and parsed.get("status") == "answered":
                         completed["interaction"] = {"answered": parsed.get("response", "")}
+                    if isinstance(parsed, dict) and parsed.get("status") == "no_response":
+                        try:
+                            from tools.user_input import (
+                                consume_user_input_completion_reason,
+                            )
+
+                            completion_reason = consume_user_input_completion_reason(
+                                session_id
+                            )
+                        except Exception:
+                            completion_reason = None
+                        if completion_reason == "expired":
+                            completed.setdefault("interaction", {})["timed_out"] = True
                     turn_ending = isinstance(parsed, dict) and parsed.get("status") in (
                         "presented",
                         "no_response",
@@ -2379,9 +2438,41 @@ class APIServerAdapter(BasePlatformAdapter):
                         parsed = json.loads(function_result or "{}")
                     except Exception:
                         parsed = {}
+                    # A resolved decision (once/session/always/deny) rides the
+                    # gated call's completed event as `interaction.answered` —
+                    # mirroring request_user_input's answered echo — so the
+                    # persisted turn rehydrates the approval card in its
+                    # granted/denied state instead of "not answered".
+                    try:
+                        from tools.tool_approval import consume_tool_approval_decision
+
+                        decision = consume_tool_approval_decision(session_id, tool_call_id)
+                    except Exception:
+                        decision = None
+                    if decision is not None:
+                        completed.setdefault("interaction", {})["answered"] = decision
                     if isinstance(parsed, dict) and parsed.get("status") == "approval_no_response":
+                        try:
+                            from tools.tool_approval import (
+                                consume_tool_approval_completion_reason,
+                            )
+
+                            completion_reason = consume_tool_approval_completion_reason(
+                                session_id,
+                                tool_call_id,
+                            )
+                        except Exception:
+                            completion_reason = None
+                        if completion_reason == "expired":
+                            completed.setdefault("interaction", {})["timed_out"] = True
+                            interrupt_message = (
+                                "awaiting user approval (tool approval timed out)"
+                            )
+                        else:
+                            interrupt_message = (
+                                "awaiting user approval (tool approval ended without response)"
+                            )
                         turn_ending = True
-                        interrupt_message = "awaiting user approval (tool approval timed out)"
                 # Omnia task-list tracker: the `todo` tool returns the full current
                 # list ({"todos": [{id, content, status}], "summary": {...}}) on every
                 # call. Forward the `todos` array on the completed event so the Omnia
@@ -2403,13 +2494,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     try:
                         agent_ref[0].interrupt(interrupt_message)
                     except Exception:
-                        # The UI already shows a hard "timed out" / "expired"
-                        # state for this card (request_user_input no_response,
-                        # or a connector-approval timeout) — if the interrupt
-                        # itself fails, the agent keeps running underneath that
-                        # UI with nothing telling us. Log loudly so this isn't
-                        # silent; don't re-raise, the tool-complete event must
-                        # still ship.
+                        # The completed event already tells the UI that this
+                        # interaction ended. If the interrupt fails, the agent
+                        # keeps running underneath that finished card. Log
+                        # loudly so this is not silent; do not re-raise because
+                        # the tool-complete event must still ship.
                         logger.warning(
                             "[api_server] failed to interrupt agent for turn-ending "
                             "tool completion (tool_call_id=%s, function_name=%s)",
@@ -4900,7 +4989,28 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=400,
                 )
-            recorded = resolve_tool_approval(session_key, tool, scope, tool_call_id)
+            raw_tools = body.get("tools")
+            tools: list[str] | None = None
+            if raw_tools is not None:
+                if not isinstance(raw_tools, list):
+                    return web.json_response(
+                        _openai_error("'tools' must be an array", code="invalid_approval_tools"),
+                        status=400,
+                    )
+                tools = []
+                for item in raw_tools:
+                    if not isinstance(item, str):
+                        return web.json_response(
+                            _openai_error(
+                                "'tools' must contain only strings",
+                                code="invalid_approval_tools",
+                            ),
+                            status=400,
+                        )
+                    stripped = item.strip()
+                    if stripped:
+                        tools.append(stripped)
+            recorded = resolve_tool_approval(session_key, tool, scope, tool_call_id, tools)
         except Exception as exc:
             logger.exception("[api_server] tool approval resolution failed")
             return web.json_response(_openai_error(str(exc)), status=500)
@@ -4990,6 +5100,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # discover_mcp_tools() and corrupt _servers or stop the MCP loop
             # mid-rebuild.
             async with self._mcp_reload_lock:
+                await self._refresh_omnio_connector_toolkit_approvals()
                 with _lock:
                     old_servers = set(_servers.keys())
                 await loop.run_in_executor(None, shutdown_mcp_servers)
@@ -5282,6 +5393,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._site = web.TCPSite(self._runner, self._host, self._port)
             await self._site.start()
 
+            await self._refresh_omnio_connector_toolkit_approvals()
             self._mark_connected()
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
@@ -5292,6 +5404,117 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
+
+    async def _refresh_omnio_connector_toolkit_approvals(self) -> None:
+        try:
+            from tools.tool_approval import (
+                register_always_approval_authority,
+                replace_injected_always_approvals,
+            )
+            from utils import env_var_enabled
+        except Exception:
+            logger.warning("[api_server] Omnio approval injection unavailable", exc_info=True)
+            return
+
+        # The snapshots loaded here are only candidate indexes. Register the
+        # uncached exact-tool check that must confirm every later skip.
+        register_always_approval_authority(
+            self._is_omnio_connector_toolkit_approval_granted
+        )
+
+        if env_var_enabled(_OMNIO_DURABLE_APPROVALS_DISABLED_ENV):
+            replace_injected_always_approvals([])
+            return
+
+        base_url = os.environ.get("OMNIA_BASE_URL", "").strip().rstrip("/")
+        api_token = os.environ.get("OMNIA_API_TOKEN", "").strip()
+        brand_id = os.environ.get("OMNIO_BRAND_ID", "").strip()
+        if not base_url or not api_token or not brand_id:
+            replace_injected_always_approvals([])
+            return
+
+        try:
+            tools = await self._fetch_omnio_connector_toolkit_approvals(
+                base_url=base_url,
+                api_token=api_token,
+                brand_id=brand_id,
+            )
+        except Exception as exc:
+            logger.warning("[api_server] Omnio approval injection failed: %s", exc)
+            replace_injected_always_approvals([])
+            return
+
+        replace_injected_always_approvals(tools)
+
+    def _is_omnio_connector_toolkit_approval_granted(
+        self,
+        function_name: str,
+    ) -> bool:
+        """Check one standing grant against Omnia without caching a positive.
+
+        Tool execution calls this from its worker thread. Any missing authority,
+        timeout, non-2xx response or malformed body raises; the approval gate
+        catches that and prompts instead of executing the write.
+        """
+        from utils import env_var_enabled
+
+        if env_var_enabled(_OMNIO_DURABLE_APPROVALS_DISABLED_ENV):
+            raise RuntimeError("durable approval authority is disabled")
+
+        base_url = os.environ.get("OMNIA_BASE_URL", "").strip().rstrip("/")
+        api_token = os.environ.get("OMNIA_API_TOKEN", "").strip()
+        brand_id = os.environ.get("OMNIO_BRAND_ID", "").strip()
+        if not base_url or not api_token or not brand_id:
+            raise RuntimeError("durable approval authority is unavailable")
+
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_token}",
+        }
+        bypass = os.environ.get("VERCEL_AUTOMATION_BYPASS_SECRET", "").strip()
+        if bypass:
+            headers["x-vercel-protection-bypass"] = bypass
+        url = (
+            f"{base_url}/api/agents/omnio/connector-toolkit-approvals?"
+            f"{urlencode({'brand': brand_id})}"
+        )
+        request = Request(url, headers=headers, method="GET")
+        with urlopen(
+            request,
+            timeout=_OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS,
+        ) as response:
+            status = response.status
+            if not isinstance(status, int) or not 200 <= status < 300:
+                raise RuntimeError(f"omnia_status={status}")
+            payload = json.loads(response.read())
+
+        tools = _parse_omnio_connector_toolkit_approval_tools(payload)
+        return function_name in tools
+
+    async def _fetch_omnio_connector_toolkit_approvals(
+        self, *, base_url: str, api_token: str, brand_id: str
+    ) -> list[str]:
+        import aiohttp
+
+        headers = {"Authorization": f"Bearer {api_token}"}
+        bypass = os.environ.get("VERCEL_AUTOMATION_BYPASS_SECRET", "").strip()
+        if bypass:
+            headers["x-vercel-protection-bypass"] = bypass
+        url = (
+            f"{base_url}/api/agents/omnio/connector-toolkit-approvals?"
+            f"{urlencode({'brand': brand_id})}"
+        )
+        timeout = aiohttp.ClientTimeout(total=_OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 404:
+                    return []
+                if response.status >= 400:
+                    text = await response.text()
+                    raise RuntimeError(f"omnia_status={response.status} body={text[:160]}")
+                payload = await response.json(content_type=None)
+
+        return _parse_omnio_connector_toolkit_approval_tools(payload)
 
     async def disconnect(self) -> None:
         """Stop the aiohttp web server and release all owned resources.

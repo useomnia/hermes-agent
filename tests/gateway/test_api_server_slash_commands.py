@@ -109,6 +109,98 @@ class TestSkillExpansion:
         resolve.assert_called_once_with("site_audit")
 
 
+class TestMidMessageExpansion:
+    def test_mid_sentence_skill_expands_with_surrounding_prose_as_instruction(self):
+        patches = _patch_skills(skill_key="/site-audit", skill_msg="X", bundle_key=None)
+        with patches[0], patches[1], patches[2], patches[3] as build:
+            out = _adapter()._maybe_expand_slash_command(
+                "please /site-audit the pricing page", SESSION_ID
+            )
+        assert out == "X"
+        build.assert_called_once_with("/site-audit", "please the pricing page", task_id=SESSION_ID)
+
+    def test_command_on_its_own_line_expands_and_keeps_other_lines(self):
+        patches = _patch_skills(skill_key="/site-audit", skill_msg="X", bundle_key=None)
+        with patches[0], patches[1], patches[2], patches[3] as build:
+            out = _adapter()._maybe_expand_slash_command(
+                "some context first\n/site-audit\non example.com", SESSION_ID
+            )
+        assert out == "X"
+        build.assert_called_once_with(
+            "/site-audit", "some context first\non example.com", task_id=SESSION_ID
+        )
+
+    def test_command_at_end_of_message_uses_preceding_text_as_instruction(self):
+        patches = _patch_skills(skill_key="/site-audit", skill_msg="X", bundle_key=None)
+        with patches[0], patches[1], patches[2], patches[3] as build:
+            out = _adapter()._maybe_expand_slash_command("audit my site /site-audit", SESSION_ID)
+        assert out == "X"
+        build.assert_called_once_with("/site-audit", "audit my site", task_id=SESSION_ID)
+
+    def test_unconfirmed_mid_message_token_passes_through(self):
+        # Prose mentioning a path-like token (the /brand folder) must not expand.
+        patches = _patch_skills(skill_key=None, bundle_key=None)
+        with patches[0], patches[1], patches[2], patches[3]:
+            out = _adapter()._maybe_expand_slash_command(
+                "put the report in /brand please", SESSION_ID
+            )
+        assert out is None
+
+    def test_confirmed_candidate_wins_over_earlier_unconfirmed_tokens(self):
+        # An unconfirmed token (/brand) is skipped and the later confirmed one
+        # expands; the unconfirmed token stays in the instruction as raw text.
+        with (
+            patch("agent.skill_bundles.resolve_bundle_command_key", return_value=None),
+            patch(
+                "agent.skill_commands.resolve_skill_command_key",
+                side_effect=[None, "/site-audit"],
+            ),
+            patch("agent.skill_commands.build_skill_invocation_message", return_value="X") as build,
+        ):
+            out = _adapter()._maybe_expand_slash_command(
+                "read /brand first then /site-audit example.com", SESSION_ID
+            )
+        assert out == "X"
+        build.assert_called_once_with(
+            "/site-audit", "read /brand first then example.com", task_id=SESSION_ID
+        )
+
+    def test_first_of_two_confirmed_commands_wins(self):
+        # One command per message: the FIRST confirmed one runs (matching the
+        # composer, which refuses a second chip, and slash-command convention);
+        # the later command survives only as raw text in the instruction.
+        with (
+            patch("agent.skill_bundles.resolve_bundle_command_key", return_value=None),
+            patch("agent.skill_commands.resolve_skill_command_key", side_effect=["/site-audit"]) as resolve,
+            patch("agent.skill_commands.build_skill_invocation_message", return_value="X") as build,
+        ):
+            out = _adapter()._maybe_expand_slash_command(
+                "/site-audit example.com then /create-pdf it", SESSION_ID
+            )
+        assert out == "X"
+        resolve.assert_called_once_with("site-audit")
+        build.assert_called_once_with(
+            "/site-audit", "example.com then /create-pdf it", task_id=SESSION_ID
+        )
+
+    def test_mid_message_learn_is_rewritten(self):
+        with patch("agent.learn_prompt.build_learn_prompt", return_value="LEARN PROMPT") as build:
+            out = _adapter()._maybe_expand_slash_command(
+                "read the docs then /learn how deploys work", SESSION_ID
+            )
+        assert out == "LEARN PROMPT"
+        build.assert_called_once_with("read the docs then how deploys work")
+
+    def test_slash_inside_a_word_is_not_a_candidate(self):
+        # "w/e" and URLs contain slashes but no whitespace-delimited "/token".
+        assert (
+            _adapter()._maybe_expand_slash_command(
+                "check https://x.com/site-audit w/e", SESSION_ID
+            )
+            is None
+        )
+
+
 class TestBundlePrecedence:
     def test_bundle_wins_over_skill(self):
         patches = _patch_skills(

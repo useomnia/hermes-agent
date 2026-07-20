@@ -360,6 +360,8 @@ def make_tool_result_message(name: str, content: Any, tool_call_id: str) -> dict
 # overhead of the wrapper outweighs any indirect-injection risk.
 _UNTRUSTED_TOOL_NAMES = frozenset({
     "web_extract",
+    "web_map",
+    "web_read",
     "web_search",
 })
 

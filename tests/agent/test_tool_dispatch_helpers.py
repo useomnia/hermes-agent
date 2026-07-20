@@ -2,7 +2,8 @@
 delimiter wrapping that hardens against indirect prompt injection (#496).
 
 Promptware defense: results from tools that fetch attacker-controllable content
-(web_extract, browser_*, mcp_*) get wrapped in <untrusted_tool_result>…</…> so
+(web_extract, web_map, web_read, web_search, browser_*, mcp_*) get wrapped in
+<untrusted_tool_result>…</…> so
 the model treats them as data, not instructions. The wrapper is intentionally
 NOT a regex scan — it's an unconditional architectural mark on every result
 from a known-untrusted source.
@@ -48,7 +49,7 @@ class TestNeverParallel:
 class TestUntrustedToolClassification:
     @pytest.mark.parametrize(
         "name",
-        ["web_extract", "web_search"],
+        ["web_extract", "web_map", "web_read", "web_search"],
     )
     def test_named_high_risk_tools(self, name):
         assert _is_untrusted_tool(name)
@@ -143,6 +144,18 @@ class TestUntrustedWrapping:
         long = "Page snapshot data " * 10
         result = _maybe_wrap_untrusted("browser_snapshot", long)
         assert result.startswith('<untrusted_tool_result source="browser_snapshot">')
+
+    def test_web_read_result_wrapped(self):
+        result = _maybe_wrap_untrusted("web_read", SAMPLE_LONG_TEXT)
+        assert result.startswith('<untrusted_tool_result source="web_read">')
+        assert result.endswith("</untrusted_tool_result>")
+        assert SAMPLE_LONG_TEXT in result
+
+    def test_web_map_result_wrapped(self):
+        result = _maybe_wrap_untrusted("web_map", SAMPLE_LONG_TEXT)
+        assert result.startswith('<untrusted_tool_result source="web_map">')
+        assert result.endswith("</untrusted_tool_result>")
+        assert SAMPLE_LONG_TEXT in result
 
 
 # =========================================================================
