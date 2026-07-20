@@ -6745,7 +6745,13 @@ def _load_installable_optional_extras(group: str = "all") -> list[str]:
     if not isinstance(optional_deps, dict):
         return []
 
-    refs = optional_deps.get(group, [])
+    refs = optional_deps.get(group)
+    if refs is None:
+        # Not a named group in pyproject.toml — a CSV of extras recorded by
+        # the installer's ``--extras`` flag (e.g. ``mcp,web``). The listed
+        # names ARE the extras; keep only ones that still exist.
+        return [name for name in group.split(",") if name in optional_deps]
+
     referenced: list[str] = []
     for ref in refs:
         if "[" in ref and "]" in ref:
@@ -6754,6 +6760,37 @@ def _load_installable_optional_extras(group: str = "all") -> list[str]:
                 referenced.append(name)
 
     return referenced
+
+
+# Extras profile chosen at install time (scripts/install.sh ``--extras``).
+# Like ``.update-incomplete`` below it lives next to the venv, not under
+# $HERMES_HOME, because the venv is shared across all profiles — the extras
+# set is a property of the install, not of a profile. When present,
+# ``hermes update`` and the interrupted-install recovery reinstall THAT set
+# instead of the default ``[all]``, so a lean install (e.g. a headless
+# sandbox installed with ``--extras mcp``) is never silently re-fattened by
+# an update. Delete the file — or re-run the installer without ``--extras``
+# — to return to ``[all]``.
+INSTALL_EXTRAS_MARKER = ".install-extras"
+
+
+def _installed_extras_group() -> str:
+    """Return the extras group recorded at install time (default ``all``).
+
+    Reads ``PROJECT_ROOT/.install-extras``: a single line holding either a
+    CSV of extras names (``mcp`` / ``mcp,web``) or ``none`` for core-only.
+    Absent, unreadable, empty, or malformed all mean ``all`` — the marker can
+    only narrow an install, never break an update.
+    """
+    try:
+        raw = (
+            (PROJECT_ROOT / INSTALL_EXTRAS_MARKER).read_text(encoding="utf-8").strip()
+        )
+    except OSError:
+        return "all"
+    if raw and all(ch.isalnum() or ch in "_,-" for ch in raw):
+        return raw
+    return "all"
 
 
 # Install-scoped breadcrumb dropped right before ``hermes update`` mutates the
@@ -7408,20 +7445,31 @@ def _install_python_dependencies_with_optional_fallback(
 ) -> None:
     """Install base deps plus as many optional extras as the environment supports.
 
-    By default this targets ``.[all]``; Termux callers can pass
-    ``group='termux-all'`` to use the curated Android-compatible profile.
+    By default this targets ``.[all]`` — unless the install-time extras
+    marker narrows it (see ``INSTALL_EXTRAS_MARKER``); Termux callers can
+    pass ``group='termux-all'`` to use the curated Android-compatible
+    profile, which bypasses the marker.
 
     On Windows, pre-renames live ``hermes.exe`` / ``hermes-gateway.exe`` shims
     in the venv Scripts dir before each install attempt so uv can write fresh
     copies (Windows blocks REPLACE on a running .exe but allows RENAME). See
     ``_quarantine_running_hermes_exe`` for the rationale.
     """
+    if group == "all":
+        group = _installed_extras_group()
+
     scripts_dir = _venv_scripts_dir() if _is_windows() else None
 
     def _install(args: list[str]) -> None:
         _run_quarantined_install(
             install_cmd_prefix + args, env=env, scripts_dir=scripts_dir
         )
+
+    if group == "none":
+        # Core-only install profile: no extras to attempt or retry.
+        _install(["install", "-e", "."])
+        _verify_core_dependencies_installed(install_cmd_prefix, env=env, group=group)
+        return
 
     try:
         _install(["install", "-e", f".[{group}]"])

@@ -505,6 +505,86 @@ def test_install_with_optional_fallback_honors_custom_group(monkeypatch):
     ]
 
 
+def test_install_with_optional_fallback_honors_install_extras_marker(monkeypatch, tmp_path):
+    """The .install-extras marker narrows the default [all] group."""
+    (tmp_path / ".install-extras").write_text("mcp,web\n")
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        hermes_main, "_verify_core_dependencies_installed", lambda *a, **kw: None
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        hermes_main, "_run_install_with_heartbeat", lambda cmd, **kw: calls.append(cmd)
+    )
+
+    hermes_main._install_python_dependencies_with_optional_fallback(["/usr/bin/uv", "pip"])
+
+    assert calls == [["/usr/bin/uv", "pip", "install", "-e", ".[mcp,web]"]]
+
+
+def test_install_with_optional_fallback_core_only_marker(monkeypatch, tmp_path):
+    """A 'none' marker installs core deps only — no extras tier, no retry loop."""
+    (tmp_path / ".install-extras").write_text("none\n")
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        hermes_main, "_verify_core_dependencies_installed", lambda *a, **kw: None
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        hermes_main, "_run_install_with_heartbeat", lambda cmd, **kw: calls.append(cmd)
+    )
+
+    hermes_main._install_python_dependencies_with_optional_fallback(["/usr/bin/uv", "pip"])
+
+    assert calls == [["/usr/bin/uv", "pip", "install", "-e", "."]]
+
+
+def test_install_with_optional_fallback_explicit_group_bypasses_marker(monkeypatch, tmp_path):
+    """An explicit group (Termux) wins over the install-time marker."""
+    (tmp_path / ".install-extras").write_text("mcp\n")
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        hermes_main, "_verify_core_dependencies_installed", lambda *a, **kw: None
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        hermes_main, "_run_install_with_heartbeat", lambda cmd, **kw: calls.append(cmd)
+    )
+
+    hermes_main._install_python_dependencies_with_optional_fallback(
+        ["/usr/bin/uv", "pip"], group="termux-all"
+    )
+
+    assert calls == [["/usr/bin/uv", "pip", "install", "-e", ".[termux-all]"]]
+
+
+def test_installed_extras_group_defaults_and_validation(monkeypatch, tmp_path):
+    """Absent, empty, or malformed markers all fall back to 'all'."""
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    assert hermes_main._installed_extras_group() == "all"
+
+    (tmp_path / ".install-extras").write_text("mcp\n")
+    assert hermes_main._installed_extras_group() == "mcp"
+
+    (tmp_path / ".install-extras").write_text("mcp; rm -rf /\n")
+    assert hermes_main._installed_extras_group() == "all"
+
+    (tmp_path / ".install-extras").write_text("\n")
+    assert hermes_main._installed_extras_group() == "all"
+
+
+def test_load_installable_optional_extras_csv_group(monkeypatch, tmp_path):
+    """A CSV group resolves to its own extras names, dropping removed ones."""
+    (tmp_path / "pyproject.toml").write_text(
+        "[project.optional-dependencies]\nmcp = []\nweb = []\n"
+    )
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    assert hermes_main._load_installable_optional_extras("mcp,web,gone") == ["mcp", "web"]
+
+
 def test_install_heartbeat_prints_when_dependency_install_is_silent(monkeypatch, capsys):
     """Long quiet installs should emit periodic heartbeat lines."""
 
