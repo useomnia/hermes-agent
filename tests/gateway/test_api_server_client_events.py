@@ -82,11 +82,11 @@ class TestClientEventForwarding:
                 ts_cb = kwargs.get("tool_start_callback")
                 tc_cb = kwargs.get("tool_complete_callback")
                 if ts_cb:
-                    ts_cb("call_1", "emit_omnio_event", tool_args)
+                    ts_cb("call_1", "emit_client_event", tool_args)
                     tool_args["name"] = "mutated_event"
                     payload["id"] = "mutated"
                 if tc_cb:
-                    tc_cb("call_1", "emit_omnio_event", tool_args, '{"status":"emitted"}')
+                    tc_cb("call_1", "emit_client_event", tool_args, '{"status":"emitted"}')
                 if cb:
                     await asyncio.sleep(0.05)
                     cb("ok")
@@ -108,7 +108,7 @@ class TestClientEventForwarding:
                 body = await resp.text()
 
         events = _extract_tool_progress_events(body)
-        running = [e for e in events if e.get("status") == "running" and e.get("tool") == "emit_omnio_event"]
+        running = [e for e in events if e.get("status") == "running" and e.get("tool") == "emit_client_event"]
         assert len(running) == 1, f"expected 1 running event, got {events}"
         assert running[0]["clientEvent"] == expected_event
         assert "client" not in running[0]
@@ -167,9 +167,9 @@ class TestClientEventForwarding:
                 tc_cb = kwargs.get("tool_complete_callback")
                 # Pass a string instead of dict for args
                 if ts_cb:
-                    ts_cb("call_1", "emit_omnio_event", "not-a-dict")
+                    ts_cb("call_1", "emit_client_event", "not-a-dict")
                 if tc_cb:
-                    tc_cb("call_1", "emit_omnio_event", "not-a-dict", '{"status":"emitted"}')
+                    tc_cb("call_1", "emit_client_event", "not-a-dict", '{"status":"emitted"}')
                 if cb:
                     await asyncio.sleep(0.05)
                     cb("ok")
@@ -260,9 +260,9 @@ class TestClientEventForwarding:
                 ts_cb = kwargs.get("tool_start_callback")
                 tc_cb = kwargs.get("tool_complete_callback")
                 if ts_cb:
-                    ts_cb("call_1", "emit_omnio_event", tool_args)
+                    ts_cb("call_1", "emit_client_event", tool_args)
                 if tc_cb:
-                    tc_cb("call_1", "emit_omnio_event", tool_args, '{"status":"emitted"}')
+                    tc_cb("call_1", "emit_client_event", tool_args, '{"status":"emitted"}')
                 if cb:
                     await asyncio.sleep(0.05)
                     cb("ok")
@@ -284,6 +284,6 @@ class TestClientEventForwarding:
                 body = await resp.text()
 
         events = _extract_tool_progress_events(body)
-        completed = [e for e in events if e.get("status") == "completed" and e.get("tool") == "emit_omnio_event"]
+        completed = [e for e in events if e.get("status") == "completed" and e.get("tool") == "emit_client_event"]
         assert len(completed) == 1, f"expected 1 completed event, got {events}"
         assert "clientEvent" not in completed[0], f"completed event has clientEvent: {completed[0]}"

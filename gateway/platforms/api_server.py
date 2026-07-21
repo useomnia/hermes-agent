@@ -94,6 +94,26 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 
+_CUSTOM_TOOL_INPUT_KEYS = {
+    "request_user_input": "interaction",
+    "emit_client_event": "clientEvent",
+}
+
+
+def _project_custom_tool_inputs(function_name: str, function_args: Any) -> dict[str, Any]:
+    """Project allowlisted tool arguments onto a progress event.
+
+    Tool arguments may contain sensitive values, so projection is default-deny:
+    only explicitly listed tools expose their inputs to SSE consumers. Copying
+    the arguments also preserves their tool-start state if a handler mutates the
+    original object before the queued progress event is serialized.
+    """
+    output_key = _CUSTOM_TOOL_INPUT_KEYS.get(function_name)
+    if output_key is None or not isinstance(function_args, dict):
+        return {}
+    return {output_key: copy.deepcopy(function_args)}
+
+
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
     """Parse a listen port without letting malformed env/config values crash startup."""
     try:
@@ -2327,25 +2347,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "toolCallId": tool_call_id,
                     "status": "running",
                 }
-                # Omnia structured-interaction protocol: the request_user_input
-                # tool (shipped by the omnio_interaction plugin) carries its prompt
-                # args so the Omnia chat can render a proper form control. We forward
-                # the args verbatim under "interaction" — the per-kind shape lives in
-                # the plugin schema and the Omnia frontend, so new kinds need no
-                # change here. Gated on the tool name so no other tool's args reach
-                # the wire; request_user_input never receives a secret as an arg (it
-                # asks FOR one), so nothing sensitive crosses the wire. The tool then
-                # BLOCKS in its plugin worker (tools/user_input) until the user
-                # answers the card rendered here; the answer becomes the tool result
-                # inline, so the turn stays alive (see _on_tool_complete).
-                if function_name == "request_user_input" and isinstance(function_args, dict):
-                    progress["interaction"] = function_args
-                # Semantic client events: emit_omnio_event may project its call
-                # arguments under ``clientEvent``. The client validates the versioned
-                # envelope independently; Hermes transports it but never defines or
-                # executes the UI effect. Completed events stay generic.
-                if function_name == "emit_omnio_event" and isinstance(function_args, dict):
-                    progress["clientEvent"] = copy.deepcopy(function_args)
+                progress.update(
+                    _project_custom_tool_inputs(function_name, function_args)
+                )
                 _stream_q.put(("__tool_progress__", progress))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
