@@ -581,22 +581,44 @@ def fail_closed_denial(function_name: str) -> Optional[str]:
     return _denial_result(None, status="approval_error") if gated else None
 
 
-def _credit_cost_sentence(descriptor: dict, function_args: Optional[dict]) -> str:
+def _credit_cost_data(descriptor: dict, function_args: Optional[dict]) -> dict:
     strategy = descriptor.get("strategy")
     unit = descriptor.get("unit")
     credits_per_unit = descriptor.get("creditsPerUnit")
+    if not (
+        isinstance(credits_per_unit, (int, float))
+        and not isinstance(credits_per_unit, bool)
+    ):
+        credits_per_unit = None
+
+    credits = None
+    engine_count = None
     if (
         strategy == "fixed"
         and unit == "per_engine"
-        and isinstance(credits_per_unit, (int, float))
-        and not isinstance(credits_per_unit, bool)
+        and credits_per_unit is not None
     ):
         engines = function_args.get("engines") if isinstance(function_args, dict) else None
         if isinstance(engines, list):
             engine_count = len(set(engines))
-            total = credits_per_unit * engine_count
+            credits = credits_per_unit * engine_count
+
+    return {
+        "credits": credits,
+        "creditsPerUnit": credits_per_unit,
+        "unit": unit if isinstance(unit, str) else None,
+        "engineCount": engine_count,
+    }
+
+
+def _credit_cost_sentence(descriptor: dict, cost: dict) -> str:
+    strategy = descriptor.get("strategy")
+    credits_per_unit = cost["creditsPerUnit"]
+    if strategy == "fixed" and cost["unit"] == "per_engine" and credits_per_unit is not None:
+        engine_count = cost["engineCount"]
+        if engine_count is not None:
             return (
-                f"This call spends {total:g} credits "
+                f"This call spends {cost['credits']:g} credits "
                 f"({credits_per_unit:g} x {engine_count} engines)."
             )
         return f"This call spends {credits_per_unit:g} credits per engine."
@@ -635,16 +657,19 @@ def maybe_require_tool_approval(
     else:
         options = CREDIT_APPROVAL_OPTIONS
         option_scopes = CREDIT_APPROVAL_OPTION_SCOPES
+        cost = _credit_cost_data(credits_descriptor, function_args)
         question = (
             f'Allow Omnio to use "{_readable_tool(function_name)}"? '
-            f"{_credit_cost_sentence(credits_descriptor, function_args)}"
+            f"{_credit_cost_sentence(credits_descriptor, cost)}"
         )
 
-    approval = {
+    approval: dict[str, object] = {
         "tool": function_name,
         "tool_call_id": tool_call_id or "",
         "option_scopes": list(option_scopes),
     }
+    if credits_descriptor is not None:
+        approval["cost"] = cost
 
     interaction_event = {
         "tool": function_name,

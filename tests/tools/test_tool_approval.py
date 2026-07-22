@@ -213,6 +213,7 @@ class TestMaybeRequireToolApproval:
         assert it["options"] == APPROVAL_OPTIONS
         assert it["approval"]["tool"] == GATED
         assert it["approval"]["option_scopes"] == APPROVAL_OPTION_SCOPES
+        assert "cost" not in it["approval"]
 
 
 class TestCreditApproval:
@@ -259,6 +260,12 @@ class TestCreditApproval:
             "This call spends 90 credits (30 x 3 engines)."
             in captured["interaction"]["question"]
         )
+        assert captured["interaction"]["approval"]["cost"] == {
+            "credits": 90,
+            "creditsPerUnit": 30,
+            "unit": "per_engine",
+            "engineCount": 3,
+        }
 
     def test_should_deduplicate_engines_in_the_fixed_spend_total(self):
         captured = {}
@@ -280,6 +287,12 @@ class TestCreditApproval:
         question = captured["interaction"]["question"]
         assert "This call spends 60 credits (30 x 2 engines)." in question
         assert "90 credits" not in question
+        assert captured["interaction"]["approval"]["cost"] == {
+            "credits": 60,
+            "creditsPerUnit": 30,
+            "unit": "per_engine",
+            "engineCount": 2,
+        }
 
     def test_should_show_the_per_engine_price_when_arguments_are_missing(self):
         captured = {}
@@ -295,6 +308,12 @@ class TestCreditApproval:
             "This call spends 30 credits per engine."
             in captured["interaction"]["question"]
         )
+        assert captured["interaction"]["approval"]["cost"] == {
+            "credits": None,
+            "creditsPerUnit": 30,
+            "unit": "per_engine",
+            "engineCount": None,
+        }
 
     def test_should_not_claim_a_total_for_real_cost_spend(self):
         captured = {}
@@ -321,6 +340,12 @@ class TestCreditApproval:
         assert "This call spends credits based on its actual cost." in question
         assert "90 credits" not in question
         assert "30 x 3" not in question
+        assert captured["interaction"]["approval"]["cost"] == {
+            "credits": None,
+            "creditsPerUnit": None,
+            "unit": "run",
+            "engineCount": None,
+        }
 
     def test_should_not_consult_preexisting_session_or_always_grants(self):
         record_session_approval(SESSION, CREDIT_GATED)
