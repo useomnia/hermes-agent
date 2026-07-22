@@ -4345,11 +4345,14 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
             approval_token = None
+            approval_notify_token = None
             user_input_token = None
             if approval_session_key:
                 approval_token = set_current_session_key(approval_session_key)
                 if approval_notify is not None:
-                    register_tool_approval_notify(approval_session_key, approval_notify)
+                    approval_notify_token = register_tool_approval_notify(
+                        approval_session_key, approval_notify
+                    )
                     # Mark this session as having an interactive chat surface so a
                     # blocking request_user_input fails fast on non-chat paths (no
                     # approval_notify) instead of parking for the full timeout.
@@ -4402,9 +4405,9 @@ class APIServerAdapter(BasePlatformAdapter):
             finally:
                 clear_session_vars(tokens)
                 if approval_session_key:
-                    if approval_notify is not None:
+                    if approval_notify_token is not None:
                         unregister_tool_approval_notify(
-                            approval_session_key, approval_notify
+                            approval_session_key, approval_notify_token
                         )
                     # Drop the interactive-surface mark AND release any
                     # request_user_input call still parked on this session, so a

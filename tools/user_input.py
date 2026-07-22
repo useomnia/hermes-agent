@@ -31,10 +31,9 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
-import time
-from typing import Callable, Optional
+from typing import Optional
 
+from tools.blocking_wait import BlockingWaitRegistry
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -56,30 +55,16 @@ BLOCKING_DISABLED: bool = env_var_enabled(_ENV_DISABLED)
 _ENV_TIMEOUT = "OMNIO_USER_INPUT_TIMEOUT"
 _DEFAULT_TIMEOUT_S = 300
 
-_lock = threading.Lock()
-# session_key -> FIFO of blocked input waiters.
-_waits: dict[str, list["_InputWait"]] = {}
-# session_key -> reason for the most recently completed unresolved wait.
-# request_user_input is never run concurrently, so one slot per session is
-# sufficient and avoids changing the plugin's Optional[str] return contract.
-_completion_reasons: dict[str, str] = {}
-# Sessions with an interactive chat surface that can render the card and POST an
-# answer back, keyed to the run that owns the registration. The api_server chat
-# path registers the session here; a
-# non-interactive caller (e.g. a proactive /v1/runs task) is absent, so the gate
-# fails fast instead of parking the worker for the full timeout with no one to
-# answer. Mirrors tools/tool_approval.py's "no notify cb → no surface" check.
-_active_sessions: dict[str, object] = {}
+# This gate owns a separate instance from tool_approval, so answer and approval
+# state cannot cross-talk. User-input surfaces carry no gate-specific value.
+_wait_registry: BlockingWaitRegistry[str, None, None] = BlockingWaitRegistry()
 
 
 def register_user_input_session(session_key: str) -> object | None:
     """Mark an interactive chat surface and return its ownership token."""
     if not session_key:
         return None
-    token = object()
-    with _lock:
-        _active_sessions[session_key] = token
-    return token
+    return _wait_registry.register_surface(session_key)
 
 
 def unregister_user_input_session(session_key: str, token: object) -> None:
@@ -87,25 +72,7 @@ def unregister_user_input_session(session_key: str, token: object) -> None:
     this session when *token* still owns its registration."""
     if not session_key:
         return
-    with _lock:
-        if _active_sessions.get(session_key) is not token:
-            return
-        _active_sessions.pop(session_key, None)
-        _completion_reasons.pop(session_key, None)
-        waiters = _waits.pop(session_key, [])
-    for entry in waiters:
-        entry.event.set()  # answer stays None → caller maps to "no answer"
-
-
-class _InputWait:
-    """One blocked ``request_user_input`` call awaiting the user's answer."""
-
-    __slots__ = ("event", "tool_call_id", "answer")
-
-    def __init__(self, tool_call_id: str = "") -> None:
-        self.event = threading.Event()
-        self.tool_call_id = tool_call_id
-        self.answer: Optional[str] = None  # the user's submitted answer text
+    _wait_registry.unregister_surface(session_key, token)
 
 
 def _input_timeout() -> int:
@@ -115,21 +82,15 @@ def _input_timeout() -> int:
         return _DEFAULT_TIMEOUT_S
 
 
-def _drop_wait(session_key: str, entry: "_InputWait") -> None:
-    with _lock:
-        queue = _waits.get(session_key)
-        if queue and entry in queue:
-            queue.remove(entry)
-        if queue is not None and not queue:
-            _waits.pop(session_key, None)
-
-
 def consume_user_input_completion_reason(session_key: str) -> Optional[str]:
-    """Return and clear the last unresolved wait reason for a session."""
+    """Return and clear the sole unresolved wait reason for a session.
+
+    ``request_user_input`` never runs concurrently within one session, so its
+    public contract intentionally needs no tool-call id.
+    """
     if not session_key:
         return None
-    with _lock:
-        return _completion_reasons.pop(session_key, None)
+    return _wait_registry.consume_session_completion_reason(session_key)
 
 
 def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
@@ -144,63 +105,16 @@ def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
     if not session_key:
         # No conversation surface to receive an answer on — don't park forever.
         return None
-    with _lock:
-        if session_key not in _active_sessions:
-            # No interactive chat surface for this session (e.g. a proactive
-            # /v1/runs task): fail fast rather than park for the full timeout
-            # with no one to answer. Mirrors the approval gate's no-surface deny.
-            return None
-        _completion_reasons.pop(session_key, None)
-        entry = _InputWait(tool_call_id)
-        _waits.setdefault(session_key, []).append(entry)
-
-    # Block in short slices so we can heartbeat the inactivity tracker — without
-    # it the gateway watchdog would kill the agent while the user is answering —
-    # and observe the interrupt bit so a stop/disconnect releases the worker
-    # promptly (agent.interrupt() fans the bit out to this tool-worker thread).
-    # Mirrors tools/tool_approval.await_tool_approval.
-    # Soft-optional imports: a stripped runtime may not ship these helpers. Import
-    # into a temp and assign to an optional-typed local so the None fallback is a
-    # type-clean assignment (importing the name directly would declare it as the
-    # function type, which `None` then can't be assigned to).
-    touch_activity_if_due: Callable[..., None] | None = None
-    try:
-        from tools.environments.base import (
-            touch_activity_if_due as _touch_activity_if_due,
-        )
-
-        touch_activity_if_due = _touch_activity_if_due
-    except Exception:  # pragma: no cover
-        pass
-    is_interrupted: Callable[[], bool] | None = None
-    try:
-        from tools.interrupt import is_interrupted as _is_interrupted
-
-        is_interrupted = _is_interrupted
-    except Exception:  # pragma: no cover
-        pass
-
-    now = time.monotonic()
-    deadline = now + max(_input_timeout(), 0)
-    activity = {"last_touch": now, "start": now}
-    expired = False
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            expired = True
-            break
-        if entry.event.wait(timeout=min(1.0, remaining)):
-            break
-        if is_interrupted is not None and is_interrupted():
-            break  # answer stays None → caller maps to "no answer"
-        if touch_activity_if_due is not None:
-            touch_activity_if_due(activity, "waiting for user input")
-
-    _drop_wait(session_key, entry)
-    if entry.answer is None:
-        with _lock:
-            _completion_reasons[session_key] = "expired" if expired else "cancelled"
-    return entry.answer
+    # The public completion contract is one slot per session. Clear a prior
+    # sequential call's unconsumed reason before parking the next request.
+    _wait_registry.consume_session_completion_reason(session_key)
+    answer, _reason = _wait_registry.wait(
+        session_key,
+        tool_call_id,
+        _input_timeout(),
+        "waiting for user input",
+    )
+    return answer
 
 
 def resolve_user_input(session_key: str, answer: str, tool_call_id: str = "") -> bool:
@@ -214,32 +128,16 @@ def resolve_user_input(session_key: str, answer: str, tool_call_id: str = "") ->
     """
     if not session_key:
         return False
-    with _lock:
-        queue = _waits.get(session_key)
-        entry = None
-        if queue:
-            if tool_call_id:
-                for index, candidate in enumerate(queue):
-                    if candidate.tool_call_id == tool_call_id:
-                        entry = queue.pop(index)
-                        break
-            if entry is None:
-                entry = queue.pop(0)
-        if queue is not None and not queue:
-            _waits.pop(session_key, None)
-    if entry is None:
-        return False
-    entry.answer = answer if answer is not None else ""
-    entry.event.set()
-    return True
+    return _wait_registry.resolve(
+        session_key,
+        tool_call_id,
+        answer if answer is not None else "",
+        fallback_on_miss=True,
+    )
 
 
 def clear_session(session_key: str) -> None:
     """Release blocked input waiters during an explicit conversation reset."""
     if not session_key:
         return
-    with _lock:
-        _completion_reasons.pop(session_key, None)
-        waiters = _waits.pop(session_key, [])
-    for entry in waiters:
-        entry.event.set()
+    _wait_registry.clear(session_key)

@@ -4,6 +4,9 @@ Covers auth, request validation, and that a valid answer releases the matching
 blocked waiter (the agent worker parked inside the plugin's await_user_input).
 """
 
+import threading
+import time
+
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -36,9 +39,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
 
 @pytest.fixture(autouse=True)
 def _clean_state():
-    user_input._waits.clear()
+    user_input.clear_session(SESSION)
     yield
-    user_input._waits.clear()
+    user_input.clear_session(SESSION)
 
 
 @pytest.fixture
@@ -61,8 +64,21 @@ async def test_requires_auth():
 
 @pytest.mark.asyncio
 async def test_delivers_the_answer_to_a_blocked_waiter(adapter):
-    entry = user_input._InputWait("call-1")
-    user_input._waits[SESSION] = [entry]
+    user_input.register_user_input_session(SESSION)
+    result: dict[str, str | None] = {}
+    thread = threading.Thread(
+        target=lambda: result.setdefault(
+            "answer", user_input.await_user_input(SESSION, "call-1")
+        )
+    )
+    thread.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if user_input._wait_registry.pending_count(SESSION):
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("the user-input waiter should be parked")
 
     app = _create_app(adapter)
     async with TestClient(TestServer(app)) as cli:
@@ -76,7 +92,9 @@ async def test_delivers_the_answer_to_a_blocked_waiter(adapter):
 
     assert body["object"] == "omnio.user_input_response"
     assert body["resolved"] is True
-    assert entry.answer == "Tuesday at 3pm" and entry.event.is_set()
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert result["answer"] == "Tuesday at 3pm"
 
 
 @pytest.mark.asyncio

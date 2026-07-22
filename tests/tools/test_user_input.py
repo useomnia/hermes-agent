@@ -8,10 +8,6 @@ import pytest
 import tools.user_input as user_input
 from tools.interrupt import set_interrupt
 from tools.user_input import (
-    _InputWait,
-    _active_sessions,
-    _completion_reasons,
-    _waits,
     await_user_input,
     clear_session,
     consume_user_input_completion_reason,
@@ -25,25 +21,41 @@ SESSION = "sess-1"
 
 @pytest.fixture(autouse=True)
 def _clean_state():
-    _waits.clear()
-    _active_sessions.clear()
-    _completion_reasons.clear()
+    clear_session(SESSION)
     register_user_input_session(SESSION)  # an interactive chat surface is present
     yield
-    _waits.clear()
-    _active_sessions.clear()
-    _completion_reasons.clear()
+    clear_session(SESSION)
 
 
 def _wait_until_blocked(session_key: str = SESSION, timeout: float = 3.0) -> bool:
     """Poll until a waiter is registered for the session (the worker is parked)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        with user_input._lock:
-            if _waits.get(session_key):
-                return True
+        if user_input._wait_registry.pending_count(session_key):
+            return True
         time.sleep(0.01)
     return False
+
+
+def _start_wait(
+    call_id: str, session_key: str = SESSION
+) -> tuple[threading.Thread, dict[str, object]]:
+    result: dict[str, object] = {}
+    previous_count = user_input._wait_registry.pending_count(session_key)
+
+    def worker():
+        result["answer"] = await_user_input(session_key, call_id)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if user_input._wait_registry.pending_count(session_key) > previous_count:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("the new waiter should be parked")
+    return thread, result
 
 
 class TestAwaitAndResolve:
@@ -86,19 +98,33 @@ class TestAwaitAndResolve:
     def test_timeout_drops_the_waiter(self, monkeypatch):
         monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "0")
         await_user_input(SESSION, "call-1")
-        assert SESSION not in _waits, "a timed-out wait must not leak a waiter"
+        assert user_input._wait_registry.pending_count(SESSION) == 0
+
+    def test_next_wait_clears_the_previous_session_completion_reason(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "0")
+        assert await_user_input(SESSION, "call-old") is None
+        monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "5")
+
+        waiter, result = _start_wait("call-new")
+        assert resolve_user_input(SESSION, "answer", "call-new") is True
+        waiter.join(timeout=3)
+
+        assert result["answer"] == "answer"
+        assert consume_user_input_completion_reason(SESSION) is None
 
     def test_returns_none_without_a_session_key_and_does_not_park(self):
         # No conversation surface to receive an answer → return immediately.
         assert await_user_input("", "call-1") is None
-        assert not _waits
+        assert user_input._wait_registry.pending_count("") == 0
 
     def test_returns_none_without_an_interactive_surface_and_does_not_park(self):
         # A session with no registered chat surface (e.g. a proactive /v1/runs
         # task) must fail fast, not park for the full timeout with no one to answer.
-        _active_sessions.pop(SESSION, None)
+        clear_session(SESSION)
         assert await_user_input(SESSION, "call-1") is None
-        assert SESSION not in _waits
+        assert user_input._wait_registry.pending_count(SESSION) == 0
 
     def test_interrupt_releases_a_blocked_wait_and_returns_none(self):
         result: dict[str, object] = {}
@@ -131,38 +157,46 @@ class TestResolveUserInput:
         assert resolve_user_input(SESSION, "hi", "call-1") is False
 
     def test_resolves_the_matching_call_id_not_the_queue_head(self):
-        first = _InputWait("call-A")
-        second = _InputWait("call-B")
-        _waits[SESSION] = [first, second]
+        first, first_result = _start_wait("call-A")
+        second, second_result = _start_wait("call-B")
 
         assert resolve_user_input(SESSION, "answer-B", "call-B") is True
 
-        assert second.answer == "answer-B" and second.event.is_set()
-        assert first.answer is None and not first.event.is_set()
+        second.join(timeout=3)
+        assert second_result["answer"] == "answer-B"
+        assert first.is_alive()
+        assert resolve_user_input(SESSION, "answer-A", "call-A") is True
+        first.join(timeout=3)
+        assert first_result["answer"] == "answer-A"
 
     def test_falls_back_to_fifo_head_when_no_call_id(self):
-        first = _InputWait("call-A")
-        second = _InputWait("call-B")
-        _waits[SESSION] = [first, second]
+        first, first_result = _start_wait("call-A")
+        second, second_result = _start_wait("call-B")
 
         assert resolve_user_input(SESSION, "answer", "") is True
 
-        assert first.answer == "answer" and first.event.is_set()
-        assert second.answer is None and not second.event.is_set()
+        first.join(timeout=3)
+        assert first_result["answer"] == "answer"
+        assert second.is_alive()
+        assert resolve_user_input(SESSION, "answer-B", "call-B") is True
+        second.join(timeout=3)
+        assert second_result["answer"] == "answer-B"
 
     def test_falls_back_to_fifo_when_call_id_does_not_match(self):
-        only = _InputWait("call-A")
-        _waits[SESSION] = [only]
+        only, result = _start_wait("call-A")
 
         assert resolve_user_input(SESSION, "answer", "call-NOPE") is True
-        assert only.answer == "answer" and only.event.is_set()
+        only.join(timeout=3)
+        assert result["answer"] == "answer"
 
     def test_scopes_waiters_per_session(self):
-        mine = _InputWait("call-A")
-        _waits[SESSION] = [mine]
+        mine, result = _start_wait("call-A")
 
         assert resolve_user_input("other-session", "answer") is False
-        assert mine.answer is None and not mine.event.is_set()
+        assert mine.is_alive()
+        assert resolve_user_input(SESSION, "mine", "call-A") is True
+        mine.join(timeout=3)
+        assert result["answer"] == "mine"
 
 
 class TestClearSession:
@@ -180,7 +214,7 @@ class TestClearSession:
         thread.join(timeout=3)
         assert not thread.is_alive(), "clear_session must release parked waiters"
         assert result["answer"] is None, "a cleared wait yields no answer"
-        assert SESSION not in _waits
+        assert user_input._wait_registry.pending_count(SESSION) == 0
 
     def test_is_a_noop_without_a_session_key(self):
         # Should not raise and should not touch state.
@@ -204,7 +238,7 @@ class TestSurfaceRegistry:
         thread.join(timeout=3)
         assert not thread.is_alive(), "unregister must release parked waiters"
         assert result["answer"] is None
-        assert SESSION not in _active_sessions
+        assert user_input._wait_registry.has_surface(SESSION) is False
         # A subsequent input on the now-unregistered session fails fast.
         assert await_user_input(SESSION, "call-2") is None
 
@@ -214,23 +248,21 @@ class TestSurfaceRegistry:
         assert first_token is not None
         assert second_token is not None
         assert first_token is not second_token
-        waiter = _InputWait("call-new")
-        _waits[SESSION] = [waiter]
-        _completion_reasons[SESSION] = "cancelled"
+        waiter, result = _start_wait("call-new")
 
         unregister_user_input_session(SESSION, first_token)
 
-        assert _active_sessions[SESSION] is second_token
-        assert _waits[SESSION] == [waiter]
-        assert not waiter.event.is_set()
-        assert _completion_reasons[SESSION] == "cancelled"
+        assert user_input._wait_registry.has_surface(SESSION) is True
+        assert user_input._wait_registry.pending_count(SESSION) == 1
+        assert waiter.is_alive()
 
         unregister_user_input_session(SESSION, second_token)
 
-        assert SESSION not in _active_sessions
-        assert SESSION not in _waits
-        assert waiter.event.is_set()
-        assert SESSION not in _completion_reasons
+        waiter.join(timeout=3)
+        assert not waiter.is_alive()
+        assert result["answer"] is None
+        assert user_input._wait_registry.has_surface(SESSION) is False
+        assert user_input._wait_registry.pending_count(SESSION) == 0
 
 
 class TestKillswitch:

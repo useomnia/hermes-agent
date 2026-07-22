@@ -36,10 +36,10 @@ import json
 import logging
 import os
 import threading
-import time
 from typing import Callable, Optional
 
 from tools.approval import get_current_session_key
+from tools.blocking_wait import BlockingWaitEntry, BlockingWaitRegistry
 from tools.mcp_tool import (
     mcp_tool_credits_meta,
     mcp_tool_has_read_only_hint,
@@ -92,29 +92,16 @@ _injected_always_approved: set[str] = set()
 # warm. The API server registers this callback after it has loaded its Omnia
 # authority configuration.
 _always_approval_authority: Callable[[str], bool] | None = None
-# session_key -> per-session notify callback (bridges guard thread → chat stream).
-_notify_cbs: dict[str, Callable[[dict], None]] = {}
-# session_key -> FIFO of blocked approval waiters.
-_waits: dict[str, list["_ApprovalWait"]] = {}
-# (session_key, tool_call_id) -> reason for an unresolved completed wait.
-_completion_reasons: dict[tuple[str, str], str] = {}
+# Mechanical surface/wait state stays isolated from the user-input gate by this
+# module's own registry instance. The waiter payload is the gated tool name.
+_wait_registry: BlockingWaitRegistry[
+    str, Callable[[dict], None], str
+] = BlockingWaitRegistry()
 # (session_key, tool_call_id) -> the resolved decision
 # (once/session/always/deny/skip) for a released waiter, consumed by the
 # gateway's tool-complete callback to echo `interaction.answered` on the gated
 # call's completed event.
 _decisions: dict[tuple[str, str], str] = {}
-
-
-class _ApprovalWait:
-    """One blocked tool call awaiting the user's decision."""
-
-    __slots__ = ("event", "tool", "tool_call_id", "result")
-
-    def __init__(self, tool: str, tool_call_id: str = "") -> None:
-        self.event = threading.Event()
-        self.tool = tool
-        self.tool_call_id = tool_call_id
-        self.result: Optional[str] = None  # once/session/always/deny/skip
 
 
 # Frozen at import — same rationale as tools/approval.py's _YOLO_MODE_FROZEN:
@@ -238,42 +225,30 @@ def replace_injected_always_approvals(function_names: list[str]) -> None:
         _injected_always_approved.update(exact_names)
 
 
-def register_tool_approval_notify(session_key: str, cb: Callable[[dict], None]) -> None:
-    """Register the chat surface's per-session callback that pushes an approval
-    interaction onto the stream. Called once per chat run around the agent."""
-    if not session_key:
-        return
-    with _lock:
-        _notify_cbs[session_key] = cb
-
-
-def unregister_tool_approval_notify(
+def register_tool_approval_notify(
     session_key: str, cb: Callable[[dict], None]
-) -> None:
-    """Drop the notify callback AND release any still-blocked waiters for this
-    session when *cb* still owns its registration."""
+) -> object | None:
+    """Register the chat surface callback and return its ownership token."""
+    if not session_key:
+        return None
+    return _wait_registry.register_surface(session_key, cb)
+
+
+def unregister_tool_approval_notify(session_key: str, token: object) -> None:
+    """Drop an owned surface and release any still-blocked waiters."""
     if not session_key:
         return
-    with _lock:
-        if _notify_cbs.get(session_key) is not cb:
-            return
-        _notify_cbs.pop(session_key, None)
-        for key in [key for key in _completion_reasons if key[0] == session_key]:
-            _completion_reasons.pop(key, None)
-        for key in [key for key in _decisions if key[0] == session_key]:
-            _decisions.pop(key, None)
-        waiters = _waits.pop(session_key, [])
-    for entry in waiters:
-        entry.event.set()  # result stays None → guard fails closed (deny)
 
+    def clear_decisions() -> None:
+        with _lock:
+            for key in [key for key in _decisions if key[0] == session_key]:
+                _decisions.pop(key, None)
 
-def _drop_wait(session_key: str, entry: "_ApprovalWait") -> None:
-    with _lock:
-        queue = _waits.get(session_key)
-        if queue and entry in queue:
-            queue.remove(entry)
-        if queue is not None and not queue:
-            _waits.pop(session_key, None)
+    _wait_registry.unregister_surface(
+        session_key,
+        token,
+        on_unregister=clear_decisions,
+    )
 
 
 def consume_tool_approval_completion_reason(
@@ -283,8 +258,7 @@ def consume_tool_approval_completion_reason(
     """Return and clear the unresolved wait reason for one approval call."""
     if not session_key:
         return None
-    with _lock:
-        return _completion_reasons.pop((session_key, tool_call_id or ""), None)
+    return _wait_registry.consume_completion_reason(session_key, tool_call_id)
 
 
 def await_tool_approval(
@@ -304,16 +278,20 @@ def await_tool_approval(
     the two are kept distinct only so it can pick the right (turn-ending vs not)
     denial status.
     """
-    with _lock:
-        cb = _notify_cbs.get(session_key)
+    def notify(cb: Callable[[dict], None] | None) -> None:
         if cb is None:
-            return _NO_SURFACE  # no interactive surface → caller denies the write
-        _completion_reasons.pop((session_key, tool_call_id or ""), None)
-        entry = _ApprovalWait(function_name, tool_call_id)
-        _waits.setdefault(session_key, []).append(entry)
+            raise RuntimeError("tool-approval surface has no notify callback")
+        cb(interaction_event)
 
     try:
-        cb(interaction_event)
+        result, reason = _wait_registry.wait(
+            session_key,
+            tool_call_id,
+            _approval_timeout(),
+            "waiting for tool approval",
+            payload=function_name,
+            on_parked=notify,
+        )
     except Exception:
         # The notify callback raising is a plumbing malfunction (e.g. the chat
         # stream write failed) — the card was never actually shown, so the user
@@ -322,59 +300,10 @@ def await_tool_approval(
         # non-turn-ending `approval_error` status, not a genuine `None` timeout
         # (which would end the turn via `approval_no_response`).
         logger.warning("tool-approval notify failed", exc_info=True)
-        _drop_wait(session_key, entry)
         return _NO_SURFACE
-
-    # Block in short slices so we can heartbeat the inactivity tracker — without
-    # it the gateway watchdog would kill the agent while the user is deciding.
-    # Import into a temp and assign to an optional-typed local so the None fallback
-    # is a type-clean assignment (importing the name directly would declare it as
-    # the function type, which `None` then can't be assigned to).
-    touch_activity_if_due: Callable[..., None] | None = None
-    try:
-        from tools.environments.base import (
-            touch_activity_if_due as _touch_activity_if_due,
-        )
-
-        touch_activity_if_due = _touch_activity_if_due
-    except Exception:  # pragma: no cover
-        pass
-    # A disconnect/stop reaches this worker as a thread interrupt: on SSE
-    # disconnect the gateway calls agent.interrupt(), which fans the interrupt
-    # bit out to the tool-worker thread running this guard. Observe it and
-    # release — otherwise the worker parks here for the full timeout while the
-    # run can't unwind (its notify cleanup only runs once this returns).
-    is_interrupted: Callable[[], bool] | None = None
-    try:
-        from tools.interrupt import is_interrupted as _is_interrupted
-
-        is_interrupted = _is_interrupted
-    except Exception:  # pragma: no cover
-        pass
-
-    now = time.monotonic()
-    deadline = now + max(_approval_timeout(), 0)
-    activity = {"last_touch": now, "start": now}
-    expired = False
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            expired = True
-            break
-        if entry.event.wait(timeout=min(1.0, remaining)):
-            break
-        if is_interrupted is not None and is_interrupted():
-            break  # result stays None → fail closed (deny)
-        if touch_activity_if_due is not None:
-            touch_activity_if_due(activity, "waiting for tool approval")
-
-    _drop_wait(session_key, entry)
-    if entry.result is None:
-        with _lock:
-            _completion_reasons[(session_key, tool_call_id or "")] = (
-                "expired" if expired else "cancelled"
-            )
-    return entry.result
+    if reason == "no_surface":
+        return _NO_SURFACE
+    return result
 
 
 def resolve_tool_approval(
@@ -406,22 +335,9 @@ def resolve_tool_approval(
     if not session_key or scope not in APPROVAL_SCOPES:
         return False
     if scope in {"session", "always"}:
-        approval_tool = function_name
-        with _lock:
-            queue = _waits.get(session_key) or []
-            if tool_call_id:
-                matching = next(
-                    (
-                        candidate
-                        for candidate in queue
-                        if candidate.tool_call_id == tool_call_id
-                    ),
-                    None,
-                )
-                if matching is not None:
-                    approval_tool = matching.tool
-            elif queue:
-                approval_tool = queue[0].tool
+        approval_tool = (
+            _wait_registry.waiter_payload(session_key, tool_call_id) or function_name
+        )
         try:
             credit_gated = is_credit_gated_tool(approval_tool)
         except Exception:
@@ -436,31 +352,19 @@ def resolve_tool_approval(
         for tool_name in approved_tools:
             record_always_approval(tool_name)
 
-    with _lock:
-        queue = _waits.get(session_key)
-        entry = None
-        if queue:
-            if tool_call_id:
-                for index, candidate in enumerate(queue):
-                    if candidate.tool_call_id == tool_call_id:
-                        entry = queue.pop(index)
-                        break
-            else:
-                entry = queue.pop(0)
-        if queue is not None and not queue:
-            _waits.pop(session_key, None)
-        if entry is not None:
-            entry.result = scope
-            # Commit the completed-event outcome before releasing the executor
-            # worker. Once signalled, that worker can finish the tool and consume
-            # this value immediately.
+    def commit_decision(entry: BlockingWaitEntry[str, str]) -> None:
+        # Commit the completed-event outcome before releasing the executor
+        # worker. Once signalled, that worker can finish the tool and consume
+        # this value immediately.
+        with _lock:
             _decisions[(session_key, entry.tool_call_id)] = scope
-    if entry is not None:
-        # Signal only after the decision is visible to the gateway's
-        # tool-complete callback, which can run as soon as this worker resumes.
-        entry.event.set()
-        return True
-    return False
+
+    return _wait_registry.resolve(
+        session_key,
+        tool_call_id,
+        scope,
+        on_release=commit_decision,
+    )
 
 
 def consume_tool_approval_decision(
@@ -480,14 +384,9 @@ def clear_session(session_key: str) -> None:
         return
     with _lock:
         _session_approved.pop(session_key, None)
-        _notify_cbs.pop(session_key, None)
-        for key in [key for key in _completion_reasons if key[0] == session_key]:
-            _completion_reasons.pop(key, None)
         for key in [key for key in _decisions if key[0] == session_key]:
             _decisions.pop(key, None)
-        waiters = _waits.pop(session_key, [])
-    for entry in waiters:
-        entry.event.set()
+    _wait_registry.clear(session_key)
 
 
 def _readable_tool(function_name: str) -> str:

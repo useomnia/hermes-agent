@@ -2,6 +2,7 @@
 
 import json
 import threading
+import time
 
 import pytest
 
@@ -14,14 +15,10 @@ from tools.tool_approval import (
     APPROVAL_OPTIONS,
     CREDIT_APPROVAL_OPTION_SCOPES,
     CREDIT_APPROVAL_OPTIONS,
-    _ApprovalWait,
     _always_approved,
-    _completion_reasons,
     _decisions,
     _injected_always_approved,
-    _notify_cbs,
     _session_approved,
-    _waits,
     await_tool_approval,
     clear_session,
     consume_tool_approval_completion_reason,
@@ -63,10 +60,7 @@ def _clean_state(monkeypatch):
     _session_approved.clear()
     _always_approved.clear()
     _injected_always_approved.clear()
-    _notify_cbs.clear()
-    _waits.clear()
-    _completion_reasons.clear()
-    _decisions.clear()
+    clear_session(SESSION)
     register_always_approval_authority(lambda _function_name: True)
     mcp_tool._mcp_tool_read_only_hints.clear()
     mcp_tool._mcp_tool_credits_meta.clear()
@@ -80,10 +74,7 @@ def _clean_state(monkeypatch):
     _session_approved.clear()
     _always_approved.clear()
     _injected_always_approved.clear()
-    _notify_cbs.clear()
-    _waits.clear()
-    _completion_reasons.clear()
-    _decisions.clear()
+    clear_session(SESSION)
     register_always_approval_authority(None)
     mcp_tool._mcp_tool_read_only_hints.clear()
     mcp_tool._mcp_tool_credits_meta.clear()
@@ -98,6 +89,27 @@ def _resolving_notify(scope):
         resolve_tool_approval(SESSION, event["interaction"]["approval"]["tool"], scope)
 
     return cb
+
+
+def _start_approval_wait(
+    function_name: str, call_id: str
+) -> tuple[threading.Thread, dict[str, str | None]]:
+    result: dict[str, str | None] = {}
+    previous_count = tool_approval._wait_registry.pending_count(SESSION)
+
+    def worker() -> None:
+        result["choice"] = await_tool_approval(SESSION, function_name, {}, call_id)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if tool_approval._wait_registry.pending_count(SESSION) > previous_count:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("the approval waiter should be parked")
+    return thread, result
 
 
 class TestIsGatedTool:
@@ -164,19 +176,19 @@ class TestMaybeRequireToolApproval:
 
     def test_should_remember_a_session_grant_so_the_next_call_doesnt_prompt(self):
         notify = _resolving_notify("session")
-        register_tool_approval_notify(SESSION, notify)
+        notify_token = register_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(GATED) is None
         # Second call: even with the notify gone, the session grant lets it proceed.
-        unregister_tool_approval_notify(SESSION, notify)
+        unregister_tool_approval_notify(SESSION, notify_token)
         assert maybe_require_tool_approval(GATED) is None
 
     def test_once_grant_does_not_carry_to_the_next_call(self):
         notify = _resolving_notify("once")
-        register_tool_approval_notify(SESSION, notify)
+        notify_token = register_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(GATED) is None
         # The once-grant was for that one call; without the notify the next call
         # has no interactive surface and fails closed.
-        unregister_tool_approval_notify(SESSION, notify)
+        unregister_tool_approval_notify(SESSION, notify_token)
         assert maybe_require_tool_approval(GATED) is not None
 
     def test_should_fail_closed_with_no_interactive_surface(self):
@@ -399,50 +411,52 @@ class TestCreditApproval:
     @pytest.mark.parametrize("scope", ["session", "always"])
     def test_should_treat_standing_scope_resolutions_as_once(self, scope):
         notify = _resolving_notify(scope)
-        register_tool_approval_notify(SESSION, notify)
+        notify_token = register_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(CREDIT_GATED, "call-credit") is None
 
         assert consume_tool_approval_decision(SESSION, "call-credit") == "once"
         assert is_tool_approved(SESSION, CREDIT_GATED) is False
         assert is_always_approved(CREDIT_GATED) is False
 
-        unregister_tool_approval_notify(SESSION, notify)
+        unregister_tool_approval_notify(SESSION, notify_token)
         denial = maybe_require_tool_approval(CREDIT_GATED, "call-next")
         assert denial is not None
         assert json.loads(denial)["status"] == "approval_error"
 
     def test_should_enforce_once_from_the_blocked_call_identity(self):
-        entry = _ApprovalWait(CREDIT_GATED, "call-credit")
-        _waits[SESSION] = [entry]
-
-        assert (
-            resolve_tool_approval(
-                SESSION,
-                GATED,
-                "always",
-                tool_call_id="call-credit",
+        def notify(_event):
+            assert (
+                resolve_tool_approval(
+                    SESSION,
+                    GATED,
+                    "always",
+                    tool_call_id="call-credit",
+                )
+                is True
             )
-            is True
-        )
 
-        assert entry.result == "once"
+        register_tool_approval_notify(SESSION, notify)
+        choice = await_tool_approval(SESSION, CREDIT_GATED, {}, "call-credit")
+
+        assert choice == "once"
         assert is_always_approved(GATED) is False
 
     def test_should_preserve_skip_scope_for_a_credit_gated_call(self):
-        entry = _ApprovalWait(CREDIT_GATED, "call-credit")
-        _waits[SESSION] = [entry]
-
-        assert (
-            resolve_tool_approval(
-                SESSION,
-                CREDIT_GATED,
-                "skip",
-                tool_call_id="call-credit",
+        def notify(_event):
+            assert (
+                resolve_tool_approval(
+                    SESSION,
+                    CREDIT_GATED,
+                    "skip",
+                    tool_call_id="call-credit",
+                )
+                is True
             )
-            is True
-        )
 
-        assert entry.result == "skip"
+        register_tool_approval_notify(SESSION, notify)
+        choice = await_tool_approval(SESSION, CREDIT_GATED, {}, "call-credit")
+
+        assert choice == "skip"
         assert consume_tool_approval_decision(SESSION, "call-credit") == "skip"
         assert is_tool_approved(SESSION, CREDIT_GATED) is False
         assert is_always_approved(CREDIT_GATED) is False
@@ -581,20 +595,20 @@ class TestAlwaysScope:
 
     def test_should_proceed_and_persist_when_the_user_allows_always(self):
         notify = _resolving_notify("always")
-        register_tool_approval_notify(SESSION, notify)
+        notify_token = register_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(GATED, "call-1") is None
         # The grant carried to the next call without any interactive surface.
-        unregister_tool_approval_notify(SESSION, notify)
+        unregister_tool_approval_notify(SESSION, notify_token)
         assert maybe_require_tool_approval(GATED) is None
 
     def test_first_always_call_proceeds_but_later_call_waits_for_persistence(self):
         register_always_approval_authority(None)
         notify = _resolving_notify("always")
-        register_tool_approval_notify(SESSION, notify)
+        notify_token = register_tool_approval_notify(SESSION, notify)
 
         assert maybe_require_tool_approval(GATED, "call-1") is None
 
-        unregister_tool_approval_notify(SESSION, notify)
+        unregister_tool_approval_notify(SESSION, notify_token)
         result = maybe_require_tool_approval(GATED, "call-2")
         assert json.loads(result)["status"] == "approval_error"
 
@@ -650,9 +664,9 @@ class TestAlwaysScope:
         self,
     ):
         notify = _resolving_notify("always")
-        register_tool_approval_notify(SESSION, notify)
+        notify_token = register_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(GATED, "call-1") is None
-        unregister_tool_approval_notify(SESSION, notify)
+        unregister_tool_approval_notify(SESSION, notify_token)
         assert maybe_require_tool_approval(GATED, "call-2") is None
 
         replace_injected_always_approvals([])
@@ -715,10 +729,12 @@ class TestResolveToolApproval:
         assert is_tool_approved(SESSION, GATED) is True
 
     def test_waiter_present_once_returns_true(self):
-        entry = _ApprovalWait(GATED, "call-A")
-        _waits[SESSION] = [entry]
+        register_tool_approval_notify(SESSION, lambda _event: None)
+        waiter, result = _start_approval_wait(GATED, "call-A")
         assert resolve_tool_approval(SESSION, GATED, "once", "call-A") is True
-        assert entry.result == "once" and entry.event.is_set()
+        waiter.join(timeout=3)
+        assert not waiter.is_alive()
+        assert result["choice"] == "once"
 
     def test_should_release_a_waiter_with_skip_without_recording_a_grant(self):
         def notify(_event):
@@ -736,38 +752,44 @@ class TestResolveToolApproval:
     def test_should_record_the_decision_for_the_completed_event_echo(self):
         # A released waiter's decision is consumed once by the gateway's
         # tool-complete callback (interaction.answered on the completed event).
-        entry = _ApprovalWait(GATED, "call-A")
-        _waits[SESSION] = [entry]
+        register_tool_approval_notify(SESSION, lambda _event: None)
+        waiter, _result = _start_approval_wait(GATED, "call-A")
         resolve_tool_approval(SESSION, GATED, "deny", "call-A")
+        waiter.join(timeout=3)
 
         assert consume_tool_approval_decision(SESSION, "call-A") == "deny"
         assert consume_tool_approval_decision(SESSION, "call-A") is None
 
-    def test_should_store_the_decision_before_releasing_the_waiter(self):
-        entry = _ApprovalWait(GATED, "call-A")
-        _waits[SESSION] = [entry]
-        consumed = threading.Event()
-        observed: list[str | None] = []
-        signal = entry.event.set
+    def test_should_store_the_decision_before_releasing_the_waiter(self, monkeypatch):
+        write_started = threading.Event()
+        allow_write = threading.Event()
 
-        def signal_then_wait_for_consumer() -> None:
-            signal()
-            assert consumed.wait(timeout=3), "consumer should run after the signal"
+        class BlockingDecisions(dict):
+            def __setitem__(self, key, value):
+                write_started.set()
+                assert allow_write.wait(timeout=3)
+                super().__setitem__(key, value)
 
-        entry.event.set = signal_then_wait_for_consumer
+        monkeypatch.setattr(tool_approval, "_decisions", BlockingDecisions())
+        register_tool_approval_notify(SESSION, lambda _event: None)
+        waiter, result = _start_approval_wait(GATED, "call-A")
+        resolver = threading.Thread(
+            target=lambda: resolve_tool_approval(
+                SESSION, GATED, "once", "call-A"
+            )
+        )
+        resolver.start()
+        assert write_started.wait(timeout=3)
+        waiter.join(timeout=0.1)
+        assert waiter.is_alive(), "decision storage must finish before release"
 
-        def consume_after_signal() -> None:
-            assert entry.event.wait(timeout=3), "resolver should release the waiter"
-            observed.append(consume_tool_approval_decision(SESSION, "call-A"))
-            consumed.set()
-
-        consumer = threading.Thread(target=consume_after_signal)
-        consumer.start()
-        assert resolve_tool_approval(SESSION, GATED, "once", "call-A") is True
-        consumer.join(timeout=3)
-
-        assert not consumer.is_alive()
-        assert observed == ["once"]
+        allow_write.set()
+        resolver.join(timeout=3)
+        waiter.join(timeout=3)
+        assert not resolver.is_alive()
+        assert not waiter.is_alive()
+        assert result["choice"] == "once"
+        assert consume_tool_approval_decision(SESSION, "call-A") == "once"
 
     def test_should_not_record_a_decision_when_no_waiter_was_released(self):
         # A late decision (the wait already timed out) records the grant but
@@ -782,24 +804,32 @@ class TestResolveToolApproval:
     def test_should_resolve_the_matching_call_id_not_the_queue_head(self):
         # Two writes blocked in one turn: resolving by call id must release the
         # one the user decided on, not whichever is first in the FIFO.
-        first = _ApprovalWait(GATED, "call-A")
-        second = _ApprovalWait(GATED, "call-B")
-        _waits[SESSION] = [first, second]
+        register_tool_approval_notify(SESSION, lambda _event: None)
+        first, first_result = _start_approval_wait(GATED, "call-A")
+        second, second_result = _start_approval_wait(GATED, "call-B")
 
         assert resolve_tool_approval(SESSION, GATED, "once", "call-B") is True
 
-        assert second.result == "once" and second.event.is_set()
-        assert first.result is None and not first.event.is_set()
+        second.join(timeout=3)
+        assert second_result["choice"] == "once"
+        assert first.is_alive()
+        assert resolve_tool_approval(SESSION, GATED, "deny", "call-A") is True
+        first.join(timeout=3)
+        assert first_result["choice"] == "deny"
 
     def test_should_fall_back_to_fifo_head_when_no_call_id_is_given(self):
-        first = _ApprovalWait(GATED, "call-A")
-        second = _ApprovalWait(GATED, "call-B")
-        _waits[SESSION] = [first, second]
+        register_tool_approval_notify(SESSION, lambda _event: None)
+        first, first_result = _start_approval_wait(GATED, "call-A")
+        second, second_result = _start_approval_wait(GATED, "call-B")
 
         assert resolve_tool_approval(SESSION, GATED, "deny") is True
 
-        assert first.result == "deny" and first.event.is_set()
-        assert second.result is None and not second.event.is_set()
+        first.join(timeout=3)
+        assert first_result["choice"] == "deny"
+        assert second.is_alive()
+        assert resolve_tool_approval(SESSION, GATED, "once", "call-B") is True
+        second.join(timeout=3)
+        assert second_result["choice"] == "once"
 
 
 class TestSurfaceRegistry:
@@ -810,27 +840,34 @@ class TestSurfaceRegistry:
         def second_notify(_event):
             pass
 
-        register_tool_approval_notify(SESSION, first_notify)
-        register_tool_approval_notify(SESSION, second_notify)
-        waiter = _ApprovalWait(GATED, "call-new")
-        _waits[SESSION] = [waiter]
-        _completion_reasons[(SESSION, "call-new")] = "cancelled"
+        first_token = register_tool_approval_notify(SESSION, first_notify)
+        second_token = register_tool_approval_notify(SESSION, second_notify)
+        _wait_registry = tool_approval._wait_registry
+        assert _wait_registry.wait(
+            SESSION, "call-old", 0, "waiting", payload=GATED
+        ) == (None, "expired")
+        waiter, result = _start_approval_wait(GATED, "call-new")
         _decisions[(SESSION, "call-new")] = "once"
 
-        unregister_tool_approval_notify(SESSION, first_notify)
+        unregister_tool_approval_notify(SESSION, first_token)
 
-        assert _notify_cbs[SESSION] is second_notify
-        assert _waits[SESSION] == [waiter]
-        assert not waiter.event.is_set()
-        assert _completion_reasons[(SESSION, "call-new")] == "cancelled"
+        assert _wait_registry.surface_value(SESSION) is second_notify
+        assert _wait_registry.pending_count(SESSION) == 1
+        assert waiter.is_alive()
+        assert consume_tool_approval_completion_reason(SESSION, "call-old") == "expired"
         assert _decisions[(SESSION, "call-new")] == "once"
 
-        unregister_tool_approval_notify(SESSION, second_notify)
+        assert _wait_registry.wait(
+            SESSION, "call-old", 0, "waiting", payload=GATED
+        ) == (None, "expired")
+        unregister_tool_approval_notify(SESSION, second_token)
 
-        assert SESSION not in _notify_cbs
-        assert SESSION not in _waits
-        assert waiter.event.is_set()
-        assert (SESSION, "call-new") not in _completion_reasons
+        waiter.join(timeout=3)
+        assert not waiter.is_alive()
+        assert result["choice"] is None
+        assert _wait_registry.has_surface(SESSION) is False
+        assert _wait_registry.pending_count(SESSION) == 0
+        assert consume_tool_approval_completion_reason(SESSION, "call-old") is None
         assert (SESSION, "call-new") not in _decisions
 
 
