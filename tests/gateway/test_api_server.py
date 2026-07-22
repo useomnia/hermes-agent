@@ -2114,6 +2114,21 @@ class TestChatCompletionsEndpoint:
         assert fake_agent.completed_event["interaction"] == {"answered": "deny"}
 
     @pytest.mark.asyncio
+    async def test_stream_connector_skipped_decision_rides_completed_event(self, adapter):
+        """A skip echoes so a reloaded card reads Skipped without ending the turn."""
+        import json as _json
+
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter,
+            "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT",
+            _json.dumps({"status": "approval_skipped", "error": "skipped"}),
+            decision="skip",
+        )
+
+        assert fake_agent.interrupt_calls == []
+        assert fake_agent.completed_event["interaction"] == {"answered": "skip"}
+
+    @pytest.mark.asyncio
     async def test_stream_connector_approval_error_does_not_end_turn(self, adapter):
         """A guard-error / no-surface denial (status "approval_error") must
         NOT end the turn — the user may well be present (guard error) or

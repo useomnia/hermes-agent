@@ -89,3 +89,41 @@ async def test_new_omnia_request_can_supply_optional_sibling_tools():
     assert body["recorded"] is True
     assert tool_approval.is_tool_approved(SESSION, GATED) is True
     assert tool_approval.is_tool_approved(SESSION, SIBLING) is True
+
+
+@pytest.mark.asyncio
+async def test_omnia_request_accepts_skip_for_a_live_waiter():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    _park_waiter()
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        response = await client.post(
+            "/v1/omnio/tool-approval",
+            headers={"X-Hermes-Session-Id": SESSION},
+            json={"tool": GATED, "scope": "skip", "toolCallId": "call-1"},
+        )
+        body = await response.json()
+
+    assert response.status == 200
+    assert body["scope"] == "skip"
+    assert body["recorded"] is True
+    assert tool_approval.consume_tool_approval_decision(SESSION, "call-1") == "skip"
+    assert tool_approval.is_tool_approved(SESSION, GATED) is False
+    assert tool_approval.is_always_approved(GATED) is False
+
+
+@pytest.mark.asyncio
+async def test_omnia_request_rejects_an_invalid_scope():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    _park_waiter()
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        response = await client.post(
+            "/v1/omnio/tool-approval",
+            headers={"X-Hermes-Session-Id": SESSION},
+            json={"tool": GATED, "scope": "forever", "toolCallId": "call-1"},
+        )
+        body = await response.json()
+
+    assert response.status == 400
+    assert body["error"]["code"] == "invalid_approval_scope"

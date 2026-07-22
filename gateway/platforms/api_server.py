@@ -2441,18 +2441,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 # registered. Like request_user_input's "no_response" above, this
                 # ends the turn, so a late decision lands as the next turn rather
                 # than trying to resume a call the agent has moved on from. An
-                # explicit deny is NOT turn-ending — that's today's inline
-                # denial-and-continue behavior, unchanged.
+                # explicit deny or skip is NOT turn-ending — the agent receives
+                # the fail-closed result inline and continues.
                 elif is_gated_tool(function_name):
                     try:
                         parsed = json.loads(function_result or "{}")
                     except Exception:
                         parsed = {}
-                    # A resolved decision (once/session/always/deny) rides the
-                    # gated call's completed event as `interaction.answered` —
-                    # mirroring request_user_input's answered echo — so the
+                    # A resolved decision (once/session/always/deny/skip) rides
+                    # the gated call's completed event as `interaction.answered`
+                    # — mirroring request_user_input's answered echo — so the
                     # persisted turn rehydrates the approval card in its
-                    # granted/denied state instead of "not answered".
+                    # resolved state instead of "not answered".
                     try:
                         from tools.tool_approval import consume_tool_approval_decision
 
@@ -2538,8 +2538,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         progress[key] = kwargs[key]
                 _stream_q.put(("__tool_progress__", progress))
 
-            # Connector write-tool approval: the guard blocks the agent worker
-            # thread and pushes the approval card onto this stream via this
+            # Gated-tool approval: the guard blocks the agent worker thread and
+            # pushes the approval card onto this stream via this
             # notify; the user's resolve (POST /v1/omnio/tool-approval) unblocks
             # it and the SAME tool call runs inline. The card rides the tool's
             # "running" lifecycle (same toolCallId), so the client renders it in
@@ -4327,8 +4327,8 @@ class APIServerAdapter(BasePlatformAdapter):
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
 
-        ``approval_session_key`` + ``approval_notify`` arm the connector
-        write-tool approval gate: the key is bound for the worker thread (so the
+        ``approval_session_key`` + ``approval_notify`` arm the gated-tool
+        approval gate: the key is bound for the worker thread (so the
         guard's ``get_current_session_key()`` matches) and the notify (which
         pushes the approval card onto this run's stream) is registered for the
         duration of the run. Omit them for non-interactive callers — a gated
@@ -4945,24 +4945,25 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_omnio_tool_approval(self, request: "web.Request") -> "web.Response":
         """POST /v1/omnio/tool-approval — record a user's decision on a gated
-        connector WRITE tool.
+        connector write or credit-spend tool.
 
         The guard is BLOCKING: the agent worker is parked on this exact call
         waiting for the decision. The request is keyed by the conversation's
         session id (the ``X-Hermes-Session-Id`` header the proxy derives from the
         source id — the value the guard scoped its prompt to) AND the tool's call
         id, so resolution unblocks THIS specific call (approve → it proceeds
-        inline; deny → a denial) rather than whichever waiter is at the queue
-        head — which is what keeps two writes pending in one turn from
-        cross-talking. A `session`-scope decision is also remembered so later
-        calls of the same tool skip the prompt.
+        inline; deny/skip → a fail-closed result) rather than whichever waiter
+        is at the queue head — which is what keeps two writes pending in one
+        turn from cross-talking. For connector writes, a `session`-scope
+        decision is also remembered so later calls of the same tool skip the
+        prompt.
 
         The response's ``recorded`` field is True only when a blocked waiter
-        was actually released by this call — i.e. the write is still live and
-        will proceed/deny per ``choice``. False means the wait already ended
-        (timed out, or the turn moved on) before this decision arrived: the
-        card in the UI is stale and the write did not run, even for a
-        `session`/`always` scope that still got persisted for next time.
+        was actually released by this call — i.e. the gated call is still live
+        and will proceed or fail closed per ``choice``. False means the wait
+        already ended (timed out, or the turn moved on) before this decision
+        arrived: the card in the UI is stale and the tool did not run, even for a
+        standing connector scope that still got persisted for next time.
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -5301,7 +5302,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
-            # Omnia connector-write approval (see _handle_omnio_tool_approval).
+            # Omnia gated-tool approval (see _handle_omnio_tool_approval).
             self._app.router.add_post("/v1/omnio/tool-approval", self._handle_omnio_tool_approval)
             # Omnia blocking request_user_input answer delivery (see _handle_omnio_user_input).
             self._app.router.add_post("/v1/omnio/user-input", self._handle_omnio_user_input)

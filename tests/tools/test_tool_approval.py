@@ -22,6 +22,7 @@ from tools.tool_approval import (
     _notify_cbs,
     _session_approved,
     _waits,
+    await_tool_approval,
     clear_session,
     consume_tool_approval_completion_reason,
     consume_tool_approval_decision,
@@ -148,6 +149,19 @@ class TestMaybeRequireToolApproval:
         # agent continues and reports the denial inline.
         assert json.loads(result)["status"] == "approval_denied"
 
+    def test_should_fail_closed_with_skip_semantics_when_the_user_types_past(self):
+        register_tool_approval_notify(SESSION, _resolving_notify("skip"))
+
+        result = maybe_require_tool_approval(GATED, "call-1")
+
+        assert result is not None
+        parsed = json.loads(result)
+        assert parsed["status"] == "approval_skipped"
+        assert "sending a new message instead" in parsed["error"]
+        assert "arrives as the next user turn" in parsed["error"]
+        assert "address their new message instead" in parsed["error"]
+        assert "let them know it needs their approval" not in parsed["error"]
+
     def test_should_remember_a_session_grant_so_the_next_call_doesnt_prompt(self):
         register_tool_approval_notify(SESSION, _resolving_notify("session"))
         assert maybe_require_tool_approval(GATED) is None
@@ -213,6 +227,8 @@ class TestMaybeRequireToolApproval:
         assert it["options"] == APPROVAL_OPTIONS
         assert it["approval"]["tool"] == GATED
         assert it["approval"]["option_scopes"] == APPROVAL_OPTION_SCOPES
+        assert it["approval"]["skip_scope"] is True
+        assert "skip" not in it["approval"]["option_scopes"]
         assert "cost" not in it["approval"]
 
 
@@ -238,6 +254,8 @@ class TestCreditApproval:
             interaction["approval"]["option_scopes"]
             == CREDIT_APPROVAL_OPTION_SCOPES
         )
+        assert interaction["approval"]["skip_scope"] is True
+        assert "skip" not in interaction["approval"]["option_scopes"]
 
     def test_should_show_the_total_for_fixed_per_engine_spend(self):
         captured = {}
@@ -407,6 +425,25 @@ class TestCreditApproval:
         assert entry.result == "once"
         assert is_always_approved(GATED) is False
 
+    def test_should_preserve_skip_scope_for_a_credit_gated_call(self):
+        entry = _ApprovalWait(CREDIT_GATED, "call-credit")
+        _waits[SESSION] = [entry]
+
+        assert (
+            resolve_tool_approval(
+                SESSION,
+                CREDIT_GATED,
+                "skip",
+                tool_call_id="call-credit",
+            )
+            is True
+        )
+
+        assert entry.result == "skip"
+        assert consume_tool_approval_decision(SESSION, "call-credit") == "skip"
+        assert is_tool_approved(SESSION, CREDIT_GATED) is False
+        assert is_always_approved(CREDIT_GATED) is False
+
 
 class TestCreditApprovalDispatch:
     def test_should_execute_the_same_call_inline_when_approved(self, monkeypatch):
@@ -458,6 +495,28 @@ class TestCreditApprovalDispatch:
         )
 
         assert json.loads(result)["status"] == "approval_denied"
+        assert dispatched == []
+
+    def test_should_not_execute_the_call_when_skipped(self, monkeypatch):
+        import model_tools
+
+        dispatched = []
+
+        def dispatch(function_name, function_args, **kwargs):
+            dispatched.append((function_name, function_args))
+            return json.dumps({"success": True})
+
+        monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
+        register_tool_approval_notify(SESSION, _resolving_notify("skip"))
+
+        result = model_tools.handle_function_call(
+            CREDIT_GATED,
+            {"engines": ["google"]},
+            tool_call_id="call-credit",
+            skip_pre_tool_call_hook=True,
+        )
+
+        assert json.loads(result)["status"] == "approval_skipped"
         assert dispatched == []
 
     def test_should_fail_closed_without_dispatch_when_the_gate_raises(
@@ -654,6 +713,19 @@ class TestResolveToolApproval:
         _waits[SESSION] = [entry]
         assert resolve_tool_approval(SESSION, GATED, "once", "call-A") is True
         assert entry.result == "once" and entry.event.is_set()
+
+    def test_should_release_a_waiter_with_skip_without_recording_a_grant(self):
+        def notify(_event):
+            assert resolve_tool_approval(SESSION, GATED, "skip", "call-A") is True
+
+        register_tool_approval_notify(SESSION, notify)
+
+        choice = await_tool_approval(SESSION, GATED, {}, "call-A")
+
+        assert choice == "skip"
+        assert consume_tool_approval_decision(SESSION, "call-A") == "skip"
+        assert is_tool_approved(SESSION, GATED) is False
+        assert is_always_approved(GATED) is False
 
     def test_should_record_the_decision_for_the_completed_event_echo(self):
         # A released waiter's decision is consumed once by the gateway's

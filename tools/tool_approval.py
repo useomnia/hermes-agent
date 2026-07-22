@@ -20,7 +20,8 @@ gets the real result; on deny it gets a denial. This is deliberately not the
 non-blocking "return a prompt, ask the agent to re-issue" pattern: an MCP tool
 result is wrapped as untrusted data the model is told to ignore, so it cannot be
 used to instruct a re-call — and the agent would confabulate success instead of
-re-issuing. Blocking keeps the result trustworthy and the agent honest.
+re-issuing. Blocking keeps the result trustworthy and the agent honest. A skip
+also fails closed when the user sends a new message instead of deciding.
 
 The chat surface registers a per-session notify callback
 (``register_tool_approval_notify``) that pushes the interaction onto the chat
@@ -63,7 +64,7 @@ CONNECTORS_TOOL_PREFIX = "mcp_connectors_"
 # Omnia frontend can map a chosen label back to its scope.
 APPROVAL_OPTIONS = ["Allow once", "Allow for this chat", "Allow always", "Deny"]
 APPROVAL_OPTION_SCOPES = ["once", "session", "always", "deny"]
-APPROVAL_SCOPES = frozenset({"once", "session", "always", "deny"})
+APPROVAL_SCOPES = frozenset({"once", "session", "always", "deny", "skip"})
 CREDIT_APPROVAL_OPTIONS = ["Approve", "Deny"]
 CREDIT_APPROVAL_OPTION_SCOPES = ["once", "deny"]
 
@@ -97,9 +98,10 @@ _notify_cbs: dict[str, Callable[[dict], None]] = {}
 _waits: dict[str, list["_ApprovalWait"]] = {}
 # (session_key, tool_call_id) -> reason for an unresolved completed wait.
 _completion_reasons: dict[tuple[str, str], str] = {}
-# (session_key, tool_call_id) -> the resolved decision (once/session/always/deny)
-# for a released waiter, consumed by the gateway's tool-complete callback to
-# echo `interaction.answered` on the gated call's completed event.
+# (session_key, tool_call_id) -> the resolved decision
+# (once/session/always/deny/skip) for a released waiter, consumed by the
+# gateway's tool-complete callback to echo `interaction.answered` on the gated
+# call's completed event.
 _decisions: dict[tuple[str, str], str] = {}
 
 
@@ -112,7 +114,7 @@ class _ApprovalWait:
         self.event = threading.Event()
         self.tool = tool
         self.tool_call_id = tool_call_id
-        self.result: Optional[str] = None  # "once" | "session" | "always" | "deny"
+        self.result: Optional[str] = None  # once/session/always/deny/skip
 
 
 # Frozen at import — same rationale as tools/approval.py's _YOLO_MODE_FROZEN:
@@ -289,14 +291,14 @@ def await_tool_approval(
 ) -> Optional[str]:
     """Surface the approval card and block until the user resolves it.
 
-    Returns the chosen scope (``once`` / ``session`` / ``deny``); ``None`` when
-    the wait genuinely timed out or the agent was interrupted (the user
-    stopped the turn, or the chat disconnected) while a real surface was
-    registered; or the ``_NO_SURFACE`` sentinel when there was no chat surface
-    registered at all (non-interactive caller). The caller MUST fail closed
-    (not execute the write) for both ``None`` and ``_NO_SURFACE`` — the two are
-    kept distinct only so it can pick the right (turn-ending vs not) denial
-    status.
+    Returns the chosen scope (``once`` / ``session`` / ``always`` / ``deny`` /
+    ``skip``); ``None`` when the wait genuinely timed out or the agent was
+    interrupted (the user stopped the turn, or the chat disconnected) while a
+    real surface was registered; or the ``_NO_SURFACE`` sentinel when there was
+    no chat surface registered at all (non-interactive caller). The caller MUST
+    fail closed (not execute the write) for both ``None`` and ``_NO_SURFACE`` —
+    the two are kept distinct only so it can pick the right (turn-ending vs not)
+    denial status.
     """
     with _lock:
         cb = _notify_cbs.get(session_key)
@@ -460,7 +462,7 @@ def resolve_tool_approval(
 def consume_tool_approval_decision(
     session_key: str, tool_call_id: str = ""
 ) -> Optional[str]:
-    """Pop the recorded decision (once/session/always/deny) for a released
+    """Pop the recorded decision (once/session/always/deny/skip) for a released
     gated call, or None when the wait ended without one (timeout/interrupt)."""
     if not session_key:
         return None
@@ -532,14 +534,16 @@ def _denial_result(choice: Optional[str], *, status: Optional[str] = None) -> st
 
     Also carries a machine-readable ``status`` field for the api_server seam to
     key its turn-ending decision on, alongside the human-readable ``error``
-    text (unchanged):
+    text:
       - ``choice == "deny"`` -> ``"approval_denied"`` (explicit denial; NOT
         turn-ending, the agent continues and reports it inline).
+      - ``choice == "skip"`` -> ``"approval_skipped"`` (the user sent a new
+        message instead; NOT turn-ending, so it arrives as the next user turn).
       - otherwise (the wait ended unresolved with a real approval surface — a
         timeout, or an interrupt/stop releasing the waiter) ->
         ``"approval_no_response"`` (turn-ending; for the interrupt case the turn
         is already ending, so the extra interrupt is a no-op).
-      - ``status`` overrides both defaults — used for paths that are neither of
+      - ``status`` overrides these defaults — used for paths that are none of
         the above and must NOT be turn-ending: a guard error
         (``fail_closed_denial``) or no interactive surface at all
         (``maybe_require_tool_approval``'s no-surface branch).
@@ -547,17 +551,26 @@ def _denial_result(choice: Optional[str], *, status: Optional[str] = None) -> st
     if choice == "deny":
         reason = "The user declined this action."
         default_status = "approval_denied"
+        tail = "let them know it needs their approval."
+    elif choice == "skip":
+        reason = (
+            "The user skipped this request by sending a new message instead; "
+            "their message arrives as the next user turn."
+        )
+        default_status = "approval_skipped"
+        tail = "address their new message instead."
     else:
         reason = (
             "This action needs the user's approval, which wasn't granted (no response)."
         )
         default_status = "approval_no_response"
+        tail = "let them know it needs their approval."
     return json.dumps(
         {
             "status": status or default_status,
             "error": (
                 f"{reason} It was NOT performed. Do not retry it or tell the user it "
-                "succeeded; let them know it needs their approval."
+                f"succeeded; {tail}"
             ),
         },
         ensure_ascii=False,
@@ -644,7 +657,8 @@ def maybe_require_tool_approval(
     Returns ``None`` when the call may proceed (read tool, gating disabled,
     connector write already approved for the session, or just approved).
     Otherwise BLOCKS until the user resolves the prompt and returns a denial
-    tool-result string (the tool must not execute) on deny / timeout / no-surface.
+    tool-result string (the tool must not execute) on deny / skip / timeout /
+    no-surface.
     """
     if not is_gated_tool(function_name):
         return None
@@ -674,6 +688,7 @@ def maybe_require_tool_approval(
         "tool": function_name,
         "tool_call_id": tool_call_id or "",
         "option_scopes": list(option_scopes),
+        "skip_scope": True,
     }
     if credits_descriptor is not None:
         approval["cost"] = cost
@@ -698,12 +713,13 @@ def maybe_require_tool_approval(
         return None
     if choice == "once":
         return None  # this call proceeds; the next one prompts again
+    if choice in ("deny", "skip"):
+        return _denial_result(choice)
     if choice == _NO_SURFACE:
         # No interactive surface at all (e.g. a proactive /v1/runs task) — fail
         # closed, but NOT turn-ending: there was never anyone who could have
         # answered, so interrupting a headless run would be wrong.
         return _denial_result(None, status="approval_error")
-    # deny (choice == "deny") / an unresolved wait with a real surface —
-    # timeout or interrupt (choice is None) → fail closed; the unresolved wait
-    # is turn-ending via "approval_no_response", deny is not.
-    return _denial_result(choice)
+    # An unresolved wait with a real surface — timeout or interrupt (choice is
+    # None) — fails closed and ends the turn via "approval_no_response".
+    return _denial_result(None)
