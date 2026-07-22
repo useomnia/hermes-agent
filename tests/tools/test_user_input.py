@@ -96,7 +96,7 @@ class TestAwaitAndResolve:
     def test_returns_none_without_an_interactive_surface_and_does_not_park(self):
         # A session with no registered chat surface (e.g. a proactive /v1/runs
         # task) must fail fast, not park for the full timeout with no one to answer.
-        _active_sessions.discard(SESSION)
+        _active_sessions.pop(SESSION, None)
         assert await_user_input(SESSION, "call-1") is None
         assert SESSION not in _waits
 
@@ -190,6 +190,8 @@ class TestClearSession:
 class TestSurfaceRegistry:
     def test_unregister_drops_the_surface_and_releases_waiters(self):
         result: dict[str, object] = {}
+        token = register_user_input_session(SESSION)
+        assert token is not None
 
         def worker():
             result["answer"] = await_user_input(SESSION, "call-1")
@@ -198,13 +200,37 @@ class TestSurfaceRegistry:
         thread.start()
         assert _wait_until_blocked()
 
-        unregister_user_input_session(SESSION)
+        unregister_user_input_session(SESSION, token)
         thread.join(timeout=3)
         assert not thread.is_alive(), "unregister must release parked waiters"
         assert result["answer"] is None
         assert SESSION not in _active_sessions
         # A subsequent input on the now-unregistered session fails fast.
         assert await_user_input(SESSION, "call-2") is None
+
+    def test_stale_unregister_preserves_the_new_run_state(self):
+        first_token = register_user_input_session(SESSION)
+        second_token = register_user_input_session(SESSION)
+        assert first_token is not None
+        assert second_token is not None
+        assert first_token is not second_token
+        waiter = _InputWait("call-new")
+        _waits[SESSION] = [waiter]
+        _completion_reasons[SESSION] = "cancelled"
+
+        unregister_user_input_session(SESSION, first_token)
+
+        assert _active_sessions[SESSION] is second_token
+        assert _waits[SESSION] == [waiter]
+        assert not waiter.event.is_set()
+        assert _completion_reasons[SESSION] == "cancelled"
+
+        unregister_user_input_session(SESSION, second_token)
+
+        assert SESSION not in _active_sessions
+        assert SESSION not in _waits
+        assert waiter.event.is_set()
+        assert SESSION not in _completion_reasons
 
 
 class TestKillswitch:

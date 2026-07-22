@@ -163,18 +163,20 @@ class TestMaybeRequireToolApproval:
         assert "let them know it needs their approval" not in parsed["error"]
 
     def test_should_remember_a_session_grant_so_the_next_call_doesnt_prompt(self):
-        register_tool_approval_notify(SESSION, _resolving_notify("session"))
+        notify = _resolving_notify("session")
+        register_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(GATED) is None
         # Second call: even with the notify gone, the session grant lets it proceed.
-        unregister_tool_approval_notify(SESSION)
+        unregister_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(GATED) is None
 
     def test_once_grant_does_not_carry_to_the_next_call(self):
-        register_tool_approval_notify(SESSION, _resolving_notify("once"))
+        notify = _resolving_notify("once")
+        register_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(GATED) is None
         # The once-grant was for that one call; without the notify the next call
         # has no interactive surface and fails closed.
-        unregister_tool_approval_notify(SESSION)
+        unregister_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(GATED) is not None
 
     def test_should_fail_closed_with_no_interactive_surface(self):
@@ -396,14 +398,15 @@ class TestCreditApproval:
 
     @pytest.mark.parametrize("scope", ["session", "always"])
     def test_should_treat_standing_scope_resolutions_as_once(self, scope):
-        register_tool_approval_notify(SESSION, _resolving_notify(scope))
+        notify = _resolving_notify(scope)
+        register_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(CREDIT_GATED, "call-credit") is None
 
         assert consume_tool_approval_decision(SESSION, "call-credit") == "once"
         assert is_tool_approved(SESSION, CREDIT_GATED) is False
         assert is_always_approved(CREDIT_GATED) is False
 
-        unregister_tool_approval_notify(SESSION)
+        unregister_tool_approval_notify(SESSION, notify)
         denial = maybe_require_tool_approval(CREDIT_GATED, "call-next")
         assert denial is not None
         assert json.loads(denial)["status"] == "approval_error"
@@ -577,19 +580,21 @@ class TestAlwaysScope:
         assert maybe_require_tool_approval(GATED) is None
 
     def test_should_proceed_and_persist_when_the_user_allows_always(self):
-        register_tool_approval_notify(SESSION, _resolving_notify("always"))
+        notify = _resolving_notify("always")
+        register_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(GATED, "call-1") is None
         # The grant carried to the next call without any interactive surface.
-        unregister_tool_approval_notify(SESSION)
+        unregister_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(GATED) is None
 
     def test_first_always_call_proceeds_but_later_call_waits_for_persistence(self):
         register_always_approval_authority(None)
-        register_tool_approval_notify(SESSION, _resolving_notify("always"))
+        notify = _resolving_notify("always")
+        register_tool_approval_notify(SESSION, notify)
 
         assert maybe_require_tool_approval(GATED, "call-1") is None
 
-        unregister_tool_approval_notify(SESSION)
+        unregister_tool_approval_notify(SESSION, notify)
         result = maybe_require_tool_approval(GATED, "call-2")
         assert json.loads(result)["status"] == "approval_error"
 
@@ -644,9 +649,10 @@ class TestAlwaysScope:
     def test_revoke_reload_after_in_chat_always_grant_forces_the_next_call_to_prompt(
         self,
     ):
-        register_tool_approval_notify(SESSION, _resolving_notify("always"))
+        notify = _resolving_notify("always")
+        register_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(GATED, "call-1") is None
-        unregister_tool_approval_notify(SESSION)
+        unregister_tool_approval_notify(SESSION, notify)
         assert maybe_require_tool_approval(GATED, "call-2") is None
 
         replace_injected_always_approvals([])
@@ -794,6 +800,38 @@ class TestResolveToolApproval:
 
         assert first.result == "deny" and first.event.is_set()
         assert second.result is None and not second.event.is_set()
+
+
+class TestSurfaceRegistry:
+    def test_stale_unregister_preserves_the_new_run_state(self):
+        def first_notify(_event):
+            pass
+
+        def second_notify(_event):
+            pass
+
+        register_tool_approval_notify(SESSION, first_notify)
+        register_tool_approval_notify(SESSION, second_notify)
+        waiter = _ApprovalWait(GATED, "call-new")
+        _waits[SESSION] = [waiter]
+        _completion_reasons[(SESSION, "call-new")] = "cancelled"
+        _decisions[(SESSION, "call-new")] = "once"
+
+        unregister_tool_approval_notify(SESSION, first_notify)
+
+        assert _notify_cbs[SESSION] is second_notify
+        assert _waits[SESSION] == [waiter]
+        assert not waiter.event.is_set()
+        assert _completion_reasons[(SESSION, "call-new")] == "cancelled"
+        assert _decisions[(SESSION, "call-new")] == "once"
+
+        unregister_tool_approval_notify(SESSION, second_notify)
+
+        assert SESSION not in _notify_cbs
+        assert SESSION not in _waits
+        assert waiter.event.is_set()
+        assert (SESSION, "call-new") not in _completion_reasons
+        assert (SESSION, "call-new") not in _decisions
 
 
 class TestConcurrentApproval:

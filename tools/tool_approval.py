@@ -247,12 +247,16 @@ def register_tool_approval_notify(session_key: str, cb: Callable[[dict], None]) 
         _notify_cbs[session_key] = cb
 
 
-def unregister_tool_approval_notify(session_key: str) -> None:
+def unregister_tool_approval_notify(
+    session_key: str, cb: Callable[[dict], None]
+) -> None:
     """Drop the notify callback AND release any still-blocked waiters for this
-    session (so a finished/interrupted run can't leave a thread parked)."""
+    session when *cb* still owns its registration."""
     if not session_key:
         return
     with _lock:
+        if _notify_cbs.get(session_key) is not cb:
+            return
         _notify_cbs.pop(session_key, None)
         for key in [key for key in _completion_reasons if key[0] == session_key]:
             _completion_reasons.pop(key, None)

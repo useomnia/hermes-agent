@@ -64,28 +64,33 @@ _waits: dict[str, list["_InputWait"]] = {}
 # sufficient and avoids changing the plugin's Optional[str] return contract.
 _completion_reasons: dict[str, str] = {}
 # Sessions with an interactive chat surface that can render the card and POST an
-# answer back. The api_server chat path registers the session here; a
+# answer back, keyed to the run that owns the registration. The api_server chat
+# path registers the session here; a
 # non-interactive caller (e.g. a proactive /v1/runs task) is absent, so the gate
 # fails fast instead of parking the worker for the full timeout with no one to
 # answer. Mirrors tools/tool_approval.py's "no notify cb → no surface" check.
-_active_sessions: set[str] = set()
+_active_sessions: dict[str, object] = {}
 
 
-def register_user_input_session(session_key: str) -> None:
-    """Mark a session as having an interactive chat surface (can answer cards)."""
+def register_user_input_session(session_key: str) -> object | None:
+    """Mark an interactive chat surface and return its ownership token."""
     if not session_key:
-        return
+        return None
+    token = object()
     with _lock:
-        _active_sessions.add(session_key)
+        _active_sessions[session_key] = token
+    return token
 
 
-def unregister_user_input_session(session_key: str) -> None:
+def unregister_user_input_session(session_key: str, token: object) -> None:
     """Drop the interactive-surface mark AND release any still-blocked waiters for
-    this session, so a finished/interrupted run can't leave a worker parked."""
+    this session when *token* still owns its registration."""
     if not session_key:
         return
     with _lock:
-        _active_sessions.discard(session_key)
+        if _active_sessions.get(session_key) is not token:
+            return
+        _active_sessions.pop(session_key, None)
         _completion_reasons.pop(session_key, None)
         waiters = _waits.pop(session_key, [])
     for entry in waiters:
@@ -230,9 +235,7 @@ def resolve_user_input(session_key: str, answer: str, tool_call_id: str = "") ->
 
 
 def clear_session(session_key: str) -> None:
-    """Release any blocked input waiters for a session (run end / reset), so a
-    finished or interrupted run never leaves a worker thread parked. The released
-    waiter's answer stays ``None`` → the caller maps it to a "no answer" result."""
+    """Release blocked input waiters during an explicit conversation reset."""
     if not session_key:
         return
     with _lock:

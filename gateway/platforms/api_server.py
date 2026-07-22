@@ -4345,6 +4345,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
             approval_token = None
+            user_input_token = None
             if approval_session_key:
                 approval_token = set_current_session_key(approval_session_key)
                 if approval_notify is not None:
@@ -4355,7 +4356,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     try:
                         from tools.user_input import register_user_input_session
 
-                        register_user_input_session(approval_session_key)
+                        user_input_token = register_user_input_session(
+                            approval_session_key
+                        )
                     except Exception:
                         pass
             tokens = self._bind_api_server_session(
@@ -4400,17 +4403,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 clear_session_vars(tokens)
                 if approval_session_key:
                     if approval_notify is not None:
-                        unregister_tool_approval_notify(approval_session_key)
+                        unregister_tool_approval_notify(
+                            approval_session_key, approval_notify
+                        )
                     # Drop the interactive-surface mark AND release any
                     # request_user_input call still parked on this session, so a
                     # finished/interrupted run never leaves a worker thread blocked
                     # (its answer stays None → "no answer" result).
-                    try:
-                        from tools.user_input import unregister_user_input_session
+                    if user_input_token is not None:
+                        try:
+                            from tools.user_input import unregister_user_input_session
 
-                        unregister_user_input_session(approval_session_key)
-                    except Exception:
-                        pass
+                            unregister_user_input_session(
+                                approval_session_key, user_input_token
+                            )
+                        except Exception:
+                            pass
                     if approval_token is not None:
                         reset_current_session_key(approval_token)
 
