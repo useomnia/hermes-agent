@@ -2046,6 +2046,60 @@ class TestChatCompletionsEndpoint:
         assert fake_agent.completed_event["interaction"] == {"answered": "always"}
 
     @pytest.mark.asyncio
+    async def test_stream_credit_approval_decision_rides_completed_event(self, adapter):
+        """A credit-gated non-connector tool persists its resolved card state."""
+        import json as _json
+
+        from tools.mcp_tool import (
+            _forget_mcp_tool_server,
+            _track_mcp_tool_credits,
+        )
+
+        tool_name = "mcp_omnia_create_prompts_insights"
+        _track_mcp_tool_credits(tool_name, {"strategy": "real-cost"})
+        try:
+            fake_agent = await self._run_tool_complete_scenario(
+                adapter,
+                tool_name,
+                _json.dumps({"status": "ok", "data": {}}),
+                decision="once",
+            )
+        finally:
+            _forget_mcp_tool_server(tool_name)
+
+        assert fake_agent.interrupt_calls == []
+        assert fake_agent.completed_event["interaction"] == {"answered": "once"}
+
+    @pytest.mark.asyncio
+    async def test_stream_credit_approval_timeout_ends_turn(self, adapter):
+        """A credit-gated non-connector timeout is marked and ends the turn."""
+        import json as _json
+
+        from tools.mcp_tool import (
+            _forget_mcp_tool_server,
+            _track_mcp_tool_credits,
+        )
+
+        tool_name = "mcp_omnia_create_prompts_insights"
+        _track_mcp_tool_credits(tool_name, {"strategy": "real-cost"})
+        try:
+            fake_agent = await self._run_tool_complete_scenario(
+                adapter,
+                tool_name,
+                _json.dumps(
+                    {"status": "approval_no_response", "error": "no response"}
+                ),
+                completion_reason="expired",
+            )
+        finally:
+            _forget_mcp_tool_server(tool_name)
+
+        assert fake_agent.interrupt_calls == [
+            "awaiting user approval (tool approval timed out)"
+        ]
+        assert fake_agent.completed_event["interaction"]["timed_out"] is True
+
+    @pytest.mark.asyncio
     async def test_stream_connector_denied_decision_rides_completed_event(self, adapter):
         """A deny echoes too, so a reloaded denied card reads Denied."""
         import json as _json

@@ -1102,12 +1102,12 @@ def handle_function_call(
             if function_name in {"write_file", "patch"}:
                 return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
 
-        # Connector WRITE tools (Omnia/Omnio) require a BLOCKING per-call user
-        # approval rendered as a card in the chat: the guard parks this worker
-        # until the user resolves it; on approval the SAME call proceeds inline,
-        # on deny/timeout/interrupt it returns a denial. The gate must FAIL
-        # CLOSED — a guard error on a gated write denies it rather than running
-        # it unapproved (mirrors the ACP write_file/patch deny above).
+        # Connector writes and MCP credit spends (Omnia/Omnio) require a
+        # BLOCKING user approval rendered as a card in the chat: the guard parks
+        # this worker until the user resolves it; on approval the SAME call
+        # proceeds inline, on deny/timeout/interrupt it returns a denial. The
+        # gate must FAIL CLOSED — a guard error on a gated tool denies it rather
+        # than running it unapproved (mirrors the ACP write_file/patch deny above).
         try:
             from tools.tool_approval import fail_closed_denial, maybe_require_tool_approval
         except Exception as _tool_approval_imp_err:
@@ -1120,7 +1120,11 @@ def handle_function_call(
             )
         else:
             try:
-                approval_required = maybe_require_tool_approval(function_name, tool_call_id or "")
+                approval_required = maybe_require_tool_approval(
+                    function_name,
+                    tool_call_id or "",
+                    function_args=function_args,
+                )
             except Exception as _tool_approval_err:
                 logger.error(
                     "tool approval guard error; failing closed for gated tools: %s",

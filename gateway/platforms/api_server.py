@@ -2378,7 +2378,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
-                from tools.tool_approval import CONNECTORS_TOOL_PREFIX
+                from tools.tool_approval import is_gated_tool
                 _started_tool_call_ids.discard(tool_call_id)
                 completed = {
                     "tool": function_name,
@@ -2435,15 +2435,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         "presented",
                         "no_response",
                     )
-                # Connector write-approval gate (tools/tool_approval.py): the wait
-                # for the approval card ended unresolved (timeout, or an
-                # interrupt/stop releasing the waiter) while a real approval
-                # surface was registered. Like request_user_input's "no_response"
-                # above, this ends the turn, so a late decision lands as the next
-                # turn rather than trying to resume a call the agent has moved on
-                # from. An explicit deny is NOT turn-ending — that's today's
-                # inline denial-and-continue behavior, unchanged.
-                elif function_name.startswith(CONNECTORS_TOOL_PREFIX):
+                # Tool-approval gate (tools/tool_approval.py): the wait for the
+                # approval card ended unresolved (timeout, or an interrupt/stop
+                # releasing the waiter) while a real approval surface was
+                # registered. Like request_user_input's "no_response" above, this
+                # ends the turn, so a late decision lands as the next turn rather
+                # than trying to resume a call the agent has moved on from. An
+                # explicit deny is NOT turn-ending — that's today's inline
+                # denial-and-continue behavior, unchanged.
+                elif is_gated_tool(function_name):
                     try:
                         parsed = json.loads(function_result or "{}")
                     except Exception:

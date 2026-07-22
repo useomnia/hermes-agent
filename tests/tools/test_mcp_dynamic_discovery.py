@@ -10,8 +10,8 @@ from tools.mcp_tool import MCPServerTask, _register_server_tools
 from tools.registry import ToolRegistry
 
 
-def _make_mcp_tool(name: str, desc: str = ""):
-    return SimpleNamespace(name=name, description=desc, inputSchema=None)
+def _make_mcp_tool(name: str, desc: str = "", meta: dict | None = None):
+    return SimpleNamespace(name=name, description=desc, inputSchema=None, meta=meta)
 
 
 class TestRegisterServerTools:
@@ -34,6 +34,45 @@ class TestRegisterServerTools:
             assert "mcp_my_srv_my_tool" in mock_registry.get_all_tool_names()
             assert validate_toolset("my_srv") is True
             assert "mcp_my_srv_my_tool" in resolve_toolset("my_srv")
+
+    def test_tracks_and_forgets_credit_metadata(self, mock_registry):
+        from tools.mcp_tool import (
+            _forget_mcp_tool_server,
+            _mcp_tool_credits_meta,
+            mcp_tool_credits_meta,
+        )
+
+        descriptor = {
+            "workflow": "insights",
+            "strategy": "fixed",
+            "unit": "per_engine",
+            "creditsPerUnit": 30,
+        }
+        server = MCPServerTask("omnia")
+        server._tools = [
+            _make_mcp_tool(
+                "create-prompts-insights",
+                "Create prompt insights",
+                {"omnia/credits": descriptor},
+            ),
+            _make_mcp_tool("read-brand", "Read Brand"),
+        ]
+        server.session = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            registered = _register_server_tools("omnia", server, {})
+
+        credit_tool = "mcp_omnia_create_prompts_insights"
+        read_tool = "mcp_omnia_read_brand"
+        assert mcp_tool_credits_meta(credit_tool) == descriptor
+        assert _mcp_tool_credits_meta[read_tool] is None
+
+        for tool_name in registered:
+            _forget_mcp_tool_server(tool_name)
+
+        assert mcp_tool_credits_meta(credit_tool) is None
+        assert credit_tool not in _mcp_tool_credits_meta
+        assert read_tool not in _mcp_tool_credits_meta
 
 
 class TestRefreshTools:

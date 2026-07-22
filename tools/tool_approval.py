@@ -1,8 +1,9 @@
-"""Per-call user approval for connector WRITE tools (Omnia / Omnio).
+"""Per-call user approval for connector writes and MCP credit spends.
 
 Reads run ungated. WRITE actions on a customer's connected third-party SaaS
 (e.g. drafting an email, creating a doc) require an explicit per-call user
-approval rendered as a control in the Omnia chat.
+approval rendered as a control in the Omnia chat. MCP tools advertising an
+``_meta["omnia/credits"]`` descriptor require approval for every call.
 
 A tool is gated when the connectors MCP route advertised it as NOT read-only
 (MCP ``readOnlyHint=False``). The route derives that from its own write allowlist
@@ -38,7 +39,11 @@ import time
 from typing import Callable, Optional
 
 from tools.approval import get_current_session_key
-from tools.mcp_tool import mcp_tool_has_read_only_hint, mcp_tool_is_read_only
+from tools.mcp_tool import (
+    mcp_tool_credits_meta,
+    mcp_tool_has_read_only_hint,
+    mcp_tool_is_read_only,
+)
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -59,6 +64,8 @@ CONNECTORS_TOOL_PREFIX = "mcp_connectors_"
 APPROVAL_OPTIONS = ["Allow once", "Allow for this chat", "Allow always", "Deny"]
 APPROVAL_OPTION_SCOPES = ["once", "session", "always", "deny"]
 APPROVAL_SCOPES = frozenset({"once", "session", "always", "deny"})
+CREDIT_APPROVAL_OPTIONS = ["Approve", "Deny"]
+CREDIT_APPROVAL_OPTION_SCOPES = ["once", "deny"]
 
 # Sentinel returned by ``await_tool_approval`` when there is no interactive
 # surface registered at all (e.g. a proactive /v1/runs headless task with
@@ -124,20 +131,30 @@ def _approval_timeout() -> int:
 
 
 def is_gated_tool(function_name: str) -> bool:
-    """Whether *function_name* is a connector WRITE that needs approval.
+    """Whether *function_name* needs connector-write or credit approval.
 
     Gates a connectors-server tool (``mcp_connectors_<slug>``) unless the route
     advertised it as read-only (MCP ``readOnlyHint=True``). The route stamps that
     per tool from its write allowlist, so the gated set tracks exactly what the
     route exposes — no provision-time snapshot to drift. FAILS CLOSED: a
     connectors tool with no read-only hint (e.g. a route that hasn't advertised
-    it yet) is gated rather than run as an ungated write.
+    it yet) is gated rather than run as an ungated write. Any MCP tool with an
+    Omnia credit-spend descriptor is gated regardless of its server prefix.
     """
     if _DISABLED_FROZEN:
         return False
+    if mcp_tool_credits_meta(function_name) is not None:
+        return True
     if not function_name or not function_name.startswith(CONNECTORS_TOOL_PREFIX):
         return False
     return not mcp_tool_is_read_only(function_name)
+
+
+def is_credit_gated_tool(function_name: str) -> bool:
+    """Whether *function_name* advertises a per-call credit spend."""
+    if _DISABLED_FROZEN:
+        return False
+    return mcp_tool_credits_meta(function_name) is not None
 
 
 def is_tool_approved(session_key: str, function_name: str) -> bool:
@@ -377,10 +394,34 @@ def resolve_tool_approval(
     ran. `session`/`always` grants are still recorded in that case — they
     legitimately help the NEXT call of the same tool skip the prompt — but the
     call itself reports False so the caller can tell the user their decision
-    arrived too late to affect this write.
+    arrived too late to affect this write. Credit-gated calls are the exception:
+    their `session`/`always` decisions are reduced to `once` and never recorded.
     """
     if not session_key or scope not in APPROVAL_SCOPES:
         return False
+    if scope in {"session", "always"}:
+        approval_tool = function_name
+        with _lock:
+            queue = _waits.get(session_key) or []
+            if tool_call_id:
+                matching = next(
+                    (
+                        candidate
+                        for candidate in queue
+                        if candidate.tool_call_id == tool_call_id
+                    ),
+                    None,
+                )
+                if matching is not None:
+                    approval_tool = matching.tool
+            elif queue:
+                approval_tool = queue[0].tool
+        try:
+            credit_gated = is_credit_gated_tool(approval_tool)
+        except Exception:
+            credit_gated = True
+        if credit_gated:
+            scope = "once"
     approved_tools = _approved_tool_names(function_name, tools)
     if scope == "session":
         for tool_name in approved_tools:
@@ -540,29 +581,69 @@ def fail_closed_denial(function_name: str) -> Optional[str]:
     return _denial_result(None, status="approval_error") if gated else None
 
 
+def _credit_cost_sentence(descriptor: dict, function_args: Optional[dict]) -> str:
+    strategy = descriptor.get("strategy")
+    unit = descriptor.get("unit")
+    credits_per_unit = descriptor.get("creditsPerUnit")
+    if (
+        strategy == "fixed"
+        and unit == "per_engine"
+        and isinstance(credits_per_unit, (int, float))
+        and not isinstance(credits_per_unit, bool)
+    ):
+        engines = function_args.get("engines") if isinstance(function_args, dict) else None
+        if isinstance(engines, list):
+            engine_count = len(set(engines))
+            total = credits_per_unit * engine_count
+            return (
+                f"This call spends {total:g} credits "
+                f"({credits_per_unit:g} x {engine_count} engines)."
+            )
+        return f"This call spends {credits_per_unit:g} credits per engine."
+    if strategy == "real-cost":
+        return "This call spends credits based on its actual cost."
+    return "This call spends credits."
+
+
 def maybe_require_tool_approval(
     function_name: str,
     tool_call_id: str = "",
+    function_args: Optional[dict] = None,
 ) -> Optional[str]:
-    """Gate a connector write tool behind a blocking user approval.
+    """Gate a connector write or MCP credit spend behind user approval.
 
     Returns ``None`` when the call may proceed (read tool, gating disabled,
-    already approved for the session, or just approved). Otherwise BLOCKS until
-    the user resolves the prompt and returns a denial tool-result string (the
-    write must not execute) on deny / timeout / no-surface.
+    connector write already approved for the session, or just approved).
+    Otherwise BLOCKS until the user resolves the prompt and returns a denial
+    tool-result string (the tool must not execute) on deny / timeout / no-surface.
     """
     if not is_gated_tool(function_name):
         return None
+    credits_descriptor = mcp_tool_credits_meta(function_name)
     session_key = get_current_session_key()
-    if is_always_approved(function_name):
-        return None  # granted for every conversation on this gateway
-    if is_tool_approved(session_key, function_name):
-        return None  # approved for the whole session earlier
+    if credits_descriptor is None:
+        if is_always_approved(function_name):
+            return None  # granted for every conversation on this gateway
+        if is_tool_approved(session_key, function_name):
+            return None  # approved for the whole session earlier
+        options = APPROVAL_OPTIONS
+        option_scopes = APPROVAL_OPTION_SCOPES
+        question = (
+            f'Allow Omnio to use "{_readable_tool(function_name)}"? '
+            "It will act on your connected account."
+        )
+    else:
+        options = CREDIT_APPROVAL_OPTIONS
+        option_scopes = CREDIT_APPROVAL_OPTION_SCOPES
+        question = (
+            f'Allow Omnio to use "{_readable_tool(function_name)}"? '
+            f"{_credit_cost_sentence(credits_descriptor, function_args)}"
+        )
 
     approval = {
         "tool": function_name,
         "tool_call_id": tool_call_id or "",
-        "option_scopes": list(APPROVAL_OPTION_SCOPES),
+        "option_scopes": list(option_scopes),
     }
 
     interaction_event = {
@@ -571,11 +652,8 @@ def maybe_require_tool_approval(
         "status": "running",
         "interaction": {
             "kind": "approval",
-            "question": (
-                f'Allow Omnio to use "{_readable_tool(function_name)}"? '
-                "It will act on your connected account."
-            ),
-            "options": list(APPROVAL_OPTIONS),
+            "question": question,
+            "options": list(options),
             "approval": approval,
         },
     }

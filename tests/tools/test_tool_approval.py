@@ -12,6 +12,8 @@ from tools.interrupt import set_interrupt
 from tools.tool_approval import (
     APPROVAL_OPTION_SCOPES,
     APPROVAL_OPTIONS,
+    CREDIT_APPROVAL_OPTION_SCOPES,
+    CREDIT_APPROVAL_OPTIONS,
     _ApprovalWait,
     _always_approved,
     _completion_reasons,
@@ -25,9 +27,12 @@ from tools.tool_approval import (
     consume_tool_approval_decision,
     fail_closed_denial,
     is_always_approved,
+    is_credit_gated_tool,
     is_gated_tool,
     is_tool_approved,
     maybe_require_tool_approval,
+    record_always_approval,
+    record_session_approval,
     register_always_approval_authority,
     register_tool_approval_notify,
     replace_injected_always_approvals,
@@ -38,6 +43,13 @@ from tools.tool_approval import (
 GATED = "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT"
 SIBLING = "mcp_connectors_GMAIL_SEND_EMAIL"
 READ = "mcp_connectors_GOOGLE_ANALYTICS_RUN_REPORT"
+CREDIT_GATED = "mcp_omnia_create_prompts_insights"
+CREDIT_DESCRIPTOR = {
+    "workflow": "insights",
+    "strategy": "fixed",
+    "unit": "per_engine",
+    "creditsPerUnit": 30,
+}
 SESSION = "sess-1"
 
 
@@ -56,11 +68,13 @@ def _clean_state(monkeypatch):
     _decisions.clear()
     register_always_approval_authority(lambda _function_name: True)
     mcp_tool._mcp_tool_read_only_hints.clear()
+    mcp_tool._mcp_tool_credits_meta.clear()
     # Model the connectors route having advertised its tools: the write is NOT
     # read-only (gated), the read IS (ungated). Gating reads the live annotation.
     mcp_tool._track_mcp_tool_read_only(GATED, False)
     mcp_tool._track_mcp_tool_read_only(SIBLING, False)
     mcp_tool._track_mcp_tool_read_only(READ, True)
+    mcp_tool._track_mcp_tool_credits(CREDIT_GATED, CREDIT_DESCRIPTOR)
     yield
     _session_approved.clear()
     _always_approved.clear()
@@ -71,6 +85,7 @@ def _clean_state(monkeypatch):
     _decisions.clear()
     register_always_approval_authority(None)
     mcp_tool._mcp_tool_read_only_hints.clear()
+    mcp_tool._mcp_tool_credits_meta.clear()
     reset_current_session_key(token)
 
 
@@ -91,6 +106,10 @@ class TestIsGatedTool:
     def test_should_gate_a_connector_write_tool(self):
         assert is_gated_tool(GATED) is True
 
+    def test_should_gate_any_mcp_tool_with_a_credit_descriptor(self):
+        assert is_credit_gated_tool(CREDIT_GATED) is True
+        assert is_gated_tool(CREDIT_GATED) is True
+
     def test_should_not_gate_a_connector_read_tool(self):
         assert is_gated_tool(READ) is False
 
@@ -102,12 +121,14 @@ class TestIsGatedTool:
     def test_should_not_gate_when_the_killswitch_is_set(self, monkeypatch):
         monkeypatch.setattr(tool_approval, "_DISABLED_FROZEN", True)
         assert is_gated_tool(GATED) is False
+        assert is_gated_tool(CREDIT_GATED) is False
 
     def test_should_not_gate_a_non_connectors_tool(self):
         assert is_gated_tool("terminal") is False
         # Another MCP server's write hint is NOT routed through the connector gate.
         mcp_tool._track_mcp_tool_read_only("mcp_other_DO_THING", False)
         assert is_gated_tool("mcp_other_DO_THING") is False
+        assert is_gated_tool("mcp_omnia_unadvertised_tool") is False
 
 
 class TestMaybeRequireToolApproval:
@@ -192,6 +213,240 @@ class TestMaybeRequireToolApproval:
         assert it["options"] == APPROVAL_OPTIONS
         assert it["approval"]["tool"] == GATED
         assert it["approval"]["option_scopes"] == APPROVAL_OPTION_SCOPES
+
+
+class TestCreditApproval:
+    def test_should_surface_only_per_call_approve_and_deny_options(self):
+        captured = {}
+
+        def notify(event):
+            captured.update(event)
+            resolve_tool_approval(SESSION, CREDIT_GATED, "once")
+
+        register_tool_approval_notify(SESSION, notify)
+        assert maybe_require_tool_approval(CREDIT_GATED, "call-credit") is None
+
+        interaction = captured["interaction"]
+        assert interaction["kind"] == "approval"
+        assert interaction["options"] == ["Approve", "Deny"]
+        assert interaction["options"] == CREDIT_APPROVAL_OPTIONS
+        assert interaction["approval"]["tool"] == CREDIT_GATED
+        assert interaction["approval"]["tool_call_id"] == "call-credit"
+        assert interaction["approval"]["option_scopes"] == ["once", "deny"]
+        assert (
+            interaction["approval"]["option_scopes"]
+            == CREDIT_APPROVAL_OPTION_SCOPES
+        )
+
+    def test_should_show_the_total_for_fixed_per_engine_spend(self):
+        captured = {}
+
+        def notify(event):
+            captured.update(event)
+            resolve_tool_approval(SESSION, CREDIT_GATED, "once")
+
+        register_tool_approval_notify(SESSION, notify)
+        assert (
+            maybe_require_tool_approval(
+                CREDIT_GATED,
+                "call-credit",
+                function_args={"engines": ["google", "chatgpt", "perplexity"]},
+            )
+            is None
+        )
+
+        assert (
+            "This call spends 90 credits (30 x 3 engines)."
+            in captured["interaction"]["question"]
+        )
+
+    def test_should_deduplicate_engines_in_the_fixed_spend_total(self):
+        captured = {}
+
+        def notify(event):
+            captured.update(event)
+            resolve_tool_approval(SESSION, CREDIT_GATED, "once")
+
+        register_tool_approval_notify(SESSION, notify)
+        assert (
+            maybe_require_tool_approval(
+                CREDIT_GATED,
+                "call-credit",
+                function_args={"engines": ["openai", "openai", "perplexity"]},
+            )
+            is None
+        )
+
+        question = captured["interaction"]["question"]
+        assert "This call spends 60 credits (30 x 2 engines)." in question
+        assert "90 credits" not in question
+
+    def test_should_show_the_per_engine_price_when_arguments_are_missing(self):
+        captured = {}
+
+        def notify(event):
+            captured.update(event)
+            resolve_tool_approval(SESSION, CREDIT_GATED, "once")
+
+        register_tool_approval_notify(SESSION, notify)
+        assert maybe_require_tool_approval(CREDIT_GATED, "call-credit") is None
+
+        assert (
+            "This call spends 30 credits per engine."
+            in captured["interaction"]["question"]
+        )
+
+    def test_should_not_claim_a_total_for_real_cost_spend(self):
+        captured = {}
+        mcp_tool._track_mcp_tool_credits(
+            CREDIT_GATED,
+            {"workflow": "insights", "strategy": "real-cost", "unit": "run"},
+        )
+
+        def notify(event):
+            captured.update(event)
+            resolve_tool_approval(SESSION, CREDIT_GATED, "once")
+
+        register_tool_approval_notify(SESSION, notify)
+        assert (
+            maybe_require_tool_approval(
+                CREDIT_GATED,
+                "call-credit",
+                function_args={"engines": ["google", "chatgpt", "perplexity"]},
+            )
+            is None
+        )
+
+        question = captured["interaction"]["question"]
+        assert "This call spends credits based on its actual cost." in question
+        assert "90 credits" not in question
+        assert "30 x 3" not in question
+
+    def test_should_not_consult_preexisting_session_or_always_grants(self):
+        record_session_approval(SESSION, CREDIT_GATED)
+        record_always_approval(CREDIT_GATED)
+        prompts = []
+
+        def notify(event):
+            prompts.append(event)
+            resolve_tool_approval(SESSION, CREDIT_GATED, "once")
+
+        register_tool_approval_notify(SESSION, notify)
+        assert maybe_require_tool_approval(CREDIT_GATED, "call-credit") is None
+        assert len(prompts) == 1
+
+    @pytest.mark.parametrize("scope", ["session", "always"])
+    def test_should_treat_standing_scope_resolutions_as_once(self, scope):
+        register_tool_approval_notify(SESSION, _resolving_notify(scope))
+        assert maybe_require_tool_approval(CREDIT_GATED, "call-credit") is None
+
+        assert consume_tool_approval_decision(SESSION, "call-credit") == "once"
+        assert is_tool_approved(SESSION, CREDIT_GATED) is False
+        assert is_always_approved(CREDIT_GATED) is False
+
+        unregister_tool_approval_notify(SESSION)
+        denial = maybe_require_tool_approval(CREDIT_GATED, "call-next")
+        assert denial is not None
+        assert json.loads(denial)["status"] == "approval_error"
+
+    def test_should_enforce_once_from_the_blocked_call_identity(self):
+        entry = _ApprovalWait(CREDIT_GATED, "call-credit")
+        _waits[SESSION] = [entry]
+
+        assert (
+            resolve_tool_approval(
+                SESSION,
+                GATED,
+                "always",
+                tool_call_id="call-credit",
+            )
+            is True
+        )
+
+        assert entry.result == "once"
+        assert is_always_approved(GATED) is False
+
+
+class TestCreditApprovalDispatch:
+    def test_should_execute_the_same_call_inline_when_approved(self, monkeypatch):
+        import model_tools
+
+        dispatched = []
+        captured = {}
+
+        def dispatch(function_name, function_args, **kwargs):
+            dispatched.append((function_name, function_args))
+            return json.dumps({"success": True})
+
+        def notify(event):
+            captured.update(event)
+            resolve_tool_approval(SESSION, CREDIT_GATED, "once", "call-credit")
+
+        monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
+        register_tool_approval_notify(SESSION, notify)
+        function_args = {"engines": ["google", "chatgpt", "perplexity"]}
+
+        result = model_tools.handle_function_call(
+            CREDIT_GATED,
+            function_args,
+            tool_call_id="call-credit",
+            skip_pre_tool_call_hook=True,
+        )
+
+        assert json.loads(result) == {"success": True}
+        assert dispatched == [(CREDIT_GATED, function_args)]
+        assert "90 credits" in captured["interaction"]["question"]
+
+    def test_should_not_execute_the_call_when_denied(self, monkeypatch):
+        import model_tools
+
+        dispatched = []
+
+        def dispatch(function_name, function_args, **kwargs):
+            dispatched.append((function_name, function_args))
+            return json.dumps({"success": True})
+
+        monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
+        register_tool_approval_notify(SESSION, _resolving_notify("deny"))
+
+        result = model_tools.handle_function_call(
+            CREDIT_GATED,
+            {"engines": ["google"]},
+            tool_call_id="call-credit",
+            skip_pre_tool_call_hook=True,
+        )
+
+        assert json.loads(result)["status"] == "approval_denied"
+        assert dispatched == []
+
+    def test_should_fail_closed_without_dispatch_when_the_gate_raises(
+        self, monkeypatch
+    ):
+        import model_tools
+
+        dispatched = []
+
+        def dispatch(function_name, function_args, **kwargs):
+            dispatched.append((function_name, function_args))
+            return json.dumps({"success": True})
+
+        def raise_gate_error(*args, **kwargs):
+            raise RuntimeError("credit gate failed")
+
+        monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
+        monkeypatch.setattr(
+            tool_approval, "maybe_require_tool_approval", raise_gate_error
+        )
+
+        result = model_tools.handle_function_call(
+            CREDIT_GATED,
+            {"engines": ["google"]},
+            tool_call_id="call-credit",
+            skip_pre_tool_call_hook=True,
+        )
+
+        assert json.loads(result)["status"] == "approval_error"
+        assert dispatched == []
 
 class TestAlwaysScope:
     """`always` grants a tool for EVERY conversation on this gateway (not just the
