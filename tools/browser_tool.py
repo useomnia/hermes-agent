@@ -811,6 +811,7 @@ def _run_chrome_fallback_command(
     command: str,
     args: List[str],
     timeout: int,
+    source_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run a browser command in a temporary Chrome session at the current URL.
 
@@ -822,15 +823,22 @@ def _run_chrome_fallback_command(
     """
     import uuid
 
-    # 1. Grab the current URL from the Lightpanda session. Use
-    # ``_engine_override=\"auto\"`` so this helper does not recursively trigger
-    # Lightpanda→Chrome fallback if the eval call itself fails.
-    url_result = _run_browser_command(
-        task_id, "eval", ["window.location.href"], timeout=10, _engine_override="auto"
-    )
-    current_url = None
-    if url_result.get("success"):
-        current_url = url_result.get("data", {}).get("result", "").strip().strip('"').strip("'")
+    # 1. Use a URL captured before timeout reset when available. Otherwise ask
+    # the live Lightpanda session, preserving the ordinary fallback path.
+    current_url = source_url
+    if not current_url:
+        url_result = _run_browser_command(
+            task_id,
+            "eval",
+            ["window.location.href"],
+            timeout=10,
+            _engine_override="auto",
+        )
+        if url_result.get("success"):
+            current_url = (
+                url_result.get("data", {}).get("result", "")
+                .strip().strip('"').strip("'")
+            )
     if not current_url:
         logger.warning("Chrome fallback: could not determine current URL from LP session")
         return {"success": False, "error": "Chrome fallback failed: could not determine current URL"}
@@ -975,9 +983,12 @@ def _chrome_fallback_screenshot(
     task_id: str,
     args: List[str],
     timeout: int,
+    source_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Take a screenshot using a temporary Chrome session."""
-    return _run_chrome_fallback_command(task_id, "screenshot", args, timeout)
+    return _run_chrome_fallback_command(
+        task_id, "screenshot", args, timeout, source_url=source_url
+    )
 
 
 def _auto_local_for_private_urls() -> bool:
@@ -1406,6 +1417,105 @@ def _verify_reapable_browser_daemon(daemon_pid: int, socket_dir: str,
     return True
 
 
+def _terminate_timed_out_browser_daemon(
+    session_info: Dict[str, str], socket_dir: str
+) -> bool:
+    """Terminate the agent-browser daemon left running after a CLI timeout."""
+    session_name = session_info.get("session_name", "")
+    if not session_name:
+        return False
+
+    pid_file = os.path.join(socket_dir, f"{session_name}.pid")
+    try:
+        daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        logger.warning(
+            "Could not reset timed-out browser session %s: daemon PID unavailable",
+            session_name,
+        )
+        return False
+
+    if not _verify_reapable_browser_daemon(
+        daemon_pid, socket_dir, session_name
+    ):
+        return False
+
+    try:
+        if session_info.get("cdp_url"):
+            # A CDP-backed Chrome belongs to external infrastructure. Terminate
+            # only agent-browser's daemon process, never its process tree.
+            import psutil
+
+            daemon = psutil.Process(daemon_pid)
+            daemon.terminate()
+            try:
+                daemon.wait(timeout=5)
+            except psutil.TimeoutExpired:
+                daemon.kill()
+                daemon.wait(timeout=5)
+        else:
+            # Local Chromium is owned by the daemon, so clean up its children too.
+            from tools.process_registry import ProcessRegistry
+
+            ProcessRegistry._terminate_host_pid(daemon_pid)
+    except Exception as exc:
+        logger.warning(
+            "Could not terminate timed-out browser daemon PID %d (session %s): %s",
+            daemon_pid,
+            session_name,
+            exc,
+        )
+        return False
+
+    shutil.rmtree(socket_dir, ignore_errors=True)
+    return True
+
+
+def _reset_browser_session_after_timeout(
+    task_id: str, session_info: Dict[str, str], socket_dir: str
+) -> None:
+    """Reset session state after agent-browser leaves its daemon wedged."""
+    session_name = session_info.get("session_name", "")
+    cache_dropped = False
+    with _cleanup_lock:
+        current = _active_sessions.get(task_id)
+        if current is session_info:
+            _active_sessions.pop(task_id, None)
+            _session_last_activity.pop(task_id, None)
+            _recording_sessions.discard(task_id)
+            cache_dropped = True
+
+    daemon_terminated = _terminate_timed_out_browser_daemon(
+        session_info, socket_dir
+    )
+    bb_session_id = session_info.get("bb_session_id")
+    if cache_dropped and bb_session_id:
+        try:
+            provider = _get_cloud_provider()
+            if provider is not None:
+                provider.close_session(bb_session_id)
+            else:
+                logger.warning(
+                    "Could not release timed-out cloud browser session %s: "
+                    "configured provider unavailable",
+                    bb_session_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not release timed-out cloud browser session %s: %s",
+                bb_session_id,
+                exc,
+            )
+    logger.warning(
+        "Reset browser session after command timeout (task=%s, session=%s, "
+        "daemon_terminated=%s, cache_dropped=%s)",
+        task_id,
+        session_name,
+        daemon_terminated,
+        cache_dropped,
+    )
+
+
 def _reap_orphaned_browser_sessions():
     """Scan for orphaned agent-browser daemon processes from previous runs.
 
@@ -1719,6 +1829,11 @@ BROWSER_TOOL_SCHEMAS = [
                     "type": "boolean",
                     "default": False,
                     "description": "If true, overlay numbered [N] labels on interactive elements. Each [N] maps to ref @eN for subsequent browser commands. Useful for QA and spatial reasoning about page layout."
+                },
+                "full": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Viewport screenshot by default; set full=true to capture the entire page height — slow and expensive on long pages, use only when the question genuinely needs below-the-fold content."
                 }
             },
             "required": ["question"]
@@ -2093,6 +2208,7 @@ def _run_browser_command(
     # hybrid private-URL routing can create a local sidecar while a cloud
     # provider remains configured for public URLs.
     engine = _engine_override or _get_browser_engine()
+    fallback_source_url: Optional[str] = None
     if engine != "auto" and not _is_camofox_mode() and not session_info.get("cdp_url"):
         backend_args += ["--engine", engine]
 
@@ -2217,8 +2333,21 @@ def _run_browser_command(
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            if engine == "lightpanda":
+                if command == "open" and args:
+                    fallback_source_url = args[0]
+                else:
+                    fallback_source_url = session_info.get("_current_url")
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait()
+            finally:
+                _reset_browser_session_after_timeout(
+                    task_id, session_info, task_socket_dir
+                )
             logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
                            command, timeout, task_id, task_socket_dir)
             result = {"success": False, "error": f"Command timed out after {timeout} seconds"}
@@ -2307,6 +2436,14 @@ def _run_browser_command(
         logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         result = {"success": False, "error": str(e)}
 
+    if result.get("success"):
+        data = result.get("data", {})
+        result_url = data.get("url") if isinstance(data, dict) else None
+        if not result_url and command == "open" and args:
+            result_url = args[0]
+        if result_url:
+            session_info["_current_url"] = str(result_url)
+
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.
     # This runs for ALL exit paths (timeout, empty, non-JSON, nonzero rc, parsed).
@@ -2320,10 +2457,24 @@ def _run_browser_command(
         )
         # For screenshots, use the dedicated Chrome fallback helper
         # (spins up a separate Chrome session to the same URL).
+        fallback_kwargs = (
+            {"source_url": fallback_source_url} if fallback_source_url else {}
+        )
         if command == "screenshot":
-            fallback_result = _chrome_fallback_screenshot(task_id, args or [], timeout)
+            fallback_result = _chrome_fallback_screenshot(
+                task_id,
+                args or [],
+                timeout,
+                **fallback_kwargs,
+            )
         else:
-            fallback_result = _run_chrome_fallback_command(task_id, command, args, timeout)
+            fallback_result = _run_chrome_fallback_command(
+                task_id,
+                command,
+                args,
+                timeout,
+                **fallback_kwargs,
+            )
         return _annotate_lightpanda_fallback(fallback_result, fallback_reason)
 
     return result
@@ -2606,7 +2757,12 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Auto-take a compact snapshot so the model can act immediately
         # without a separate browser_snapshot call.
         try:
-            snap_result = _run_browser_command(nav_session_key, "snapshot", ["-c"])
+            snap_result = _run_browser_command(
+                nav_session_key,
+                "snapshot",
+                ["-c"],
+                timeout=max(_get_command_timeout(), 90),
+            )
             if snap_result.get("success"):
                 snap_data = snap_result.get("data", {})
                 snapshot_text = snap_data.get("snapshot", "")
@@ -2655,7 +2811,12 @@ def browser_snapshot(
     if not full:
         args.extend(["-c"])  # Compact mode
 
-    result = _run_browser_command(effective_task_id, "snapshot", args)
+    result = _run_browser_command(
+        effective_task_id,
+        "snapshot",
+        args,
+        timeout=max(_get_command_timeout(), 90),
+    )
 
     if result.get("success"):
         data = result.get("data", {})
@@ -3202,7 +3363,12 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-def browser_vision(question: str, annotate: bool = False, task_id: Optional[str] = None) -> Union[str, Dict[str, Any]]:
+def browser_vision(
+    question: str,
+    annotate: bool = False,
+    task_id: Optional[str] = None,
+    full: bool = False,
+) -> Union[str, Dict[str, Any]]:
     """
     Take a screenshot of the current page for visual inspection.
 
@@ -3220,6 +3386,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         question: What you want to know about the page visually
         annotate: If True, overlay numbered [N] labels on interactive elements
         task_id: Task identifier for session isolation
+        full: If True, capture the entire page height instead of the viewport
 
     Returns:
         A JSON string with vision analysis results and screenshot_path, or a
@@ -3227,7 +3394,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     """
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_vision
-        return camofox_vision(question, annotate, task_id)
+        return camofox_vision(question, annotate, task_id, full=full)
 
     import base64
     import uuid as uuid_mod
@@ -3249,8 +3416,12 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         screenshot_args = []
         if annotate:
             screenshot_args.append("--annotate")
+        if full:
+            screenshot_args.append("--full")
         fb_result = _chrome_fallback_screenshot(
-            effective_task_id, screenshot_args, _get_command_timeout(),
+            effective_task_id,
+            screenshot_args,
+            max(_get_command_timeout(), 90),
         )
         fb_reason = "Lightpanda has no graphical renderer for screenshots; used Chrome for vision capture."
         fb_result = _annotate_lightpanda_fallback(fb_result, fb_reason)
@@ -3304,12 +3475,14 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             screenshot_args = []
             if annotate:
                 screenshot_args.append("--annotate")
-            screenshot_args.append("--full")
+            if full:
+                screenshot_args.append("--full")
             screenshot_args.append(str(screenshot_path))
             result = _run_browser_command(
                 effective_task_id,
                 "screenshot",
                 screenshot_args,
+                timeout=max(_get_command_timeout(), 90),
                 # If the Lightpanda pre-route already failed, force Chrome so
                 # _run_browser_command doesn't trigger a redundant LP fallback.
                 _engine_override="auto" if _lp_prerouted else None,
@@ -3991,7 +4164,12 @@ registry.register(
     name="browser_vision",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_vision"],
-    handler=lambda args, **kw: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_vision(
+        question=args.get("question", ""),
+        annotate=args.get("annotate", False),
+        task_id=kw.get("task_id"),
+        full=args.get("full", False),
+    ),
     check_fn=check_browser_vision_requirements,
     emoji="👁️",
 )

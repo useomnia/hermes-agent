@@ -152,6 +152,16 @@ class TestBrowserVisionAnnotate:
         assert "annotate" in props
         assert props["annotate"]["type"] == "boolean"
 
+    def test_schema_has_full_param(self):
+        from tools.browser_tool import BROWSER_TOOL_SCHEMAS
+
+        schema = next(s for s in BROWSER_TOOL_SCHEMAS if s["name"] == "browser_vision")
+        full = schema["parameters"]["properties"]["full"]
+        assert full["type"] == "boolean"
+        assert full["default"] is False
+        assert "viewport" in full["description"].lower()
+        assert "entire page height" in full["description"]
+
     def test_annotate_false_no_flag(self):
         """Without annotate, screenshot command has no --annotate flag."""
         from tools.browser_tool import browser_vision
@@ -192,6 +202,59 @@ class TestBrowserVisionAnnotate:
                 args = mock_cmd.call_args[0]
                 cmd_args = args[2] if len(args) > 2 else []
                 assert "--annotate" in cmd_args
+
+    def test_viewport_capture_is_default_and_uses_capture_timeout(self, tmp_path):
+        from tools.browser_tool import browser_vision
+
+        with (
+            patch("hermes_constants.get_hermes_dir", return_value=tmp_path),
+            patch("tools.browser_tool._cleanup_old_screenshots"),
+            patch("tools.browser_tool._get_browser_engine", return_value="auto"),
+            patch("tools.browser_tool._get_command_timeout", return_value=30),
+            patch(
+                "tools.browser_tool._run_browser_command",
+                return_value={"success": False, "error": "capture failed"},
+            ) as mock_cmd,
+        ):
+            browser_vision("test", task_id="test")
+
+        assert mock_cmd.call_args.args[:2] == ("test", "screenshot")
+        assert "--full" not in mock_cmd.call_args.args[2]
+        assert mock_cmd.call_args.kwargs["timeout"] == 90
+
+    def test_full_capture_adds_flag_and_honors_larger_timeout(self, tmp_path):
+        from tools.browser_tool import browser_vision
+
+        with (
+            patch("hermes_constants.get_hermes_dir", return_value=tmp_path),
+            patch("tools.browser_tool._cleanup_old_screenshots"),
+            patch("tools.browser_tool._get_browser_engine", return_value="auto"),
+            patch("tools.browser_tool._get_command_timeout", return_value=120),
+            patch(
+                "tools.browser_tool._run_browser_command",
+                return_value={"success": False, "error": "capture failed"},
+            ) as mock_cmd,
+        ):
+            browser_vision("test", task_id="test", full=True)
+
+        assert "--full" in mock_cmd.call_args.args[2]
+        assert mock_cmd.call_args.kwargs["timeout"] == 120
+
+    def test_registry_handler_passes_full(self):
+        from tools import browser_tool
+        from tools.registry import registry
+
+        entry = registry.get_entry("browser_vision")
+        assert entry is not None
+        with patch("tools.browser_tool.browser_vision", return_value="ok") as mock_vision:
+            assert entry.handler(
+                {"question": "inspect", "annotate": True, "full": True},
+                task_id="task-1",
+            ) == "ok"
+
+        mock_vision.assert_called_once_with(
+            question="inspect", annotate=True, task_id="task-1", full=True
+        )
 
 
 class TestBrowserVisionConfig:

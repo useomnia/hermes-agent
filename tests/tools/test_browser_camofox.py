@@ -361,10 +361,13 @@ class TestCamofoxVisionConfig:
             patch("tools.browser_camofox.load_config", return_value={"auxiliary": {"vision": {"temperature": 1, "timeout": 45}}}),
         ):
             mock_open.return_value.__enter__.return_value.read.return_value = b"fakepng"
-            result = json.loads(camofox_vision("what is on the page?", annotate=True, task_id="t11"))
+            result = json.loads(camofox_vision(
+                "what is on the page?", annotate=True, task_id="t11", full=True
+            ))
 
         assert result["success"] is True
         assert result["analysis"] == "Camofox screenshot analysis"
+        assert mock_get_raw.call_args.kwargs["params"]["fullPage"] == "true"
         assert mock_llm.call_args.kwargs["temperature"] == 1.0
         assert mock_llm.call_args.kwargs["timeout"] == 45.0
 
@@ -397,6 +400,7 @@ class TestCamofoxVisionConfig:
 
         assert result["success"] is True
         assert result["analysis"] == "Default camofox screenshot analysis"
+        assert "fullPage" not in mock_get_raw.call_args.kwargs["params"]
         assert mock_llm.call_args.kwargs["temperature"] == 0.1
         assert mock_llm.call_args.kwargs["timeout"] == 120.0
 
@@ -425,4 +429,18 @@ class TestBrowserToolRouting:
         from tools.browser_tool import check_browser_requirements
         assert check_browser_requirements() is True
 
+    def test_browser_vision_routes_full_to_camofox(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        from tools.browser_tool import browser_vision
 
+        with patch(
+            "tools.browser_camofox.camofox_vision", return_value="camofox-result"
+        ) as mock_vision:
+            result = browser_vision(
+                "inspect the full page", task_id="t_vision_route", full=True
+            )
+
+        assert result == "camofox-result"
+        mock_vision.assert_called_once_with(
+            "inspect the full page", False, "t_vision_route", full=True
+        )

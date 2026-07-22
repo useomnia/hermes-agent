@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -487,6 +488,101 @@ class TestLightpandaFallbackWarning:
             "to": "chrome",
             "reason": "Lightpanda has no graphical renderer for screenshots; used Chrome for vision capture.",
         }
+
+    def test_browser_vision_lightpanda_passes_full_and_capture_timeout(self, tmp_path):
+        import tools.browser_tool as bt
+
+        with patch("tools.browser_tool._get_browser_engine", return_value="lightpanda"), \
+             patch("tools.browser_tool._should_inject_engine", return_value=True), \
+             patch("tools.browser_tool._get_command_timeout", return_value=30), \
+             patch(
+                 "tools.browser_tool._chrome_fallback_screenshot",
+                 return_value={"success": False, "error": "capture failed"},
+             ) as mock_fallback, \
+             patch(
+                 "tools.browser_tool._run_browser_command",
+                 return_value={"success": False, "error": "capture failed"},
+             ), \
+             patch("hermes_constants.get_hermes_dir", return_value=tmp_path):
+            bt.browser_vision("inspect below the fold", task_id="vision-full", full=True)
+
+        mock_fallback.assert_called_once_with("vision-full", ["--full"], 90)
+
+    def test_timeout_fallback_uses_url_captured_before_session_reset(self, tmp_path):
+        import tools.browser_tool as bt
+
+        session_info = {
+            "session_name": "h_heavy123",
+            "cdp_url": None,
+            "_current_url": "https://example.com/heavy",
+        }
+        fake_proc = MagicMock()
+        fake_proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="agent-browser", timeout=1),
+            None,
+        ]
+
+        def reset_session(*_args):
+            session_info.clear()
+
+        with patch("tools.browser_tool._get_browser_engine", return_value="lightpanda"), \
+             patch("tools.browser_tool._find_agent_browser", return_value="/bin/true"), \
+             patch("tools.browser_tool._requires_real_termux_browser_install", return_value=False), \
+             patch("tools.browser_tool._is_local_mode", return_value=False), \
+             patch("tools.browser_tool._is_camofox_mode", return_value=False), \
+             patch("tools.browser_tool._get_session_info", return_value=session_info), \
+             patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)), \
+             patch("tools.browser_tool._write_owner_pid"), \
+             patch("tools.browser_tool.subprocess.Popen", return_value=fake_proc), \
+             patch("tools.browser_tool._reset_browser_session_after_timeout", side_effect=reset_session), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch(
+                 "tools.browser_tool._chrome_fallback_screenshot",
+                 return_value={"success": True, "data": {"path": "/tmp/fallback.png"}},
+             ) as mock_fallback:
+            result = bt._run_browser_command(
+                "task-heavy", "screenshot", ["/tmp/source.png"], timeout=1
+            )
+
+        assert result["success"] is True
+        mock_fallback.assert_called_once_with(
+            "task-heavy",
+            ["/tmp/source.png"],
+            1,
+            source_url="https://example.com/heavy",
+        )
+
+    def test_successful_open_caches_source_url_for_timeout_fallback(self, tmp_path):
+        import tools.browser_tool as bt
+
+        session_info = {"session_name": "h_nav123", "cdp_url": None}
+        fake_proc = MagicMock()
+        fake_proc.wait.return_value = None
+        fake_proc.returncode = 0
+
+        def write_result(_cmd, *, stdout, **_kwargs):
+            os.write(stdout, json.dumps({
+                "success": True,
+                "data": {"url": "https://example.com/final"},
+            }).encode())
+            return fake_proc
+
+        with patch("tools.browser_tool._get_browser_engine", return_value="lightpanda"), \
+             patch("tools.browser_tool._find_agent_browser", return_value="/bin/true"), \
+             patch("tools.browser_tool._requires_real_termux_browser_install", return_value=False), \
+             patch("tools.browser_tool._is_local_mode", return_value=False), \
+             patch("tools.browser_tool._is_camofox_mode", return_value=False), \
+             patch("tools.browser_tool._get_session_info", return_value=session_info), \
+             patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)), \
+             patch("tools.browser_tool._write_owner_pid"), \
+             patch("tools.browser_tool.subprocess.Popen", side_effect=write_result), \
+             patch("tools.interrupt.is_interrupted", return_value=False):
+            result = bt._run_browser_command(
+                "task-nav", "open", ["https://example.com/start"], timeout=1
+            )
+
+        assert result["success"] is True
+        assert session_info["_current_url"] == "https://example.com/final"
 
 # ---------------------------------------------------------------------------
 # _engine_override parameter

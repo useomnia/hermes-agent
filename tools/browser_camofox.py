@@ -682,7 +682,7 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
 
 
 def camofox_vision(question: str, annotate: bool = False,
-                   task_id: Optional[str] = None) -> str:
+                   task_id: Optional[str] = None, full: bool = False) -> str:
     """Take a screenshot and analyze it with vision AI via Camofox."""
     try:
         session = _get_session(task_id)
@@ -690,9 +690,12 @@ def camofox_vision(question: str, annotate: bool = False,
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         # Get screenshot as binary PNG
+        screenshot_params = {"userId": session["user_id"]}
+        if full:
+            screenshot_params["fullPage"] = "true"
         resp = _get_raw(
             f"/tabs/{session['tab_id']}/screenshot",
-            params={"userId": session["user_id"]},
+            params=screenshot_params,
         )
 
         # Save screenshot to cache
@@ -789,6 +792,4 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
         "note": "Console log capture is not available with the Camofox backend. "
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
-
-
 
