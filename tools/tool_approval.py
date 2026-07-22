@@ -591,23 +591,30 @@ def _credit_cost_data(descriptor: dict, function_args: Optional[dict]) -> dict:
     ):
         credits_per_unit = None
 
+    raw_engines = (
+        function_args.get("engines") if isinstance(function_args, dict) else None
+    )
+    engines = (
+        list(dict.fromkeys(str(engine) for engine in raw_engines))
+        if isinstance(raw_engines, list)
+        else None
+    )
+    engine_count = len(engines) if engines is not None else None
     credits = None
-    engine_count = None
     if (
         strategy == "fixed"
         and unit == "per_engine"
         and credits_per_unit is not None
+        and engine_count is not None
     ):
-        engines = function_args.get("engines") if isinstance(function_args, dict) else None
-        if isinstance(engines, list):
-            engine_count = len(set(engines))
-            credits = credits_per_unit * engine_count
+        credits = credits_per_unit * engine_count
 
     return {
         "credits": credits,
         "creditsPerUnit": credits_per_unit,
         "unit": unit if isinstance(unit, str) else None,
         "engineCount": engine_count,
+        "engines": engines,
     }
 
 

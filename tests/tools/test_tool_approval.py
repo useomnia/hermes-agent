@@ -251,7 +251,7 @@ class TestCreditApproval:
             maybe_require_tool_approval(
                 CREDIT_GATED,
                 "call-credit",
-                function_args={"engines": ["google", "chatgpt", "perplexity"]},
+                function_args={"engines": ["google", 7, "perplexity"]},
             )
             is None
         )
@@ -265,6 +265,7 @@ class TestCreditApproval:
             "creditsPerUnit": 30,
             "unit": "per_engine",
             "engineCount": 3,
+            "engines": ["google", "7", "perplexity"],
         }
 
     def test_should_deduplicate_engines_in_the_fixed_spend_total(self):
@@ -292,9 +293,17 @@ class TestCreditApproval:
             "creditsPerUnit": 30,
             "unit": "per_engine",
             "engineCount": 2,
+            "engines": ["openai", "perplexity"],
         }
 
-    def test_should_show_the_per_engine_price_when_arguments_are_missing(self):
+    @pytest.mark.parametrize(
+        "function_args",
+        [None, {"engines": "google"}],
+        ids=["missing", "non-list"],
+    )
+    def test_should_show_the_per_engine_price_without_an_engine_list(
+        self, function_args
+    ):
         captured = {}
 
         def notify(event):
@@ -302,7 +311,12 @@ class TestCreditApproval:
             resolve_tool_approval(SESSION, CREDIT_GATED, "once")
 
         register_tool_approval_notify(SESSION, notify)
-        assert maybe_require_tool_approval(CREDIT_GATED, "call-credit") is None
+        assert (
+            maybe_require_tool_approval(
+                CREDIT_GATED, "call-credit", function_args=function_args
+            )
+            is None
+        )
 
         assert (
             "This call spends 30 credits per engine."
@@ -313,6 +327,7 @@ class TestCreditApproval:
             "creditsPerUnit": 30,
             "unit": "per_engine",
             "engineCount": None,
+            "engines": None,
         }
 
     def test_should_not_claim_a_total_for_real_cost_spend(self):
@@ -344,7 +359,8 @@ class TestCreditApproval:
             "credits": None,
             "creditsPerUnit": None,
             "unit": "run",
-            "engineCount": None,
+            "engineCount": 3,
+            "engines": ["google", "chatgpt", "perplexity"],
         }
 
     def test_should_not_consult_preexisting_session_or_always_grants(self):
