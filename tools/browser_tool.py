@@ -187,6 +187,26 @@ _last_screenshot_cleanup_by_dir: dict[str, float] = {}
 # Default timeout for browser commands (seconds)
 DEFAULT_COMMAND_TIMEOUT = 30
 
+# Navigation has its own smaller bound because agent-browser waits for
+# network-idle internally. Pages with long-lived requests can be usable well
+# before that wait settles; browser_navigate probes DOM readiness afterward.
+DEFAULT_NAVIGATION_TIMEOUT = 15
+READINESS_PROBE_TIMEOUT = 5
+
+# CDP discovery is commonly racing a relay that has been launched but has not
+# bound its port yet. Keep both each attempt and the complete retry window
+# bounded so a permanently absent relay still fails promptly.
+CDP_DISCOVERY_ATTEMPTS = 6
+CDP_DISCOVERY_REQUEST_TIMEOUT = 1.0
+CDP_DISCOVERY_RETRY_BASE_DELAY = 0.1
+CDP_DISCOVERY_RETRY_MAX_DELAY = 0.5
+
+# Toolbox API v5 has no browser recovery operation. Version-gating before the
+# POST keeps old paired runtimes on their existing failure path.
+TOOLBOX_BROWSER_RECOVERY_MIN_VERSION = 6
+TOOLBOX_HEALTH_TIMEOUT = 3
+TOOLBOX_BROWSER_RECOVERY_TIMEOUT = 20
+
 # Max tokens for snapshot content before summarization
 SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
 
@@ -195,6 +215,8 @@ _EMPTY_OK_COMMANDS: frozenset = frozenset({"close", "record"})
 
 _cached_command_timeout: Optional[int] = None
 _command_timeout_resolved = False
+_cached_navigation_timeout: Optional[int] = None
+_navigation_timeout_resolved = False
 
 
 def _get_command_timeout() -> int:
@@ -219,6 +241,30 @@ def _get_command_timeout() -> int:
     except Exception as e:
         logger.debug("Could not read command_timeout from config: %s", e)
     _cached_command_timeout = result
+    return result
+
+
+def _get_navigation_timeout() -> int:
+    """Return the bounded timeout for agent-browser ``open`` commands."""
+    global _cached_navigation_timeout, _navigation_timeout_resolved
+    if (
+        _navigation_timeout_resolved
+        and _cached_navigation_timeout is not None
+    ):
+        return _cached_navigation_timeout
+
+    result = DEFAULT_NAVIGATION_TIMEOUT
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        val = cfg_get(cfg, "browser", "nav_timeout_s")
+        if val is not None:
+            result = max(int(val), 5)
+    except Exception as exc:
+        logger.debug("Could not read browser.nav_timeout_s from config: %s", exc)
+    _cached_navigation_timeout = result
+    _navigation_timeout_resolved = True
     return result
 
 
@@ -264,21 +310,43 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     else:
         version_url = discovery_url.rstrip("/") + "/json/version"
 
-    try:
-        response = requests.get(version_url, timeout=10)
-        response.raise_for_status()
-        payload = response.json()
-    except Exception as exc:
-        logger.warning("Failed to resolve CDP endpoint %s via %s: %s", raw, version_url, exc)
-        return raw
+    for attempt in range(1, CDP_DISCOVERY_ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                version_url,
+                timeout=CDP_DISCOVERY_REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
+            if not ws_url:
+                raise ValueError(
+                    "CDP discovery response has no webSocketDebuggerUrl"
+                )
+            break
+        except Exception as exc:
+            if attempt == CDP_DISCOVERY_ATTEMPTS:
+                logger.warning(
+                    "Failed to resolve configured CDP endpoint after %d "
+                    "attempts; using the original endpoint",
+                    attempt,
+                )
+                return raw
+            delay = min(
+                CDP_DISCOVERY_RETRY_BASE_DELAY * (2 ** (attempt - 1)),
+                CDP_DISCOVERY_RETRY_MAX_DELAY,
+            )
+            logger.debug(
+                "CDP discovery attempt %d/%d failed; retrying in %.1fs: %s",
+                attempt,
+                CDP_DISCOVERY_ATTEMPTS,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
 
-    ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
-    if ws_url:
-        logger.info("Resolved CDP endpoint %s -> %s", raw, ws_url)
-        return ws_url
-
-    logger.warning("CDP discovery at %s did not return webSocketDebuggerUrl; using raw endpoint", version_url)
-    return raw
+    logger.info("Resolved CDP endpoint %s -> %s", raw, ws_url)
+    return ws_url
 
 
 def _get_cdp_override() -> str:
@@ -307,6 +375,221 @@ def _get_cdp_override() -> str:
         logger.debug("Could not read browser.cdp_url from config: %s", e)
 
     return ""
+
+
+def _toolbox_browser_binding() -> Optional[Tuple[str, Dict[str, str]]]:
+    """Return the paired Toolbox browser endpoint and authenticated headers."""
+    base_url = os.environ.get("OMNIO_TOOLBOX_URL", "").strip().rstrip("/")
+    bearer = os.environ.get("OMNIO_TOOLBOX_BEARER", "").strip()
+    if not base_url or not bearer:
+        return None
+    brand = (
+        os.environ.get("OMNIO_TOOLBOX_BRAND", "").strip()
+        or os.environ.get("OMNIO_BRAND_ID", "").strip()
+        or "__default__"
+    )
+    return (
+        f"{base_url}/browser",
+        {
+            "Authorization": f"Bearer {bearer}",
+            "Content-Type": "application/json",
+            "X-Omnio-Brand": brand,
+        },
+    )
+
+
+def _recover_omnio_browser() -> bool:
+    """Ask a recovery-capable paired Toolbox to replace the Brand context."""
+    binding = _toolbox_browser_binding()
+    if binding is None:
+        return False
+    browser_url, headers = binding
+    health_url = browser_url.rsplit("/", 1)[0] + "/health"
+
+    try:
+        health_response = requests.get(
+            health_url,
+            headers=headers,
+            timeout=TOOLBOX_HEALTH_TIMEOUT,
+        )
+        health_payload = health_response.json()
+        version_raw = (
+            health_payload.get("version")
+            if isinstance(health_payload, dict)
+            else None
+        )
+        if (
+            isinstance(version_raw, bool)
+            or not isinstance(version_raw, (int, str))
+        ):
+            raise ValueError("Toolbox health response has no API version")
+        version = int(version_raw)
+    except (TypeError, ValueError, requests.RequestException) as exc:
+        logger.warning(
+            "Could not determine paired Toolbox browser recovery capability: %s",
+            exc,
+        )
+        return False
+
+    if version < TOOLBOX_BROWSER_RECOVERY_MIN_VERSION:
+        logger.info(
+            "Paired Toolbox API v%d does not support browser recovery; "
+            "preserving the original browser failure",
+            version,
+        )
+        return False
+
+    try:
+        response = requests.post(
+            browser_url,
+            headers=headers,
+            json={"operation": "recover"},
+            timeout=TOOLBOX_BROWSER_RECOVERY_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        logger.warning("Paired Toolbox browser recovery request failed: %s", exc)
+        return False
+
+    if response.status_code in {404, 405, 422, 501}:
+        logger.info(
+            "Paired Toolbox API v%d rejected browser recovery as unsupported "
+            "(status=%d); preserving the original browser failure",
+            version,
+            response.status_code,
+        )
+        return False
+    if not 200 <= response.status_code < 300:
+        logger.warning(
+            "Paired Toolbox browser recovery failed (status=%d)",
+            response.status_code,
+        )
+        return False
+    return True
+
+
+def _find_structured_browser_error(value: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
+    """Find a Toolbox retry contract nested in parsed or textual CLI output."""
+    if depth > 4:
+        return None
+    if isinstance(value, dict):
+        required = {"code", "phase", "retryable", "commandStarted"}
+        if required.issubset(value):
+            code = value.get("code")
+            phase = value.get("phase")
+            retryable = value.get("retryable")
+            command_started = value.get("commandStarted")
+            if (
+                isinstance(code, str)
+                and code
+                and isinstance(phase, str)
+                and phase
+                and isinstance(retryable, bool)
+                and isinstance(command_started, bool)
+            ):
+                return value
+        for key in ("error", "detail", "data", "cause"):
+            nested = _find_structured_browser_error(value.get(key), depth + 1)
+            if nested is not None:
+                return nested
+        return None
+    if isinstance(value, list):
+        for item in value:
+            nested = _find_structured_browser_error(item, depth + 1)
+            if nested is not None:
+                return nested
+        return None
+    if not isinstance(value, str):
+        return None
+
+    stripped = value.strip()
+    try:
+        decoded = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"\{", stripped):
+            try:
+                decoded, _ = decoder.raw_decode(stripped[match.start():])
+            except (json.JSONDecodeError, ValueError):
+                continue
+            nested = _find_structured_browser_error(decoded, depth + 1)
+            if nested is not None:
+                return nested
+        return None
+    return _find_structured_browser_error(decoded, depth + 1)
+
+
+def _is_browser_timeout_failure(result: Dict[str, Any]) -> bool:
+    error = result.get("error", "")
+    if not isinstance(error, str):
+        error = json.dumps(error, ensure_ascii=False, default=str)
+    lowered = error.lower()
+    return "timed out" in lowered or "timeout" in lowered
+
+
+def _should_recover_browser_failure(result: Dict[str, Any]) -> bool:
+    structured = _find_structured_browser_error(result)
+    if structured is None:
+        return False
+
+    should_recover = (
+        structured["code"] == "renderer_unresponsive"
+        and structured["retryable"] is True
+    )
+    logger.warning(
+        "Browser command received structured Toolbox failure "
+        "(code=%s, phase=%s, retryable=%s, command_started=%s, "
+        "recover=%s)",
+        structured["code"],
+        structured["phase"],
+        structured["retryable"],
+        structured["commandStarted"],
+        should_recover,
+    )
+    return should_recover
+
+
+def _recover_browser_after_failure(
+    result: Dict[str, Any],
+    *,
+    cdp_backed: bool,
+) -> bool:
+    """Recover once after a structured retryable renderer failure."""
+    if result.get("success") or not cdp_backed:
+        return False
+    if not _should_recover_browser_failure(result):
+        return False
+    return _recover_omnio_browser()
+
+
+def _retry_navigation_after_recovery(
+    task_id: str,
+    url: str,
+    timeout: int,
+    result: Dict[str, Any],
+    *,
+    cdp_backed: bool,
+) -> Dict[str, Any]:
+    """Recover an Omnio CDP browser and retry one navigation once."""
+    if not _recover_browser_after_failure(
+        result,
+        cdp_backed=cdp_backed,
+    ):
+        return result
+
+    logger.warning(
+        "Recovered paired browser after navigation failure; retrying once "
+        "(task=%s)",
+        task_id,
+    )
+    retried = _run_browser_command(
+        task_id,
+        "open",
+        [url],
+        timeout=timeout,
+    )
+    retried = dict(retried)
+    retried["_browser_recovery_attempted"] = True
+    return retried
 
 
 def _get_dialog_policy_config() -> Tuple[str, float]:
@@ -2567,6 +2850,143 @@ def _truncate_snapshot(snapshot_text: str, max_chars: int = 8000) -> str:
     return '\n'.join(result)
 
 
+def _session_is_cdp_backed(
+    task_id: str,
+    session_info: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Return whether a task uses a CDP backend that Toolbox can recover."""
+    if session_info is not None:
+        return bool(session_info.get("cdp_url"))
+    with _cleanup_lock:
+        active_session = _active_sessions.get(task_id)
+    if active_session is not None:
+        return bool(active_session.get("cdp_url"))
+    if _is_local_sidecar_key(task_id):
+        return False
+    return bool(os.environ.get("BROWSER_CDP_URL", "").strip())
+
+
+def _decode_navigation_probe(result: Dict[str, Any]) -> Dict[str, str]:
+    """Normalize agent-browser eval output for the navigation readiness probe."""
+    if not result.get("success"):
+        return {}
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return {}
+    value = data.get("result")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return {"readyState": value.strip().strip('"').strip("'")}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: str(value.get(key) or "").strip()
+        for key in ("readyState", "url", "title")
+    }
+
+
+def _navigation_probe_matches_page(
+    requested_url: str,
+    previous_url: str,
+    current_url: str,
+) -> bool:
+    """Reject a readiness probe that merely rediscovered the previous page."""
+    normalized_current = current_url.rstrip("/")
+    if normalized_current.lower() == "about:blank":
+        return False
+    if not normalized_current:
+        return not previous_url
+    normalized_previous = previous_url.rstrip("/")
+    normalized_requested = requested_url.rstrip("/")
+    return not (
+        normalized_previous
+        and normalized_current == normalized_previous
+        and normalized_requested != normalized_previous
+    )
+
+
+def _probe_navigation_readiness(
+    task_id: str,
+    requested_url: str,
+    previous_url: str,
+    open_result: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return a synthetic successful open result when the loaded page is usable."""
+    eval_result = _run_browser_command(
+        task_id,
+        "eval",
+        [
+            "JSON.stringify({readyState: document.readyState, "
+            "url: window.location.href, title: document.title})"
+        ],
+        timeout=READINESS_PROBE_TIMEOUT,
+    )
+    probe = _decode_navigation_probe(eval_result)
+
+    snapshot_result = _run_browser_command(
+        task_id,
+        "snapshot",
+        ["-c"],
+        timeout=READINESS_PROBE_TIMEOUT,
+    )
+    snapshot_data = snapshot_result.get("data")
+    if not isinstance(snapshot_data, dict):
+        snapshot_data = {}
+    snapshot_text = snapshot_data.get("snapshot", "")
+    if not isinstance(snapshot_text, str):
+        snapshot_text = ""
+    refs = snapshot_data.get("refs", {})
+    if not isinstance(refs, dict):
+        refs = {}
+
+    ready_state = probe.get("readyState", "").lower()
+    page_ready = ready_state in {"interactive", "complete"}
+    snapshot_ready = bool(snapshot_text.strip())
+    current_url = probe.get("url", "")
+    if not (page_ready or snapshot_ready):
+        return None
+    # An unknown current URL (the eval probe failed) is only trustworthy when
+    # there was no previous page to be stale from: otherwise a snapshot taken on
+    # the prior page's DOM would be reported as the requested navigation.
+    probe_matches_page = (
+        snapshot_ready
+        and not current_url
+        and not previous_url
+    ) or _navigation_probe_matches_page(
+        requested_url,
+        previous_url,
+        current_url,
+    )
+    if not probe_matches_page:
+        logger.warning(
+            "Navigation readiness probe still points at the previous page; "
+            "preserving the open failure (task=%s)",
+            task_id,
+        )
+        return None
+
+    resolved_url = current_url or requested_url
+    with _cleanup_lock:
+        active_session = _active_sessions.get(task_id)
+        if active_session is not None:
+            active_session["_current_url"] = resolved_url
+
+    return {
+        "success": True,
+        "data": {
+            "title": probe.get("title", ""),
+            "url": resolved_url,
+            "snapshot": snapshot_text,
+            "refs": refs,
+        },
+        "_partial_load": True,
+        "_network_idle_timeout": _is_browser_timeout_failure(open_result),
+        "_readiness_state": ready_state or "snapshot",
+    }
+
+
 # ============================================================================
 # Browser Tool Functions
 # ============================================================================
@@ -2672,15 +3092,58 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         session_info["_first_nav"] = False
         _maybe_start_recording(nav_session_key)
 
-    result = _run_browser_command(nav_session_key, "open", [url], timeout=max(_get_command_timeout(), 60))
+    previous_url = str(session_info.get("_current_url") or "")
+    navigation_timeout = _get_navigation_timeout()
+    result = _run_browser_command(
+        nav_session_key,
+        "open",
+        [url],
+        timeout=navigation_timeout,
+    )
 
     # Remember which session served this nav so snapshot/click/fill/...
     # on the same task_id hit it (critical when hybrid routing has both a
     # cloud session and a local sidecar alive concurrently).
     _last_active_session_key[effective_task_id] = nav_session_key
 
+    if not result.get("success"):
+        readiness_result = _probe_navigation_readiness(
+            nav_session_key,
+            url,
+            previous_url,
+            result,
+        )
+        if readiness_result is not None:
+            result = readiness_result
+        else:
+            result = _retry_navigation_after_recovery(
+                nav_session_key,
+                url,
+                navigation_timeout,
+                result,
+                cdp_backed=_session_is_cdp_backed(
+                    nav_session_key,
+                    session_info,
+                ),
+            )
+            if (
+                not result.get("success")
+                and result.get("_browser_recovery_attempted")
+            ):
+                readiness_result = _probe_navigation_readiness(
+                    nav_session_key,
+                    url,
+                    previous_url,
+                    result,
+                )
+                if readiness_result is not None:
+                    readiness_result["_browser_recovery_attempted"] = True
+                    result = readiness_result
+
     if result.get("success"):
         data = result.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
         title = data.get("title", "")
         final_url = data.get("url", url)
 
@@ -2724,6 +3187,20 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "title": title
         }
         _copy_fallback_warning(response, result)
+        if result.get("_partial_load"):
+            response.update({
+                "partial_load": True,
+                "network_idle_timeout": bool(
+                    result.get("_network_idle_timeout")
+                ),
+                "readiness_state": result.get("_readiness_state", "snapshot"),
+                "note": (
+                    "Navigation did not report full load completion, but the "
+                    "page is usable and returned a readiness snapshot."
+                ),
+            })
+        if result.get("_browser_recovery_attempted"):
+            response["browser_recovered"] = True
 
         # Detect common "blocked" page patterns from title/url
         blocked_patterns = [
@@ -2754,27 +3231,41 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
                 )
             response["stealth_features"] = active_features
 
-        # Auto-take a compact snapshot so the model can act immediately
-        # without a separate browser_snapshot call.
-        try:
-            snap_result = _run_browser_command(
-                nav_session_key,
-                "snapshot",
-                ["-c"],
-                timeout=max(_get_command_timeout(), 90),
-            )
-            if snap_result.get("success"):
-                snap_data = snap_result.get("data", {})
-                snapshot_text = snap_data.get("snapshot", "")
-                refs = snap_data.get("refs", {})
-                if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
-                    snapshot_text = _truncate_snapshot(snapshot_text)
-                response["snapshot"] = snapshot_text
-                response["element_count"] = len(refs) if refs else 0
-                if snap_result.get("fallback_warning") and not response.get("fallback_warning"):
-                    _copy_fallback_warning(response, snap_result)
-        except Exception as e:
-            logger.debug("Auto-snapshot after navigate failed: %s", e)
+        snapshot_text = data.get("snapshot")
+        refs = data.get("refs", {})
+        if not isinstance(refs, dict):
+            refs = {}
+        if not isinstance(snapshot_text, str):
+            # Auto-take a compact snapshot so the model can act immediately
+            # without a separate browser_snapshot call.
+            try:
+                snapshot_timeout = max(_get_command_timeout(), 90)
+                snap_result = _run_browser_command(
+                    nav_session_key,
+                    "snapshot",
+                    ["-c"],
+                    timeout=snapshot_timeout,
+                )
+                if snap_result.get("success"):
+                    snap_data = snap_result.get("data", {})
+                    if not isinstance(snap_data, dict):
+                        snap_data = {}
+                    snapshot_text = snap_data.get("snapshot", "")
+                    refs = snap_data.get("refs", {})
+                    if not isinstance(refs, dict):
+                        refs = {}
+                    if (
+                        snap_result.get("fallback_warning")
+                        and not response.get("fallback_warning")
+                    ):
+                        _copy_fallback_warning(response, snap_result)
+            except Exception as exc:
+                logger.debug("Auto-snapshot after navigate failed: %s", exc)
+        if isinstance(snapshot_text, str):
+            if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
+                snapshot_text = _truncate_snapshot(snapshot_text)
+            response["snapshot"] = snapshot_text
+            response["element_count"] = len(refs)
 
         return json.dumps(response, ensure_ascii=False)
     else:
@@ -2811,12 +3302,34 @@ def browser_snapshot(
     if not full:
         args.extend(["-c"])  # Compact mode
 
+    snapshot_timeout = max(_get_command_timeout(), 90)
+    cdp_backed = _session_is_cdp_backed(effective_task_id)
     result = _run_browser_command(
         effective_task_id,
         "snapshot",
         args,
-        timeout=max(_get_command_timeout(), 90),
+        timeout=snapshot_timeout,
     )
+    session_reset = _recover_browser_after_failure(
+        result,
+        cdp_backed=cdp_backed,
+    )
+    if session_reset:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "The browser renderer became unresponsive and the "
+                    "session was reset; re-open the page with "
+                    "browser_navigate to continue."
+                ),
+                "code": "browser_session_reset",
+                "retryable": True,
+                "session_reset": True,
+                "next_action": "browser_navigate",
+            },
+            ensure_ascii=False,
+        )
 
     if result.get("success"):
         data = result.get("data", {})
@@ -2835,7 +3348,6 @@ def browser_snapshot(
             "element_count": len(refs) if refs else 0
         }
         _copy_fallback_warning(response, result)
-
         # Merge supervisor state (pending dialogs + frame tree) when a CDP
         # supervisor is attached to this task. No-op otherwise. See
         # website/docs/developer-guide/browser-supervisor.md.
@@ -3834,6 +4346,7 @@ def cleanup_all_browsers() -> None:
     # Reset cached lookups so they are re-evaluated on next use.
     global _cached_agent_browser, _agent_browser_resolved
     global _cached_command_timeout, _command_timeout_resolved
+    global _cached_navigation_timeout, _navigation_timeout_resolved
     global _cached_chromium_installed
     global _cached_browser_engine, _browser_engine_resolved
     _cached_agent_browser = None
@@ -3841,6 +4354,8 @@ def cleanup_all_browsers() -> None:
     _discover_homebrew_node_dirs.cache_clear()
     _cached_command_timeout = None
     _command_timeout_resolved = False
+    _cached_navigation_timeout = None
+    _navigation_timeout_resolved = False
     _cached_chromium_installed = None
     _cached_browser_engine = None
     _browser_engine_resolved = False

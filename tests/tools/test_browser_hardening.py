@@ -17,6 +17,8 @@ def _reset_caches():
     bt._agent_browser_resolved = False
     bt._cached_command_timeout = None
     bt._command_timeout_resolved = False
+    bt._cached_navigation_timeout = None
+    bt._navigation_timeout_resolved = False
     # lru_cache for _discover_homebrew_node_dirs
     if hasattr(bt._discover_homebrew_node_dirs, "cache_clear"):
         bt._discover_homebrew_node_dirs.cache_clear()
@@ -82,7 +84,11 @@ class TestFindAgentBrowserCache:
 
         with patch("shutil.which", return_value=None), \
              patch("os.path.isdir", return_value=False), \
-             patch.object(Path, "exists", mock_exists):
+             patch.object(Path, "exists", mock_exists), \
+             patch(
+                 "hermes_cli.dep_ensure.ensure_dependency",
+                 return_value=False,
+             ):
             with pytest.raises(FileNotFoundError):
                 bt._find_agent_browser()
         # Second call should also raise (from cache)
@@ -114,6 +120,22 @@ class TestCommandTimeoutCache:
             _get_command_timeout()
             _get_command_timeout()
         mock_read.assert_called_once()
+
+
+class TestNavigationTimeoutCache:
+
+    def test_default_is_15(self):
+        from tools.browser_tool import _get_navigation_timeout
+
+        with patch("hermes_cli.config.read_raw_config", return_value={}):
+            assert _get_navigation_timeout() == 15
+
+    def test_reads_nav_timeout_from_config(self):
+        from tools.browser_tool import _get_navigation_timeout
+
+        cfg = {"browser": {"nav_timeout_s": 22}}
+        with patch("hermes_cli.config.read_raw_config", return_value=cfg):
+            assert _get_navigation_timeout() == 22
 
 
 class TestSessionInactivityTimeout:

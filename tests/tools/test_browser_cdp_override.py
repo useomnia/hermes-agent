@@ -1,4 +1,6 @@
-from unittest.mock import Mock, patch
+import logging
+import requests
+from unittest.mock import Mock, call, patch
 
 
 HOST = "example-host"
@@ -25,7 +27,7 @@ class TestResolveCdpOverride:
             resolved = _resolve_cdp_override(HTTP_URL)
 
         assert resolved == WS_URL
-        mock_get.assert_called_once_with(VERSION_URL, timeout=10)
+        mock_get.assert_called_once_with(VERSION_URL, timeout=1.0)
 
     def test_resolves_bare_ws_hostport_to_discovery_websocket(self):
         from tools.browser_tool import _resolve_cdp_override
@@ -38,13 +40,75 @@ class TestResolveCdpOverride:
             resolved = _resolve_cdp_override(f"ws://{HOST}:{PORT}")
 
         assert resolved == WS_URL
-        mock_get.assert_called_once_with(VERSION_URL, timeout=10)
+        mock_get.assert_called_once_with(VERSION_URL, timeout=1.0)
+
+    def test_retries_until_late_relay_binds(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
+
+        with (
+            patch(
+                "tools.browser_tool.requests.get",
+                side_effect=[
+                    requests.ConnectionError("connection refused"),
+                    requests.ConnectionError("connection refused"),
+                    response,
+                ],
+            ) as mock_get,
+            patch("tools.browser_tool.time.sleep") as mock_sleep,
+        ):
+            resolved = _resolve_cdp_override(HTTP_URL)
+
+        assert resolved == WS_URL
+        assert mock_get.call_args_list == [
+            call(VERSION_URL, timeout=1.0),
+            call(VERSION_URL, timeout=1.0),
+            call(VERSION_URL, timeout=1.0),
+        ]
+        assert mock_sleep.call_args_list == [call(0.1), call(0.2)]
 
     def test_falls_back_to_raw_url_when_discovery_fails(self):
         from tools.browser_tool import _resolve_cdp_override
 
-        with patch("tools.browser_tool.requests.get", side_effect=RuntimeError("boom")):
+        with (
+            patch(
+                "tools.browser_tool.requests.get",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch("tools.browser_tool.time.sleep"),
+        ):
             assert _resolve_cdp_override(HTTP_URL) == HTTP_URL
+
+    def test_logs_one_sanitized_warning_after_all_attempts_fail(self, caplog):
+        from tools.browser_tool import _resolve_cdp_override
+
+        secret_url = f"http://token-secret@{HOST}:{PORT}"
+        with (
+            caplog.at_level(logging.DEBUG, logger="tools.browser_tool"),
+            patch(
+                "tools.browser_tool.requests.get",
+                side_effect=RuntimeError("connection refused"),
+            ),
+            patch("tools.browser_tool.time.sleep"),
+        ):
+            assert _resolve_cdp_override(secret_url) == secret_url
+
+        warning_messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        debug_messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.DEBUG
+        ]
+        assert len(warning_messages) == 1
+        assert "token-secret" not in warning_messages[0]
+        assert len(debug_messages) == 5
 
     def test_normalizes_provider_returned_http_cdp_url_when_creating_session(self, monkeypatch):
         import tools.browser_tool as browser_tool
@@ -75,7 +139,7 @@ class TestResolveCdpOverride:
         provider.create_session.assert_called_once_with("task-browser-use")
         mock_get.assert_called_once_with(
             "https://cdp.browser-use.example/session/json/version",
-            timeout=10,
+            timeout=1.0,
         )
 
 
@@ -99,7 +163,7 @@ class TestGetCdpOverride:
             resolved = browser_tool._get_cdp_override()
 
         assert resolved == WS_URL
-        mock_get.assert_called_once_with(VERSION_URL, timeout=10)
+        mock_get.assert_called_once_with(VERSION_URL, timeout=1.0)
 
     def test_uses_config_browser_cdp_url_when_env_missing(self, monkeypatch):
         import tools.browser_tool as browser_tool
@@ -115,4 +179,4 @@ class TestGetCdpOverride:
             resolved = browser_tool._get_cdp_override()
 
         assert resolved == WS_URL
-        mock_get.assert_called_once_with(VERSION_URL, timeout=10)
+        mock_get.assert_called_once_with(VERSION_URL, timeout=1.0)
