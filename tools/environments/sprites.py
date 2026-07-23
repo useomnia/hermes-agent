@@ -356,7 +356,10 @@ class SpritesFileOperations(ShellFileOperations):
                 "target": target,
                 "fileGlob": file_glob,
                 "limit": limit,
-                "offset": offset,
+                # The toolbox /files model validates offset as 1-based
+                # (ge=1, shared with read's line offset) and converts back
+                # internally; translate our 0-based result offset at the wire.
+                "offset": offset + 1,
                 "outputMode": output_mode,
                 "context": context,
             }

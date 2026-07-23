@@ -326,6 +326,39 @@ def test_sprites_file_operations_should_use_files_endpoint_for_write():
     ]
 
 
+def test_sprites_search_should_send_a_one_based_offset_to_the_toolbox():
+    from tools.environments.sprites import SpritesEnvironment, SpritesFileOperations
+
+    class FakeEnv:
+        cwd = "/brand"
+        config = None
+
+        def __init__(self):
+            self.requests = []
+
+        def file_request(self, payload):
+            self.requests.append(payload)
+            return {"matches": [], "totalCount": 0}
+
+        def execute(self, command, cwd=None, **kwargs):
+            return {"output": "", "returncode": 0}
+
+    env = FakeEnv()
+    ops = SpritesFileOperations(cast(SpritesEnvironment, env))
+
+    result = ops.search("needle", path="/brand")
+
+    assert result.error is None
+    # Hermes offsets are 0-based result skips; the toolbox /files model
+    # validates offset as 1-based (ge=1), so the default must arrive as 1.
+    assert env.requests[0]["offset"] == 1
+
+    env.requests.clear()
+    ops.search("needle", path="/brand", offset=50)
+
+    assert env.requests[0]["offset"] == 51
+
+
 def test_execute_code_guard_should_approve_sprites_backend():
     from tools.approval import check_execute_code_guard
 
