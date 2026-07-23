@@ -919,7 +919,8 @@ def _execute_remote(
             "command -v python3 >/dev/null 2>&1 && echo OK",
             cwd="/", timeout=15,
         )
-        if "OK" not in py_check.get("output", ""):
+        py_check_output = str(py_check.get("output", ""))
+        if "OK" not in py_check_output and py_check.get("returncode") == 1:
             return json.dumps({
                 "status": "error",
                 "error": (
@@ -930,6 +931,11 @@ def _execute_remote(
                 "tool_calls_made": 0,
                 "duration_seconds": 0,
             })
+        if "OK" not in py_check_output:
+            raise RuntimeError(
+                "Python 3 availability probe failed without proving Python is absent "
+                f"(exit code {py_check.get('returncode', 'unknown')})"
+            )
 
         # Create sandbox directory on remote
         env.execute(

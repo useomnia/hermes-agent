@@ -300,21 +300,18 @@ class TestExecute:
         assert "hi" in cmd
 
 
-    def test_daytona_error_triggers_retry(self, make_env, daytona_sdk):
+    def test_daytona_error_surfaces_from_threaded_process(self, make_env, daytona_sdk):
         sb = _make_sandbox()
         sb.state = "started"
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),  # $HOME
             _make_exec_response(result="", exit_code=0),  # init_session
-            daytona_sdk.DaytonaError("transient"),  # first attempt fails
-            _make_exec_response(result="ok", exit_code=0),  # retry succeeds
+            daytona_sdk.DaytonaError("transient"),
         ]
         env = make_env(sandbox=sb)
 
-        result = env.execute("echo retry")
-        # DaytonaError now surfaces directly through _ThreadedProcessHandle
-        # (no retry logic) — the error becomes returncode=1
-        assert result["returncode"] == 1
+        with pytest.raises(daytona_sdk.DaytonaError, match="transient"):
+            env.execute("echo retry")
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +379,7 @@ class TestInterrupt:
 
 class TestRetryExhausted:
     def test_both_attempts_fail(self, make_env, daytona_sdk):
-        """DaytonaError surfaces directly as rc=1 (retry logic was removed)."""
+        """DaytonaError surfaces directly through the threaded adapter."""
         sb = _make_sandbox()
         sb.state = "started"
         sb.process.exec.side_effect = [
@@ -392,9 +389,8 @@ class TestRetryExhausted:
         ]
         env = make_env(sandbox=sb)
 
-        result = env.execute("echo x")
-        # Error surfaces directly through _ThreadedProcessHandle (rc=1)
-        assert result["returncode"] == 1
+        with pytest.raises(daytona_sdk.DaytonaError, match="fail1"):
+            env.execute("echo x")
 
 
 # ---------------------------------------------------------------------------

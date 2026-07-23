@@ -1,6 +1,7 @@
 """Omnio toolbox Sprite execution environment."""
 
 import base64
+import http.client
 import json
 import logging
 import stat
@@ -57,6 +58,98 @@ def _normalize_toolbox_url(value: str) -> str:
 
 class SpritesToolboxError(RuntimeError):
     """Raised when the Omnio toolbox API rejects a request."""
+
+    code: str | None
+    phase: str | None
+    retryable: bool
+    command_started: bool | None
+    request_id: str | None
+    http_status: int | None
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        phase: str | None = None,
+        retryable: bool = False,
+        command_started: bool | None = None,
+        request_id: str | None = None,
+        http_status: int | None = None,
+    ):
+        self.code = code
+        self.phase = phase
+        self.retryable = retryable
+        self.command_started = command_started
+        self.request_id = request_id
+        self.http_status = http_status
+
+        details = []
+        if code:
+            details.append(f"code={code}")
+        if phase:
+            details.append(f"phase={phase}")
+        if command_started is not None:
+            details.append(f"commandStarted={str(command_started).lower()}")
+        if request_id:
+            details.append(f"requestId={request_id}")
+        if details:
+            message = f"{message} ({', '.join(details)})"
+
+        super().__init__(message)
+
+
+def _optional_string(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _toolbox_error_from_payload(
+    path: str,
+    payload: dict[str, Any],
+    *,
+    http_status: int | None = None,
+    fallback_message: str = "Toolbox request failed",
+) -> SpritesToolboxError:
+    error_payload = payload.get("error")
+    if isinstance(error_payload, dict):
+        message = (
+            _optional_string(error_payload.get("message"))
+            or _optional_string(payload.get("detail"))
+            or fallback_message
+        )
+        command_started_value = error_payload.get("commandStarted")
+        command_started = (
+            command_started_value if isinstance(command_started_value, bool) else None
+        )
+        code = _optional_string(error_payload.get("code"))
+        phase = _optional_string(error_payload.get("phase"))
+        retryable = error_payload.get("retryable") is True
+        request_id = _optional_string(error_payload.get("requestId"))
+    else:
+        message = (
+            _optional_string(error_payload)
+            or _optional_string(payload.get("detail"))
+            or fallback_message
+        )
+        command_started = None
+        code = None
+        phase = None
+        retryable = False
+        request_id = None
+
+    prefix = f"Toolbox API {path}"
+    if http_status is not None:
+        prefix += f" failed with HTTP {http_status}"
+
+    return SpritesToolboxError(
+        f"{prefix}: {message}",
+        code=code,
+        phase=phase,
+        retryable=retryable,
+        command_started=command_started,
+        request_id=request_id,
+        http_status=http_status,
+    )
 
 
 class SpritesEnvironment(BaseEnvironment):
@@ -121,16 +214,27 @@ class SpritesEnvironment(BaseEnvironment):
                 raw_body = response.read(_MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
             body = exc.read(_MAX_ERROR_BYTES).decode("utf-8", errors="replace")
-            message = body
             try:
                 parsed = json.loads(body)
-                message = str(parsed.get("error") or parsed.get("detail") or body)
             except json.JSONDecodeError:
-                pass
-            raise SpritesToolboxError(
-                f"Toolbox API {path} failed with HTTP {exc.code}: {message}"
-            ) from exc
+                parsed = None
+            if isinstance(parsed, dict):
+                error = _toolbox_error_from_payload(
+                    path,
+                    parsed,
+                    http_status=exc.code,
+                    fallback_message=body or str(exc.reason),
+                )
+            else:
+                error = SpritesToolboxError(
+                    f"Toolbox API {path} failed with HTTP {exc.code}: "
+                    f"{body or exc.reason}",
+                    http_status=exc.code,
+                )
+            raise error from exc
         except urllib.error.URLError as exc:
+            raise SpritesToolboxError(f"Toolbox API {path} is unreachable: {exc}") from exc
+        except (OSError, http.client.HTTPException) as exc:
             raise SpritesToolboxError(f"Toolbox API {path} is unreachable: {exc}") from exc
 
         if len(raw_body) > _MAX_RESPONSE_BYTES:
@@ -242,6 +346,12 @@ class SpritesEnvironment(BaseEnvironment):
             )
             output = response.get("output", "")
             exit_code = response.get("returncode", response.get("exitCode", 0))
+            if (
+                "error" in response
+                and response["error"] is not None
+                and response["error"] != ""
+            ):
+                raise _toolbox_error_from_payload("/exec", response)
             return (str(output), int(exit_code))
 
         return _ThreadedProcessHandle(exec_fn)

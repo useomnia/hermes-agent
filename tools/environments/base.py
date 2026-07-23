@@ -256,6 +256,10 @@ class _ThreadedProcessHandle:
     def returncode(self) -> int | None:
         return self._returncode
 
+    @property
+    def error(self) -> Exception | None:
+        return self._error
+
     def poll(self) -> int | None:
         return self._returncode if self._done.is_set() else None
 
@@ -756,6 +760,9 @@ class BaseEnvironment(ABC):
                 time.monotonic() - _activity_state["start"],
                 proc.returncode,
             )
+
+        if isinstance(proc, _ThreadedProcessHandle) and proc.error is not None:
+            raise proc.error
 
         return {"output": "".join(output_chunks), "returncode": proc.returncode}
 

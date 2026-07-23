@@ -3,7 +3,24 @@
 import threading
 import time
 
-from tools.environments.base import _ThreadedProcessHandle
+import pytest
+
+from tools.environments.base import BaseEnvironment, _ThreadedProcessHandle
+
+
+class _TestEnvironment(BaseEnvironment):
+    def _run_bash(
+        self,
+        cmd_string,
+        *,
+        login=False,
+        timeout=120,
+        stdin_data=None,
+    ):
+        raise NotImplementedError
+
+    def cleanup(self):
+        return None
 
 
 class TestBasicExecution:
@@ -30,13 +47,30 @@ class TestBasicExecution:
         assert "error occurred" in output
 
     def test_exception_in_exec_fn(self):
+        error = RuntimeError("boom")
+
         def exec_fn():
-            raise RuntimeError("boom")
+            raise error
 
         handle = _ThreadedProcessHandle(exec_fn)
         handle.wait(timeout=5)
 
         assert handle.returncode == 1
+        assert handle.error is error
+
+    def test_wait_for_process_reraises_exec_fn_exception(self):
+        error = RuntimeError("boom")
+
+        def exec_fn():
+            raise error
+
+        handle = _ThreadedProcessHandle(exec_fn)
+        env = _TestEnvironment(cwd="/tmp", timeout=5)
+
+        with pytest.raises(RuntimeError, match="boom") as exc_info:
+            env._wait_for_process(handle, timeout=2)
+
+        assert exc_info.value is error
 
     def test_empty_output(self):
         def exec_fn():

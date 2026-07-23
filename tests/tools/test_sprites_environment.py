@@ -2,6 +2,31 @@ import json
 from typing import cast
 
 
+def _run_terminal_with_existing_env(monkeypatch, env):
+    import tools.terminal_tool as terminal_tool
+
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: {
+            "env_type": "sprites",
+            "timeout": 30,
+            "cwd": "/brand",
+        },
+    )
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda *_args, **_kwargs: {"approved": True},
+    )
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 0.0})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+
+    return json.loads(terminal_tool.terminal_tool("echo hello"))
+
+
 def test_get_env_config_should_default_sprites_to_brand_workspace(monkeypatch):
     from tools.terminal_tool import _get_env_config
 
@@ -272,6 +297,222 @@ def test_sprites_request_should_reject_oversized_response(monkeypatch):
 
     with pytest.raises(SpritesToolboxError, match="response exceeded"):
         env._request_json("/health", timeout=5)
+
+
+def test_sprites_request_should_parse_structured_toolbox_error(monkeypatch):
+    import io
+    import urllib.error
+    from email.message import Message
+
+    import pytest
+
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment, SpritesToolboxError
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.toolbox_url = "https://toolbox.example"
+    env.bearer_token = "pair-secret"
+    env.brand = "brand-123"
+    env.timeout = 60
+    body = json.dumps({
+        "error": {
+            "code": "EXEC_START_FAILED",
+            "phase": "start",
+            "retryable": True,
+            "commandStarted": False,
+            "requestId": "req-123",
+            "message": "executor unavailable",
+        }
+    }).encode()
+    http_error = urllib.error.HTTPError(
+        "https://toolbox.example/exec",
+        503,
+        "Service Unavailable",
+        Message(),
+        io.BytesIO(body),
+    )
+
+    def raise_http_error(request, timeout):
+        raise http_error
+
+    monkeypatch.setattr(
+        sprites_module._URL_OPENER,
+        "open",
+        raise_http_error,
+    )
+
+    with pytest.raises(SpritesToolboxError) as exc_info:
+        env._request_json("/exec", timeout=5)
+
+    error = exc_info.value
+    assert error.code == "EXEC_START_FAILED"
+    assert error.phase == "start"
+    assert error.retryable is True
+    assert error.command_started is False
+    assert error.request_id == "req-123"
+    assert error.http_status == 503
+    assert "executor unavailable" in str(error)
+    assert "code=EXEC_START_FAILED" in str(error)
+    assert "phase=start" in str(error)
+
+
+def test_sprites_request_should_treat_v4_error_as_nonretryable(monkeypatch):
+    import io
+    import urllib.error
+    from email.message import Message
+
+    import pytest
+
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment, SpritesToolboxError
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.toolbox_url = "https://toolbox.example"
+    env.bearer_token = "pair-secret"
+    env.brand = "brand-123"
+    env.timeout = 60
+    http_error = urllib.error.HTTPError(
+        "https://toolbox.example/exec",
+        503,
+        "Service Unavailable",
+        Message(),
+        io.BytesIO(b'{"error":"toolbox is still resuming"}'),
+    )
+
+    def raise_http_error(request, timeout):
+        raise http_error
+
+    monkeypatch.setattr(
+        sprites_module._URL_OPENER,
+        "open",
+        raise_http_error,
+    )
+
+    with pytest.raises(SpritesToolboxError) as exc_info:
+        env._request_json("/exec", timeout=5)
+
+    error = exc_info.value
+    assert error.retryable is False
+    assert error.command_started is None
+    assert error.code is None
+    assert error.phase is None
+    assert "toolbox is still resuming" in str(error)
+
+
+def test_terminal_should_retry_confirmed_not_started_error_once(monkeypatch):
+    import tools.terminal_tool as terminal_tool
+    from tools.environments.sprites import SpritesToolboxError
+
+    error = SpritesToolboxError(
+        "Toolbox API /exec failed with HTTP 503: executor unavailable",
+        code="EXEC_START_FAILED",
+        phase="start",
+        retryable=True,
+        command_started=False,
+        request_id="req-123",
+        http_status=503,
+    )
+
+    class FakeEnv:
+        cwd = "/brand"
+
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, command, **kwargs):
+            self.calls += 1
+            raise error
+
+    env = FakeEnv()
+    sleeps = []
+    monkeypatch.setattr(terminal_tool.time, "sleep", sleeps.append)
+
+    result = _run_terminal_with_existing_env(monkeypatch, env)
+
+    assert env.calls == 2
+    assert sleeps == [terminal_tool._CONFIRMED_NOT_STARTED_RETRY_DELAY_SECONDS]
+    assert result["exit_code"] == -1
+    assert "executor unavailable" in result["error"]
+    assert "code=EXEC_START_FAILED" in result["error"]
+    assert "phase=start" in result["error"]
+
+
+def test_terminal_should_not_retry_ambiguous_timeout(monkeypatch):
+    import tools.terminal_tool as terminal_tool
+
+    class FakeEnv:
+        cwd = "/brand"
+
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, command, **kwargs):
+            self.calls += 1
+            raise TimeoutError("read timed out after request was sent")
+
+    env = FakeEnv()
+    sleeps = []
+    monkeypatch.setattr(terminal_tool.time, "sleep", sleeps.append)
+
+    result = _run_terminal_with_existing_env(monkeypatch, env)
+
+    assert env.calls == 1
+    assert sleeps == []
+    assert result["exit_code"] == -1
+    assert "read timed out after request was sent" in result["error"]
+
+
+def test_terminal_should_not_retry_unstructured_v4_error(monkeypatch):
+    import tools.terminal_tool as terminal_tool
+    from tools.environments.sprites import SpritesToolboxError
+
+    error = SpritesToolboxError(
+        "Toolbox API /exec failed with HTTP 503: toolbox is still resuming",
+        http_status=503,
+    )
+
+    class FakeEnv:
+        cwd = "/brand"
+
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, command, **kwargs):
+            self.calls += 1
+            raise error
+
+    env = FakeEnv()
+    sleeps = []
+    monkeypatch.setattr(terminal_tool.time, "sleep", sleeps.append)
+
+    result = _run_terminal_with_existing_env(monkeypatch, env)
+
+    assert env.calls == 1
+    assert sleeps == []
+    assert "toolbox is still resuming" in result["error"]
+
+
+def test_terminal_should_not_retry_user_command_exit_one(monkeypatch):
+    class FakeEnv:
+        cwd = "/brand"
+
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, command, **kwargs):
+            self.calls += 1
+            return {"output": "", "returncode": 1}
+
+    env = FakeEnv()
+
+    result = _run_terminal_with_existing_env(monkeypatch, env)
+
+    assert env.calls == 1
+    assert result == {
+        "output": "",
+        "exit_code": 1,
+        "error": None,
+    }
 
 
 def test_toolbox_url_should_require_a_safe_origin():

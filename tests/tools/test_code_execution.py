@@ -140,6 +140,73 @@ class TestHermesToolsGeneration(unittest.TestCase):
 
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
+    def test_remote_python_probe_surfaces_toolbox_failure(self):
+        from tools.environments.sprites import SpritesToolboxError
+
+        error = SpritesToolboxError(
+            "Toolbox API /exec failed with HTTP 503: executor unavailable",
+            code="EXEC_START_FAILED",
+            phase="start",
+            retryable=True,
+            command_started=False,
+            request_id="req-123",
+            http_status=503,
+        )
+
+        class FakeEnv:
+            def get_temp_dir(self):
+                return "/tmp"
+
+            def execute(self, command, cwd=None, timeout=None):
+                if "command -v python3" in command:
+                    raise error
+                return {"output": "", "returncode": 0}
+
+        env = FakeEnv()
+
+        with patch(
+            "tools.code_execution_tool._load_config",
+            return_value={"timeout": 30, "max_tool_calls": 5},
+        ), patch(
+            "tools.code_execution_tool._get_or_create_env",
+            return_value=(env, "sprites"),
+        ):
+            result = json.loads(
+                _execute_remote("print('hello')", "task-1", ["terminal"])
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("executor unavailable", result["error"])
+        self.assertIn("code=EXEC_START_FAILED", result["error"])
+        self.assertIn("phase=start", result["error"])
+        self.assertNotIn("Python 3 is not available", result["error"])
+
+    def test_remote_python_probe_reports_confirmed_absence(self):
+        class FakeEnv:
+            def get_temp_dir(self):
+                return "/tmp"
+
+            def execute(self, command, cwd=None, timeout=None):
+                if "command -v python3" in command:
+                    return {"output": "", "returncode": 1}
+                return {"output": "", "returncode": 0}
+
+        env = FakeEnv()
+
+        with patch(
+            "tools.code_execution_tool._load_config",
+            return_value={"timeout": 30, "max_tool_calls": 5},
+        ), patch(
+            "tools.code_execution_tool._get_or_create_env",
+            return_value=(env, "sprites"),
+        ):
+            result = json.loads(
+                _execute_remote("print('hello')", "task-1", ["terminal"])
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Python 3 is not available", result["error"])
+
     def test_execute_remote_uses_backend_temp_dir_for_sandbox(self):
         class FakeEnv:
             def __init__(self):
