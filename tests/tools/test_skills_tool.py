@@ -244,6 +244,16 @@ class TestFindAllSkills:
         assert len(skills) == 1
         assert skills[0]["category"] == "mlops"
 
+    def test_metadata_hidden_flag_is_surfaced(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path, "internal", frontmatter_extra="metadata:\n  hidden: true\n"
+            )
+            _make_skill(tmp_path, "visible")
+            skills = {s["name"]: s for s in _find_all_skills()}
+        assert skills["internal"].get("hidden") is True
+        assert "hidden" not in skills["visible"]
+
     def test_description_from_body_when_missing(self, tmp_path):
         """If no description in frontmatter, first non-header line is used."""
         skill_dir = tmp_path / "no-desc"

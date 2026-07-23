@@ -676,6 +676,14 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     "description": description,
                     "category": category,
                 }
+                # Surface the agentskills.io `metadata.hidden` flag so listing
+                # consumers (GET /v1/skills, client palettes) can filter
+                # internal skills without restating the set client-side. The
+                # skill itself stays fully loadable/invocable — hidden is a
+                # presentation hint, not an access control.
+                metadata = frontmatter.get("metadata")
+                if isinstance(metadata, dict) and metadata.get("hidden") in (True, "true"):
+                    skill["hidden"] = True
                 if provenance_names is not None:
                     bundled_names, hub_installed_names = provenance_names
                     provenance = classify_skill_provenance(
