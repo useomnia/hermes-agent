@@ -2385,7 +2385,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "toolCallId": tool_call_id,
                     "status": "completed",
                 }
-                # request_user_input returns one of three result shapes; the plugin
+                # request_user_input returns one of four result shapes; the plugin
                 # owns which, and we honor it here:
                 #  - status "answered": the worker blocked and the user's answer IS
                 #    the result. Surface it on the completed event under
@@ -2431,9 +2431,20 @@ class APIServerAdapter(BasePlatformAdapter):
                             completion_reason = None
                         if completion_reason == "expired":
                             completed.setdefault("interaction", {})["timed_out"] = True
-                    turn_ending = isinstance(parsed, dict) and parsed.get("status") in (
-                        "presented",
-                        "no_response",
+                    #  - status "dismissed": the user dismissed the card instead of
+                    #    answering it. `continue: true` (the dock's dismiss button)
+                    #    keeps the turn going so the agent replies to the dismissal
+                    #    inline; `continue: false` (a composer dismissal) ends the
+                    #    turn so the agent's reply targets the follow-up user turn
+                    #    the chat sends next. No answer is recorded either way.
+                    if isinstance(parsed, dict) and parsed.get("status") == "dismissed":
+                        completed.setdefault("interaction", {})["dismissed"] = True
+                    turn_ending = isinstance(parsed, dict) and (
+                        parsed.get("status") in ("presented", "no_response")
+                        or (
+                            parsed.get("status") == "dismissed"
+                            and not parsed.get("continue", False)
+                        )
                     )
                 # Tool-approval gate (tools/tool_approval.py): the wait for the
                 # approval card ended unresolved (timeout, or an interrupt/stop
