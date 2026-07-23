@@ -515,17 +515,32 @@ def test_terminal_should_not_retry_user_command_exit_one(monkeypatch):
     }
 
 
-def test_toolbox_url_should_require_a_safe_origin():
+def test_toolbox_url_should_require_a_safe_origin_and_preserve_base_path():
     import pytest
 
     from tools.environments.sprites import _normalize_toolbox_url
 
+    # A bare origin is preserved (gateway paired with a direct-forwarding proxy).
     assert _normalize_toolbox_url("https://toolbox.example/") == "https://toolbox.example"
     assert _normalize_toolbox_url("http://127.0.0.1:8643") == "http://127.0.0.1:8643"
+    # A base path is preserved so the gateway can target the proxy's loopback
+    # Toolbox forwarder; the trailing slash is stripped so appended endpoint
+    # paths (e.g. /exec) never produce a doubled separator.
+    assert (
+        _normalize_toolbox_url("http://127.0.0.1:8642/internal/toolbox")
+        == "http://127.0.0.1:8642/internal/toolbox"
+    )
+    assert (
+        _normalize_toolbox_url("http://127.0.0.1:8642/internal/toolbox/")
+        == "http://127.0.0.1:8642/internal/toolbox"
+    )
+    # Unsafe shapes are still rejected.
     with pytest.raises(ValueError, match="HTTPS outside loopback"):
         _normalize_toolbox_url("http://toolbox.example")
-    with pytest.raises(ValueError, match="must not contain a path"):
-        _normalize_toolbox_url("https://toolbox.example/redirect")
+    with pytest.raises(ValueError, match="credentials, a query, or a fragment"):
+        _normalize_toolbox_url("https://toolbox.example/base?foo=bar")
+    with pytest.raises(ValueError, match="credentials, a query, or a fragment"):
+        _normalize_toolbox_url("https://user:pass@toolbox.example/")
 
 
 def test_sprites_file_operations_should_use_files_endpoint_for_write():

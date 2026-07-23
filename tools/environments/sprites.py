@@ -49,11 +49,16 @@ def _normalize_toolbox_url(value: str) -> str:
         raise ValueError("OMNIO_TOOLBOX_URL must be an HTTP(S) origin")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError("OMNIO_TOOLBOX_URL must not contain credentials, a query, or a fragment")
-    if parsed.path not in {"", "/"}:
-        raise ValueError("OMNIO_TOOLBOX_URL must not contain a path")
     if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "::1", "localhost"}:
         raise ValueError("OMNIO_TOOLBOX_URL must use HTTPS outside loopback")
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    # A base path is allowed so the gateway can point at the proxy's
+    # authenticated loopback Toolbox forwarder (e.g. .../internal/toolbox);
+    # per-endpoint paths like /exec are appended to it. A bare origin (no path)
+    # remains valid, so a gateway paired with a proxy that forwards directly is
+    # unaffected. The trailing slash is stripped so f"{base}{path}" never
+    # produces a doubled separator.
+    base_path = parsed.path.rstrip("/")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, base_path, "", ""))
 
 
 class SpritesToolboxError(RuntimeError):
