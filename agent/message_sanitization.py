@@ -28,6 +28,41 @@ logger = logging.getLogger(__name__)
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
 
+def insert_ephemeral_messages(
+    messages: list[dict[str, Any]],
+    ephemeral_messages: list[dict[str, Any]],
+    *,
+    before_current_user: bool = False,
+) -> list[dict[str, Any]]:
+    """Return API messages with non-persistent context inserted at the requested boundary.
+
+    ``before_current_user`` is used for dynamic, current-turn context such as
+    AG-UI state. It keeps that context next to the latest user request without
+    adding it to the persisted conversation history or stable prompt prefix.
+    """
+    result = list(messages)
+    if not ephemeral_messages:
+        return result
+
+    if before_current_user:
+        # Insert immediately before the latest user message so current-turn
+        # context is adjacent to the request it describes.
+        insert_at = next(
+            (
+                index
+                for index in range(len(result) - 1, -1, -1)
+                if result[index].get('role') == 'user'
+            ),
+            len(result),
+        )
+    else:
+        insert_at = 1 if result and result[0].get('role') == 'system' else 0
+
+    for offset, message in enumerate(ephemeral_messages):
+        result.insert(insert_at + offset, message.copy())
+    return result
+
+
 def _sanitize_surrogates(text: str) -> str:
     """Replace lone surrogate code points with U+FFFD (replacement character).
 

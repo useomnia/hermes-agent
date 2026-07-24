@@ -912,10 +912,19 @@ def drop_thinking_only_and_merge_users(
         )
     ]
     dropped = len(messages) - len(kept)
-    if dropped == 0:
+    # Dropping a thinking-only assistant turn can leave two user messages
+    # adjacent. Ephemeral per-turn context (such as AG-UI state) can create
+    # the same shape even when no assistant turn was dropped. Detect it so
+    # the merge pass below can restore the provider's role alternation.
+    has_adjacent_users = any(
+        previous.get("role") == "user" and current.get("role") == "user"
+        for previous, current in zip(kept, kept[1:])
+    )
+    if dropped == 0 and not has_adjacent_users:
         return messages
 
-    # Pass 2: merge any newly-adjacent user messages.
+    # Pass 2: merge any adjacent user messages. This also handles ephemeral
+    # per-call context inserted next to the current user message.
     merged: List[Dict[str, Any]] = []
     merges = 0
     for m in kept:
