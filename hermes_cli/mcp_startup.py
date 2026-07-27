@@ -75,6 +75,32 @@ def mcp_discovery_was_started() -> bool:
 # can't hang a turn forever.
 AGENT_BUILD_JOIN_SECONDS = 130.0
 
+# Set once if a join ever exhausts its bound with discovery still running. That
+# bound is a backstop for a WEDGED discovery thread, and a wedged thread does not
+# recover — so charging it again to the next caller would turn one stuck server
+# into *every* later request paying the full bound and still getting a partial
+# registry. After the first exhaustion the process gives up for good and falls
+# back to the late-binding refresh, the same degradation the CLI and TUI have
+# always accepted. Written once, from whichever thread got there first; a benign
+# double-write only repeats the log line.
+_join_abandoned = False
+
+
+def _abandon_join() -> None:
+    global _join_abandoned
+
+    if _join_abandoned:
+        return
+    _join_abandoned = True
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "MCP discovery did not finish within %.0fs; giving up for this process. "
+        "Agents built from here on may start with an incomplete MCP tool registry "
+        "and rely on the late-binding refresh.",
+        AGENT_BUILD_JOIN_SECONDS,
+    )
+
 
 def ensure_mcp_discovery_complete(timeout: "float | None" = None) -> None:
     """Block until MCP discovery has run, for callers that need the full registry.
@@ -91,13 +117,25 @@ def ensure_mcp_discovery_complete(timeout: "float | None" = None) -> None:
     heartbeats; putting it back on the loop would re-create #16856.
 
     Never raises: a timed-out or failed join degrades to the existing
-    late-binding refresh rather than killing the turn.
+    late-binding refresh rather than killing the turn. And it only ever times out
+    ONCE per process — see ``_join_abandoned``, which stops a permanently wedged
+    discovery thread from re-charging the full bound to every later agent build.
     """
     try:
         if mcp_discovery_was_started():
+            if _join_abandoned:
+                # An earlier caller already waited out the full bound on this
+                # thread and it never finished. Don't re-charge that wait.
+                return
             wait_for_mcp_discovery(
                 timeout=AGENT_BUILD_JOIN_SECONDS if timeout is None else timeout
             )
+            thread = _mcp_discovery_thread
+            if timeout is None and thread is not None and thread.is_alive():
+                # Only the default bound retires the join. An explicit (smaller)
+                # timeout is a caller saying "wait this long", not evidence that
+                # discovery is wedged.
+                _abandon_join()
             return
         # No thread was started — ``start_background_mcp_discovery`` skips when
         # its cheap ``read_raw_config`` probe finds no ``mcp_servers``. That probe
