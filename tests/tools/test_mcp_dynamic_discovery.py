@@ -62,8 +62,8 @@ class TestRegisterServerTools:
         with patch("tools.registry.registry", mock_registry):
             registered = _register_server_tools("omnia", server, {})
 
-        credit_tool = "mcp_omnia_create_prompts_insights"
-        read_tool = "mcp_omnia_read_brand"
+        credit_tool = "mcp__omnia__create_prompts_insights"
+        read_tool = "mcp__omnia__read_brand"
         assert mcp_tool_credits_meta(credit_tool) == descriptor
         assert _mcp_tool_credits_meta[read_tool] is None
 
