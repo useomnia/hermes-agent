@@ -73,6 +73,23 @@ class TestFileToolsContainerConfig:
         cc = self._run(cfg, "t4").get("container_config", {})
         assert cc.get("docker_forward_env") == []
 
+    def test_sprites_pairing_config_is_forwarded(self):
+        captured = self._run(
+            _make_env_config(
+                env_type="sprites",
+                sprites_url="https://toolbox.example",
+                sprites_bearer="pair-secret",
+                sprites_brand="brand-123",
+            ),
+            "sprite-files",
+        )
+
+        assert captured["container_config"]["sprites_url"] == (
+            "https://toolbox.example"
+        )
+        assert captured["container_config"]["sprites_bearer"] == "pair-secret"
+        assert captured["container_config"]["sprites_brand"] == "brand-123"
+
     def test_cwd_only_raw_task_override_reaches_file_environment(self):
         """CWD-only task overrides collapse to default but must keep their cwd."""
         captured = self._run(
