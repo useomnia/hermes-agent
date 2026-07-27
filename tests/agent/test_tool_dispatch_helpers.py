@@ -9,11 +9,13 @@ from a known-untrusted source.
 """
 
 import pytest
+from types import SimpleNamespace
 
 from agent.tool_dispatch_helpers import (
     _extract_file_mutation_targets,
     _is_untrusted_tool,
     _maybe_wrap_untrusted,
+    _plan_tool_batch_segments,
     make_tool_result_message,
 )
 
@@ -26,7 +28,7 @@ from agent.tool_dispatch_helpers import (
 class TestUntrustedToolClassification:
     @pytest.mark.parametrize(
         "name",
-        ["web_extract", "web_search"],
+        ["web_extract", "web_search", "web_read", "web_map"],
     )
     def test_named_high_risk_tools(self, name):
         assert _is_untrusted_tool(name)
@@ -58,6 +60,31 @@ class TestUntrustedToolClassification:
     def test_empty_name_is_not_untrusted(self):
         assert not _is_untrusted_tool("")
         assert not _is_untrusted_tool(None)
+
+
+def test_request_user_input_is_an_ordered_parallelism_barrier():
+    """Interactive input must not race past work on either side of the call."""
+    def tool_call(name: str):
+        return SimpleNamespace(
+            function=SimpleNamespace(name=name, arguments="{}")
+        )
+
+    calls = [
+        tool_call("web_search"),
+        tool_call("web_search"),
+        tool_call("request_user_input"),
+        tool_call("web_search"),
+        tool_call("web_search"),
+    ]
+
+    segments = _plan_tool_batch_segments(calls)
+
+    assert [kind for kind, _ in segments] == [
+        "parallel",
+        "sequential",
+        "parallel",
+    ]
+    assert segments[1][1] == [calls[2]]
 
 
 # =========================================================================
