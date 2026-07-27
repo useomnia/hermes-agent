@@ -627,6 +627,31 @@ class TestSkillManageDispatcher:
         rec = usage.get("test-skill") or {}
         assert rec.get("created_by") in {None, "", False}
 
+    def test_skill_mutations_refresh_slash_command_registry(self, tmp_path):
+        """Create, edit, and delete must be visible without a gateway restart."""
+        with _skill_dir(tmp_path), patch(
+            "agent.skill_commands.scan_skill_commands"
+        ) as scan_commands:
+            created = json.loads(skill_manage(
+                action="create",
+                name="test-skill",
+                content=VALID_SKILL_CONTENT,
+            ))
+            edited = json.loads(skill_manage(
+                action="edit",
+                name="test-skill",
+                content=VALID_SKILL_CONTENT_2,
+            ))
+            deleted = json.loads(skill_manage(
+                action="delete",
+                name="test-skill",
+            ))
+
+        assert created["success"] is True
+        assert edited["success"] is True
+        assert deleted["success"] is True
+        assert scan_commands.call_count == 3
+
     def test_create_from_background_review_marks_agent_created(self, tmp_path):
         """Background-review fork creates ARE marked as agent-created."""
         from tools.skill_provenance import set_current_write_origin, BACKGROUND_REVIEW
