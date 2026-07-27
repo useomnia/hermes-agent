@@ -350,8 +350,9 @@ class TestBrowserVisionAnnotate:
         full = schema["parameters"]["properties"]["full"]
         assert full["type"] == "boolean"
         assert full["default"] is False
-        assert "viewport" in full["description"].lower()
-        assert "entire page height" in full["description"]
+        description = full["description"].lower()
+        assert "viewport" in description
+        assert "full page" in description
 
     def test_annotate_false_no_flag(self):
         """Without annotate, screenshot command has no --annotate flag."""
