@@ -116,6 +116,18 @@ class TestPlanToolBatchSegments:
         assert _kinds(segments) == ["parallel", "sequential"]
         assert [tc.id for tc in segments[1][1]] == ["c1"]
 
+    def test_request_user_input_is_a_barrier(self):
+        calls = [
+            _tc("web_search", call_id="r1"),
+            _tc("web_search", call_id="r2"),
+            _tc("request_user_input", '{"question":"?"}', call_id="u1"),
+        ]
+
+        segments = _plan_tool_batch_segments(calls)
+
+        assert _kinds(segments) == ["parallel", "sequential"]
+        assert [tc.id for tc in segments[1][1]] == ["u1"]
+
     def test_malformed_args_call_is_a_barrier_not_a_batch_poison(self):
         calls = [
             _tc("web_search", call_id="r1"),
