@@ -756,7 +756,7 @@ def _get_or_create_env(task_id: str):
         cwd = overrides.get("cwd") or config["cwd"]
 
         container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona"}:
+        if env_type in {"docker", "singularity", "modal", "daytona", "sprites"}:
             container_config = {
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
@@ -765,6 +765,9 @@ def _get_or_create_env(task_id: str):
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                 "docker_network": config.get("docker_network", True),
+                "sprites_url": config.get("sprites_url", ""),
+                "sprites_bearer": config.get("sprites_bearer", ""),
+                "sprites_brand": config.get("sprites_brand", "default"),
             }
 
         ssh_config = None
@@ -1035,7 +1038,8 @@ def _execute_remote(
             "command -v python3 >/dev/null 2>&1 && echo OK",
             cwd="/", timeout=15,
         )
-        if "OK" not in py_check.get("output", ""):
+        py_check_output = str(py_check.get("output", ""))
+        if "OK" not in py_check_output and py_check.get("returncode") == 1:
             return json.dumps({
                 "status": "error",
                 "error": (
@@ -1046,6 +1050,12 @@ def _execute_remote(
                 "tool_calls_made": 0,
                 "duration_seconds": 0,
             })
+        if "OK" not in py_check_output:
+            raise RuntimeError(
+                "Python 3 availability probe failed without proving Python "
+                "is absent "
+                f"(exit code {py_check.get('returncode', 'unknown')})"
+            )
 
         # Create sandbox directory on remote
         env.execute(
