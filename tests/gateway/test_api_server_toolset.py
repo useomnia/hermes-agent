@@ -75,6 +75,36 @@ class TestApiServerPlatformConfig:
         discover_builtin_tools()
         assert "terminal" in _get_platform_tools({}, "api_server")
 
+    def test_sprites_api_server_exposes_terminal_without_desktop_adjunct(
+        self, monkeypatch
+    ):
+        """Paired Sprites keeps core terminal tools but not desktop-only UI."""
+        monkeypatch.setenv("TERMINAL_ENV", "sprites")
+        monkeypatch.setenv("OMNIO_TOOLBOX_URL", "https://toolbox.example")
+        monkeypatch.setenv("OMNIO_TOOLBOX_BEARER", "pair-secret")
+        monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+
+        import model_tools
+        from hermes_cli.tools_config import _get_platform_tools
+        from tools.registry import invalidate_check_fn_cache
+
+        invalidate_check_fn_cache()
+        model_tools._clear_tool_defs_cache()
+        enabled_toolsets = _get_platform_tools(
+            {},
+            "api_server",
+            include_default_mcp_servers=False,
+        )
+        tool_defs = model_tools.get_tool_definitions(
+            enabled_toolsets=sorted(enabled_toolsets),
+            quiet_mode=True,
+        )
+        names = {tool["function"]["name"] for tool in tool_defs}
+
+        assert "terminal" in enabled_toolsets
+        assert {"terminal", "process", "read_file", "write_file"}.issubset(names)
+        assert "read_terminal" not in names
+
     def test_registering_tool_into_toolset_does_not_drop_toolset_from_inference(self):
         """Class invariant (covers the delegate_cli overlay case): registering a
         NEW tool into an existing configurable toolset must never remove that
