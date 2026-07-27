@@ -863,7 +863,11 @@ class TestNousTagsScoping:
             messages=[{"role": "user", "content": "hi"}],
         )
 
-        assert "extra_body" not in kwargs
+        assert kwargs["extra_body"] == {
+            "provider": {"sort": "price"},
+            "usage": {"include": True},
+        }
+        assert "tags" not in kwargs["extra_body"]
 
 
 class TestNormalizeAuxProvider:
@@ -6810,3 +6814,40 @@ class TestCustomEndpointApiKeyInheritance:
             )
 
         assert captured.get("api_key") == "no-key-required"
+
+
+def test_openrouter_auxiliary_response_preserves_reported_cost(monkeypatch):
+    """The unified client must pass provider cost through session accounting."""
+    from agent.aux_accounting import (
+        record_aux_usage,
+        reset_accounting_context,
+        set_accounting_context,
+    )
+
+    session_db = MagicMock()
+    monkeypatch.setattr(
+        "agent.usage_pricing.estimate_usage_cost",
+        lambda *args, **kwargs: SimpleNamespace(
+            amount_usd=0.001,
+            status="estimated",
+            source="catalog",
+        ),
+    )
+    response = SimpleNamespace(
+        model="openai/gpt-5-mini",
+        usage=SimpleNamespace(
+            prompt_tokens=20,
+            completion_tokens=10,
+            cost=0.0042,
+        ),
+    )
+    token = set_accounting_context(session_db, "session-1")
+    try:
+        record_aux_usage(response, "vision", provider="openrouter")
+    finally:
+        reset_accounting_context(token)
+
+    call = session_db.record_auxiliary_usage.call_args
+    assert call.kwargs["actual_cost_usd"] == pytest.approx(0.0042)
+    assert call.kwargs["cost_status"] == "actual"
+    assert call.kwargs["cost_source"] == "provider_cost_api"
