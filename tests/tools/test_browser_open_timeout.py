@@ -93,9 +93,18 @@ class TestBrowserNavigateOpenTimeout:
     def test_first_navigation_uses_first_open_timeout(self, monkeypatch):
         captured: dict = {}
 
-        def fake_run(task_id, command, args, timeout=None):
+        def fake_run(
+            task_id,
+            command,
+            args,
+            timeout=None,
+            _defer_session_reset_on_timeout=False,
+        ):
             if command == "open":
                 captured["timeout"] = timeout
+                captured["defer_session_reset"] = (
+                    _defer_session_reset_on_timeout
+                )
             return {"success": True, "data": {"title": "t", "url": args[0] if args else ""}}
 
         monkeypatch.setattr(bt, "_get_open_command_timeout", lambda first_open=False: 120 if first_open else 60)
@@ -110,3 +119,4 @@ class TestBrowserNavigateOpenTimeout:
 
         bt.browser_navigate("https://example.com", task_id="task-1")
         assert captured["timeout"] == 120
+        assert captured["defer_session_reset"] is True
