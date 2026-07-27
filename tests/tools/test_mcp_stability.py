@@ -109,6 +109,7 @@ class TestStdioPidTracking:
         """_kill_orphaned_mcp_children does nothing when no PIDs tracked."""
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
+            _orphan_stdio_pid_servers,
             _orphan_stdio_pids,
             _stdio_pids,
             _lock,
@@ -117,6 +118,7 @@ class TestStdioPidTracking:
         with _lock:
             _stdio_pids.clear()
             _orphan_stdio_pids.clear()
+            _orphan_stdio_pid_servers.clear()
 
         # Should not raise
         _kill_orphaned_mcp_children()
@@ -125,6 +127,7 @@ class TestStdioPidTracking:
         """_kill_orphaned_mcp_children gracefully handles already-dead PIDs."""
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
+            _orphan_stdio_pid_servers,
             _orphan_stdio_pids,
             _lock,
         )
@@ -133,6 +136,7 @@ class TestStdioPidTracking:
         fake_pid = 999999999
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
+            _orphan_stdio_pid_servers[fake_pid] = "orphan"
 
         # Should not raise (ProcessLookupError is caught)
         _kill_orphaned_mcp_children()
@@ -144,6 +148,7 @@ class TestStdioPidTracking:
         """SIGTERM-first then SIGKILL after 2s for orphan cleanup."""
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
+            _orphan_stdio_pid_servers,
             _orphan_stdio_pids,
             _lock,
         )
@@ -151,7 +156,9 @@ class TestStdioPidTracking:
         fake_pid = 424242
         with _lock:
             _orphan_stdio_pids.clear()
+            _orphan_stdio_pid_servers.clear()
             _orphan_stdio_pids.add(fake_pid)
+            _orphan_stdio_pid_servers[fake_pid] = "orphan"
 
         fake_sigkill = 9
         monkeypatch.setattr(signal, "SIGKILL", fake_sigkill, raising=False)
@@ -177,6 +184,7 @@ class TestStdioPidTracking:
         """Without SIGKILL, SIGTERM is used for both phases."""
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
+            _orphan_stdio_pid_servers,
             _orphan_stdio_pids,
             _lock,
         )
@@ -184,7 +192,9 @@ class TestStdioPidTracking:
         fake_pid = 434343
         with _lock:
             _orphan_stdio_pids.clear()
+            _orphan_stdio_pid_servers.clear()
             _orphan_stdio_pids.add(fake_pid)
+            _orphan_stdio_pid_servers[fake_pid] = "orphan"
 
         monkeypatch.delattr(signal, "SIGKILL", raising=False)
 
@@ -198,6 +208,99 @@ class TestStdioPidTracking:
 
         with _lock:
             assert fake_pid not in _orphan_stdio_pids
+
+    def test_run_stdio_reaps_orphans_before_spawn(self):
+        """_run_stdio kills orphaned PIDs from prior failed attempts (#57355)."""
+        from tools.mcp_tool import (
+            _kill_orphaned_mcp_children,
+            _orphan_stdio_pids,
+            _stdio_pids,
+            _stdio_pgids,
+            _lock,
+            MCPServerTask,
+        )
+        from unittest.mock import patch, MagicMock, AsyncMock
+
+        # Seed an orphan PID that belongs to a prior failed connection.
+        fake_pid = 999999997
+        with _lock:
+            _orphan_stdio_pids.add(fake_pid)
+
+        server = MCPServerTask.__new__(MCPServerTask)
+        server.name = "test-zombie-reap"
+        server._ready = MagicMock()
+        server._shutdown_event = MagicMock()
+        server._shutdown_event.is_set.return_value = True
+        server._reconnect_event = MagicMock()
+        server._sampling = None
+        server._elicitation = None
+        server._registered_tool_names = []
+
+        config = {"command": "echo", "args": ["hello"]}
+
+        import asyncio
+
+        async def _run():
+            # _run_stdio should reap orphans before it gets to the
+            # stdio_client spawn.  Patch the OSV check (local import)
+            # and stdio_client so no real subprocess is spawned.
+            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._build_safe_env", return_value={}), \
+                 patch("tools.mcp_tool._resolve_stdio_command",
+                       return_value=("echo", {})), \
+                 patch("tools.mcp_tool._write_stderr_log_header"), \
+                 patch("tools.mcp_tool._get_mcp_stderr_log",
+                       return_value=None), \
+                 patch("tools.mcp_tool.check_package_for_malware",
+                       return_value=None, create=True), \
+                 patch("tools.osv_check.check_package_for_malware",
+                       return_value=None):
+                # Patch stdio_client to raise so the test exits quickly
+                cm = MagicMock()
+                cm.__aenter__ = AsyncMock(side_effect=RuntimeError("test"))
+                cm.__aexit__ = AsyncMock(return_value=False)
+                with patch("tools.mcp_tool.stdio_client", return_value=cm):
+                    try:
+                        await server._run_stdio(config)
+                    except Exception:
+                        pass
+
+        asyncio.run(_run())
+
+        # The orphan must have been reaped before the spawn attempt.
+        with _lock:
+            assert fake_pid not in _orphan_stdio_pids
+
+    def test_kill_orphaned_can_filter_by_server_name(self):
+        """Reconnect cleanup reaps only the orphan owned by that MCP server."""
+        from tools.mcp_tool import (
+            _kill_orphaned_mcp_children,
+            _orphan_stdio_pid_servers,
+            _orphan_stdio_pids,
+            _lock,
+        )
+
+        target_pid = 454545
+        other_pid = 464646
+        with _lock:
+            _orphan_stdio_pids.clear()
+            _orphan_stdio_pid_servers.clear()
+            _orphan_stdio_pids.update({target_pid, other_pid})
+            _orphan_stdio_pid_servers[target_pid] = "feishu"
+            _orphan_stdio_pid_servers[other_pid] = "mimir"
+
+        with patch("tools.mcp_tool.os.kill") as mock_kill, \
+             patch("gateway.status._pid_exists", return_value=False), \
+             patch("tools.mcp_tool.time.sleep") as mock_sleep:
+            _kill_orphaned_mcp_children(server_name="feishu")
+
+        mock_kill.assert_called_once_with(target_pid, signal.SIGTERM)
+        mock_sleep.assert_called_once_with(2)
+        with _lock:
+            assert target_pid not in _orphan_stdio_pids
+            assert target_pid not in _orphan_stdio_pid_servers
+            assert other_pid in _orphan_stdio_pids
+            assert _orphan_stdio_pid_servers[other_pid] == "mimir"
 
 
 # ---------------------------------------------------------------------------
@@ -214,10 +317,17 @@ class TestStdioPgroupReaping:
     """_kill_orphaned_mcp_children reaps via killpg when a pgid is tracked."""
 
     def _reset_state(self):
-        from tools.mcp_tool import _stdio_pids, _orphan_stdio_pids, _stdio_pgids, _lock
+        from tools.mcp_tool import (
+            _orphan_stdio_pid_servers,
+            _orphan_stdio_pids,
+            _stdio_pgids,
+            _stdio_pids,
+            _lock,
+        )
         with _lock:
             _stdio_pids.clear()
             _orphan_stdio_pids.clear()
+            _orphan_stdio_pid_servers.clear()
             _stdio_pgids.clear()
 
     def test_killpg_used_when_pgid_tracked(self, monkeypatch):
@@ -429,8 +539,8 @@ class TestStdioPgroupReaping:
         )
         parent_pgid = os.getpgid(parent.pid)
         # Wait for parent to exit and grandchild to spin up.
-        parent.wait(timeout=5)
-        deadline = _time.time() + 5
+        parent.wait(timeout=15)
+        deadline = _time.time() + 15  # fresh CPython spinup dilates under CI load
         while _time.time() < deadline and not grandchild_pid_file.exists():
             _time.sleep(0.05)
         assert grandchild_pid_file.exists(), "grandchild did not start"
@@ -443,6 +553,7 @@ class TestStdioPgroupReaping:
         # Drive the reaper: register the parent pid + pgid as an orphan.
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
+            _orphan_stdio_pid_servers,
             _orphan_stdio_pids,
             _stdio_pgids,
             _stdio_pids,
@@ -451,8 +562,10 @@ class TestStdioPgroupReaping:
         with _lock:
             _stdio_pids.clear()
             _orphan_stdio_pids.clear()
+            _orphan_stdio_pid_servers.clear()
             _stdio_pgids.clear()
             _orphan_stdio_pids.add(parent.pid)
+            _orphan_stdio_pid_servers[parent.pid] = "orphan"
             _stdio_pgids[parent.pid] = parent_pgid
         try:
             _kill_orphaned_mcp_children()
@@ -464,7 +577,7 @@ class TestStdioPgroupReaping:
                 pass
 
         # Grandchild should be gone — SIGTERM via killpg in phase 1 reached it.
-        deadline = _time.time() + 3
+        deadline = _time.time() + 10
         while _time.time() < deadline and psutil.pid_exists(grandchild_pid):
             _time.sleep(0.05)
         assert not psutil.pid_exists(grandchild_pid), (
@@ -559,10 +672,8 @@ class TestMCPInitialConnectionRetry:
 
         asyncio.get_event_loop().run_until_complete(_run())
 
-    def test_initial_connect_unblocks_startup_but_keeps_retrying(self):
-        """After the fast retries, the server stops blocking startup (error set,
-        _ready fired) but does NOT give up — it keeps retrying in the background
-        so a startup transient can self-heal."""
+    def test_initial_connect_gives_up_after_max_retries(self):
+        """Server parks (does not exit) after _MAX_INITIAL_CONNECT_RETRIES failures."""
         from tools.mcp_tool import MCPServerTask, _MAX_INITIAL_CONNECT_RETRIES
 
         call_count = 0
@@ -580,123 +691,18 @@ class TestMCPInitialConnectionRetry:
                 task = asyncio.ensure_future(server.run({"command": "fake"}))
                 await server._ready.wait()
 
-                # Startup is unblocked with the error surfaced, after exactly the
-                # fast-retry budget (1 initial + N retries).
+                # Should have an error after exhausting retries
                 assert server._error is not None
                 assert "DNS resolution failed" in str(server._error)
+                # 1 initial + N retries = _MAX_INITIAL_CONNECT_RETRIES + 1 total attempts
                 assert call_count == _MAX_INITIAL_CONNECT_RETRIES + 1
-                # Degraded-but-serving: the flag that makes start() RETURN (so
-                # the caller tracks this task in _servers) instead of raising.
-                assert server._serving_degraded is True
-                # Crucially: the task is still alive, retrying in the background —
-                # it did not give up for good.
-                assert not task.done()
+                # The task parks for later revival instead of exiting.
+                await asyncio.sleep(0)
+                assert not task.done(), "run task should park, not exit"
 
-                # Shutdown interrupts the background backoff promptly.
                 server._shutdown_event.set()
+                server._reconnect_event.set()
                 await asyncio.wait_for(task, timeout=5)
-
-        asyncio.get_event_loop().run_until_complete(_run())
-
-    def test_discover_tools_registers_live_on_background_recovery(self):
-        """A connect that lands AFTER startup proceeded without the server
-        (background-retry recovery) registers its tools live via a scheduled
-        refresh — the same path /v1/mcp/reload uses."""
-        from tools.mcp_tool import MCPServerTask
-
-        class _FakeTool:
-            name = "do_thing"
-
-        class _FakeResult:
-            tools = [_FakeTool()]
-
-        class _FakeSession:
-            async def list_tools(self):
-                return _FakeResult()
-
-        async def _run():
-            server = MCPServerTask("test-recover")
-            server._ready.set()            # startup already proceeded without us
-            server._registered_tool_names = []   # nothing registered yet
-            server.session = _FakeSession()
-            with patch.object(MCPServerTask, "_schedule_tools_refresh") as mock_refresh:
-                await server._discover_tools()
-                assert server._connected_once is True
-                assert server._error is None
-                assert mock_refresh.called, "recovery connect should register tools live"
-
-        asyncio.get_event_loop().run_until_complete(_run())
-
-    def test_discover_tools_no_recovery_refresh_on_first_connect(self):
-        """The first/normal connect (before _ready) registers via the startup
-        path, so it must NOT schedule a recovery refresh."""
-        from tools.mcp_tool import MCPServerTask
-
-        class _FakeTool:
-            name = "do_thing"
-
-        class _FakeResult:
-            tools = [_FakeTool()]
-
-        class _FakeSession:
-            async def list_tools(self):
-                return _FakeResult()
-
-        async def _run():
-            server = MCPServerTask("test-first")
-            server._registered_tool_names = []   # _ready NOT set: first connect
-            server.session = _FakeSession()
-            with patch.object(MCPServerTask, "_schedule_tools_refresh") as mock_refresh:
-                await server._discover_tools()
-                assert server._connected_once is True
-                assert not mock_refresh.called
-
-        asyncio.get_event_loop().run_until_complete(_run())
-
-    def test_start_returns_for_a_degraded_server_so_it_stays_trackable(self):
-        """A never-connected server that exhausted its fast retries is degraded:
-        start() must RETURN (not raise) so the caller records the still-running
-        task in _servers, reachable by shutdown / reload."""
-        from tools.mcp_tool import MCPServerTask
-
-        # run() is patched on the CLASS — MCPServerTask uses __slots__, so the
-        # instance attribute is read-only.
-        async def fake_run(self, config):
-            # Emulate run() exhausting fast retries: degraded, error surfaced,
-            # ready fired, task still looping until shutdown.
-            self._serving_degraded = True
-            self._error = ConnectionError("still down")
-            self._ready.set()
-            await self._shutdown_event.wait()
-
-        async def _run():
-            with patch.object(MCPServerTask, "run", fake_run):
-                server = MCPServerTask("test-degraded-start")
-                # Must NOT raise even though _error is set.
-                await asyncio.wait_for(server.start({"command": "fake"}), timeout=5)
-                assert server._serving_degraded is True
-                assert server._error is not None
-                assert server._task is not None and not server._task.done()
-
-                server._shutdown_event.set()
-                await asyncio.wait_for(server._task, timeout=5)
-
-        asyncio.get_event_loop().run_until_complete(_run())
-
-    def test_start_raises_for_a_permanent_failure(self):
-        """A permanent failure (e.g. initial OAuth auth error) is NOT degraded:
-        run() has exited, so start() must raise and the caller must not track it."""
-        from tools.mcp_tool import MCPServerTask
-
-        async def fake_run(self, config):
-            self._error = PermissionError("initial OAuth failed")
-            self._ready.set()
-
-        async def _run():
-            with patch.object(MCPServerTask, "run", fake_run):
-                server = MCPServerTask("test-permanent-start")
-                with pytest.raises(PermissionError):
-                    await asyncio.wait_for(server.start({"command": "fake"}), timeout=5)
 
         asyncio.get_event_loop().run_until_complete(_run())
 
@@ -728,92 +734,5 @@ class TestMCPInitialConnectionRetry:
                 # Should have the error set and be done
                 assert server._error is not None
                 await task
-
-        asyncio.get_event_loop().run_until_complete(_run())
-
-
-# ---------------------------------------------------------------------------
-# Fix: reconnect-retry budget resets on a healthy connection
-# (consecutive failures, not a lifetime tally)
-# ---------------------------------------------------------------------------
-
-class TestMCPReconnectBudgetReset:
-    """A drop that follows a healthy connection resets the reconnect budget, so
-    _MAX_RECONNECT_RETRIES means "failures in a row", not a lifetime count that
-    eventually kills a long-lived server after enough spread-out transients."""
-
-    def test_discover_tools_flags_reconnect_succeeded(self):
-        """_discover_tools marks the server viable again so run()'s loop can
-        reset its retry budget on the next drop."""
-        from tools.mcp_tool import MCPServerTask
-
-        class _FakeResult:
-            tools = []
-
-        class _FakeSession:
-            async def list_tools(self):
-                return _FakeResult()
-
-        async def _run():
-            server = MCPServerTask("test-flag")
-            server.session = _FakeSession()
-            assert server._reconnect_succeeded is False
-            await server._discover_tools()
-            assert server._reconnect_succeeded is True
-
-        asyncio.get_event_loop().run_until_complete(_run())
-
-    def test_reconnect_budget_resets_after_healthy_connection(self):
-        """Surviving MORE than _MAX_RECONNECT_RETRIES drops must NOT make the
-        server give up, as long as each drop followed a successful connect.
-
-        Regression guard: the counter used to accumulate over the connection's
-        whole life, so a long session with a handful of spread-out transients
-        would exhaust the cap and the server would die until a reload/restart.
-        """
-        from tools.mcp_tool import MCPServerTask, _MAX_RECONNECT_RETRIES
-
-        total_drops = _MAX_RECONNECT_RETRIES + 3  # well past the old lifetime cap
-        call_count = 0
-        _orig_sleep = asyncio.sleep
-
-        async def _instant_sleep(*_a, **_k):
-            # Yield to the loop without waiting out the (reset) backoff.
-            await _orig_sleep(0)
-
-        async def fake_run_stdio(self_inner, config):
-            nonlocal call_count
-            call_count += 1
-            # Model a healthy connect (what _discover_tools would do) ...
-            self_inner._connected_once = True
-            self_inner._reconnect_succeeded = True
-            self_inner._ready.set()
-            if call_count <= total_drops:
-                # ... then the transport drops.
-                raise ConnectionError("transient drop")
-            # Final attempt: stay connected until shutdown.
-            await self_inner._shutdown_event.wait()
-
-        async def _run():
-            server = MCPServerTask("test-budget-reset")
-            with patch.object(MCPServerTask, "_run_stdio", fake_run_stdio), \
-                    patch("tools.mcp_tool.asyncio.sleep", _instant_sleep):
-                task = asyncio.ensure_future(server.run({"command": "fake"}))
-                # Let the loop weather every drop and reach the final
-                # stay-connected attempt (or die early if it gave up).
-                for _ in range(10000):
-                    if task.done() or call_count > total_drops:
-                        break
-                    await _orig_sleep(0)
-
-                assert not task.done(), (
-                    "server gave up after spread-out drops — the reconnect "
-                    "budget is accumulating over the connection's lifetime "
-                    "instead of resetting on each healthy reconnect"
-                )
-                assert call_count == total_drops + 1
-
-                server._shutdown_event.set()
-                await asyncio.wait_for(task, timeout=5)
 
         asyncio.get_event_loop().run_until_complete(_run())

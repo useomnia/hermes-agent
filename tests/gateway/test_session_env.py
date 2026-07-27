@@ -48,6 +48,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_NAME", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_TYPE", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
@@ -59,6 +60,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_SOURCE") == ""
     assert get_session_env("HERMES_SESSION_CHAT_ID") == "-1001"
     assert get_session_env("HERMES_SESSION_CHAT_NAME") == "Group"
+    assert get_session_env("HERMES_SESSION_CHAT_TYPE") == "group"
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
     assert get_session_env("HERMES_SESSION_USER_NAME") == "alice"
     assert get_session_env("HERMES_SESSION_THREAD_ID") == "17585"
@@ -66,6 +68,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     # os.environ should NOT be touched
     assert os.getenv("HERMES_SESSION_PLATFORM") is None
     assert os.getenv("HERMES_SESSION_SOURCE") is None
+    assert os.getenv("HERMES_SESSION_CHAT_TYPE") is None
     assert os.getenv("HERMES_SESSION_THREAD_ID") is None
 
     # Clean up
@@ -91,6 +94,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_NAME", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_TYPE", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
@@ -109,6 +113,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     tokens = runner._set_session_env(context)
     assert get_session_env("HERMES_SESSION_PLATFORM") == "telegram"
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
+    assert get_session_env("HERMES_SESSION_CHAT_TYPE") == "group"
 
     runner._clear_session_env(tokens)
 
@@ -116,6 +121,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     assert get_session_env("HERMES_SESSION_PLATFORM") == ""
     assert get_session_env("HERMES_SESSION_CHAT_ID") == ""
     assert get_session_env("HERMES_SESSION_CHAT_NAME") == ""
+    assert get_session_env("HERMES_SESSION_CHAT_TYPE") == ""
     assert get_session_env("HERMES_SESSION_USER_ID") == ""
     assert get_session_env("HERMES_SESSION_USER_NAME") == ""
     assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
@@ -317,6 +323,7 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         )
     finally:
         runner._clear_session_env(tokens)
+        runner._shutdown_executor()
 
     assert result == {
         "platform": "telegram",
@@ -334,7 +341,10 @@ async def test_run_in_executor_with_context_forwards_args():
     def add(a, b):
         return a + b
 
-    result = await runner._run_in_executor_with_context(add, 3, 7)
+    try:
+        result = await runner._run_in_executor_with_context(add, 3, 7)
+    finally:
+        runner._shutdown_executor()
     assert result == 10
 
 
@@ -346,5 +356,46 @@ async def test_run_in_executor_with_context_propagates_exceptions():
     def blow_up():
         raise ValueError("boom")
 
-    with pytest.raises(ValueError, match="boom"):
-        await runner._run_in_executor_with_context(blow_up)
+    try:
+        with pytest.raises(ValueError, match="boom"):
+            await runner._run_in_executor_with_context(blow_up)
+    finally:
+        runner._shutdown_executor()
+
+
+@pytest.mark.asyncio
+async def test_run_in_executor_with_context_survives_default_executor_shutdown():
+    """Gateway agent work should not depend on asyncio's default executor."""
+    runner = object.__new__(GatewayRunner)
+    loop = asyncio.get_running_loop()
+
+    await loop.run_in_executor(None, lambda: None)
+    await loop.shutdown_default_executor()
+
+    try:
+        result = await runner._run_in_executor_with_context(lambda: "ok")
+    finally:
+        runner._shutdown_executor()
+
+    assert result == "ok"
+
+
+@pytest.mark.asyncio
+async def test_gateway_executor_refuses_resurrection_after_shutdown():
+    """A real gateway shutdown must NOT be resurrected by the recreate path.
+
+    _shutdown_executor() means "we're stopping" — the recreate-on-shutdown
+    logic exists to survive an *external* teardown of the loop default
+    (test_..._survives_default_executor_shutdown), not to undo our own stop.
+    """
+    runner = object.__new__(GatewayRunner)
+
+    try:
+        first = await runner._run_in_executor_with_context(lambda: "first")
+        assert first == "first"
+        runner._shutdown_executor()
+
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await runner._run_in_executor_with_context(lambda: "second")
+    finally:
+        runner._shutdown_executor()

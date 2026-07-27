@@ -376,7 +376,7 @@ def _write_gateway_desired_state(name: str, desired_state: str) -> None:
         if not profile_dir.exists():
             return
         try:
-            data = json.loads(state_file.read_text()) if state_file.exists() else {}
+            data = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
             if not isinstance(data, dict):
                 data = {}
         except (OSError, json.JSONDecodeError):
@@ -384,7 +384,7 @@ def _write_gateway_desired_state(name: str, desired_state: str) -> None:
         data["desired_state"] = desired_state
         data["updated_at"] = int(time.time())
         tmp = state_file.with_suffix(state_file.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, separators=(",", ":")) + "\n")
+        tmp.write_text(json.dumps(data, separators=(",", ":")) + "\n", encoding="utf-8")
         tmp.replace(state_file)
     except OSError:
         return
@@ -838,7 +838,7 @@ class S6ServiceManager:
         try:
             subprocess.run(
                 [f"{_S6_BIN_DIR}/s6-svc", action_flag, str(service_dir)],
-                check=True, capture_output=True, text=True, timeout=5,
+                check=True, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
             )
         except subprocess.CalledProcessError as exc:
             raise S6CommandError(
@@ -873,7 +873,7 @@ class S6ServiceManager:
         try:
             result = subprocess.run(
                 [f"{_S6_BIN_DIR}/s6-svstat", str(self.scandir / name)],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -926,7 +926,7 @@ class S6ServiceManager:
         import subprocess
         result = subprocess.run(
             [f"{_S6_BIN_DIR}/s6-svstat", str(self.scandir / name)],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
         )
         return result.returncode == 0 and "up " in result.stdout
 
@@ -965,30 +965,44 @@ class S6ServiceManager:
             )
 
         # Build the service directory atomically: write to a sibling
-        # temp dir, then rename. Avoids s6-svscan observing a half-
-        # populated directory on a fast rescan.
-        tmp_dir = svc_dir.with_name(svc_dir.name + ".tmp")
+        # temp dir, then rename. The staging name is DOT-PREFIXED
+        # (``.gateway-<profile>.tmp``) so s6-svscan ignores it while it
+        # is half-built: s6-svscan skips any scandir entry whose name
+        # begins with ``.``. Without the dot prefix, a concurrent
+        # ``s6-svscanctl -a`` rescan (fired by the cont-init reconciler
+        # registering ``gateway-default``, or by a sibling register)
+        # would supervise the still-being-seeded ``.tmp`` slot: it has a
+        # valid ``type``/``run`` by that point, so s6-supervise spawns
+        # AS ROOT and mkdir's ``supervise/`` root-owned 0700 — then this
+        # process's ``_seed_supervise_skeleton`` early-returns on the now-
+        # existing ``supervise/`` and the next ``mkdir supervise/event``
+        # hits EACCES. That is the arm64-only CI flake on
+        # test_s6_unregister_removes_service_dir_in_live_container
+        # (the wider scheduling jitter on the native arm64 runner lets the
+        # rescan land inside the ~ms seed window). The atomic rename to
+        # the dotless live name below is unaffected.
+        tmp_dir = svc_dir.with_name("." + svc_dir.name + ".tmp")
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
         tmp_dir.mkdir(parents=True)
 
         try:
-            (tmp_dir / "type").write_text("longrun\n")
+            (tmp_dir / "type").write_text("longrun\n", encoding="utf-8")
 
             run_script = self._render_run_script(profile, extra_env or {})
             run_path = tmp_dir / "run"
-            run_path.write_text(run_script)
+            run_path.write_text(run_script, encoding="utf-8")
             run_path.chmod(0o755)
 
             finish_path = tmp_dir / "finish"
-            finish_path.write_text(self._render_finish_script())
+            finish_path.write_text(self._render_finish_script(), encoding="utf-8")
             finish_path.chmod(0o755)
 
             # Persistent log rotation (OQ8-C).
             log_subdir = tmp_dir / "log"
             log_subdir.mkdir()
             log_run = log_subdir / "run"
-            log_run.write_text(self._render_log_run(profile))
+            log_run.write_text(self._render_log_run(profile), encoding="utf-8")
             log_run.chmod(0o755)
 
             # Pre-create the supervise/ skeleton with hermes ownership
@@ -1015,7 +1029,7 @@ class S6ServiceManager:
         # Trigger rescan so s6-svscan picks up the new service.
         result = subprocess.run(
             [f"{_S6_BIN_DIR}/s6-svscanctl", "-a", str(self.scandir)],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
         )
         if result.returncode != 0:
             # Clean up: rescan failed, leave the directory in place would
@@ -1052,13 +1066,13 @@ class S6ServiceManager:
         # Stop the service (best effort — service may already be down).
         subprocess.run(
             [f"{_S6_BIN_DIR}/s6-svc", "-d", str(svc_dir)],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
             check=False,
         )
         # Wait for it to actually go down (up to 10s).
         subprocess.run(
             [f"{_S6_BIN_DIR}/s6-svwait", "-D", "-t", "10000", str(svc_dir)],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15,
             check=False,
         )
 
@@ -1070,7 +1084,7 @@ class S6ServiceManager:
         # files inside the slot, so the upcoming rmtree doesn't race.
         subprocess.run(
             [f"{_S6_BIN_DIR}/s6-svscanctl", "-an", str(self.scandir)],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
             check=False,
         )
         # Give s6-svscan a moment to reap. There's no synchronous

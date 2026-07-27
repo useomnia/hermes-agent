@@ -20,10 +20,6 @@ from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
-# These tests mutate ``web_server.app.state.auth_required`` so they share
-# the same xdist group as the other dashboard-auth gated_app tests.
-pytestmark = pytest.mark.xdist_group("dashboard_auth_app_state")
-
 
 @pytest.fixture
 def gated_client():
@@ -71,6 +67,22 @@ def test_status_reports_auth_required_in_gated_mode(gated_client):
     assert body["auth_providers"] == ["stub"]
 
 
+def test_health_reports_liveness_without_loading_gateway_config(gated_client, monkeypatch):
+    def _boom():
+        raise AssertionError("health must not load gateway config")
+
+    monkeypatch.setattr("gateway.config.load_gateway_config", _boom)
+
+    r = gated_client.get("/api/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {
+        "ok": True,
+        "version": web_server.__version__,
+        "auth_required": True,
+    }
+
+
 def test_status_reports_auth_disabled_in_loopback_mode(loopback_client):
     r = loopback_client.get("/api/status")
     assert r.status_code == 200
@@ -96,6 +108,18 @@ def test_status_preserves_existing_fields(loopback_client):
     }
     missing = expected_keys - set(body.keys())
     assert not missing, f"/api/status dropped fields: {missing}"
+    # gateway_updated_at is a typed contract (web/src/lib/api.ts declares
+    # string | null): it must never be a number, and any string must
+    # round-trip through fromisoformat as a timezone-aware timestamp.
+    updated_at = body["gateway_updated_at"]
+    assert isinstance(updated_at, (str, type(None))), (
+        f"gateway_updated_at must be str|None, got {type(updated_at).__name__}: {updated_at!r}"
+    )
+    if updated_at is not None:
+        from datetime import datetime
+        parsed = datetime.fromisoformat(updated_at)
+        assert parsed.tzinfo is not None
+        assert parsed.isoformat() == updated_at, "gateway_updated_at is not canonical isoformat"
 
 
 # Host-local detail (absolute paths, PID, internal gateway URL) is deployment
