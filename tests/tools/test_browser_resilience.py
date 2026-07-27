@@ -103,6 +103,7 @@ def test_navigate_returns_partial_success_when_open_times_out_but_page_is_ready(
             "open",
             ["https://example.com"],
             timeout=15,
+            _defer_session_reset_on_timeout=True,
         ),
         call(
             "nav-ready",
@@ -331,7 +332,13 @@ def test_navigate_retryable_failure_recovers_and_retries_once(
         "element_count": 1,
     }
     assert mock_run.call_args_list == [
-        call("nav-recover", "open", ["https://example.com"], timeout=15),
+        call(
+            "nav-recover",
+            "open",
+            ["https://example.com"],
+            timeout=15,
+            _defer_session_reset_on_timeout=True,
+        ),
         call(
             "nav-recover",
             "eval",
@@ -342,7 +349,13 @@ def test_navigate_retryable_failure_recovers_and_retries_once(
             timeout=5,
         ),
         call("nav-recover", "snapshot", ["-c"], timeout=5),
-        call("nav-recover", "open", ["https://example.com"], timeout=15),
+        call(
+            "nav-recover",
+            "open",
+            ["https://example.com"],
+            timeout=15,
+            _defer_session_reset_on_timeout=True,
+        ),
         call("nav-recover", "snapshot", ["-c"], timeout=90),
     ]
     mock_recover.assert_called_once_with()

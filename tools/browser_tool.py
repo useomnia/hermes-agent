@@ -738,7 +738,13 @@ def _retry_navigation_after_recovery(
         "(task=%s)",
         task_id,
     )
-    retried = _run_browser_command(task_id, "open", [url], timeout=timeout)
+    retried = _run_browser_command(
+        task_id,
+        "open",
+        [url],
+        timeout=timeout,
+        _defer_session_reset_on_timeout=True,
+    )
     retried = dict(retried)
     retried["_browser_recovery_attempted"] = True
     return retried
@@ -2026,6 +2032,23 @@ def _reset_browser_session_after_timeout(
     )
 
 
+def _preserve_deferred_navigation_session(result: Dict[str, Any]) -> None:
+    """Keep a timed-out navigation session after its readiness probe succeeds."""
+    result.pop("_deferred_timeout_cleanup", None)
+
+
+def _reset_deferred_navigation_session(
+    task_id: str,
+    result: Dict[str, Any],
+) -> None:
+    """Consume and execute cleanup deferred by a timed-out navigation."""
+    cleanup_target = result.pop("_deferred_timeout_cleanup", None)
+    if cleanup_target is None:
+        return
+    session_info, socket_dir = cleanup_target
+    _reset_browser_session_after_timeout(task_id, session_info, socket_dir)
+
+
 def _reap_orphaned_browser_sessions():
     """Scan for orphaned agent-browser daemon processes from previous runs.
 
@@ -2665,6 +2688,7 @@ def _run_browser_command(
     args: List[str] = None,
     timeout: Optional[int] = None,
     _engine_override: Optional[str] = None,
+    _defer_session_reset_on_timeout: bool = False,
 ) -> Dict[str, Any]:
     """
     Run an agent-browser CLI command using our pre-created Browserbase session.
@@ -2678,6 +2702,8 @@ def _run_browser_command(
         _engine_override: Force a specific engine for this call only.  Used
                           internally by the Lightpanda fallback to retry with
                           Chrome without touching global state.
+        _defer_session_reset_on_timeout: Preserve a timed-out navigation
+                          session until its readiness probe completes.
 
     Returns:
         Parsed JSON response from agent-browser
@@ -2864,6 +2890,11 @@ def _run_browser_command(
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            defer_timeout_cleanup = (
+                _defer_session_reset_on_timeout
+                and command == "open"
+                and engine != "lightpanda"
+            )
             if engine == "lightpanda":
                 if command == "open" and args:
                     fallback_source_url = args[0]
@@ -2876,11 +2907,12 @@ def _run_browser_command(
             try:
                 proc.wait()
             finally:
-                _reset_browser_session_after_timeout(
-                    task_id,
-                    session_info,
-                    task_socket_dir,
-                )
+                if not defer_timeout_cleanup:
+                    _reset_browser_session_after_timeout(
+                        task_id,
+                        session_info,
+                        task_socket_dir,
+                    )
             stdout, stderr = _read_command_output_files(stdout_path, stderr_path)
             _unlink_command_output_files(stdout_path, stderr_path)
             if stderr and stderr.strip():
@@ -2895,6 +2927,11 @@ def _run_browser_command(
                 "success": False,
                 "error": _format_browser_timeout_error(command, timeout, stdout, stderr),
             }
+            if defer_timeout_cleanup:
+                result["_deferred_timeout_cleanup"] = (
+                    session_info,
+                    task_socket_dir,
+                )
             # Fall through to fallback check below
         else:
             with open(stdout_path, "r", encoding="utf-8") as f:
@@ -3461,6 +3498,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         "open",
         [url],
         timeout=navigation_timeout,
+        _defer_session_reset_on_timeout=True,
     )
 
     if not result.get("success"):
@@ -3471,8 +3509,10 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             result,
         )
         if readiness_result is not None:
+            _preserve_deferred_navigation_session(result)
             result = readiness_result
         else:
+            _reset_deferred_navigation_session(nav_session_key, result)
             result = _retry_navigation_after_recovery(
                 nav_session_key,
                 url,
@@ -3494,8 +3534,11 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
                     result,
                 )
                 if readiness_result is not None:
+                    _preserve_deferred_navigation_session(result)
                     readiness_result["_browser_recovery_attempted"] = True
                     result = readiness_result
+                else:
+                    _reset_deferred_navigation_session(nav_session_key, result)
 
     if result.get("success"):
         data = result.get("data", {})
