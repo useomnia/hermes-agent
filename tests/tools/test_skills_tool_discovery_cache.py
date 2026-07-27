@@ -91,6 +91,27 @@ def test_disabled_set_change_invalidates(tmp_path, monkeypatch):
     assert names == ["skill-one"], "disabled-set change must invalidate the cache"
 
 
+def test_provenance_change_invalidates_cached_metadata(tmp_path, monkeypatch):
+    """A manifest update must be visible without waiting for the cache TTL."""
+    _write_skill(tmp_path, "cat-a", "skill-one")
+    state = {"bundled": set()}
+    monkeypatch.setattr(
+        "tools.skill_usage.read_skill_provenance_names",
+        lambda: (state["bundled"], set()),
+    )
+    monkeypatch.setattr(
+        "tools.skill_usage.classify_skill_provenance",
+        lambda name, *, bundled_names, hub_installed_names: (
+            "bundled" if name in bundled_names else "learned"
+        ),
+    )
+
+    assert st._find_all_skills()[0]["provenance"] == "learned"
+
+    state["bundled"] = {"skill-one"}
+    assert st._find_all_skills()[0]["provenance"] == "bundled"
+
+
 def test_ttl_expiry_forces_rescan(tmp_path, monkeypatch):
     """In-place SKILL.md edits are invisible to any directory signature;
     the TTL bounds that staleness."""

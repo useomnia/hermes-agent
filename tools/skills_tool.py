@@ -103,7 +103,7 @@ _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
 
 
-def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
+def _skills_scan_signature(dirs_to_scan, disabled, provenance_names=None) -> tuple:
     """Cheap change-signature for the skill scan inputs.
 
     O(#dirs + #categories) stat calls, not a recursive walk. Includes the
@@ -133,7 +133,14 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
         except OSError:
             pass
         sig.append((str(d), m))
-    return (tuple(sig), frozenset(disabled), platform)
+    provenance_signature = None
+    if provenance_names is not None:
+        bundled_names, hub_installed_names = provenance_names
+        provenance_signature = (
+            frozenset(bundled_names),
+            frozenset(hub_installed_names),
+        )
+    return (tuple(sig), frozenset(disabled), platform, provenance_signature)
 
 
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
@@ -171,7 +178,7 @@ _PLATFORM_MAP = {
 }
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REMOTE_ENV_BACKENDS = frozenset(
-    {"docker", "singularity", "modal", "ssh", "daytona"}
+    {"docker", "singularity", "modal", "ssh", "daytona", "sprites"}
 )
 _secret_capture_callback = None
 
@@ -682,12 +689,21 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     after a short TTL to bound staleness from in-place SKILL.md edits.
     """
     from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from tools.skill_usage import (
+        classify_skill_provenance,
+        read_skill_provenance_names,
+    )
 
     cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
 
     # Load disabled set once (not per-skill). Part of the cache signature:
     # disabling a skill is a config change with no filesystem mtime bump.
     disabled = set() if skip_disabled else _get_disabled_skill_names()
+    try:
+        provenance_names = read_skill_provenance_names()
+    except Exception:
+        logger.debug("Failed to load skill provenance metadata", exc_info=True)
+        provenance_names = None
 
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
@@ -698,7 +714,11 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         dirs_to_scan.append(active_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
 
-    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    signature = _skills_scan_signature(
+        dirs_to_scan,
+        disabled,
+        provenance_names,
+    )
     now = time.monotonic()
 
     cached = _SKILLS_CACHE.get(cache_key)
@@ -753,12 +773,29 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
                 category = _get_category_from_path(skill_md)
 
-                seen_names.add(name)
-                skills.append({
+                skill = {
                     "name": name,
                     "description": description,
                     "category": category,
-                })
+                }
+                metadata = frontmatter.get("metadata")
+                if (
+                    isinstance(metadata, dict)
+                    and metadata.get("hidden") in (True, "true")
+                ):
+                    skill["hidden"] = True
+                if provenance_names is not None:
+                    bundled_names, hub_installed_names = provenance_names
+                    provenance = classify_skill_provenance(
+                        name,
+                        bundled_names=bundled_names,
+                        hub_installed_names=hub_installed_names,
+                    )
+                    if provenance is not None:
+                        skill["provenance"] = provenance
+
+                seen_names.add(name)
+                skills.append(skill)
 
             except (UnicodeDecodeError, PermissionError) as e:
                 logger.debug("Failed to read skill file %s: %s", skill_md, e)
@@ -1585,6 +1622,20 @@ def skill_view(
             if setup_needed
             else SkillReadinessStatus.AVAILABLE.value,
         }
+
+        try:
+            from tools.skill_usage import classify_skill_provenance
+
+            provenance = classify_skill_provenance(skill_name)
+        except Exception:
+            logger.debug(
+                "Failed to classify provenance for skill %s",
+                skill_name,
+                exc_info=True,
+            )
+            provenance = None
+        if provenance is not None:
+            result["provenance"] = provenance
 
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
         if setup_help:
