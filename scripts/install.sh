@@ -6,7 +6,7 @@
 # Uses uv for desktop/server installs and Python's stdlib venv + pip on Termux.
 #
 # Usage:
-#   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/useomnia/hermes-agent/main/scripts/install.sh | bash
 #
 # Or with options:
 #   curl -fsSL ... | bash -s -- --no-venv --skip-setup
@@ -43,8 +43,9 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Configuration
-REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
-REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+HERMES_REPO="${HERMES_REPO:-useomnia/hermes-agent}"
+REPO_URL_SSH="${HERMES_REPO_URL_SSH:-git@github.com:${HERMES_REPO}.git}"
+REPO_URL_HTTPS="${HERMES_REPO_URL_HTTPS:-https://github.com/${HERMES_REPO}.git}"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
@@ -71,7 +72,7 @@ USE_VENV=true
 RUN_SETUP=true
 SKIP_BROWSER=false
 NO_SKILLS=false
-BRANCH="main"
+BRANCH="${HERMES_BRANCH:-main}"
 INSTALL_COMMIT=""
 ENSURE_DEPS=""
 
@@ -80,6 +81,9 @@ STAGE_NAME=""
 JSON_OUTPUT=false
 NON_INTERACTIVE=false
 INCLUDE_DESKTOP=false
+PYTHON_EXTRAS="all"
+SKIP_FFMPEG=false
+NODE_WORKSPACES=true
 
 # Detect non-interactive mode (e.g. curl | bash)
 # When stdin is not a terminal, read -p will fail with EOF,
@@ -137,6 +141,22 @@ while [[ $# -gt 0 ]]; do
             INCLUDE_DESKTOP=true
             shift
             ;;
+        --extras)
+            if [ -z "${2:-}" ] || [[ ! "$2" =~ ^[A-Za-z0-9_,-]+$ ]]; then
+                echo "Invalid --extras value: '${2:-}'"
+                exit 1
+            fi
+            PYTHON_EXTRAS="$2"
+            shift 2
+            ;;
+        --skip-ffmpeg)
+            SKIP_FFMPEG=true
+            shift
+            ;;
+        --no-node-workspaces)
+            NODE_WORKSPACES=false
+            shift
+            ;;
         --dir)
             INSTALL_DIR="$2"
             INSTALL_DIR_EXPLICIT=true
@@ -163,18 +183,23 @@ while [[ $# -gt 0 ]]; do
             echo "  --no-skills    Start with a blank slate — seed no bundled skills, and"
             echo "                   write \$HERMES_HOME/.no-bundled-skills so future"
             echo "                   'hermes update' runs never inject bundled skills either"
-            echo "  --branch NAME  Git branch to install (default: main)"
+            echo "  --branch NAME  Git branch to install (default: main, or \$HERMES_BRANCH)"
             echo "  --commit SHA   Pin checkout to a specific commit after clone/update"
             echo "  --manifest     Print desktop bootstrap stage manifest as JSON"
             echo "  --stage NAME   Run one desktop bootstrap stage"
             echo "  --json         Print a JSON result frame for --stage"
             echo "  --non-interactive  Skip stages that require user input"
             echo "  --include-desktop  Also build the desktop app (apps/desktop -> Hermes.app)"
+            echo "  --extras LIST  Python extras profile: all, none, or CSV (for example mcp,web)"
+            echo "  --skip-ffmpeg  Skip the optional ffmpeg system package"
+            echo "  --no-node-workspaces  Install root browser dependencies without UI workspaces"
             echo "  --dir PATH     Installation directory"
             echo "                   default (non-root):  ~/.hermes/hermes-agent"
             echo "                   default (root, Linux): /usr/local/lib/hermes-agent"
             echo "  --hermes-home PATH  Data directory (default: ~/.hermes, or \$HERMES_HOME)"
             echo "  -h, --help     Show this help"
+            echo ""
+            echo "Environment overrides: HERMES_REPO=owner/repo and HERMES_BRANCH=name"
             echo ""
             echo "Notes:"
             echo "  When running as root on Linux, Hermes installs the code under"
@@ -987,8 +1012,14 @@ install_system_packages() {
         need_ripgrep=true
     fi
 
-    log_info "Checking ffmpeg (TTS voice messages)..."
-    if command -v ffmpeg &> /dev/null; then
+    if [ "$SKIP_FFMPEG" = true ]; then
+        log_info "Skipping ffmpeg (--skip-ffmpeg)"
+    else
+        log_info "Checking ffmpeg (TTS voice messages)..."
+    fi
+    if [ "$SKIP_FFMPEG" = true ]; then
+        :
+    elif command -v ffmpeg &> /dev/null; then
         local ffmpeg_ver=$(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')
         log_success "ffmpeg $ffmpeg_ver found"
         HAS_FFMPEG=true
@@ -1463,7 +1494,13 @@ install_deps() {
         fi
     fi
 
-    # Install the main package in editable mode with all extras.
+    # Install the main package in editable mode with the selected extras.
+    local _TIER1_SPEC=".[all]"
+    if [ "$PYTHON_EXTRAS" = "none" ]; then
+        _TIER1_SPEC="."
+    elif [ "$PYTHON_EXTRAS" != "all" ]; then
+        _TIER1_SPEC=".[$PYTHON_EXTRAS]"
+    fi
     #
     # Hash-verified install (Tier 0) — when uv.lock is present, prefer
     # `uv sync --locked`. The lockfile records SHA256 hashes for every
@@ -1475,7 +1512,7 @@ install_deps() {
     # hash verification — they exist to keep installs working when the
     # lockfile is stale, missing, or out-of-sync with the current
     # extras spec, NOT because they're equivalent in posture.
-    if [ -f "uv.lock" ]; then
+    if [ -f "uv.lock" ] && [ "$PYTHON_EXTRAS" = "all" ]; then
         log_info "Trying tier: hash-verified (uv.lock) ..."
         log_info "(this resolves + downloads the curated [all] set — first run on a"
         log_info " fresh venv can take 1-5 minutes; uv prints progress below)"
@@ -1502,12 +1539,15 @@ install_deps() {
         # gracefully when stdout/stderr aren't terminals.
         if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
             log_success "Main package installed (hash-verified via uv.lock)"
+            rm -f "$INSTALL_DIR/.install-extras"
             log_success "All dependencies installed"
             return 0
         fi
         log_warn "uv.lock sync failed (see uv output above), falling back to PyPI resolve..."
-    else
+    elif [ ! -f "uv.lock" ]; then
         log_info "uv.lock not found — falling back to PyPI resolve (no hash verification)"
+    else
+        log_info "Skipping uv.lock tier for selected extras profile: $PYTHON_EXTRAS"
     fi
 
     # Multi-tier fallback. The point of the tiers is that ONE compromised
@@ -1559,8 +1599,8 @@ PY
     fi
 
     # Build "[all] minus broken" spec by filtering the parsed list.
-    local _SAFE_SPEC=".[all]"
-    if [ -n "$_ALL_EXTRAS_CSV" ] && [ "${#_BROKEN_EXTRAS[@]}" -gt 0 ]; then
+    local _SAFE_SPEC="$_TIER1_SPEC"
+    if [ "$PYTHON_EXTRAS" = "all" ] && [ -n "$_ALL_EXTRAS_CSV" ] && [ "${#_BROKEN_EXTRAS[@]}" -gt 0 ]; then
         local _SAFE_EXTRAS=()
         local _e _b _skip
         IFS=',' read -ra _ALL_EXTRAS_ARR <<< "$_ALL_EXTRAS_CSV"
@@ -1592,7 +1632,7 @@ PY
         return 1
     }
 
-    install_tier "all" ".[all]" \
+    install_tier "$PYTHON_EXTRAS" "$_TIER1_SPEC" \
         || install_tier "all minus known-broken (${_BROKEN_EXTRAS[*]:-none})" "$_SAFE_SPEC" \
         || install_tier "core only (no extras)" "."
 
@@ -1601,17 +1641,23 @@ PY
     if [ "$_installed" = false ]; then
         log_error "Package installation failed even with no extras."
         log_info "Check that build tools are installed: sudo apt install build-essential python3-dev"
-        log_info "Then re-run: cd $INSTALL_DIR && uv pip install -e '.[all]'"
+        log_info "Then re-run: cd $INSTALL_DIR && uv pip install -e '$_TIER1_SPEC'"
         exit 1
     fi
 
     if [ "$_tier_name" != "all (with RL/matrix extras)" ]; then
         log_warn "Note: installed via fallback tier ($_tier_name)."
         log_info "Some optional features may be missing. After resolving any"
-        log_info "PyPI/network issue, re-run: $UV_CMD pip install -e '.[all]'"
+        log_info "PyPI/network issue, re-run: $UV_CMD pip install -e '$_TIER1_SPEC'"
     fi
 
     log_success "Main package installed"
+
+    if [ "$PYTHON_EXTRAS" = "all" ]; then
+        rm -f "$INSTALL_DIR/.install-extras"
+    else
+        printf '%s\n' "$PYTHON_EXTRAS" > "$INSTALL_DIR/.install-extras"
+    fi
 
     log_success "All dependencies installed"
 }
@@ -2158,13 +2204,18 @@ install_node_deps() {
     fi
 
     if [ -f "$INSTALL_DIR/package.json" ]; then
-        log_info "Installing Node.js dependencies (browser tools)..."
         cd "$INSTALL_DIR"
-        # Time-boxed: a stalled registry fetch would otherwise hang here with no
-        # progress (same #39219 stall class as the desktop build below).
-        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
-            log_warn "npm install failed or timed out (browser tools may not work)"
-        }
+        if [ "$NODE_WORKSPACES" = false ]; then
+            log_info "Installing root Node.js dependencies only (--no-node-workspaces)..."
+            run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --workspaces=false --silent || {
+                log_warn "npm install failed or timed out (browser tools may not work)"
+            }
+        else
+            log_info "Installing Node.js dependencies (browser tools)..."
+            run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
+                log_warn "npm install failed or timed out (browser tools may not work)"
+            }
+        fi
         log_success "Node.js dependencies installed"
 
         # Install Playwright browser + system dependencies.
@@ -2260,7 +2311,9 @@ install_node_deps() {
     fi
 
     # Install TUI dependencies
-    if [ -f "$INSTALL_DIR/ui-tui/package.json" ]; then
+    if [ "$NODE_WORKSPACES" = false ]; then
+        log_info "Skipping TUI dependencies (--no-node-workspaces)"
+    elif [ -f "$INSTALL_DIR/ui-tui/package.json" ]; then
         log_info "Installing TUI dependencies..."
         cd "$INSTALL_DIR/ui-tui"
         # Time-boxed: a stalled registry fetch would otherwise hang here (#39219).
