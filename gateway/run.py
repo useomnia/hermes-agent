@@ -11320,6 +11320,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
+                # Background tasks build their own agent and can fire before any
+                # user turn, so this snapshot needs the registry complete too —
+                # discovery is no longer guaranteed done by the time the gateway
+                # starts serving. Runs in the executor, so blocking is fine.
+                self._join_mcp_discovery()
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -14534,6 +14539,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from hermes_constants import get_hermes_home
             return get_hermes_home()
 
+    # Bound for the first-agent-build join on background MCP discovery. Sized
+    # ABOVE ``discover_mcp_tools``'s own internal 120s per-server wait rather
+    # than at ``mcp_discovery_timeout`` (default 1.5s): the CLI/TUI accept a
+    # degraded first prompt and repair it with a late refresh, but this gateway
+    # previously waited for discovery in full before serving at all, and turn 1
+    # here routinely needs every tool (an Omnio sandbox registers 221, of which
+    # 152 come from the connectors server that takes ~2-3.5s to enumerate).
+    # Waiting long enough to preserve that exactly is the whole point; the bound
+    # exists only so a wedged thread can't hang a turn forever.
+    _MCP_DISCOVERY_JOIN_SECONDS = 130.0
+
+    def _join_mcp_discovery(self) -> None:
+        """Ensure MCP discovery has finished before an agent snapshots its tools.
+
+        ``AIAgent`` reads the tool registry ONCE at construction and never
+        re-reads it (see ``refresh_agent_mcp_tools``), so this is the deadline
+        that decides whether a turn can call MCP tools at all.
+
+        **Blocking, and deliberately sync: call it only from a worker thread.**
+        Every caller sits inside an agent-building closure that is already
+        dispatched through ``_run_in_executor_with_context``, so the join never
+        touches the loop thread that platform heartbeats run on — putting it back
+        on the loop would re-create #16856. Keeping it sync means an async caller
+        cannot add that regression without noticing.
+
+        Never raises: a timed-out or failed join degrades to the existing
+        late-binding refresh rather than killing the turn.
+        """
+        try:
+            from hermes_cli.mcp_startup import (
+                mcp_discovery_was_started,
+                wait_for_mcp_discovery,
+            )
+
+            if mcp_discovery_was_started():
+                wait_for_mcp_discovery(timeout=self._MCP_DISCOVERY_JOIN_SECONDS)
+                return
+            # No thread was started — ``start_background_mcp_discovery`` skips
+            # when its cheap ``read_raw_config`` probe finds no ``mcp_servers``.
+            # That probe reads the raw file while discovery itself reads the
+            # migrated/merged config, so the two can in principle disagree.
+            # Discovering inline here means this change cannot lose a server the
+            # old blocking call would have found; it is idempotent and a no-op
+            # for the overwhelmingly common "genuinely no MCP servers" case.
+            from tools.mcp_tool import discover_mcp_tools
+
+            discover_mcp_tools()
+        except Exception as e:
+            logger.debug("MCP discovery join before agent build failed: %s", e)
+
     async def _run_agent_inner(
         self,
         message: str,
@@ -15616,6 +15671,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             logger.debug("Reusing cached agent for session %s", session_key)
 
             if agent is None:
+                # About to snapshot the tool registry, so background MCP
+                # discovery has to be done. On a cold gateway this is where the
+                # boot-time discovery cost is actually paid — minus whatever
+                # overlapped with startup and this turn's setup. Safe to block:
+                # ``run_sync`` runs in the executor, not on the loop.
+                self._join_mcp_discovery()
                 # Config changed or first message — create fresh agent
                 agent = AIAgent(
                     model=turn_route["model"],
@@ -17831,19 +17892,32 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     _ensure_windows_gateway_venv_imports()
 
-    # MCP tool discovery — run in an executor so the asyncio event loop
-    # stays responsive even when a configured MCP server is slow or
-    # unreachable.  discover_mcp_tools() uses a blocking 120s wait
-    # internally; calling it from the loop thread would freeze platform
-    # heartbeats (Discord shard, Telegram polling) until it returned.
-    # See #16856.
+    # MCP tool discovery — START it here, but do NOT wait for it: the join
+    # happens at the first agent build (``_await_mcp_discovery``), which is the
+    # first moment anything actually reads the tool registry.
+    #
+    # It used to be awaited in an executor right here. That kept the event loop
+    # responsive (#16856 — a blocking 120s discovery on the loop thread froze
+    # Discord/Telegram heartbeats), but it also put the full connect time of
+    # every configured server in front of ``runner.start()``, so the gateway
+    # served nothing until the slowest MCP server answered. Measured on a
+    # freshly provisioned Omnio sandbox: 8.83 s of a 12.3 s boot preamble, with
+    # the api_server unreachable for all of it.
+    #
+    # Backgrounding it overlaps that connect time with the rest of startup and
+    # with everything the first turn does before it snapshots tools (env load,
+    # cron scheduler, housekeeping, the shared provider client) — ~3.9 s of
+    # genuinely parallel work on the same measurement. Tool availability is
+    # unchanged: the first agent build still waits for discovery to finish, so
+    # no turn ever sees a partial tool set. This is the same
+    # background-then-join shape ``tui_gateway`` and the CLI already use.
     try:
-        from tools.mcp_tool import discover_mcp_tools
-        _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
+        from hermes_cli.mcp_startup import start_background_mcp_discovery
+
+        start_background_mcp_discovery(logger=logger, thread_name="gateway-mcp-discovery")
     except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
-    _boot_mark("mcp_discovery")
+        logger.debug("Background MCP tool discovery did not start: %s", e)
+    _boot_mark("mcp_discovery_start")
 
     # Start the gateway
     success = await runner.start()
