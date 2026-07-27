@@ -14539,55 +14539,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from hermes_constants import get_hermes_home
             return get_hermes_home()
 
-    # Bound for the first-agent-build join on background MCP discovery. Sized
-    # ABOVE ``discover_mcp_tools``'s own internal 120s per-server wait rather
-    # than at ``mcp_discovery_timeout`` (default 1.5s): the CLI/TUI accept a
-    # degraded first prompt and repair it with a late refresh, but this gateway
-    # previously waited for discovery in full before serving at all, and turn 1
-    # here routinely needs every tool (an Omnio sandbox registers 221, of which
-    # 152 come from the connectors server that takes ~2-3.5s to enumerate).
-    # Waiting long enough to preserve that exactly is the whole point; the bound
-    # exists only so a wedged thread can't hang a turn forever.
-    _MCP_DISCOVERY_JOIN_SECONDS = 130.0
-
     def _join_mcp_discovery(self) -> None:
-        """Ensure MCP discovery has finished before an agent snapshots its tools.
+        """Wait for background MCP discovery before an agent snapshots its tools.
 
-        ``AIAgent`` reads the tool registry ONCE at construction and never
-        re-reads it (see ``refresh_agent_mcp_tools``), so this is the deadline
-        that decides whether a turn can call MCP tools at all.
-
-        **Blocking, and deliberately sync: call it only from a worker thread.**
-        Every caller sits inside an agent-building closure that is already
-        dispatched through ``_run_in_executor_with_context``, so the join never
-        touches the loop thread that platform heartbeats run on — putting it back
-        on the loop would re-create #16856. Keeping it sync means an async caller
-        cannot add that regression without noticing.
-
-        Never raises: a timed-out or failed join degrades to the existing
-        late-binding refresh rather than killing the turn.
+        Thin wrapper over ``hermes_cli.mcp_startup.ensure_mcp_discovery_complete``
+        — the shared implementation, so this gateway, the api_server adapter and
+        anything added later cannot drift apart on the bound or on the
+        never-raise contract. Blocking and sync on purpose: see that docstring.
         """
-        try:
-            from hermes_cli.mcp_startup import (
-                mcp_discovery_was_started,
-                wait_for_mcp_discovery,
-            )
+        from hermes_cli.mcp_startup import ensure_mcp_discovery_complete
 
-            if mcp_discovery_was_started():
-                wait_for_mcp_discovery(timeout=self._MCP_DISCOVERY_JOIN_SECONDS)
-                return
-            # No thread was started — ``start_background_mcp_discovery`` skips
-            # when its cheap ``read_raw_config`` probe finds no ``mcp_servers``.
-            # That probe reads the raw file while discovery itself reads the
-            # migrated/merged config, so the two can in principle disagree.
-            # Discovering inline here means this change cannot lose a server the
-            # old blocking call would have found; it is idempotent and a no-op
-            # for the overwhelmingly common "genuinely no MCP servers" case.
-            from tools.mcp_tool import discover_mcp_tools
-
-            discover_mcp_tools()
-        except Exception as e:
-            logger.debug("MCP discovery join before agent build failed: %s", e)
+        ensure_mcp_discovery_complete()
 
     async def _run_agent_inner(
         self,

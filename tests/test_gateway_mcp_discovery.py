@@ -16,22 +16,6 @@ import pytest
 from hermes_cli import mcp_startup
 
 
-@pytest.fixture
-def runner():
-    """Minimal stand-in: the method only reads the join bound off ``self``.
-
-    Constructing a real ``GatewayRunner`` pulls adapters, config and a session
-    store — none of which this behaviour depends on.
-    """
-    from gateway.run import GatewayRunner
-
-    stub = types.SimpleNamespace(
-        _MCP_DISCOVERY_JOIN_SECONDS=GatewayRunner._MCP_DISCOVERY_JOIN_SECONDS
-    )
-    stub._join_mcp_discovery = GatewayRunner._join_mcp_discovery.__get__(stub)
-    return stub
-
-
 class TestDiscoveryWasStarted:
     def test_reports_false_before_any_thread_exists(self, monkeypatch):
         monkeypatch.setattr(mcp_startup, "_mcp_discovery_thread", None)
@@ -48,10 +32,8 @@ class TestDiscoveryWasStarted:
         assert mcp_startup.mcp_discovery_was_started() is True
 
 
-class TestJoinMcpDiscovery:
-    def test_joins_the_background_thread_with_a_bound_above_the_internal_wait(
-        self, runner, monkeypatch
-    ):
+class TestEnsureMcpDiscoveryComplete:
+    def test_joins_the_background_thread_with_a_bound_above_the_internal_wait(self, monkeypatch):
         seen = {}
 
         def fake_wait(timeout=None):
@@ -60,14 +42,14 @@ class TestJoinMcpDiscovery:
         monkeypatch.setattr(mcp_startup, "mcp_discovery_was_started", lambda: True)
         monkeypatch.setattr(mcp_startup, "wait_for_mcp_discovery", fake_wait)
 
-        runner._join_mcp_discovery()
+        mcp_startup.ensure_mcp_discovery_complete()
 
         # Not the 1.5s ``mcp_discovery_timeout`` the CLI uses: this gateway used
         # to wait for discovery in full, and a short bound would silently drop
         # slow servers' tools from turn 1.
         assert seen["timeout"] > 120
 
-    def test_discovers_inline_when_no_thread_was_ever_started(self, runner, monkeypatch):
+    def test_discovers_inline_when_no_thread_was_ever_started(self, monkeypatch):
         # ``start_background_mcp_discovery`` skips on a raw-config probe that can
         # disagree with the merged config discovery itself reads. Falling back
         # here is what stops this change from losing a server the old blocking
@@ -81,30 +63,71 @@ class TestJoinMcpDiscovery:
 
         monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: calls.append("discovered"))
 
-        runner._join_mcp_discovery()
+        mcp_startup.ensure_mcp_discovery_complete()
 
         assert calls == ["discovered"]
 
-    def test_both_agent_building_paths_join_before_snapshotting_tools(self):
-        """Every tool snapshot is covered, and none of them blocks the loop.
+    def test_every_full_toolset_agent_build_joins_discovery(self):
+        """Inventory every ``AIAgent(...)`` in the gateway process, not a hand-list.
 
-        The turn agent and the background-task agent are the two agents this
-        gateway builds with the full toolset, and either can be the first thing
-        that runs after boot. Both build inside a closure that
-        ``_run_in_executor_with_context`` dispatches to a worker thread, so the
-        blocking join is safe there — while an ``await`` of it in the async body
-        would freeze platform heartbeats for the whole connect time (#16856).
+        Enumerating the call sites by hand is what let the api_server adapter's
+        ``_create_agent`` — the build behind every OpenAI-compatible request, and
+        so the busiest one — ship without a join: the first turn snapshotted the
+        registry before discovery finished and ran without any MCP tool. Walking
+        the AST means a new build site fails this test instead of silently losing
+        tools at runtime.
+
+        Memory-only agents are exempt: with ``enabled_toolsets=["memory"]`` they
+        cannot reach an MCP tool, so waiting would be dead latency.
         """
-        import inspect
+        import ast
+        import pathlib
 
-        from gateway.run import GatewayRunner
+        repo = pathlib.Path(__file__).resolve().parent.parent
+        joins = ("ensure_mcp_discovery_complete", "_join_mcp_discovery")
+        unguarded = []
 
-        for method in (GatewayRunner._run_agent_inner, GatewayRunner._run_background_task):
-            source = inspect.getsource(method)
-            assert "self._join_mcp_discovery()" in source, method.__name__
-            assert "await self._join_mcp_discovery" not in source, method.__name__
+        for rel in ("gateway/run.py", "gateway/platforms/api_server.py", "gateway/slash_commands.py"):
+            tree = ast.parse((repo / rel).read_text(encoding="utf-8"))
+            # Map each AIAgent(...) call to the innermost function containing it.
+            for func in ast.walk(tree):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                body = ast.unparse(func)
+                for call in ast.walk(func):
+                    if not (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Name)
+                        and call.func.id == "AIAgent"
+                    ):
+                        continue
+                    kwargs = {k.arg: ast.unparse(k.value) for k in call.keywords if k.arg}
+                    if kwargs.get("enabled_toolsets") == "['memory']":
+                        continue
+                    if not any(j in body for j in joins):
+                        unguarded.append(f"{rel}:{call.lineno} in {func.name}")
 
-    def test_a_failing_join_never_breaks_the_turn(self, runner, monkeypatch):
+        assert not unguarded, (
+            "AIAgent built without joining MCP discovery — its turn would run "
+            f"with a partial tool registry: {sorted(set(unguarded))}"
+        )
+
+    def test_the_join_is_never_awaited_on_the_loop_thread(self):
+        """#16856: the join blocks, so it must only run in a worker thread.
+
+        Every call site sits inside a closure dispatched through
+        ``run_in_executor``; an ``await`` of it in an async body would freeze
+        platform heartbeats for the whole MCP connect time.
+        """
+        import pathlib
+
+        repo = pathlib.Path(__file__).resolve().parent.parent
+        for rel in ("gateway/run.py", "gateway/platforms/api_server.py"):
+            source = (repo / rel).read_text(encoding="utf-8")
+            assert "await self._join_mcp_discovery" not in source, rel
+            assert "await ensure_mcp_discovery_complete" not in source, rel
+
+    def test_a_failing_join_never_breaks_the_turn(self, monkeypatch):
         def explode(timeout=None):
             raise RuntimeError("discovery thread wedged")
 
@@ -112,7 +135,7 @@ class TestJoinMcpDiscovery:
         monkeypatch.setattr(mcp_startup, "wait_for_mcp_discovery", explode)
 
         # Degrades to late-binding rather than failing the message.
-        runner._join_mcp_discovery()
+        mcp_startup.ensure_mcp_discovery_complete()
 
 
 class TestStartGatewayNoLongerAwaitsDiscovery:

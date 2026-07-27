@@ -1169,6 +1169,16 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
+        # ``start_gateway`` no longer waits for MCP discovery before serving, and
+        # the agent below snapshots the tool registry once, for its whole life.
+        # This is where that snapshot happens for every OpenAI-compatible request
+        # — the busiest agent-build path in the gateway — so the wait belongs
+        # here. Safe to block: ``_run_agent`` dispatches its ``_run`` closure
+        # through ``run_in_executor``, so this is a worker thread, not the loop.
+        from hermes_cli.mcp_startup import ensure_mcp_discovery_complete
+
+        ensure_mcp_discovery_complete()
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
