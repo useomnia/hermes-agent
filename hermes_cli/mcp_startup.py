@@ -51,6 +51,19 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
         thread.start()
 
 
+def mcp_discovery_was_started() -> bool:
+    """True if a background discovery thread exists for this process.
+
+    ``start_background_mcp_discovery`` is a no-op when the cheap config probe
+    finds no ``mcp_servers``, so a caller that *depends* on discovery having run
+    (rather than merely benefiting from it) needs to know the difference between
+    "already finished" and "never started". Mirrors
+    ``tui_gateway.entry.mcp_discovery_in_flight``, but reports whether the thread
+    was ever created rather than whether it is still alive.
+    """
+    return _mcp_discovery_thread is not None
+
+
 def _resolve_discovery_timeout(explicit: "float | None") -> float:
     """Resolve the MCP discovery wait bound: explicit arg > config > default.
 

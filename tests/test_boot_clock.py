@@ -171,5 +171,7 @@ def test_every_intended_boot_phase_is_still_marked():
         "audit",
         "runner_init",
         "pid_lock",
-        "mcp_discovery",
+        # Marks when discovery is *started*, not finished — the gateway no longer
+        # waits for it here; the first agent build joins it instead.
+        "mcp_discovery_start",
     }
