@@ -349,8 +349,8 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return ws_url
 
 
-def _get_cdp_override() -> str:
-    """Return a normalized CDP URL override, or empty string.
+def _get_cdp_override_raw() -> str:
+    """Return the CONFIGURED CDP URL override verbatim, or empty string.
 
     Precedence is:
     1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
@@ -359,10 +359,16 @@ def _get_cdp_override() -> str:
     When either is set, we skip both Browserbase and the local headless
     launcher and connect directly to the supplied Chrome DevTools Protocol
     endpoint.
+
+    Pure configuration lookup: no network, no blocking. Callers that only need
+    to know WHICH BACKEND is configured must use this rather than
+    `_get_cdp_override`, whose discovery probe answers a different question
+    (is the endpoint live, and what is its concrete websocket) at the cost of
+    seconds when the endpoint is not up yet.
     """
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
-        return _resolve_cdp_override(env_override)
+        return env_override
 
     try:
         from hermes_cli.config import read_raw_config
@@ -370,11 +376,29 @@ def _get_cdp_override() -> str:
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
+            return str(browser_cfg.get("cdp_url", "") or "").strip()
     except Exception as e:
         logger.debug("Could not read browser.cdp_url from config: %s", e)
 
     return ""
+
+
+def _get_cdp_override() -> str:
+    """Return the configured CDP override RESOLVED to a connectable websocket.
+
+    Discovery is a network probe, so this belongs at the point where a browser
+    connection is actually made — never on a routing or capability check, which
+    only needs to know that an override is configured (`_get_cdp_override_raw`).
+    The endpoint frequently is not listening yet when the agent boots (the paired
+    Toolbox that hosts Chrome comes up on its own schedule), and every probe that
+    finds nothing costs the retry ladder in `_resolve_cdp_override`.
+
+    Resolution is deliberately NOT cached. The websocket it returns is bound to
+    one browser INSTANCE (`/devtools/browser/<guid>`), so a value memoized here
+    would outlive a Chrome restart behind an unchanged discovery URL and hand out
+    a dead endpoint. Discovery is cheap once it is only reached at connect time.
+    """
+    return _resolve_cdp_override(_get_cdp_override_raw())
 
 
 def _toolbox_browser_binding() -> Optional[Tuple[str, Dict[str, str]]]:
@@ -896,7 +920,7 @@ def _termux_browser_install_error() -> str:
 
 def _is_local_mode() -> bool:
     """Return True when the browser tool will use a local browser backend."""
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return False
     return _get_cloud_provider() is None
 
@@ -1383,7 +1407,7 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     """
     if task_id is None:
         task_id = "default"
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return task_id
     if _is_camofox_mode():
         return task_id
@@ -4492,7 +4516,7 @@ def check_browser_requirements() -> bool:
 
     # CDP override mode can connect to an existing remote/local browser endpoint
     # without requiring the local agent-browser binary on PATH.
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return True
 
     # The agent-browser CLI is required for local launch and cloud-provider flows.
