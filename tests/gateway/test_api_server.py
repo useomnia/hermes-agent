@@ -35,10 +35,41 @@ from gateway.platforms.api_server import (
     _hermes_version,
     _redact_api_error_text,
     _request_agent_overrides,
+    _normalize_response_format,
+    _response_format_from_text_format,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
 )
+
+
+def test_chat_and_responses_structured_output_share_one_constraint_shape():
+    """Both public API dialects must drive identical downstream semantics."""
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+    chat_constraint, chat_error = _normalize_response_format({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "answer",
+            "schema": schema,
+            "strict": True,
+        },
+    })
+    responses_constraint, responses_error = _response_format_from_text_format({
+        "format": {
+            "type": "json_schema",
+            "name": "answer",
+            "schema": schema,
+            "strict": True,
+        },
+    })
+
+    assert chat_error is None
+    assert responses_error is None
+    assert chat_constraint == responses_constraint
 
 
 # ---------------------------------------------------------------------------
