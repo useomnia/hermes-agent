@@ -511,20 +511,20 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return ws_url
 
 
-def _get_cdp_override() -> str:
-    """Return a normalized CDP URL override, or empty string.
+def _get_cdp_override_raw() -> str:
+    """Return the configured CDP URL override without network I/O.
 
     Precedence is:
     1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
     2. ``browser.cdp_url`` in config.yaml (persistent config)
 
-    When either is set, we skip both Browserbase and the local headless
-    launcher and connect directly to the supplied Chrome DevTools Protocol
-    endpoint.
+    Use this helper for availability and routing decisions. Resolving an HTTP
+    discovery endpoint can block, so only connection paths should call
+    :func:`_get_cdp_override`.
     """
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
-        return _resolve_cdp_override(env_override)
+        return env_override
 
     try:
         from hermes_cli.config import read_raw_config
@@ -532,11 +532,19 @@ def _get_cdp_override() -> str:
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
+            return str(browser_cfg.get("cdp_url", "") or "").strip()
     except Exception as e:
         logger.debug("Could not read browser.cdp_url from config: %s", e)
 
     return ""
+
+
+def _get_cdp_override() -> str:
+    """Return a normalized, connectable CDP URL override, or empty string."""
+    raw_override = _get_cdp_override_raw()
+    if not raw_override:
+        return ""
+    return _resolve_cdp_override(raw_override)
 
 
 def _toolbox_browser_binding() -> Optional[Tuple[str, Dict[str, str]]]:
@@ -1040,7 +1048,7 @@ def _termux_browser_install_error() -> str:
 
 def _is_local_mode() -> bool:
     """Return True when the browser tool will use a local browser backend."""
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return False
     return _get_cloud_provider() is None
 
@@ -1069,10 +1077,9 @@ def _is_local_backend() -> bool:
     # override still fails the local check instead of returning local and
     # skipping the private/internal SSRF gate. The override is honored from
     # either the BROWSER_CDP_URL env var or a persistent `browser.cdp_url`
-    # config (both via _get_cdp_override(), and both now suppress camofox in
-    # browser_camofox.py). _is_local_mode() already treats any CDP override as
-    # non-local; keep the two helpers in agreement.
-    if _get_cdp_override():
+    # config. Keep this gate free of connection attempts so routing remains
+    # fast when the configured endpoint is temporarily unavailable.
+    if _get_cdp_override_raw():
         return False
     if _is_camofox_mode():
         return True
@@ -1564,7 +1571,7 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     """
     if task_id is None:
         task_id = "default"
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return task_id
     if _is_camofox_mode():
         return task_id
@@ -5382,7 +5389,7 @@ def check_browser_requirements() -> bool:
 
     # CDP override mode can connect to an existing remote/local browser endpoint
     # without requiring the local agent-browser binary on PATH.
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return True
 
     # The agent-browser CLI is required for local launch and cloud-provider flows.
