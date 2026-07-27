@@ -4608,3 +4608,25 @@ class TestMcpParallelToolCalls:
             register_mcp_servers(config_off)
         with _lock:
             assert sanitize_mcp_name_component("toggle_srv") not in _parallel_safe_servers
+
+
+def test_registered_mcp_tool_metadata_drives_approval_and_credit_policy():
+    """Live MCP annotations remain authoritative only while the tool exists."""
+    from tools import mcp_tool
+
+    tool_name = "mcp__connectors__send_email"
+    credits = {"creditsPerUnit": 2, "unit": "engine"}
+    mcp_tool._track_mcp_tool_metadata(
+        tool_name,
+        read_only_hint=False,
+        credits=credits,
+    )
+
+    assert mcp_tool.mcp_tool_has_read_only_hint(tool_name) is True
+    assert mcp_tool.mcp_tool_is_read_only(tool_name) is False
+    assert mcp_tool.mcp_tool_credits_meta(tool_name) == credits
+
+    mcp_tool._forget_mcp_tool_server(tool_name)
+
+    assert mcp_tool.mcp_tool_has_read_only_hint(tool_name) is False
+    assert mcp_tool.mcp_tool_credits_meta(tool_name) is None
