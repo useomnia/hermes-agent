@@ -5329,7 +5329,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         Returns True if at least one adapter connected successfully.
         """
-        logger.info("Starting Hermes Gateway...")
+        # Stamp the boot preamble on the first line the gateway logs, so the
+        # window between process spawn and this point stops being a blind spot.
+        try:
+            from hermes_cli.boot_clock import format_preamble
+
+            preamble = format_preamble()
+        except Exception:  # noqa: BLE001 — timing must never block a boot
+            preamble = ""
+        logger.info(
+            "Starting Hermes Gateway...%s", f" [{preamble}]" if preamble else ""
+        )
         try:
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:
