@@ -161,10 +161,19 @@ def test_natural_exit_130_not_mislabeled_as_interrupt(monkeypatch):
     assert "[Command interrupted]" not in result["output"]
 
 
-def test_retry_backoff_does_not_clear_genuine_interrupt(monkeypatch):
+def test_confirmed_not_started_retry_does_not_clear_genuine_interrupt(monkeypatch):
     """A genuine interrupt that lands during the retry backoff must survive
     (the clear runs ONCE before the loop, never re-clearing on retries)."""
     from tools.environments.local import LocalEnvironment
+    from tools.environments.sprites import SpritesToolboxError
+
+    confirmed_not_started = SpritesToolboxError(
+        "executor unavailable",
+        code="EXEC_START_FAILED",
+        phase="start",
+        retryable=True,
+        command_started=False,
+    )
 
     calls = {"n": 0, "interrupted_at_retry": None}
 
@@ -174,7 +183,7 @@ def test_retry_backoff_does_not_clear_genuine_interrupt(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             set_interrupt(True)  # Stop lands during the first attempt / backoff
-            raise RuntimeError("transient backend error")
+            raise confirmed_not_started
         # Second attempt: the bit set during the backoff must NOT be re-cleared.
         calls["interrupted_at_retry"] = is_interrupted()
         return {"output": "partial\n[Command interrupted]", "returncode": 130}
