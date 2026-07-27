@@ -64,6 +64,59 @@ def mcp_discovery_was_started() -> bool:
     return _mcp_discovery_thread is not None
 
 
+# Join bound for callers that must not lose tools. Sized ABOVE
+# ``discover_mcp_tools``'s own internal 120s per-server wait rather than at
+# ``mcp_discovery_timeout`` (default 1.5s): the CLI/TUI accept a degraded first
+# prompt and repair it with the late-binding refresh, but the socket gateway used
+# to wait for discovery in full before serving at all, and its first turn
+# routinely needs every tool (an Omnio sandbox registers 221, of which 152 come
+# from a connectors server that takes ~2-3.5s to enumerate). Waiting long enough
+# to preserve that exactly is the point; the bound exists only so a wedged thread
+# can't hang a turn forever.
+AGENT_BUILD_JOIN_SECONDS = 130.0
+
+
+def ensure_mcp_discovery_complete(timeout: "float | None" = None) -> None:
+    """Block until MCP discovery has run, for callers that need the full registry.
+
+    ``AIAgent`` reads the tool registry ONCE at construction and never re-reads
+    it (see ``tools.mcp_tool.refresh_agent_mcp_tools``), so an agent built while
+    discovery is still in flight cannot call the missing tools for its whole
+    lifetime. Callers that would rather wait than lose tools use this;
+    ``wait_for_mcp_discovery`` remains the bounded, best-effort variant.
+
+    **Blocking — call it only from a worker thread.** Every current caller sits
+    inside an agent-building closure already dispatched through
+    ``run_in_executor``, so it never touches the loop thread carrying platform
+    heartbeats; putting it back on the loop would re-create #16856.
+
+    Never raises: a timed-out or failed join degrades to the existing
+    late-binding refresh rather than killing the turn.
+    """
+    try:
+        if mcp_discovery_was_started():
+            wait_for_mcp_discovery(
+                timeout=AGENT_BUILD_JOIN_SECONDS if timeout is None else timeout
+            )
+            return
+        # No thread was started — ``start_background_mcp_discovery`` skips when
+        # its cheap ``read_raw_config`` probe finds no ``mcp_servers``. That probe
+        # reads the raw file while discovery itself reads the migrated/merged
+        # config, so the two can in principle disagree. Discovering inline here
+        # means a caller cannot lose a server that a blocking discovery would
+        # have connected; it is idempotent, and a no-op for the overwhelmingly
+        # common "genuinely no MCP servers" case.
+        from tools.mcp_tool import discover_mcp_tools
+
+        discover_mcp_tools()
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).debug(
+            "MCP discovery join before agent build failed", exc_info=True
+        )
+
+
 def _resolve_discovery_timeout(explicit: "float | None") -> float:
     """Resolve the MCP discovery wait bound: explicit arg > config > default.
 
