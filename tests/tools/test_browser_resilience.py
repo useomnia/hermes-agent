@@ -22,6 +22,16 @@ def _cdp_failure(
     }
 
 
+def test_navigation_timeout_preserves_cold_start_and_bounds_warm_pages(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(browser_tool, "_get_command_timeout", lambda: 30)
+    monkeypatch.setattr(browser_tool, "_get_navigation_timeout", lambda: 15)
+
+    assert browser_tool._get_open_command_timeout(first_open=True) == 120
+    assert browser_tool._get_navigation_timeout() == 15
+
+
 def test_navigate_returns_partial_success_when_open_times_out_but_page_is_ready(
     monkeypatch,
 ) -> None:
