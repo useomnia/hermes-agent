@@ -80,13 +80,30 @@ from agent.retry_utils import (
     zai_coding_overload_retry_ceiling,
 )
 from agent.trajectory import has_incomplete_scratchpad
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import (
+    estimate_usage_cost,
+    extract_provider_cost_usd,
+    normalize_usage,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_billable_cost_delta(
+    raw_usage: Any,
+    estimated_cost: Optional[float],
+    additional_estimated_cost: Optional[float] = None,
+) -> tuple[Optional[float], Optional[float]]:
+    """Return provider-reported cost and a complete per-call billable delta."""
+    reported_cost = extract_provider_cost_usd(raw_usage)
+    billable_cost = reported_cost if reported_cost is not None else estimated_cost
+    if additional_estimated_cost is not None:
+        billable_cost = (billable_cost or 0.0) + additional_estimated_cost
+    return reported_cost, billable_cost
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -3005,6 +3022,44 @@ def run_conversation(
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
 
+                    _estimated_cost_delta = (
+                        float(cost_result.amount_usd)
+                        if cost_result.amount_usd is not None
+                        else None
+                    )
+                    _advisor_cost_delta = None
+                    if _moa_ref_cost is not None:
+                        try:
+                            _advisor_cost_delta = float(_moa_ref_cost)
+                        except (TypeError, ValueError):  # pragma: no cover - defensive
+                            pass
+                    reported_cost_usd, billable_cost_delta = (
+                        _resolve_billable_cost_delta(
+                            response.usage,
+                            _estimated_cost_delta,
+                            _advisor_cost_delta,
+                        )
+                    )
+                    if reported_cost_usd is not None:
+                        agent.session_actual_cost_usd = (
+                            agent.session_actual_cost_usd or 0.0
+                        ) + reported_cost_usd
+                        agent.session_cost_status = "actual"
+                        agent.session_cost_source = "provider_cost_api"
+                    elif (
+                        _agg_cost_provider == "openrouter"
+                        or base_url_host_matches(
+                            str(_agg_cost_base_url or ""), "openrouter.ai"
+                        )
+                    ) and not getattr(agent, "_warned_missing_provider_cost", False):
+                        agent._warned_missing_provider_cost = True
+                        logger.warning(
+                            "OpenRouter response carried no usage.cost; falling back "
+                            "to estimated cost (model=%s session=%s)",
+                            _agg_cost_model,
+                            agent.session_id,
+                        )
+
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI
                     # sessions (gateway, cron, delegated runs) cannot lose
@@ -3026,14 +3081,6 @@ def run_conversation(
                             # advisor cost (each priced at its own rate). Folded
                             # here so state.db's estimated_cost_usd includes the
                             # full MoA spend, matching the folded token counts.
-                            _cost_delta = None
-                            if cost_result.amount_usd is not None:
-                                _cost_delta = float(cost_result.amount_usd)
-                            if _moa_ref_cost is not None:
-                                try:
-                                    _cost_delta = (_cost_delta or 0.0) + float(_moa_ref_cost)
-                                except (TypeError, ValueError):  # pragma: no cover
-                                    pass
                             agent._session_db.update_token_counts(
                                 agent.session_id,
                                 input_tokens=canonical_usage.input_tokens,
@@ -3041,9 +3088,24 @@ def run_conversation(
                                 cache_read_tokens=canonical_usage.cache_read_tokens,
                                 cache_write_tokens=canonical_usage.cache_write_tokens,
                                 reasoning_tokens=canonical_usage.reasoning_tokens,
-                                estimated_cost_usd=_cost_delta,
-                                cost_status=cost_result.status,
-                                cost_source=cost_result.source,
+                                estimated_cost_usd=(
+                                    (_estimated_cost_delta or 0.0)
+                                    + (_advisor_cost_delta or 0.0)
+                                ) if (
+                                    _estimated_cost_delta is not None
+                                    or _advisor_cost_delta is not None
+                                ) else None,
+                                actual_cost_usd=billable_cost_delta,
+                                cost_status=(
+                                    "actual"
+                                    if reported_cost_usd is not None
+                                    else cost_result.status
+                                ),
+                                cost_source=(
+                                    "provider_cost_api"
+                                    if reported_cost_usd is not None
+                                    else cost_result.source
+                                ),
                                 billing_provider=agent.provider,
                                 billing_base_url=agent.base_url,
                                 billing_mode="subscription_included"
