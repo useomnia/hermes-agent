@@ -636,6 +636,25 @@ class TestMCPInitialConnectionRetry:
         from tools.mcp_tool import _MAX_INITIAL_CONNECT_RETRIES
         assert _MAX_INITIAL_CONNECT_RETRIES >= 1
 
+    def test_parked_self_probe_preserves_budget_until_session_is_proven(self):
+        """A timed revival attempt is not itself evidence of a stable session."""
+        from tools.mcp_tool import MCPServerTask, _MAX_RECONNECT_RETRIES
+
+        server = MCPServerTask("test-parked-budget")
+        server._reconnect_retries = _MAX_RECONNECT_RETRIES
+        server._was_parked = True
+
+        async def wake_from_timer():
+            return await server._wait_for_reconnect_or_shutdown(timeout=0.001)
+
+        assert asyncio.run(wake_from_timer()) == "reconnect"
+        assert server._reconnect_retries == _MAX_RECONNECT_RETRIES
+        assert server._was_parked is True
+
+        server._mark_session_proven()
+        assert server._reconnect_retries == 0
+        assert server._was_parked is False
+
     def test_initial_connect_retry_succeeds_on_second_attempt(self):
         """Server succeeds after one transient initial failure."""
         from tools.mcp_tool import MCPServerTask
