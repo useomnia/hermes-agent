@@ -57,6 +57,14 @@ class TestApprovalModeParsing:
         assert _normalize_approval_mode(True) == "manual"
 
 
+def test_sprites_backend_skips_host_dangerous_command_guards():
+    assert approval_module._should_skip_container_guards("sprites") is True
+    assert approval_module.check_dangerous_command("rm -rf /", "sprites") == {
+        "approved": True,
+        "message": None,
+    }
+
+
 class TestSmartApproval:
     def test_smart_is_the_default_approval_mode(self):
         from hermes_cli.config import DEFAULT_CONFIG
