@@ -1,9 +1,13 @@
+import ast
 import io
 import sys
+from pathlib import Path
 
 import pytest
 
 from hermes_cli import boot_clock
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 LINUX_ONLY = pytest.mark.skipif(
@@ -123,3 +127,49 @@ def test_mark_records_nothing_without_a_clock(monkeypatch):
     boot_clock.mark("main")
 
     assert boot_clock._checkpoints == []
+
+
+def _marked_names(relative_path: str, *callees: str) -> set[str]:
+    """Checkpoint names this file stamps via any of `callees`.
+
+    Read from the AST rather than by importing: `gateway.run` is a heavyweight
+    import, and what we are pinning is the call sites, not runtime behaviour.
+    A set, not a list — source order is not boot order (`hermes_cli/gateway.py`
+    defines the later checkpoint first).
+    """
+    tree = ast.parse((REPO_ROOT / relative_path).read_text(encoding="utf-8"))
+    return {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in callees
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
+
+
+def test_every_intended_boot_phase_is_still_marked():
+    # A dropped mark does not fail anything at runtime — the phase silently
+    # disappears and its cost gets misattributed to whichever neighbour
+    # survives. That is the failure mode this guards.
+    assert _marked_names("hermes_cli/main.py", "mark") == {
+        "main",
+        "skills",
+        "cli_import",
+    }
+    assert _marked_names("hermes_cli/gateway.py", "_boot_mark") == {
+        "dispatch",
+        "pre_start",
+    }
+    assert _marked_names("gateway/run.py", "_boot_mark") == {
+        "fingerprint",
+        "dup_guard",
+        "skills_resync",
+        "logging",
+        "audit",
+        "runner_init",
+        "pid_lock",
+        "mcp_discovery",
+    }
