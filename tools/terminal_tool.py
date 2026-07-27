@@ -119,6 +119,9 @@ DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
     "number",
 )
 
+_CONFIRMED_NOT_STARTED_MAX_RETRIES = 1
+_CONFIRMED_NOT_STARTED_RETRY_DELAY_SECONDS = 0.25
+
 
 def _check_disk_usage_warning():
     """Check if total disk usage exceeds warning threshold."""
@@ -1265,7 +1268,9 @@ def _safe_getcwd() -> str:
 # cwd looks when it leaks toward a Linux container's ``-w`` flag.
 _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 
-_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona"})
+_CONTAINER_BACKENDS = frozenset(
+    {"docker", "singularity", "modal", "daytona", "sprites"}
+)
 
 
 def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
@@ -1351,10 +1356,10 @@ def _get_env_config() -> Dict[str, Any]:
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     _ensure_terminal_env_bridged()
-    env_type = os.getenv("TERMINAL_ENV", "local")
+    env_type = os.getenv("TERMINAL_ENV", "local").strip().lower() or "local"
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
-    container_backend = env_type in {"docker", "singularity", "modal", "daytona"}
+    container_backend = env_type in _CONTAINER_BACKENDS
     docker_backend = env_type == "docker"
 
     # Docker/container-only env vars may be bridged from config.yaml even when
@@ -1388,6 +1393,8 @@ def _get_env_config() -> Dict[str, Any]:
         default_cwd = _safe_getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
+    elif env_type == "sprites":
+        default_cwd = "/brand"
     else:
         default_cwd = "/root"
 
@@ -1424,6 +1431,9 @@ def _get_env_config() -> Dict[str, Any]:
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
+        "sprites_url": os.getenv("OMNIO_TOOLBOX_URL", ""),
+        "sprites_bearer": os.getenv("OMNIO_TOOLBOX_BEARER", ""),
+        "sprites_brand": os.getenv("OMNIO_TOOLBOX_BRAND") or "default",
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -1491,7 +1501,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "ssh"
+            "daytona", "ssh", "sprites"
         image: Docker/Singularity/Modal image name (ignored for local/ssh)
         cwd: Working directory
         timeout: Default command timeout
@@ -1626,10 +1636,23 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             timeout=timeout,
         )
 
+    elif env_type == "sprites":
+        from tools.environments.sprites import (
+            SpritesEnvironment as _SpritesEnvironment,
+        )
+
+        return _SpritesEnvironment(
+            toolbox_url=cc.get("sprites_url", ""),
+            bearer_token=cc.get("sprites_bearer", ""),
+            brand=cc.get("sprites_brand", "default"),
+            cwd=cwd,
+            timeout=timeout,
+        )
+
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', 'ssh', or 'sprites'"
         )
 
 
@@ -2097,6 +2120,17 @@ def _resolve_command_cwd(
     return get_session_cwd(session_key) or default_cwd
 
 
+def _should_retry_execution_error(error: Exception) -> bool:
+    """Retry only a toolbox failure that proves no command began executing."""
+    from tools.environments.sprites import SpritesToolboxError
+
+    return (
+        isinstance(error, SpritesToolboxError)
+        and error.retryable is True
+        and error.command_started is False
+    )
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2289,7 +2323,7 @@ def terminal_tool(
                             }
 
                         container_config = None
-                        if env_type in {"docker", "singularity", "modal", "daytona"}:
+                        if env_type in _CONTAINER_BACKENDS:
                             container_config = {
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),
@@ -2305,6 +2339,9 @@ def terminal_tool(
                                 "docker_network": config.get("docker_network", True),
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                                "sprites_url": config.get("sprites_url", ""),
+                                "sprites_bearer": config.get("sprites_bearer", ""),
+                                "sprites_brand": config.get("sprites_brand", "default"),
                             }
 
                         local_config = None
@@ -2701,8 +2738,7 @@ def terminal_tool(
                     "error": f"Failed to start background process: {str(e)}"
                 }, ensure_ascii=False)
         else:
-            # Run foreground command with retry logic
-            max_retries = 3
+            # Retry only when the toolbox confirms the command never started.
             retry_count = 0
             result = None
             command_cwd = None
@@ -2717,7 +2753,7 @@ def terminal_tool(
                 from tools.interrupt import clear_current_thread_interrupt
                 clear_current_thread_interrupt()
 
-            while retry_count <= max_retries:
+            while True:
                 try:
                     command_cwd = _resolve_command_cwd(
                         workdir=workdir,
@@ -2736,25 +2772,36 @@ def terminal_tool(
                     }
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
-                    error_str = str(e).lower()
-                    if "timeout" in error_str:
-                        return json.dumps({
-                            "output": "",
-                            "exit_code": 124,
-                            "error": f"Command timed out after {effective_timeout} seconds"
-                        }, ensure_ascii=False)
-                    
-                    # Retry on transient errors
-                    if retry_count < max_retries:
+                    if (
+                        _should_retry_execution_error(e)
+                        and retry_count < _CONFIRMED_NOT_STARTED_MAX_RETRIES
+                    ):
                         retry_count += 1
-                        wait_time = 2 ** retry_count
-                        logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                       wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                        time.sleep(wait_time)
+                        logger.warning(
+                            "Toolbox confirmed command did not start; retrying "
+                            "in %.2fs (attempt %d/%d) - Command: %s - Error: "
+                            "%s: %s - Task: %s, Backend: %s",
+                            _CONFIRMED_NOT_STARTED_RETRY_DELAY_SECONDS,
+                            retry_count,
+                            _CONFIRMED_NOT_STARTED_MAX_RETRIES,
+                            _safe_command_preview(command),
+                            type(e).__name__,
+                            e,
+                            effective_task_id,
+                            env_type,
+                        )
+                        time.sleep(_CONFIRMED_NOT_STARTED_RETRY_DELAY_SECONDS)
                         continue
-                    
-                    logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                 max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+
+                    logger.error(
+                        "Execution failed - Command: %s - Error: %s: %s - "
+                        "Task: %s, Backend: %s",
+                        _safe_command_preview(command),
+                        type(e).__name__,
+                        e,
+                        effective_task_id,
+                        env_type,
+                    )
                     return json.dumps({
                         "output": "",
                         "exit_code": -1,
@@ -3006,10 +3053,19 @@ def check_terminal_requirements() -> bool:
             from daytona import Daytona  # noqa: F401 — SDK presence check
             return os.getenv("DAYTONA_API_KEY") is not None
 
+        elif env_type == "sprites":
+            if not config.get("sprites_url") or not config.get("sprites_bearer"):
+                logger.error(
+                    "Sprites backend selected but OMNIO_TOOLBOX_URL and "
+                    "OMNIO_TOOLBOX_BEARER are not both set."
+                )
+                return False
+            return True
+
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, ssh.",
+                "modal, daytona, ssh, sprites.",
                 env_type,
             )
             return False
@@ -3052,7 +3108,7 @@ if __name__ == "__main__":
     print(
         "  TERMINAL_ENV: "
         f"{os.getenv('TERMINAL_ENV', 'local')} "
-        "(local/docker/singularity/modal/daytona/ssh)"
+        "(local/docker/singularity/modal/daytona/ssh/sprites)"
     )
     print(f"  TERMINAL_DOCKER_IMAGE: {os.getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
