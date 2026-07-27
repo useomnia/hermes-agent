@@ -45,6 +45,8 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
+    app.router.add_put("/api/sessions/{session_id}/messages", adapter._handle_replace_session_messages)
+    app.router.add_delete("/api/sessions/{session_id}/messages", adapter._handle_delete_session_messages)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
@@ -193,6 +195,128 @@ async def test_session_messages_follow_compression_tip(adapter, session_db):
     assert messages["object"] == "list"
     assert messages["session_id"] == "tip-session"
     assert [m["content"] for m in messages["data"]] == ["after compression"]
+
+
+@pytest.mark.asyncio
+async def test_put_messages_cold_seeds_and_replaces_transcript(adapter, session_db):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        seeded = await cli.put(
+            "/api/sessions/cold-seed/messages",
+            json={"messages": [
+                {"role": "user", "content": "restored question"},
+                {"role": "assistant", "content": "restored answer"},
+            ]},
+        )
+        assert seeded.status == 200, await seeded.text()
+
+        replaced = await cli.put(
+            "/api/sessions/cold-seed/messages",
+            json={"messages": [{"role": "user", "content": "only this"}]},
+        )
+        assert replaced.status == 200, await replaced.text()
+
+    assert session_db.get_session("cold-seed") is not None
+    assert [m["content"] for m in session_db.get_messages("cold-seed")] == [
+        "only this"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_put_messages_preserves_reasoning_and_tool_calls(adapter, session_db):
+    session_id = session_db.create_session("fidelity", "api_server")
+    transcript = [
+        {"role": "user", "content": "search please"},
+        {
+            "role": "assistant",
+            "content": "calling search",
+            "reasoning_content": "the user wants a search",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "web_search", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "content": "results",
+            "tool_call_id": "call_1",
+            "tool_name": "web_search",
+        },
+    ]
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.put(
+            f"/api/sessions/{session_id}/messages",
+            json={"messages": transcript},
+        )
+        assert response.status == 200, await response.text()
+
+    restored = session_db.get_messages_as_conversation(session_id)
+    assert restored[1]["reasoning_content"] == "the user wants a search"
+    assert restored[1]["tool_calls"][0]["function"]["name"] == "web_search"
+    assert restored[2]["tool_call_id"] == "call_1"
+
+
+@pytest.mark.asyncio
+async def test_message_mutation_validation_and_truncation(adapter, session_db):
+    session_id = session_db.create_session("truncate", "api_server")
+    for index in range(4):
+        role = "user" if index % 2 == 0 else "assistant"
+        session_db.append_message(session_id, role, f"msg {index}")
+    boundary_id = session_db.get_messages(session_id)[2]["id"]
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        bad_put = await cli.put(
+            f"/api/sessions/{session_id}/messages",
+            json={"messages": "nope"},
+        )
+        assert bad_put.status == 400
+        assert (await bad_put.json())["error"]["code"] == "invalid_messages"
+
+        for query in ("", "?from=abc", "?from=0", "?from=-1"):
+            rejected = await cli.delete(
+                f"/api/sessions/{session_id}/messages{query}"
+            )
+            assert rejected.status == 400
+            assert (await rejected.json())["error"]["code"] == "invalid_from"
+
+        truncated = await cli.delete(
+            f"/api/sessions/{session_id}/messages?from={boundary_id}"
+        )
+        assert truncated.status == 200, await truncated.text()
+        assert (await truncated.json())["deleted"] == 2
+
+        beyond = boundary_id + 10_000
+        repeated = await cli.delete(
+            f"/api/sessions/{session_id}/messages?from={beyond}"
+        )
+        assert repeated.status == 200
+        assert (await repeated.json())["deleted"] == 0
+
+    assert [m["content"] for m in session_db.get_messages(session_id)] == [
+        "msg 0",
+        "msg 1",
+    ]
+    assert session_db.get_session(session_id)["message_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_message_mutations_require_auth(auth_adapter, session_db):
+    session_id = session_db.create_session("guarded", "api_server")
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        put_response = await cli.put(
+            f"/api/sessions/{session_id}/messages",
+            json={"messages": []},
+        )
+        delete_response = await cli.delete(
+            f"/api/sessions/{session_id}/messages?from=1"
+        )
+
+    assert put_response.status == 401
+    assert delete_response.status == 401
 
 
 @pytest.mark.asyncio
