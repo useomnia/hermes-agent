@@ -214,7 +214,15 @@ class TestBrowserCleanup:
             patch("tools.browser_tool._create_cdp_session", return_value=fresh_session) as mock_create,
             patch("tools.browser_tool._ensure_cdp_supervisor"),
         ):
-            assert browser_tool._get_session_info("task-1") is fresh_session
+            recovered_session = browser_tool._get_session_info("task-1")
+
+        assert recovered_session == {
+            **fresh_session,
+            "session_key": "task-1",
+            "owner_task_id": "task-1",
+        }
+        assert recovered_session is browser_tool._active_sessions["task-1"]
+        assert recovered_session is not fresh_session
 
         mock_create.assert_called_once_with("task-1", "ws://relay")
 
