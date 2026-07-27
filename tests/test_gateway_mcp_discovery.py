@@ -268,12 +268,18 @@ class TestEnsureMcpDiscoveryComplete:
             and "_mcp_reload_lock" in ast.unparse(f)
         )
         body = ast.unparse(handler)
-        assert "ensure_mcp_discovery_complete" in body, (
+        assert "wait_for_startup_mcp_discovery" in body, (
             "MCP reload tears down servers without joining startup discovery first"
         )
-        # And it must be offloaded, not awaited on the loop.
-        assert "run_in_executor(None, ensure_mcp_discovery_complete)" in body
-        assert "await ensure_mcp_discovery_complete" not in inspect.cleandoc(body)
+        # It must be offloaded, not awaited on the loop.
+        assert "run_in_executor(None, wait_for_startup_mcp_discovery)" in body
+        assert "await wait_for_startup_mcp_discovery" not in inspect.cleandoc(body)
+        # And it must be the JOIN-ONLY helper. The agent-build helper discovers
+        # inline when no startup thread exists, which here would connect servers
+        # before the handler snapshots the previous set — reporting nothing as
+        # `added` and then tearing down what it had just connected. CI caught
+        # exactly that: tests/gateway/test_api_server_mcp_reload.py.
+        assert "run_in_executor(None, ensure_mcp_discovery_complete)" not in body
 
     def test_cron_joins_startup_discovery_instead_of_starting_its_own(self):
         """Two concurrent discoveries double-connect the same server.

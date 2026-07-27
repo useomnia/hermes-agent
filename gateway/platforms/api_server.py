@@ -5152,9 +5152,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 # ``_servers``, not against in-flight connects, so the two cannot
                 # safely overlap. Let startup finish first; it is a no-op once done.
                 # In an executor because the join blocks.
-                from hermes_cli.mcp_startup import ensure_mcp_discovery_complete
+                #
+                # The join-ONLY variant, deliberately: the agent-build helper
+                # discovers inline when no startup thread exists, which here would
+                # connect servers before `old_servers` is snapshotted below — an
+                # empty `added` list, and a teardown of what it had just connected.
+                from hermes_cli.mcp_startup import wait_for_startup_mcp_discovery
 
-                await loop.run_in_executor(None, ensure_mcp_discovery_complete)
+                await loop.run_in_executor(None, wait_for_startup_mcp_discovery)
                 await self._refresh_omnio_connector_toolkit_approvals()
                 with _lock:
                     old_servers = set(_servers.keys())

@@ -122,20 +122,7 @@ def ensure_mcp_discovery_complete(timeout: "float | None" = None) -> None:
     discovery thread from re-charging the full bound to every later agent build.
     """
     try:
-        if mcp_discovery_was_started():
-            if _join_abandoned:
-                # An earlier caller already waited out the full bound on this
-                # thread and it never finished. Don't re-charge that wait.
-                return
-            wait_for_mcp_discovery(
-                timeout=AGENT_BUILD_JOIN_SECONDS if timeout is None else timeout
-            )
-            thread = _mcp_discovery_thread
-            if timeout is None and thread is not None and thread.is_alive():
-                # Only the default bound retires the join. An explicit (smaller)
-                # timeout is a caller saying "wait this long", not evidence that
-                # discovery is wedged.
-                _abandon_join()
+        if _join_startup_discovery(timeout):
             return
         # No thread was started — ``start_background_mcp_discovery`` skips when
         # its cheap ``read_raw_config`` probe finds no ``mcp_servers``. That probe
@@ -153,6 +140,50 @@ def ensure_mcp_discovery_complete(timeout: "float | None" = None) -> None:
         logging.getLogger(__name__).debug(
             "MCP discovery join before agent build failed", exc_info=True
         )
+
+
+def _join_startup_discovery(timeout: "float | None") -> bool:
+    """Join the startup discovery thread. False if there was never one.
+
+    Blocking; see ``ensure_mcp_discovery_complete`` for the thread-safety rules.
+    """
+    if not mcp_discovery_was_started():
+        return False
+    if _join_abandoned:
+        # An earlier caller already waited out the full bound on this thread and
+        # it never finished. Don't re-charge that wait.
+        return True
+    wait_for_mcp_discovery(timeout=AGENT_BUILD_JOIN_SECONDS if timeout is None else timeout)
+    thread = _mcp_discovery_thread
+    if timeout is None and thread is not None and thread.is_alive():
+        # Only the default bound retires the join. An explicit (smaller) timeout
+        # is a caller saying "wait this long", not evidence discovery is wedged.
+        _abandon_join()
+    return True
+
+
+def wait_for_startup_mcp_discovery(timeout: "float | None" = None) -> None:
+    """Join an in-flight startup discovery WITHOUT ever discovering inline.
+
+    For callers that are about to run their own ``discover_mcp_tools()`` and only
+    need the startup thread to be out of the way first — the MCP reload endpoint,
+    which must not overlap startup discovery because ``register_mcp_servers``
+    dedupes against connected servers but not against in-flight connects.
+
+    The distinction from ``ensure_mcp_discovery_complete`` matters: that one
+    discovers inline when no thread was started, which for a caller like reload
+    would connect servers BEFORE it snapshots the previous set — reporting an
+    empty ``added`` list and then tearing down and rebuilding what it just
+    connected.
+
+    **Blocking — call it only from a worker thread.**  Never raises.
+    """
+    try:
+        _join_startup_discovery(timeout)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).debug("MCP startup discovery join failed", exc_info=True)
 
 
 def _resolve_discovery_timeout(explicit: "float | None") -> float:
