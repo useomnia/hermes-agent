@@ -40,6 +40,7 @@ Requires:
 """
 
 import asyncio
+import copy
 import errno
 import hashlib
 import hmac
@@ -56,6 +57,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -90,9 +93,29 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from agent.redact import redact_sensitive_text
+from agent.structured_output import (
+    normalize_response_format as _normalize_response_format,
+    normalize_responses_text_format as _response_format_from_text_format,
+    unsupported_reason as _structured_output_unsupported_reason,
+)
 from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
+
+_OMNIO_DURABLE_APPROVALS_DISABLED_ENV = "OMNIO_TOOL_APPROVAL_DURABLE_DISABLED"
+_OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS = 5.0
+
+
+def _parse_omnio_connector_toolkit_approval_tools(payload: Any) -> list[str]:
+    """Validate and normalize Omnia's authoritative standing-grant response."""
+    if not isinstance(payload, dict):
+        raise ValueError("approval payload must be an object")
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        raise ValueError("approval payload tools must be an array")
+    if not all(isinstance(item, str) for item in tools):
+        raise ValueError("approval payload tools must contain strings")
+    return [item.strip() for item in tools if item.strip()]
 
 
 def _hermes_version() -> str:
@@ -129,6 +152,19 @@ MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
+
+_CUSTOM_TOOL_INPUT_KEYS = {
+    "request_user_input": "interaction",
+    "emit_client_event": "clientEvent",
+}
+
+
+def _project_custom_tool_inputs(function_name: str, function_args: Any) -> dict[str, Any]:
+    """Copy allowlisted tool inputs onto client-visible progress events."""
+    output_key = _CUSTOM_TOOL_INPUT_KEYS.get(function_name)
+    if output_key is None or not isinstance(function_args, dict):
+        return {}
+    return {output_key: copy.deepcopy(function_args)}
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1261,6 +1297,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # agent with model="" that 400s every call until manual retry.
         self._last_resolved_model: Dict[str, str] = {}
         self._session_db_lock: Optional[asyncio.Lock] = None  # Single-flight for lazy init
+        self._mcp_reload_lock: Optional[asyncio.Lock] = None
+        self._skills_reload_lock: Optional[asyncio.Lock] = None
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -1769,6 +1807,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            ("PUT", "/api/sessions/{session_id}/messages", self._handle_replace_session_messages),
+            ("DELETE", "/api/sessions/{session_id}/messages", self._handle_delete_session_messages),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -1794,6 +1834,10 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
+            ("POST", "/v1/omnio/tool-approval", self._handle_omnio_tool_approval),
+            ("POST", "/v1/omnio/user-input", self._handle_omnio_user_input),
+            ("POST", "/v1/mcp/reload", self._handle_mcp_reload),
+            ("POST", "/v1/skills/reload", self._handle_skills_reload),
         ]
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
@@ -2298,9 +2342,11 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        reasoning_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        tool_gen_callback=None,
         gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
@@ -2308,6 +2354,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2594,9 +2641,11 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
+            "reasoning_callback": reasoning_callback,
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
+            "tool_gen_callback": tool_gen_callback,
             "session_db": self._ensure_session_db(),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
@@ -2606,6 +2655,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        agent._gateway_response_format = response_format
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -2620,6 +2670,24 @@ class APIServerAdapter(BasePlatformAdapter):
             ),
         }
         return agent
+
+    def _structured_output_error(
+        self, response_format: Optional[Dict[str, Any]]
+    ) -> Optional["web.Response"]:
+        if not response_format:
+            return None
+        try:
+            from gateway.run import _resolve_runtime_agent_kwargs
+
+            api_mode = (_resolve_runtime_agent_kwargs() or {}).get("api_mode")
+        except Exception:
+            return None
+        reason = _structured_output_unsupported_reason(response_format, api_mode)
+        if reason:
+            return web.json_response(
+                _openai_error(reason, param="response_format"), status=400
+            )
+        return None
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -2816,6 +2884,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "omnio_blocking_interactions": True,
+                "mcp_reload": True,
+                "skills_reload": True,
+                "structured_output": True,
                 "session_resources": True,
                 "model_options": True,
                 "session_chat": True,
@@ -2852,10 +2924,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
+                "session_messages_replace": {
+                    "method": "PUT",
+                    "path": "/api/sessions/{session_id}/messages",
+                },
+                "session_messages_truncate": {
+                    "method": "DELETE",
+                    "path": "/api/sessions/{session_id}/messages",
+                },
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
+                "omnio_tool_approval": {
+                    "method": "POST",
+                    "path": "/v1/omnio/tool-approval",
+                },
+                "omnio_user_input": {
+                    "method": "POST",
+                    "path": "/v1/omnio/user-input",
+                },
+                "mcp_reload": {"method": "POST", "path": "/v1/mcp/reload"},
+                "skills_reload": {
+                    "method": "POST",
+                    "path": "/v1/skills/reload",
+                },
             },
         })
 
@@ -3226,6 +3319,108 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
+        })
+
+    async def _handle_replace_session_messages(self, request: "web.Request") -> "web.Response":
+        """PUT a full transcript, creating the session on a cold seed."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return web.json_response(
+                _openai_error("'messages' must be a list", code="invalid_messages"),
+                status=400,
+            )
+        if not all(
+            isinstance(message, dict) and isinstance(message.get("role"), str)
+            for message in messages
+        ):
+            return web.json_response(
+                _openai_error(
+                    "each message must be an object with a string 'role'",
+                    code="invalid_messages",
+                ),
+                status=400,
+            )
+        if re.search(r"[\r\n\x00]", session_id):
+            return web.json_response(
+                _openai_error("Invalid session ID", code="invalid_session_id"),
+                status=400,
+            )
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable", code="session_db_unavailable"
+                ),
+                status=503,
+            )
+        session = await asyncio.to_thread(db.get_session, session_id)
+        if not session:
+            logger.info("PUT session messages: cold-seeding new session row %s", session_id)
+            await asyncio.to_thread(db.create_session, session_id, "api_server")
+        await asyncio.to_thread(db.replace_messages, session_id, messages)
+        return web.json_response({
+            "object": "hermes.session.messages",
+            "session_id": session_id,
+            "count": len(messages),
+        })
+
+    async def _handle_delete_session_messages(self, request: "web.Request") -> "web.Response":
+        """DELETE messages at and after the requested positive message id."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        raw_from = request.query.get("from")
+        if raw_from is None:
+            return web.json_response(
+                _openai_error(
+                    "Missing required 'from' query parameter", code="invalid_from"
+                ),
+                status=400,
+            )
+        try:
+            from_id = int(raw_from)
+        except (TypeError, ValueError):
+            return web.json_response(
+                _openai_error(
+                    "'from' must be an integer message id", code="invalid_from"
+                ),
+                status=400,
+            )
+        if from_id < 1:
+            return web.json_response(
+                _openai_error(
+                    "'from' must be a positive message id", code="invalid_from"
+                ),
+                status=400,
+            )
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable", code="session_db_unavailable"
+                ),
+                status=503,
+            )
+        deleted = await asyncio.to_thread(
+            db.delete_messages_from, session_id, from_id
+        )
+        return web.json_response({
+            "object": "hermes.session.messages.truncated",
+            "session_id": session_id,
+            "deleted": deleted,
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
@@ -3650,6 +3845,84 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "runtime": runtime,
         })
+    def _maybe_expand_slash_command(
+        self, user_message: Any, session_id: str
+    ) -> Optional[str]:
+        if not isinstance(user_message, str):
+            return None
+        for command, instruction in self._slash_command_candidates(user_message):
+            expanded = self._expand_slash_command(command, instruction, session_id)
+            if expanded is not None:
+                return expanded
+        return None
+
+    @staticmethod
+    def _slash_command_candidates(text: str) -> list[tuple[str, str]]:
+        candidates = []
+        for match in re.finditer(r"(?<!\S)/(\S+)", text):
+            before = text[: match.start()]
+            after = text[match.end() :]
+            instruction = (
+                (before + after.lstrip()).strip()
+                if before.strip()
+                else after.strip()
+            )
+            candidates.append((match.group(1), instruction))
+        return candidates
+
+    def _expand_slash_command(
+        self, command: str, user_instruction: str, session_id: str
+    ) -> Optional[str]:
+        if command == "learn":
+            try:
+                from agent.learn_prompt import build_learn_prompt
+
+                return build_learn_prompt(user_instruction)
+            except Exception:
+                logger.exception("Failed to build the /learn prompt")
+                return None
+        try:
+            from agent.skill_bundles import (
+                build_bundle_invocation_message,
+                resolve_bundle_command_key,
+            )
+            from agent.skill_commands import (
+                build_skill_invocation_message,
+                resolve_skill_command_key,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Skill command modules unavailable; forwarding /%s as-is: %s",
+                command,
+                exc,
+            )
+            return None
+
+        try:
+            bundle_key = resolve_bundle_command_key(command)
+            if bundle_key is not None:
+                bundle_result = build_bundle_invocation_message(
+                    bundle_key, user_instruction, task_id=session_id
+                )
+                if bundle_result and bundle_result[0]:
+                    return bundle_result[0]
+                logger.error("Bundle /%s resolved but built no payload", command)
+        except Exception:
+            logger.exception("Bundle command expansion failed for /%s", command)
+
+        try:
+            command_key = resolve_skill_command_key(command)
+            if command_key is not None:
+                message = build_skill_invocation_message(
+                    command_key, user_instruction, task_id=session_id
+                )
+                if message:
+                    return message
+                logger.error("Skill /%s resolved but built no payload", command)
+        except Exception:
+            logger.exception("Skill command expansion failed for /%s", command)
+        return None
+
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -3672,6 +3945,18 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+
+        response_format, response_format_error = _normalize_response_format(
+            body.get("response_format")
+        )
+        if response_format_error:
+            return web.json_response(
+                _openai_error(response_format_error, param="response_format"),
+                status=400,
+            )
+        unsupported = self._structured_output_error(response_format)
+        if unsupported is not None:
+            return unsupported
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -3776,6 +4061,10 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
+        expanded_command = self._maybe_expand_slash_command(user_message, session_id)
+        if expanded_command is not None:
+            user_message = expanded_command
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
@@ -3814,6 +4103,30 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
+            def _on_reasoning(text):
+                if text:
+                    _stream_q.put(("__reasoning__", text))
+
+            def _on_tool_gen(function_name):
+                if (
+                    not isinstance(function_name, str)
+                    or not function_name
+                    or function_name.startswith("_")
+                ):
+                    return
+                from agent.display import get_tool_emoji
+
+                _stream_q.put(
+                    (
+                        "__tool_progress__",
+                        {
+                            "tool": function_name,
+                            "emoji": get_tool_emoji(function_name),
+                            "status": "generating",
+                        },
+                    )
+                )
+
             # Track which tool_call_ids we've emitted a "running" lifecycle
             # event for, so a "completed" event without a matching "running"
             # (e.g. internal/filtered tools) is silently dropped instead of
@@ -3838,13 +4151,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 _started_tool_call_ids.add(tool_call_id)
                 from agent.display import build_tool_preview, get_tool_emoji
                 label = build_tool_preview(function_name, function_args) or function_name
-                _stream_q.put(("__tool_progress__", {
+                progress = {
                     "tool": function_name,
                     "emoji": get_tool_emoji(function_name),
                     "label": label,
                     "toolCallId": tool_call_id,
                     "status": "running",
-                }))
+                }
+                progress.update(_project_custom_tool_inputs(function_name, function_args))
+                _stream_q.put(("__tool_progress__", progress))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
                 """Emit the matching ``status: completed`` event.
@@ -3855,21 +4170,131 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
+                from tools.tool_approval import is_gated_tool
+
                 _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put(("__tool_progress__", {
+                completed = {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
-                }))
+                }
+                turn_ending = False
+                interrupt_message = "awaiting user interaction (request_user_input)"
+                try:
+                    parsed = json.loads(function_result or "{}")
+                except Exception:
+                    parsed = {}
+
+                if function_name == "request_user_input":
+                    if isinstance(parsed, dict) and parsed.get("status") == "answered":
+                        completed["interaction"] = {
+                            "answered": parsed.get("response", "")
+                        }
+                    if isinstance(parsed, dict) and parsed.get("status") == "no_response":
+                        try:
+                            from tools.user_input import (
+                                consume_user_input_completion_reason,
+                            )
+
+                            completion_reason = consume_user_input_completion_reason(
+                                session_id
+                            )
+                        except Exception:
+                            completion_reason = None
+                        if completion_reason == "expired":
+                            completed.setdefault("interaction", {})["timed_out"] = True
+                    turn_ending = isinstance(parsed, dict) and parsed.get("status") in {
+                        "presented",
+                        "no_response",
+                    }
+                elif is_gated_tool(function_name):
+                    try:
+                        from tools.tool_approval import consume_tool_approval_decision
+
+                        decision = consume_tool_approval_decision(
+                            session_id, tool_call_id
+                        )
+                    except Exception:
+                        decision = None
+                    if decision is not None:
+                        completed.setdefault("interaction", {})["answered"] = decision
+                    if (
+                        isinstance(parsed, dict)
+                        and parsed.get("status") == "approval_no_response"
+                    ):
+                        try:
+                            from tools.tool_approval import (
+                                consume_tool_approval_completion_reason,
+                            )
+
+                            completion_reason = consume_tool_approval_completion_reason(
+                                session_id, tool_call_id
+                            )
+                        except Exception:
+                            completion_reason = None
+                        if completion_reason == "expired":
+                            completed.setdefault("interaction", {})["timed_out"] = True
+                            interrupt_message = (
+                                "awaiting user approval (tool approval timed out)"
+                            )
+                        else:
+                            interrupt_message = (
+                                "awaiting user approval "
+                                "(tool approval ended without response)"
+                            )
+                        turn_ending = True
+                elif function_name == "todo":
+                    todos = parsed.get("todos") if isinstance(parsed, dict) else None
+                    if isinstance(todos, list):
+                        completed["todos"] = todos
+
+                _stream_q.put(("__tool_progress__", completed))
+                if turn_ending and agent_ref[0] is not None:
+                    try:
+                        agent_ref[0].interrupt(interrupt_message)
+                    except Exception:
+                        logger.warning(
+                            "[api_server] failed to interrupt agent for "
+                            "turn-ending tool completion "
+                            "(tool_call_id=%s, function_name=%s)",
+                            tool_call_id,
+                            function_name,
+                            exc_info=True,
+                        )
+
+            def _on_tool_progress(event_type, name=None, preview=None, args=None, **kwargs):
+                if not isinstance(event_type, str) or not event_type.startswith(
+                    "subagent"
+                ):
+                    return
+                progress = {"tool": name, "status": event_type, "preview": preview}
+                for key in (
+                    "subagent_id",
+                    "parent_id",
+                    "depth",
+                    "task_index",
+                    "task_count",
+                    "goal",
+                    "tool_count",
+                ):
+                    if key in kwargs:
+                        progress[key] = kwargs[key]
+                _stream_q.put(("__tool_progress__", progress))
+
+            def _approval_notify(event: "Dict[str, Any]") -> None:
+                event = dict(event or {})
+                if "command" in event:
+                    from gateway.run import _redact_approval_command
+
+                    event["command"] = _redact_approval_command(event.get("command"))
+                try:
+                    _stream_q.put_nowait(("__tool_progress__", event))
+                except Exception:
+                    pass
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             #
-            # ``tool_progress_callback`` is intentionally not wired here:
-            # it would duplicate every emit because ``run_agent`` fires it
-            # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
-            # The structured callbacks are strictly richer (they carry
-            # the tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -3877,10 +4302,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                reasoning_callback=_on_reasoning,
+                tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                tool_gen_callback=_on_tool_gen,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                response_format=response_format,
+                approval_session_key=session_id,
+                approval_notify=_approval_notify,
                 **agent_overrides,
                 route=route,
             ))
@@ -3902,6 +4333,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                response_format=response_format,
                 **agent_overrides,
                 route=route,
             )
@@ -3910,7 +4342,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if idempotency_key:
             fp = _make_request_fingerprint(
                 body,
-                keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
+                keys=[
+                    "model",
+                    "provider",
+                    "model_options",
+                    "messages",
+                    "tools",
+                    "tool_choice",
+                    "stream",
+                    "response_format",
+                ],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
@@ -4070,10 +4511,23 @@ class APIServerAdapter(BasePlatformAdapter):
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
                 else:
+                    delta_key = "content"
+                    delta_value = item
+                    if (
+                        isinstance(item, tuple)
+                        and len(item) == 2
+                        and item[0] == "__reasoning__"
+                    ):
+                        delta_key = "reasoning_content"
+                        delta_value = item[1]
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                        "choices": [{
+                            "index": 0,
+                            "delta": {delta_key: delta_value},
+                            "finish_reason": None,
+                        }],
                     }
                     await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 return time.monotonic()
@@ -4840,6 +5294,18 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation = body.get("conversation")
         store = _coerce_request_bool(body.get("store"), default=True)
 
+        response_format, response_format_error = _response_format_from_text_format(
+            body.get("text")
+        )
+        if response_format_error:
+            return web.json_response(
+                _openai_error(response_format_error, param="text.format"),
+                status=400,
+            )
+        unsupported = self._structured_output_error(response_format)
+        if unsupported is not None:
+            return unsupported
+
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
             return web.json_response(_openai_error("Cannot use both 'conversation' and 'previous_response_id'"), status=400)
@@ -4989,6 +5455,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                response_format=response_format,
                 **agent_overrides,
                 route=route,
             ))
@@ -5024,6 +5491,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                response_format=response_format,
                 **agent_overrides,
                 route=route,
             )
@@ -5041,6 +5509,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "provider",
                     "model_options",
                     "tools",
+                    "text",
                 ],
             )
             try:
@@ -5707,9 +6176,11 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        reasoning_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        tool_gen_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None,
@@ -5720,6 +6191,9 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        response_format: Optional[Dict[str, Any]] = None,
+        approval_session_key: Optional[str] = None,
+        approval_notify: Optional[Any] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5761,14 +6235,32 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
                 )
+                approval_token = None
+                approval_notify_token = None
+                user_input_token = None
                 try:
+                    if approval_session_key:
+                        from tools.approval import set_current_session_key
+                        from tools.tool_approval import register_tool_approval_notify
+                        from tools.user_input import register_user_input_session
+
+                        approval_token = set_current_session_key(approval_session_key)
+                        if approval_notify is not None:
+                            approval_notify_token = register_tool_approval_notify(
+                                approval_session_key, approval_notify
+                            )
+                        user_input_token = register_user_input_session(
+                            approval_session_key
+                        )
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=stream_delta_callback,
+                        reasoning_callback=reasoning_callback,
                         tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback,
                         tool_complete_callback=tool_complete_callback,
+                        tool_gen_callback=tool_gen_callback,
                         gateway_session_key=gateway_session_key,
                         requested_model=requested_model,
                         requested_provider=requested_provider,
@@ -5776,6 +6268,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        response_format=response_format,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
@@ -5902,6 +6395,23 @@ class APIServerAdapter(BasePlatformAdapter):
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                     )
                 finally:
+                    if approval_session_key:
+                        if approval_notify_token is not None:
+                            from tools.tool_approval import unregister_tool_approval_notify
+
+                            unregister_tool_approval_notify(
+                                approval_session_key, approval_notify_token
+                            )
+                        if user_input_token is not None:
+                            from tools.user_input import unregister_user_input_session
+
+                            unregister_user_input_session(
+                                approval_session_key, user_input_token
+                            )
+                        if approval_token is not None:
+                            from tools.approval import reset_current_session_key
+
+                            reset_current_session_key(approval_token)
                     clear_session_vars(tokens)
 
         self._activate_admitted_request()
@@ -6578,6 +7088,194 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_omnio_tool_approval(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Resolve one blocked Omnia connector or credit-spend tool call."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        tool = str(body.get("tool", "")).strip()
+        scope = str(body.get("scope", "")).strip().lower()
+        tool_call_id = str(
+            body.get("toolCallId", "") or body.get("tool_call_id", "")
+        ).strip()
+        if not tool:
+            return web.json_response(
+                _openai_error("Missing 'tool'", code="approval_missing_tool"),
+                status=400,
+            )
+
+        session_key = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if not session_key:
+            return web.json_response(
+                _openai_error(
+                    "Missing X-Hermes-Session-Id", code="approval_no_session"
+                ),
+                status=400,
+            )
+
+        try:
+            from tools.tool_approval import APPROVAL_SCOPES, resolve_tool_approval
+
+            if scope not in APPROVAL_SCOPES:
+                return web.json_response(
+                    _openai_error(
+                        "Invalid scope; expected one of: "
+                        f"{', '.join(sorted(APPROVAL_SCOPES))}",
+                        code="invalid_approval_scope",
+                    ),
+                    status=400,
+                )
+            raw_tools = body.get("tools")
+            tools: list[str] | None = None
+            if raw_tools is not None:
+                if not isinstance(raw_tools, list):
+                    return web.json_response(
+                        _openai_error(
+                            "'tools' must be an array",
+                            code="invalid_approval_tools",
+                        ),
+                        status=400,
+                    )
+                if not all(isinstance(item, str) for item in raw_tools):
+                    return web.json_response(
+                        _openai_error(
+                            "'tools' must contain only strings",
+                            code="invalid_approval_tools",
+                        ),
+                        status=400,
+                    )
+                tools = [item.strip() for item in raw_tools if item.strip()]
+            recorded = resolve_tool_approval(
+                session_key, tool, scope, tool_call_id, tools
+            )
+        except Exception as exc:
+            logger.exception("[api_server] tool approval resolution failed")
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        return web.json_response(
+            {
+                "object": "omnio.tool_approval_response",
+                "tool": tool,
+                "scope": scope,
+                "recorded": recorded,
+            }
+        )
+
+    async def _handle_omnio_user_input(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Deliver an answer to the matching blocked request_user_input call."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        response = body.get("response")
+        if not isinstance(response, str):
+            return web.json_response(
+                _openai_error(
+                    "Missing 'response' string",
+                    code="user_input_missing_response",
+                ),
+                status=400,
+            )
+        tool_call_id = str(
+            body.get("toolCallId", "") or body.get("tool_call_id", "")
+        ).strip()
+        session_key = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if not session_key:
+            return web.json_response(
+                _openai_error(
+                    "Missing X-Hermes-Session-Id", code="user_input_no_session"
+                ),
+                status=400,
+            )
+
+        try:
+            from tools.user_input import resolve_user_input
+
+            resolved = resolve_user_input(session_key, response, tool_call_id)
+        except Exception as exc:
+            logger.exception("[api_server] user input resolution failed")
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        return web.json_response(
+            {"object": "omnio.user_input_response", "resolved": resolved}
+        )
+
+    async def _handle_mcp_reload(self, request: "web.Request") -> "web.Response":
+        """Reconnect MCP servers and refresh their tool registry in place."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        loop = asyncio.get_running_loop()
+        if self._mcp_reload_lock is None:
+            self._mcp_reload_lock = asyncio.Lock()
+        try:
+            from tools.mcp_tool import (
+                _lock,
+                _servers,
+                discover_mcp_tools,
+                shutdown_mcp_servers,
+            )
+
+            async with self._mcp_reload_lock:
+                await self._refresh_omnio_connector_toolkit_approvals()
+                with _lock:
+                    old_servers = set(_servers.keys())
+                await loop.run_in_executor(None, shutdown_mcp_servers)
+                new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+                with _lock:
+                    connected = set(_servers.keys())
+        except Exception as exc:
+            logger.exception("[api_server] MCP reload failed")
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        return web.json_response(
+            {
+                "object": "hermes.mcp.reload",
+                "servers": sorted(connected),
+                "added": sorted(connected - old_servers),
+                "removed": sorted(old_servers - connected),
+                "tools": len(new_tools),
+            }
+        )
+
+    async def _handle_skills_reload(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Rescan skills without restarting the gateway."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        loop = asyncio.get_running_loop()
+        if self._skills_reload_lock is None:
+            self._skills_reload_lock = asyncio.Lock()
+        try:
+            from agent.skill_commands import reload_skills
+
+            async with self._skills_reload_lock:
+                diff = await loop.run_in_executor(None, reload_skills)
+        except Exception as exc:
+            logger.exception("[api_server] skills reload failed")
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        return web.json_response({"object": "hermes.skills.reload", **diff})
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -6839,6 +7537,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 return False
 
+            await self._refresh_omnio_connector_toolkit_approvals()
             self._mark_connected()
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
@@ -6849,6 +7548,114 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
+
+    async def _refresh_omnio_connector_toolkit_approvals(self) -> None:
+        try:
+            from tools.tool_approval import (
+                register_always_approval_authority,
+                replace_injected_always_approvals,
+            )
+            from utils import env_var_enabled
+        except Exception:
+            logger.warning(
+                "[api_server] Omnio approval injection unavailable",
+                exc_info=True,
+            )
+            return
+
+        register_always_approval_authority(
+            self._is_omnio_connector_toolkit_approval_granted
+        )
+        if env_var_enabled(_OMNIO_DURABLE_APPROVALS_DISABLED_ENV):
+            replace_injected_always_approvals([])
+            return
+
+        base_url = os.environ.get("OMNIA_BASE_URL", "").strip().rstrip("/")
+        api_token = os.environ.get("OMNIA_API_TOKEN", "").strip()
+        brand_id = os.environ.get("OMNIO_BRAND_ID", "").strip()
+        if not base_url or not api_token or not brand_id:
+            replace_injected_always_approvals([])
+            return
+
+        try:
+            tools = await self._fetch_omnio_connector_toolkit_approvals(
+                base_url=base_url,
+                api_token=api_token,
+                brand_id=brand_id,
+            )
+        except Exception as exc:
+            logger.warning("[api_server] Omnio approval injection failed: %s", exc)
+            replace_injected_always_approvals([])
+            return
+
+        replace_injected_always_approvals(tools)
+
+    def _is_omnio_connector_toolkit_approval_granted(
+        self, function_name: str
+    ) -> bool:
+        """Confirm a standing connector approval against Omnia at execution."""
+        from utils import env_var_enabled
+
+        if env_var_enabled(_OMNIO_DURABLE_APPROVALS_DISABLED_ENV):
+            raise RuntimeError("durable approval authority is disabled")
+
+        base_url = os.environ.get("OMNIA_BASE_URL", "").strip().rstrip("/")
+        api_token = os.environ.get("OMNIA_API_TOKEN", "").strip()
+        brand_id = os.environ.get("OMNIO_BRAND_ID", "").strip()
+        if not base_url or not api_token or not brand_id:
+            raise RuntimeError("durable approval authority is unavailable")
+
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_token}",
+        }
+        bypass = os.environ.get("VERCEL_AUTOMATION_BYPASS_SECRET", "").strip()
+        if bypass:
+            headers["x-vercel-protection-bypass"] = bypass
+        url = (
+            f"{base_url}/api/agents/omnio/connector-toolkit-approvals?"
+            f"{urlencode({'brand': brand_id})}"
+        )
+        request = Request(url, headers=headers, method="GET")
+        with urlopen(
+            request, timeout=_OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS
+        ) as response:
+            status = response.status
+            if not isinstance(status, int) or not 200 <= status < 300:
+                raise RuntimeError(f"omnia_status={status}")
+            payload = json.loads(response.read())
+
+        tools = _parse_omnio_connector_toolkit_approval_tools(payload)
+        return function_name in tools
+
+    async def _fetch_omnio_connector_toolkit_approvals(
+        self, *, base_url: str, api_token: str, brand_id: str
+    ) -> list[str]:
+        import aiohttp
+
+        headers = {"Authorization": f"Bearer {api_token}"}
+        bypass = os.environ.get("VERCEL_AUTOMATION_BYPASS_SECRET", "").strip()
+        if bypass:
+            headers["x-vercel-protection-bypass"] = bypass
+        url = (
+            f"{base_url}/api/agents/omnio/connector-toolkit-approvals?"
+            f"{urlencode({'brand': brand_id})}"
+        )
+        timeout = aiohttp.ClientTimeout(
+            total=_OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS
+        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 404:
+                    return []
+                if response.status >= 400:
+                    text = await response.text()
+                    raise RuntimeError(
+                        f"omnia_status={response.status} body={text[:160]}"
+                    )
+                payload = await response.json(content_type=None)
+
+        return _parse_omnio_connector_toolkit_approval_tools(payload)
 
     async def disconnect(self) -> None:
         """Stop the aiohttp web server and release all owned resources.
