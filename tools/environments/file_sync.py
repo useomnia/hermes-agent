@@ -79,6 +79,35 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
     return files
 
 
+def iter_sprites_sync_files(
+    container_base: str = "/skills",
+) -> list[tuple[str, str]]:
+    """Enumerate skills for a secret-free paired toolbox sync.
+
+    Credentials are owned by the gateway harness and must never cross into the
+    Sprite. Refuse the sync entirely if credential mounts are configured.
+    """
+    from tools.credential_files import (
+        get_credential_file_mounts,
+        iter_skills_files,
+    )
+
+    credential_mounts = list(get_credential_file_mounts())
+    if credential_mounts:
+        paths = ", ".join(
+            sorted(entry["host_path"] for entry in credential_mounts)
+        )
+        raise RuntimeError(
+            "Sprites backend refuses to sync credential files to the runtime: "
+            f"{paths}"
+        )
+
+    return [
+        (entry["host_path"], entry["container_path"])
+        for entry in iter_skills_files(container_base=container_base)
+    ]
+
+
 def _credential_host_paths() -> set[str]:
     """Return credential files that are upload-only for remote sandboxes."""
     try:
