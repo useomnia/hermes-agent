@@ -8497,7 +8497,10 @@ def _load_installable_optional_extras(group: str = "all") -> list[str]:
     if not isinstance(optional_deps, dict):
         return []
 
-    refs = optional_deps.get(group, [])
+    refs = optional_deps.get(group)
+    if refs is None:
+        return [name for name in group.split(",") if name in optional_deps]
+
     referenced: list[str] = []
     for ref in refs:
         if "[" in ref and "]" in ref:
@@ -8511,6 +8514,9 @@ def _load_installable_optional_extras(group: str = "all") -> list[str]:
 # Install-scoped breadcrumbs live next to the venv (not under $HERMES_HOME)
 # because the venv is shared across profiles.
 #
+# ``.install-extras`` — optional-dependency profile selected by the installer.
+# Updates reuse this install-scoped choice so a lean install stays lean.
+#
 # ``.update-incomplete`` — generic core ``.[all]`` install was interrupted.
 # Cleared only after a confirmed full dependency reinstall/recovery.
 #
@@ -8520,6 +8526,24 @@ def _load_installable_optional_extras(group: str = "all") -> list[str]:
 # the generic core marker (#58004 review).
 def _update_marker_path() -> Path:
     return PROJECT_ROOT / ".update-incomplete"
+
+
+INSTALL_EXTRAS_MARKER = ".install-extras"
+
+
+def _installed_extras_group() -> str:
+    """Return the valid install-scoped extras profile, defaulting to ``all``."""
+    try:
+        raw = (
+            (PROJECT_ROOT / INSTALL_EXTRAS_MARKER)
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+    except OSError:
+        return "all"
+    if raw and all(character.isalnum() or character in "_,-" for character in raw):
+        return raw
+    return "all"
 
 
 def _lazy_refresh_marker_path() -> Path:
@@ -9639,20 +9663,30 @@ def _install_python_dependencies_with_optional_fallback(
 ) -> None:
     """Install base deps plus as many optional extras as the environment supports.
 
-    By default this targets ``.[all]``; Termux callers can pass
-    ``group='termux-all'`` to use the curated Android-compatible profile.
+    The default ``all`` group honors the install-scoped extras marker. Termux
+    callers pass ``termux-all`` explicitly and bypass that marker.
 
     On Windows, pre-renames live ``hermes.exe`` / ``hermes-gateway.exe`` shims
     in the venv Scripts dir before each install attempt so uv can write fresh
     copies (Windows blocks REPLACE on a running .exe but allows RENAME). See
     ``_quarantine_running_hermes_exe`` for the rationale.
     """
+    if group == "all":
+        group = _installed_extras_group()
+
     scripts_dir = _venv_scripts_dir() if _is_windows() else None
 
     def _install(args: list[str]) -> None:
         _run_quarantined_install(
             install_cmd_prefix + args, env=env, scripts_dir=scripts_dir
         )
+
+    if group == "none":
+        _install(["install", "-e", "."])
+        _verify_core_dependencies_installed(
+            install_cmd_prefix, env=env, group=group
+        )
+        return
 
     try:
         _install(["install", "-e", f".[{group}]"])
