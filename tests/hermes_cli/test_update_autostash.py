@@ -1126,6 +1126,44 @@ def test_install_method_marker_not_autostashed_by_update(tmp_path):
     assert ".install_method" not in status
 
 
+def test_install_extras_marker_not_autostashed_by_update(tmp_path):
+    """The lean-install profile must survive the updater's untracked stash."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    repo_gitignore = Path(hermes_main.__file__).resolve().parents[1] / ".gitignore"
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True
+        )
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / ".gitignore").write_text(repo_gitignore.read_text())
+    (tmp_path / "tracked.txt").write_text("x\n")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    marker = tmp_path / ".install-extras"
+    marker.write_text("mcp,web\n")
+
+    git("stash", "push", "--include-untracked", "-m", "hermes-update-autostash")
+
+    assert marker.exists(), (
+        ".install-extras was swept into the update autostash — it must be listed "
+        "in .gitignore so a lean install retains its extras profile."
+    )
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=tmp_path, capture_output=True, text=True
+    ).stdout
+    assert ".install-extras" not in status
+
+
 # ---------------------------------------------------------------------------
 # Permission-denied autostash class: undeletable untracked files (root-owned
 # packaging/ etc.) must not abort the update when the stash entry was created.
