@@ -312,6 +312,94 @@ class TestBrowserCleanup:
         mock_terminate.assert_not_called()
         browser_tool._last_active_session_key.pop("task-1", None)
 
+    def test_warm_navigation_does_not_succeed_after_snapshot_timeout(
+        self, tmp_path
+    ):
+        browser_tool = self.browser_tool
+        session_info = {
+            "session_name": "cdp_snapshot_timeout",
+            "cdp_url": "ws://relay/devtools/browser/snapshot-timeout",
+            "_first_nav": False,
+        }
+        browser_tool._active_sessions["task-1"] = session_info
+        browser_tool._session_last_activity["task-1"] = 123.0
+
+        open_proc = MagicMock()
+        open_proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="agent-browser", timeout=1),
+            None,
+        ]
+        snapshot_proc = MagicMock()
+        snapshot_proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="agent-browser", timeout=5),
+            None,
+        ]
+        real_run = browser_tool._run_browser_command
+
+        def run_command(task_id, command, args=None, timeout=None, **kwargs):
+            if command in {"open", "snapshot"}:
+                return real_run(
+                    task_id,
+                    command,
+                    args,
+                    timeout,
+                    **kwargs,
+                )
+            assert command == "eval"
+            assert browser_tool._active_sessions.get(task_id) is session_info
+            return {
+                "success": True,
+                "data": {
+                    "result": json.dumps({
+                        "readyState": "complete",
+                        "url": "https://example.com/",
+                        "title": "Example Domain",
+                    }),
+                },
+            }
+
+        with (
+            patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)),
+            patch("tools.browser_tool._find_agent_browser", return_value="/bin/true"),
+            patch(
+                "tools.browser_tool._requires_real_termux_browser_install",
+                return_value=False,
+            ),
+            patch("tools.browser_tool._is_local_mode", return_value=False),
+            patch("tools.browser_tool._is_local_backend", return_value=True),
+            patch("tools.browser_tool._is_camofox_mode", return_value=False),
+            patch("tools.browser_tool.check_website_access", return_value=None),
+            patch("tools.browser_tool._get_session_info", return_value=session_info),
+            patch("tools.browser_tool._get_navigation_timeout", return_value=1),
+            patch("tools.browser_tool._write_owner_pid"),
+            patch(
+                "tools.browser_tool.subprocess.Popen",
+                side_effect=[open_proc, snapshot_proc],
+            ),
+            patch(
+                "tools.browser_tool._terminate_timed_out_browser_daemon",
+                return_value=True,
+            ) as mock_terminate,
+            patch("tools.browser_tool._get_browser_engine", return_value="auto"),
+            patch("tools.browser_tool._recover_omnio_browser", return_value=False),
+            patch("tools.browser_tool._run_browser_command", side_effect=run_command),
+        ):
+            result = json.loads(
+                browser_tool.browser_navigate(
+                    "https://example.com",
+                    task_id="task-1",
+                )
+            )
+
+        assert result == {
+            "success": False,
+            "error": "Command timed out after 1 seconds",
+        }
+        assert "task-1" not in browser_tool._active_sessions
+        assert "task-1" not in browser_tool._session_last_activity
+        mock_terminate.assert_called_once()
+        browser_tool._last_active_session_key.pop("task-1", None)
+
     def test_warm_navigation_timeout_cleans_up_after_failed_readiness_probe(
         self, tmp_path
     ):

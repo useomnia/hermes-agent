@@ -2049,6 +2049,19 @@ def _reset_deferred_navigation_session(
     _reset_browser_session_after_timeout(task_id, session_info, socket_dir)
 
 
+def _deferred_navigation_session_is_active(
+    task_id: str,
+    result: Dict[str, Any],
+) -> bool:
+    """Check that a readiness probe has not reset its deferred session."""
+    cleanup_target = result.get("_deferred_timeout_cleanup")
+    if cleanup_target is None:
+        return True
+    session_info, _socket_dir = cleanup_target
+    with _cleanup_lock:
+        return _active_sessions.get(task_id) is session_info
+
+
 def _reap_orphaned_browser_sessions():
     """Scan for orphaned agent-browser daemon processes from previous runs.
 
@@ -3308,6 +3321,14 @@ def _probe_navigation_readiness(
         ],
         timeout=READINESS_PROBE_TIMEOUT,
     )
+    if not _deferred_navigation_session_is_active(task_id, open_result):
+        open_result.pop("_deferred_timeout_cleanup", None)
+        logger.warning(
+            "Navigation readiness eval reset the deferred browser session; "
+            "preserving the open failure (task=%s)",
+            task_id,
+        )
+        return None
     probe = _decode_navigation_probe(eval_result)
 
     snapshot_result = _run_browser_command(
@@ -3316,6 +3337,14 @@ def _probe_navigation_readiness(
         ["-c"],
         timeout=READINESS_PROBE_TIMEOUT,
     )
+    if not _deferred_navigation_session_is_active(task_id, open_result):
+        open_result.pop("_deferred_timeout_cleanup", None)
+        logger.warning(
+            "Navigation readiness snapshot reset the deferred browser session; "
+            "preserving the open failure (task=%s)",
+            task_id,
+        )
+        return None
     snapshot_data = snapshot_result.get("data")
     if not isinstance(snapshot_data, dict):
         snapshot_data = {}
