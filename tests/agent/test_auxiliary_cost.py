@@ -1,167 +1,76 @@
-"""Tests for auxiliary-LLM cost accounting (Omnio).
+"""Regression coverage for Omnio auxiliary-LLM cost accounting."""
 
-Auxiliary calls (vision, web_extract summarizer, compression, title-gen, ...) are
-priced and added to the CURRENT session's `estimated_cost_usd` in state.db so a
-reader summing the session tree sees agent + auxiliary cost together. These pin:
-  - the happy path writes the priced cost (+ tokens) to the active session;
-  - every no-op guard (no context, no session, no usage, unknown/zero price);
-  - accounting never raises;
-  - `_validate_llm_response` (the single return chokepoint) triggers accounting.
-"""
-
-from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-import agent.auxiliary_client as ac
+from agent.aux_accounting import (
+    record_aux_usage,
+    reset_accounting_context,
+    set_accounting_context,
+)
 
 
-def _response(*, model="google/gemini-3.1-flash-lite", usage=True, cost=None):
-    """A minimal OpenAI-shaped response with the .choices[0].message shape the
-    validator requires, plus optional .usage / .model for pricing. Pass `cost`
-    to simulate OpenRouter's usage-accounting `usage.cost` (provider-reported)."""
-    resp = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))],
-        model=model,
-    )
-    if usage:
-        resp.usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
-        if cost is not None:
-            resp.usage.cost = cost
-    return resp
+def _response(*, reported_cost=None):
+    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
+    if reported_cost is not None:
+        usage.cost = reported_cost
+    return SimpleNamespace(model="google/gemini-3.1-flash-lite", usage=usage)
 
 
-def _canonical():
-    return SimpleNamespace(
-        input_tokens=10,
-        output_tokens=5,
-        cache_read_tokens=0,
-        cache_write_tokens=0,
-        reasoning_tokens=0,
-    )
-
-
-@pytest.fixture(autouse=True)
-def _reset_ctx():
-    """ContextVars persist within a thread across tests — reset to the default so
-    each test controls the in-flight request identity deterministically."""
-    ac._AUX_COST_CTX.set(None)
-    yield
-    ac._AUX_COST_CTX.set(None)
-
-
-def _patch_pricing(amount_usd):
-    """Patch the lazily-imported pricing helpers to deterministic values."""
-    cost = SimpleNamespace(amount_usd=amount_usd, status="estimated", source="catalog")
-    return (
-        patch("agent.usage_pricing.normalize_usage", return_value=_canonical()),
-        patch("agent.usage_pricing.estimate_usage_cost", return_value=cost),
-    )
-
-
-def test_should_add_priced_cost_to_the_current_session():
-    ac._AUX_COST_CTX.set(("openrouter", "google/gemini-3.1-flash-lite", "https://openrouter.ai/api/v1", "k"))
+def test_should_persist_estimate_as_complete_billable_cost_when_provider_omits_cost(
+    monkeypatch,
+):
     db = MagicMock()
-    norm, est = _patch_pricing(Decimal("0.0012"))
-    with norm, est, \
-        patch("gateway.session_context.get_session_env", return_value="sess-1"), \
-        patch.object(ac, "_get_aux_cost_session_db", return_value=db):
-        ac._account_auxiliary_cost(_response())
+    monkeypatch.setattr(
+        "agent.usage_pricing.estimate_usage_cost",
+        lambda *args, **kwargs: SimpleNamespace(
+            amount_usd=0.0012, status="estimated", source="catalog"
+        ),
+    )
+    token = set_accounting_context(db, "sess-1")
+    try:
+        record_aux_usage(_response(), "vision", provider="openrouter")
+    finally:
+        reset_accounting_context(token)
 
-    db.update_token_counts.assert_called_once()
-    call = db.update_token_counts.call_args
-    assert call.args[0] == "sess-1"  # attributed to the active session
+    call = db.record_auxiliary_usage.call_args
     assert call.kwargs["estimated_cost_usd"] == pytest.approx(0.0012)
-    # No provider-reported cost on this response, so actual_cost_usd carries the
-    # ESTIMATE — keeping the row's billable total complete for the proxy's per-row
-    # COALESCE(actual, estimated) — while cost_status stays "estimated".
     assert call.kwargs["actual_cost_usd"] == pytest.approx(0.0012)
     assert call.kwargs["cost_status"] == "estimated"
-    assert call.kwargs["input_tokens"] == 10
-    assert call.kwargs["output_tokens"] == 5
-    assert call.kwargs["api_call_count"] == 1
-    assert call.kwargs["model"] == "google/gemini-3.1-flash-lite"
 
 
-def test_should_prefer_reported_cost_over_estimate_for_actual():
-    # When OpenRouter reports a real usage.cost, actual_cost_usd is the REPORTED
-    # figure (not the estimate) and cost_status flips to actual.
-    ac._AUX_COST_CTX.set(("openrouter", "google/gemini-3.1-flash-lite", "https://openrouter.ai/api/v1", "k"))
+def test_should_prefer_provider_reported_cost_for_complete_billable_cost(monkeypatch):
     db = MagicMock()
-    norm, est = _patch_pricing(Decimal("0.0012"))
-    with norm, est, \
-        patch("gateway.session_context.get_session_env", return_value="sess-1"), \
-        patch.object(ac, "_get_aux_cost_session_db", return_value=db):
-        ac._account_auxiliary_cost(_response(cost=0.0033))
+    monkeypatch.setattr(
+        "agent.usage_pricing.estimate_usage_cost",
+        lambda *args, **kwargs: SimpleNamespace(
+            amount_usd=0.0012, status="estimated", source="catalog"
+        ),
+    )
+    token = set_accounting_context(db, "sess-1")
+    try:
+        record_aux_usage(
+            _response(reported_cost=0.0033),
+            "vision",
+            provider="openrouter",
+        )
+    finally:
+        reset_accounting_context(token)
 
-    call = db.update_token_counts.call_args
-    assert call.kwargs["actual_cost_usd"] == pytest.approx(0.0033)
+    call = db.record_auxiliary_usage.call_args
     assert call.kwargs["estimated_cost_usd"] == pytest.approx(0.0012)
+    assert call.kwargs["actual_cost_usd"] == pytest.approx(0.0033)
     assert call.kwargs["cost_status"] == "actual"
     assert call.kwargs["cost_source"] == "provider_cost_api"
 
 
-def test_should_noop_when_no_request_context_is_set():
-    # _AUX_COST_CTX defaults to None (reset by the fixture) — nothing to price.
+def test_should_swallow_storage_errors_so_accounting_cannot_break_the_call():
     db = MagicMock()
-    with patch.object(ac, "_get_aux_cost_session_db", return_value=db):
-        ac._account_auxiliary_cost(_response())
-    db.update_token_counts.assert_not_called()
-
-
-def test_should_noop_when_there_is_no_active_session():
-    ac._AUX_COST_CTX.set(("openrouter", "m", "u", "k"))
-    db = MagicMock()
-    norm, est = _patch_pricing(Decimal("0.0012"))
-    with norm, est, \
-        patch("gateway.session_context.get_session_env", return_value=""), \
-        patch.object(ac, "_get_aux_cost_session_db", return_value=db):
-        ac._account_auxiliary_cost(_response())
-    db.update_token_counts.assert_not_called()
-
-
-def test_should_noop_when_the_response_has_no_usage():
-    ac._AUX_COST_CTX.set(("openrouter", "m", "u", "k"))
-    db = MagicMock()
-    with patch("gateway.session_context.get_session_env", return_value="sess-1"), \
-        patch.object(ac, "_get_aux_cost_session_db", return_value=db):
-        ac._account_auxiliary_cost(_response(usage=False))
-    db.update_token_counts.assert_not_called()
-
-
-@pytest.mark.parametrize("amount", [None, Decimal("0"), Decimal("-0.5")])
-def test_should_noop_when_price_is_unknown_or_nonpositive(amount):
-    # Unknown price (None) or subscription-included / zero ⇒ nothing to add.
-    ac._AUX_COST_CTX.set(("openrouter", "m", "u", "k"))
-    db = MagicMock()
-    norm, est = _patch_pricing(amount)
-    with norm, est, \
-        patch("gateway.session_context.get_session_env", return_value="sess-1"), \
-        patch.object(ac, "_get_aux_cost_session_db", return_value=db):
-        ac._account_auxiliary_cost(_response())
-    db.update_token_counts.assert_not_called()
-
-
-def test_should_swallow_errors_so_accounting_never_breaks_a_call():
-    ac._AUX_COST_CTX.set(("openrouter", "m", "u", "k"))
-    norm = patch("agent.usage_pricing.normalize_usage", side_effect=RuntimeError("boom"))
-    with norm, patch("gateway.session_context.get_session_env", return_value="sess-1"):
-        # Must not raise.
-        ac._account_auxiliary_cost(_response())
-
-
-def test_validate_llm_response_should_trigger_accounting_on_success():
-    # The single return chokepoint accounts the cost of every validated response.
-    with patch.object(ac, "_account_auxiliary_cost") as spy:
-        resp = _response()
-        assert ac._validate_llm_response(resp, "vision") is resp
-        spy.assert_called_once_with(resp)
-
-
-def test_validate_llm_response_should_not_account_an_invalid_response():
-    with patch.object(ac, "_account_auxiliary_cost") as spy:
-        with pytest.raises(RuntimeError):
-            ac._validate_llm_response(SimpleNamespace(), "vision")  # no .choices
-        spy.assert_not_called()
+    db.record_auxiliary_usage.side_effect = RuntimeError("disk full")
+    token = set_accounting_context(db, "sess-1")
+    try:
+        record_aux_usage(_response(), "vision", provider="openrouter")
+    finally:
+        reset_accounting_context(token)

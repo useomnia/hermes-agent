@@ -100,7 +100,11 @@ def record_aux_usage(
         if raw_usage is None:
             return
 
-        from agent.usage_pricing import estimate_usage_cost, normalize_usage
+        from agent.usage_pricing import (
+            estimate_usage_cost,
+            extract_provider_cost_usd,
+            normalize_usage,
+        )
 
         usage = normalize_usage(raw_usage, provider=provider)
         if not (
@@ -112,14 +116,21 @@ def record_aux_usage(
 
         model = str(getattr(response, "model", "") or "") or "unknown"
         estimated_cost = None
+        estimated_status = None
+        estimated_source = None
         try:
             cost = estimate_usage_cost(
                 model, usage, provider=provider, base_url=base_url
             )
             if cost.amount_usd is not None:
                 estimated_cost = float(cost.amount_usd)
+                estimated_status = cost.status
+                estimated_source = cost.source
         except Exception:
             logger.debug("Aux usage cost estimation failed", exc_info=True)
+
+        reported_cost = extract_provider_cost_usd(raw_usage)
+        billable_cost = reported_cost if reported_cost is not None else estimated_cost
 
         session_db.record_auxiliary_usage(
             session_id,
@@ -133,6 +144,13 @@ def record_aux_usage(
             cache_write_tokens=usage.cache_write_tokens,
             reasoning_tokens=usage.reasoning_tokens,
             estimated_cost_usd=estimated_cost,
+            actual_cost_usd=billable_cost,
+            cost_status="actual" if reported_cost is not None else (
+                estimated_status if estimated_cost is not None else None
+            ),
+            cost_source=(
+                "provider_cost_api" if reported_cost is not None else estimated_source
+            ),
         )
     except Exception:
         logger.debug("Aux usage recording failed (non-fatal)", exc_info=True)

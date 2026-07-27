@@ -18,8 +18,8 @@ def db(tmp_path):
     return SessionDB(tmp_path / "state.db")
 
 
-def _mk_response(model="aux-model", prompt=100, completion=20):
-    return SimpleNamespace(
+def _mk_response(model="aux-model", prompt=100, completion=20, cost=None):
+    response = SimpleNamespace(
         model=model,
         usage=SimpleNamespace(
             prompt_tokens=prompt,
@@ -28,6 +28,9 @@ def _mk_response(model="aux-model", prompt=100, completion=20):
         ),
         choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
     )
+    if cost is not None:
+        response.usage.cost = cost
+    return response
 
 
 def _usage_rows(db, session_id):
@@ -206,6 +209,36 @@ class TestAmbientAccountingContext:
         assert rows[0]["model"] == "aux-m"
         assert rows[0]["input_tokens"] == 100
         assert rows[0]["output_tokens"] == 20
+
+    def test_record_aux_usage_prefers_provider_reported_cost(self, db, monkeypatch):
+        from agent.aux_accounting import (
+            record_aux_usage,
+            reset_accounting_context,
+            set_accounting_context,
+        )
+
+        db.create_session("s1", source="cli")
+        monkeypatch.setattr(
+            "agent.usage_pricing.estimate_usage_cost",
+            lambda *args, **kwargs: SimpleNamespace(
+                amount_usd=0.0012, status="estimated", source="catalog"
+            ),
+        )
+        token = set_accounting_context(db, "s1")
+        try:
+            record_aux_usage(
+                _mk_response(model="aux-m", cost=0.0033),
+                "vision",
+                provider="openrouter",
+            )
+        finally:
+            reset_accounting_context(token)
+
+        row = _usage_rows(db, "s1")[0]
+        assert row["estimated_cost_usd"] == pytest.approx(0.0012)
+        assert row["actual_cost_usd"] == pytest.approx(0.0033)
+        assert row["cost_status"] == "actual"
+        assert row["cost_source"] == "provider_cost_api"
 
     def test_noop_outside_context(self, db):
         from agent.aux_accounting import record_aux_usage

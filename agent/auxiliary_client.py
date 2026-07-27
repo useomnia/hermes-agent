@@ -7126,6 +7126,14 @@ def _build_call_kwargs(
             merged_extra["reasoning"] = {"enabled": True, "effort": effort}
     if provider == "nous" and "tags" not in merged_extra:
         merged_extra["tags"] = _nous_portal_tags()
+    if (
+        provider == "openrouter"
+        or base_url_host_matches(str(effective_base or ""), "openrouter.ai")
+    ):
+        merged_extra["usage"] = {"include": True}
+        provider_preferences = dict(merged_extra.get("provider") or {})
+        provider_preferences.setdefault("sort", "price")
+        merged_extra["provider"] = provider_preferences
     if merged_extra:
         kwargs["extra_body"] = merged_extra
 
