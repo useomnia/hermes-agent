@@ -3,10 +3,14 @@
 `Starting Hermes Gateway...` is the first thing the gateway logs, and everything
 before it — interpreter startup, the CLI's import graph, argument parsing, the
 lazy import of the gateway and agent modules, building the gateway itself — is
-invisible. On a freshly provisioned sandbox that window measures ~9.9 s, of which
-only ~0.5 s is reaching the CLI entry point, so the cost is in the preamble that
-follows rather than in import weight; a cold read of a 12 MB shared object on the
-same box runs at 1090 MB/s, so it is not first-read cost either.
+invisible. On a freshly provisioned sandbox that window measures ~10-11 s.
+
+Import weight is not the cause: reaching the CLI entry point is ~0.5-1.0 s, the
+lazy `gateway.run` import ~20 ms, and a cold read of a 12 MB shared object on the
+same box runs at 1090 MB/s, so it is not first-read cost either. Measured with
+the checkpoints below, the window is dominated by work rather than loading —
+~2.5 s in the cold bundled-skills sync, and ~7.3 s inside `start_gateway` before
+it logs anything.
 
 Checkpoints stamped along the way turn one opaque number into a breakdown. Each
 records the process's age when it was reached, so consecutive differences are the
