@@ -4981,9 +4981,6 @@ class SessionDB:
         actual_cost_usd: Optional[float] = None,
         cost_status: Optional[str] = None,
         cost_source: Optional[str] = None,
-        actual_cost_usd: Optional[float] = None,
-        cost_status: Optional[str] = None,
-        cost_source: Optional[str] = None,
         pricing_version: Optional[str] = None,
         billing_provider: Optional[str] = None,
         billing_base_url: Optional[str] = None,
@@ -5267,6 +5264,9 @@ class SessionDB:
         cache_write_tokens: int = 0,
         reasoning_tokens: int = 0,
         estimated_cost_usd: Optional[float] = None,
+        actual_cost_usd: Optional[float] = None,
+        cost_status: Optional[str] = None,
+        cost_source: Optional[str] = None,
     ) -> None:
         """Record an auxiliary LLM call's usage against *session_id* (issue #23270).
 
