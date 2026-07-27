@@ -724,6 +724,22 @@ class _FakeGoogleChatAdapter:
         return {"ok": True}
 
 
+@pytest.fixture(autouse=True)
+def close_response_stores_created_by_test(monkeypatch):
+    """Close every SQLite response store created during a test."""
+    stores = []
+    original_init = ResponseStore.__init__
+
+    def tracked_init(store, *args, **kwargs):
+        original_init(store, *args, **kwargs)
+        stores.append(store)
+
+    monkeypatch.setattr(ResponseStore, "__init__", tracked_init)
+    yield
+    for store in reversed(stores):
+        store.close()
+
+
 @pytest.fixture
 def adapter():
     return _make_adapter()
