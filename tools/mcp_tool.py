@@ -4088,12 +4088,18 @@ _parallel_safe_servers: set = set()
 # guessing.
 _mcp_tool_server_names: Dict[str, str] = {}
 
+# Omnia approval metadata captured from each live MCP tool registration.
+# Missing read-only hints are intentionally represented as ``None`` so the
+# connector gate can fail closed, while credit descriptors remain optional.
+_mcp_tool_read_only_hints: Dict[str, Optional[bool]] = {}
+_mcp_tool_credits_meta: Dict[str, Optional[dict]] = {}
+
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
 
 # Protects _mcp_loop, _mcp_thread, _servers, MCP connection status maps,
-# _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
+# _parallel_safe_servers, MCP tool provenance/metadata, and _stdio_pids.
 _lock = threading.Lock()
 
 # PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
@@ -5412,10 +5418,56 @@ def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
         _mcp_tool_server_names[tool_name] = safe_server_name
 
 
+def _track_mcp_tool_metadata(
+    tool_name: str,
+    *,
+    read_only_hint: Optional[bool],
+    credits: Optional[dict],
+) -> None:
+    """Capture approval metadata from one advertised MCP tool."""
+    with _lock:
+        _mcp_tool_read_only_hints[tool_name] = read_only_hint
+        _mcp_tool_credits_meta[tool_name] = credits
+
+
+def _track_mcp_tool_read_only(
+    tool_name: str, read_only_hint: Optional[bool]
+) -> None:
+    """Record one MCP tool's read-only annotation for the approval gate."""
+    with _lock:
+        _mcp_tool_read_only_hints[tool_name] = read_only_hint
+
+
+def _track_mcp_tool_credits(tool_name: str, credits: Optional[dict]) -> None:
+    """Record one MCP tool's Omnia credit-spend descriptor."""
+    with _lock:
+        _mcp_tool_credits_meta[tool_name] = credits
+
+
 def _forget_mcp_tool_server(tool_name: str) -> None:
-    """Forget MCP server provenance for a deregistered tool."""
+    """Forget MCP provenance and approval metadata for a deregistered tool."""
     with _lock:
         _mcp_tool_server_names.pop(tool_name, None)
+        _mcp_tool_read_only_hints.pop(tool_name, None)
+        _mcp_tool_credits_meta.pop(tool_name, None)
+
+
+def mcp_tool_is_read_only(tool_name: str) -> bool:
+    """Return whether a registered MCP tool explicitly advertises read-only."""
+    with _lock:
+        return _mcp_tool_read_only_hints.get(tool_name) is True
+
+
+def mcp_tool_has_read_only_hint(tool_name: str) -> bool:
+    """Return whether a registered MCP tool advertised ``readOnlyHint``."""
+    with _lock:
+        return tool_name in _mcp_tool_read_only_hints
+
+
+def mcp_tool_credits_meta(tool_name: str) -> Optional[dict]:
+    """Return the registered Omnia credit-spend descriptor, when present."""
+    with _lock:
+        return _mcp_tool_credits_meta.get(tool_name)
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -5554,6 +5606,17 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             description=schema["description"],
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
+        annotations = getattr(mcp_tool, "annotations", None)
+        tool_meta = getattr(mcp_tool, "meta", None)
+        _track_mcp_tool_metadata(
+            tool_name_prefixed,
+            read_only_hint=getattr(annotations, "readOnlyHint", None),
+            credits=(
+                tool_meta.get("omnia/credits")
+                if isinstance(tool_meta, dict)
+                else None
+            ),
+        )
         registered_names.append(tool_name_prefixed)
 
     # Register MCP Resources & Prompts utility tools, filtered by config and
