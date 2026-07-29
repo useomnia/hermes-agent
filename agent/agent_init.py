@@ -1264,6 +1264,14 @@ def init_agent(
     # are noisy.
     agent._environment_probe = bool(_agent_section.get("environment_probe", True))
 
+    # Prompt-content disclosure settings. Defaults preserve the full upstream
+    # prompt; embedders can suppress or replace runtime-internal identifiers.
+    agent._profile_hint = bool(_agent_section.get("profile_hint", True))
+    agent._terminal_backend_hint = bool(_agent_section.get("terminal_backend_hint", True))
+    agent._model_info_hint = bool(_agent_section.get("model_info_hint", True))
+    agent._agent_help_guidance = bool(_agent_section.get("agent_help_guidance", True))
+    agent._fallback_identity = str(_agent_section.get("fallback_identity", "") or "")
+
     # Per-platform prompt-hint overrides (config.yaml → platform_hints).
     # Lets an enterprise admin append to or replace Hermes' built-in
     # platform hint for a single messaging platform (e.g. WhatsApp) without
