@@ -1023,6 +1023,13 @@ DEFAULT_CONFIG = {
         # (docker/modal/ssh — they have their own probe).  Set False to
         # disable entirely.
         "environment_probe": True,
+        # Runtime-internal prompt hints and fallback identity. Embedders can
+        # customize these without changing upstream prompt behavior by default.
+        "profile_hint": True,
+        "terminal_backend_hint": True,
+        "model_info_hint": True,
+        "agent_help_guidance": True,
+        "fallback_identity": "",
         # Embedder-supplied environment description appended to the system
         # prompt's environment-hints block. Lets a host that wraps Hermes
         # (sandbox runner, managed platform) explain the runtime environment

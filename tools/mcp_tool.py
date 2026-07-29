@@ -3863,14 +3863,12 @@ def _handle_auth_error_and_retry(
 
         try:
             result = retry_call()
-            try:
-                parsed = json.loads(result)
-                if "error" not in parsed:
-                    _reset_server_error(server_name)
-                    return result
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)
-                return result
+            # A completed retry proves the reconnect and the transport
+            # both work — return it even when it carries an
+            # application-level error payload. Only a raising retry
+            # falls through to the needs_reauth path below.
+            _reset_server_error(server_name)
+            return result
         except Exception as retry_exc:
             logger.warning(
                 "MCP %s/%s retry after auth recovery failed: %s",
@@ -4059,14 +4057,10 @@ def _handle_session_expired_and_retry(
 
     try:
         result = retry_call()
-        try:
-            parsed = json.loads(result)
-            if "error" not in parsed:
-                _reset_server_error(server_name)
-                return result
-        except (json.JSONDecodeError, TypeError):
-            _reset_server_error(server_name)
-            return result
+        # A completed retry proves the rebuilt transport works — return
+        # it even when it carries an application-level error payload.
+        _reset_server_error(server_name)
+        return result
     except Exception as retry_exc:
         logger.warning(
             "MCP %s/%s retry after session reconnect failed: %s",
@@ -4722,15 +4716,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+            # The RPC round-trip completed, so the server is reachable —
+            # even when the payload is an application-level tool error
+            # (``result.isError``, e.g. a "not found" lookup). Only the
+            # transport-failure paths below count toward the breaker;
+            # sniffing the payload for an "error" key conflated the two
+            # and let a few bad-argument calls take a healthy server
+            # "offline" for the whole cooldown.
+            _reset_server_error(server_name)
             return result
         except InterruptedError:
             return _interrupted_call_result()

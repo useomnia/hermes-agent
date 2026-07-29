@@ -114,6 +114,141 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
         thread.start()
 
 
+def mcp_discovery_was_started() -> bool:
+    """True if a background discovery thread exists for this process.
+
+    ``start_background_mcp_discovery`` is a no-op when the cheap config probe
+    finds no ``mcp_servers``, so a caller that *depends* on discovery having run
+    (rather than merely benefiting from it) needs to know the difference between
+    "already finished" and "never started". Mirrors
+    ``tui_gateway.entry.mcp_discovery_in_flight``, but reports whether the thread
+    was ever created rather than whether it is still alive.
+    """
+    return _mcp_discovery_thread is not None
+
+
+# Join bound for callers that must not lose tools. Sized ABOVE
+# ``discover_mcp_tools``'s own internal 120s per-server wait rather than at
+# ``mcp_discovery_timeout`` (default 1.5s): the CLI/TUI accept a degraded first
+# prompt and repair it with the late-binding refresh, but the socket gateway used
+# to wait for discovery in full before serving at all, and its first turn
+# routinely needs every tool (an Omnio sandbox registers 221, of which 152 come
+# from a connectors server that takes ~2-3.5s to enumerate). Waiting long enough
+# to preserve that exactly is the point; the bound exists only so a wedged thread
+# can't hang a turn forever.
+AGENT_BUILD_JOIN_SECONDS = 130.0
+
+# Set once if a join ever exhausts its bound with discovery still running. That
+# bound is a backstop for a WEDGED discovery thread, and a wedged thread does not
+# recover — so charging it again to the next caller would turn one stuck server
+# into *every* later request paying the full bound and still getting a partial
+# registry. After the first exhaustion the process gives up for good and falls
+# back to the late-binding refresh, the same degradation the CLI and TUI have
+# always accepted. Written once, from whichever thread got there first; a benign
+# double-write only repeats the log line.
+_join_abandoned = False
+
+
+def _abandon_join() -> None:
+    global _join_abandoned
+
+    if _join_abandoned:
+        return
+    _join_abandoned = True
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "MCP discovery did not finish within %.0fs; giving up for this process. "
+        "Agents built from here on may start with an incomplete MCP tool registry "
+        "and rely on the late-binding refresh.",
+        AGENT_BUILD_JOIN_SECONDS,
+    )
+
+
+def ensure_mcp_discovery_complete(timeout: "float | None" = None) -> None:
+    """Block until MCP discovery has run, for callers that need the full registry.
+
+    ``AIAgent`` reads the tool registry ONCE at construction and never re-reads
+    it (see ``tools.mcp_tool.refresh_agent_mcp_tools``), so an agent built while
+    discovery is still in flight cannot call the missing tools for its whole
+    lifetime. Callers that would rather wait than lose tools use this;
+    ``wait_for_mcp_discovery`` remains the bounded, best-effort variant.
+
+    **Blocking — call it only from a worker thread.** Every current caller sits
+    inside an agent-building closure already dispatched through
+    ``run_in_executor``, so it never touches the loop thread carrying platform
+    heartbeats; putting it back on the loop would re-create #16856.
+
+    Never raises: a timed-out or failed join degrades to the existing
+    late-binding refresh rather than killing the turn. And it only ever times out
+    ONCE per process — see ``_join_abandoned``, which stops a permanently wedged
+    discovery thread from re-charging the full bound to every later agent build.
+    """
+    try:
+        if _join_startup_discovery(timeout):
+            return
+        # No thread was started — ``start_background_mcp_discovery`` skips when
+        # its cheap ``read_raw_config`` probe finds no ``mcp_servers``. That probe
+        # reads the raw file while discovery itself reads the migrated/merged
+        # config, so the two can in principle disagree. Discovering inline here
+        # means a caller cannot lose a server that a blocking discovery would
+        # have connected; it is idempotent, and a no-op for the overwhelmingly
+        # common "genuinely no MCP servers" case.
+        from tools.mcp_tool import discover_mcp_tools
+
+        discover_mcp_tools()
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).debug(
+            "MCP discovery join before agent build failed", exc_info=True
+        )
+
+
+def _join_startup_discovery(timeout: "float | None") -> bool:
+    """Join the startup discovery thread. False if there was never one.
+
+    Blocking; see ``ensure_mcp_discovery_complete`` for the thread-safety rules.
+    """
+    if not mcp_discovery_was_started():
+        return False
+    if _join_abandoned:
+        # An earlier caller already waited out the full bound on this thread and
+        # it never finished. Don't re-charge that wait.
+        return True
+    wait_for_mcp_discovery(timeout=AGENT_BUILD_JOIN_SECONDS if timeout is None else timeout)
+    thread = _mcp_discovery_thread
+    if timeout is None and thread is not None and thread.is_alive():
+        # Only the default bound retires the join. An explicit (smaller) timeout
+        # is a caller saying "wait this long", not evidence discovery is wedged.
+        _abandon_join()
+    return True
+
+
+def wait_for_startup_mcp_discovery(timeout: "float | None" = None) -> None:
+    """Join an in-flight startup discovery WITHOUT ever discovering inline.
+
+    For callers that are about to run their own ``discover_mcp_tools()`` and only
+    need the startup thread to be out of the way first — the MCP reload endpoint,
+    which must not overlap startup discovery because ``register_mcp_servers``
+    dedupes against connected servers but not against in-flight connects.
+
+    The distinction from ``ensure_mcp_discovery_complete`` matters: that one
+    discovers inline when no thread was started, which for a caller like reload
+    would connect servers BEFORE it snapshots the previous set — reporting an
+    empty ``added`` list and then tearing down and rebuilding what it just
+    connected.
+
+    **Blocking — call it only from a worker thread.**  Never raises.
+    """
+    try:
+        _join_startup_discovery(timeout)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).debug("MCP startup discovery join failed", exc_info=True)
+
+
 def _resolve_discovery_timeout(explicit: "float | None") -> float:
     """Resolve the MCP discovery wait bound: explicit arg > config > default.
 

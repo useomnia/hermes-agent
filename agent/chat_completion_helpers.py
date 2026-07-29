@@ -35,8 +35,9 @@ from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
 from agent.message_sanitization import (
-    _sanitize_surrogates,
     _repair_tool_call_arguments,
+    _sanitize_surrogates,
+    insert_ephemeral_messages,
 )
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
@@ -2011,10 +2012,11 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
-        if agent.prefill_messages:
-            sys_offset = 1 if effective_system else 0
-            for idx, pfm in enumerate(agent.prefill_messages):
-                api_messages.insert(sys_offset + idx, pfm.copy())
+        api_messages = insert_ephemeral_messages(
+            api_messages,
+            agent.prefill_messages,
+            before_current_user=getattr(agent, "_prefill_before_current_user", False),
+        )
 
         # Same safety net as the main loop: repair tool-call/result
         # pairing before asking for a final summary.  Compression and

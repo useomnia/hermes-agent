@@ -5021,6 +5021,10 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     success = False
     try:
+        # Everything after this point is `start_gateway`'s own work — importing
+        # the gateway and agent modules, then building the gateway — up to the
+        # first line it logs.
+        _boot_mark("pre_start")
         success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
@@ -6622,6 +6626,17 @@ def _dispatch_all_via_service_manager_if_s6(action: str) -> bool:
 
 
 
+def _boot_mark(name: str) -> None:
+    """Stamp a boot checkpoint. Silent on any failure — the boot matters, the
+    measurement does not."""
+    try:
+        from hermes_cli.boot_clock import mark
+
+        mark(name)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def gateway_command(args):
     """Handle gateway subcommands."""
     try:
@@ -6759,6 +6774,8 @@ def _block_until_terminated() -> None:
 
 
 def _gateway_command_inner(args):
+    _boot_mark("dispatch")
+
     subcmd = getattr(args, "gateway_command", None)
 
     # Default to run if no subcommand

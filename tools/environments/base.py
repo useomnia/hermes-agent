@@ -556,7 +556,13 @@ class BaseEnvironment(ABC):
         # static path is shell-quoted (Windows/Git-Bash drive letters, spaces)
         # with ``$BASHPID`` left outside the quotes so it still expands.
         _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # Backends may return a temp dir that does not exist yet (or that a
+        # sandbox restart wipes). Recreate it before writing session state.
+        _quoted_temp_dir = self._quote_shell_path(
+            self.get_temp_dir().rstrip("/") or "/"
+        )
         bootstrap = (
+            f"mkdir -p {_quoted_temp_dir} 2>/dev/null || true\n"
             f"umask 077\n"
             f"{_export_dump_excluding_session_vars(_snap_tmp)}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
@@ -671,8 +677,16 @@ class BaseEnvironment(ABC):
         # writers never share a temp name and clobber each other before the mv.
         # Static path shell-quoted (Windows/spaces); ``$BASHPID`` left to expand.
         _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        _quoted_temp_dir = self._quote_shell_path(
+            self.get_temp_dir().rstrip("/") or "/"
+        )
 
         parts = []
+
+        # Recreate the session temp dir if a sandbox restart wiped it — the
+        # snapshot / cwd writes below fail otherwise, and a failed `>` prints
+        # to stderr before any `2>/dev/null` on the same command applies.
+        parts.append(f"mkdir -p {_quoted_temp_dir} 2>/dev/null || true")
 
         # Source snapshot (env vars from previous commands).
         # Redirect stdout to /dev/null: on macOS (bash 3.2 and certain

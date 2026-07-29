@@ -5,6 +5,8 @@ import http.client
 import json
 import logging
 import stat
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,6 +33,9 @@ _MAX_ERROR_BYTES = 4096
 _MAX_SKILL_FILE_BYTES = 2 * 1024 * 1024
 _MAX_SKILL_BATCH_FILES = 200
 _MAX_SKILL_BATCH_BYTES = 16 * 1024 * 1024
+_MAX_FILE_CONTENT_BYTES = 2 * 1024 * 1024
+_EXEC_PREDISPATCH_RETRY_DELAYS_SECONDS = (2.0, 4.0)
+_EXEC_RETRY_MIN_REQUEST_BUDGET_SECONDS = 1.0
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -70,24 +75,30 @@ class SpritesToolboxError(RuntimeError):
     command_started: bool | None
     request_id: str | None
     http_status: int | None
+    detail: str | None
+    request_cwd: str | None
 
     def __init__(
         self,
         message: str,
         *,
+        detail: str | None = None,
         code: str | None = None,
         phase: str | None = None,
         retryable: bool = False,
         command_started: bool | None = None,
         request_id: str | None = None,
         http_status: int | None = None,
+        request_cwd: str | None = None,
     ):
+        self.detail = detail
         self.code = code
         self.phase = phase
         self.retryable = retryable
         self.command_started = command_started
         self.request_id = request_id
         self.http_status = http_status
+        self.request_cwd = request_cwd
 
         details = []
         if code:
@@ -114,6 +125,8 @@ def _toolbox_error_from_payload(
     *,
     http_status: int | None = None,
     fallback_message: str = "Toolbox request failed",
+    raw_body: str | None = None,
+    request_cwd: str | None = None,
 ) -> SpritesToolboxError:
     error_payload = payload.get("error")
     if isinstance(error_payload, dict):
@@ -147,14 +160,48 @@ def _toolbox_error_from_payload(
         prefix += f" failed with HTTP {http_status}"
 
     return SpritesToolboxError(
-        f"{prefix}: {message}",
+        f"{prefix}: {raw_body if raw_body is not None else message}",
+        detail=message,
         code=code,
         phase=phase,
         retryable=retryable,
         command_started=command_started,
         request_id=request_id,
         http_status=http_status,
+        request_cwd=request_cwd,
     )
+
+
+def _should_retry_exec_predispatch(error: SpritesToolboxError) -> bool:
+    return (
+        error.http_status == 503
+        and error.retryable is True
+        and error.command_started is False
+    )
+
+
+def render_sprites_toolbox_error(
+    error: SpritesToolboxError,
+    *,
+    service: str,
+    action: str,
+    context: str,
+) -> str:
+    """Render a concise model-facing error while preserving ``error`` for logs."""
+    status = error.http_status
+    if status is not None and 400 <= status < 500:
+        detail = error.detail or "the toolbox rejected the request"
+        return f"{action} not run: {context} - {detail}"
+
+    if status is None or status >= 500:
+        code = f", code={error.code}" if error.code else ""
+        return (
+            f"{service} temporarily unavailable "
+            f"(infrastructure issue{code}); retry shortly"
+        )
+
+    detail = error.detail or "the toolbox rejected the request"
+    return f"{action} not run: {context} - {detail}"
 
 
 class SpritesEnvironment(BaseEnvironment):
@@ -198,6 +245,9 @@ class SpritesEnvironment(BaseEnvironment):
         *,
         timeout: int | None = None,
         method: str = "POST",
+        retry_exec_predispatch: bool = False,
+        retry_deadline_seconds: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         data = None
         headers = {
@@ -208,39 +258,107 @@ class SpritesEnvironment(BaseEnvironment):
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
 
-        request = urllib.request.Request(
-            f"{self.toolbox_url}{path}",
-            data=data,
-            headers=headers,
-            method=method,
+        retry_count = 0
+        retry_deadline = (
+            time.monotonic() + retry_deadline_seconds
+            if retry_deadline_seconds is not None
+            else None
         )
-        try:
-            with _URL_OPENER.open(request, timeout=timeout or self.timeout) as response:
-                raw_body = response.read(_MAX_RESPONSE_BYTES + 1)
-        except urllib.error.HTTPError as exc:
-            body = exc.read(_MAX_ERROR_BYTES).decode("utf-8", errors="replace")
+        request_cwd = (
+            _optional_string(payload.get("cwd"))
+            if path == "/exec" and isinstance(payload, dict)
+            else None
+        )
+        while True:
+            request = urllib.request.Request(
+                f"{self.toolbox_url}{path}",
+                data=data,
+                headers=headers,
+                method=method,
+            )
             try:
-                parsed = json.loads(body)
-            except json.JSONDecodeError:
-                parsed = None
-            if isinstance(parsed, dict):
-                error = _toolbox_error_from_payload(
-                    path,
-                    parsed,
-                    http_status=exc.code,
-                    fallback_message=body or str(exc.reason),
-                )
-            else:
-                error = SpritesToolboxError(
-                    f"Toolbox API {path} failed with HTTP {exc.code}: "
-                    f"{body or exc.reason}",
-                    http_status=exc.code,
-                )
-            raise error from exc
-        except urllib.error.URLError as exc:
-            raise SpritesToolboxError(f"Toolbox API {path} is unreachable: {exc}") from exc
-        except (OSError, http.client.HTTPException) as exc:
-            raise SpritesToolboxError(f"Toolbox API {path} is unreachable: {exc}") from exc
+                with _URL_OPENER.open(request, timeout=timeout or self.timeout) as response:
+                    raw_body = response.read(_MAX_RESPONSE_BYTES + 1)
+                break
+            except urllib.error.HTTPError as exc:
+                body = exc.read(_MAX_ERROR_BYTES).decode("utf-8", errors="replace")
+                try:
+                    parsed = json.loads(body)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    error = _toolbox_error_from_payload(
+                        path,
+                        parsed,
+                        http_status=exc.code,
+                        fallback_message=body or str(exc.reason),
+                        raw_body=body,
+                        request_cwd=request_cwd,
+                    )
+                else:
+                    detail = body or str(exc.reason)
+                    error = SpritesToolboxError(
+                        f"Toolbox API {path} failed with HTTP {exc.code}: "
+                        f"{detail}",
+                        detail=detail,
+                        http_status=exc.code,
+                        request_cwd=request_cwd,
+                    )
+
+                if (
+                    retry_exec_predispatch
+                    and path == "/exec"
+                    and retry_count < len(_EXEC_PREDISPATCH_RETRY_DELAYS_SECONDS)
+                    and _should_retry_exec_predispatch(error)
+                ):
+                    delay = _EXEC_PREDISPATCH_RETRY_DELAYS_SECONDS[retry_count]
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise error from exc
+                    if (
+                        retry_deadline is not None
+                        and time.monotonic()
+                        + delay
+                        + _EXEC_RETRY_MIN_REQUEST_BUDGET_SECONDS
+                        > retry_deadline
+                    ):
+                        raise error from exc
+
+                    retry_count += 1
+                    logger.warning(
+                        "Retrying Toolbox API %s after retryable pre-dispatch HTTP 503 "
+                        "in %.1fs (retry %d/%d, code=%s, phase=%s, requestId=%s)",
+                        path,
+                        delay,
+                        retry_count,
+                        len(_EXEC_PREDISPATCH_RETRY_DELAYS_SECONDS),
+                        error.code,
+                        error.phase,
+                        error.request_id,
+                    )
+                    if cancel_event is None:
+                        time.sleep(delay)
+                    elif cancel_event.wait(delay):
+                        raise error from exc
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise error from exc
+                    if (
+                        retry_deadline is not None
+                        and time.monotonic()
+                        + _EXEC_RETRY_MIN_REQUEST_BUDGET_SECONDS
+                        > retry_deadline
+                    ):
+                        raise error from exc
+                    continue
+
+                raise error from exc
+            except urllib.error.URLError as exc:
+                raise SpritesToolboxError(
+                    f"Toolbox API {path} is unreachable: {exc}"
+                ) from exc
+            except (OSError, http.client.HTTPException) as exc:
+                raise SpritesToolboxError(
+                    f"Toolbox API {path} is unreachable: {exc}"
+                ) from exc
 
         if len(raw_body) > _MAX_RESPONSE_BYTES:
             raise SpritesToolboxError(
@@ -266,6 +384,25 @@ class SpritesEnvironment(BaseEnvironment):
 
     def get_temp_dir(self) -> str:
         return "/tmp/.hermes-session"
+
+    def write_file_content(self, path: str, content: str) -> bool:
+        """Write one UTF-8 file through `/files`, within its 2 MiB request cap."""
+        content_size = len(content.encode("utf-8"))
+        if content_size > _MAX_FILE_CONTENT_BYTES:
+            raise SpritesToolboxError(
+                f"Toolbox API /files write content exceeded "
+                f"{_MAX_FILE_CONTENT_BYTES} bytes ({content_size} bytes)"
+            )
+
+        response = self.file_request(
+            {
+                "operation": "write",
+                "path": path,
+                "content": content,
+                "encoding": "utf-8",
+            }
+        )
+        return not bool(response.get("error"))
 
     def _sprites_upload(self, host_path: str, remote_path: str) -> None:
         encoded, _size = self._encoded_skill(host_path, remote_path)
@@ -337,6 +474,8 @@ class SpritesEnvironment(BaseEnvironment):
         timeout: int = 120,
         stdin_data: str | None = None,
     ):
+        cancel_event = threading.Event()
+
         def exec_fn() -> tuple[str, int]:
             response = self._request_json(
                 "/exec",
@@ -348,6 +487,9 @@ class SpritesEnvironment(BaseEnvironment):
                     "timeoutSeconds": timeout,
                 },
                 timeout=timeout + 5,
+                retry_exec_predispatch=True,
+                retry_deadline_seconds=timeout,
+                cancel_event=cancel_event,
             )
             output = response.get("output", "")
             exit_code = response.get("returncode", response.get("exitCode", 0))
@@ -356,10 +498,14 @@ class SpritesEnvironment(BaseEnvironment):
                 and response["error"] is not None
                 and response["error"] != ""
             ):
-                raise _toolbox_error_from_payload("/exec", response)
+                raise _toolbox_error_from_payload(
+                    "/exec",
+                    response,
+                    request_cwd=self.cwd,
+                )
             return (str(output), int(exit_code))
 
-        return _ThreadedProcessHandle(exec_fn)
+        return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel_event.set)
 
     def cleanup(self):
         return None
@@ -373,7 +519,32 @@ class SpritesFileOperations(ShellFileOperations):
         self.env: SpritesEnvironment = terminal_env
 
     def _files(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self.env.file_request(payload)
+        try:
+            return self.env.file_request(payload)
+        except SpritesToolboxError as error:
+            operation = str(payload.get("operation", "unknown"))
+            path = payload.get("path")
+            if path is None and ("src" in payload or "dst" in payload):
+                path = f"{payload.get('src')} -> {payload.get('dst')}"
+            context = (
+                f"path {path!r}"
+                if path is not None
+                else f"cwd {self.env.cwd!r}"
+            )
+            logger.error(
+                "Toolbox file operation failed - Operation: %s - Error: %s: %s",
+                operation,
+                type(error).__name__,
+                error,
+            )
+            return {
+                "error": render_sprites_toolbox_error(
+                    error,
+                    service="file tools",
+                    action="file operation",
+                    context=context,
+                )
+            }
 
     def read_file(self, path: str, offset: int = 1, limit: int = 500) -> ReadResult:
         from tools.file_operations import normalize_read_pagination

@@ -2692,9 +2692,14 @@ def cmd_chat(args):
 
 def cmd_gateway(args):
     """Gateway management commands."""
+    from hermes_cli.boot_clock import mark
+
     _sync_bundled_skills_quietly()
+    mark("skills")
 
     from hermes_cli.gateway import gateway_command
+
+    mark("cli_import")
 
     gateway_command(args)
 
@@ -15489,6 +15494,12 @@ def cmd_claw(args):
 
 def main():
     """Main entry point for hermes CLI."""
+    # First statement: everything before it (interpreter startup and this
+    # module's import graph) is otherwise unmeasurable from inside the process.
+    from hermes_cli.boot_clock import mark
+
+    mark("main")
+
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()

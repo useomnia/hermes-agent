@@ -637,9 +637,12 @@ BROWSER_CDP_SCHEMA: Dict[str, Any] = {
 def _browser_cdp_check() -> bool:
     """Availability check for browser_cdp.
 
-    The tool is offered when a static CDP endpoint is configured via
+    The tool is only offered when a static CDP URL is configured — via
     ``/browser connect`` (``BROWSER_CDP_URL``) or ``browser.cdp_url`` in
-    ``config.yaml``. Reachability is checked lazily when the tool connects.
+    ``config.yaml``. Configuration, not liveness: the endpoint's health at
+    registration says nothing about its health when the model calls the tool,
+    and probing it here stalls registration whenever the browser host has not
+    come up yet.
 
     Backends that do *not* currently expose CDP to us — Camofox (REST-only),
     the default local agent-browser mode (Playwright hides its internal CDP
@@ -661,6 +664,10 @@ def _browser_cdp_check() -> bool:
         return False
     if not check_browser_requirements():
         return False
+    # Whether the tool is OFFERED depends only on an override being configured.
+    # Probing the endpoint here would stall tool registration whenever the
+    # browser host is not up yet, and would gate the tool on liveness at a
+    # moment that says nothing about liveness at call time.
     return bool(_get_cdp_override_raw())
 
 

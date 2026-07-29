@@ -3422,7 +3422,24 @@ def run_job(
         # register_mcp_servers(). Non-fatal on failure: a broken MCP server
         # shouldn't kill an otherwise-working cron job. See #4219.
         try:
+            # Join the gateway's background startup discovery rather than starting a
+            # second one. `register_mcp_servers()` dedupes only against servers
+            # already CONNECTED (`k not in _servers`), not against ones still
+            # connecting, so a job due on the first ticker iteration could otherwise
+            # connect the same server the startup thread is mid-handshake with —
+            # duplicate stdio children, with the later connection overwriting the
+            # first. `ensure_mcp_discovery_complete` falls back to a direct
+            # `discover_mcp_tools()` when no startup thread exists, which is the
+            # standalone-cron case this code was written for. Blocking is fine here:
+            # `run_job` is dispatched to the parallel/sequential ThreadPoolExecutor,
+            # never run on the ticker or gateway loop thread.
+            from hermes_cli.mcp_startup import ensure_mcp_discovery_complete
             from tools.mcp_tool import discover_mcp_tools
+
+            ensure_mcp_discovery_complete()
+            # Unchanged from before, and now genuinely idempotent: with startup
+            # discovery joined, every configured server is already in `_servers`,
+            # so this finds no new servers and just returns the connected set.
             _mcp_tools = discover_mcp_tools()
             if _mcp_tools:
                 logger.info(

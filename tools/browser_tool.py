@@ -512,15 +512,21 @@ def _resolve_cdp_override(cdp_url: str) -> str:
 
 
 def _get_cdp_override_raw() -> str:
-    """Return the configured CDP URL override without network I/O.
+    """Return the CONFIGURED CDP URL override verbatim, or empty string.
 
     Precedence is:
     1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
     2. ``browser.cdp_url`` in config.yaml (persistent config)
 
-    Use this helper for availability and routing decisions. Resolving an HTTP
-    discovery endpoint can block, so only connection paths should call
-    :func:`_get_cdp_override`.
+    When either is set, we skip both Browserbase and the local headless
+    launcher and connect directly to the supplied Chrome DevTools Protocol
+    endpoint.
+
+    Pure configuration lookup: no network, no blocking. Callers that only need
+    to know WHICH BACKEND is configured must use this rather than
+    `_get_cdp_override`, whose discovery probe answers a different question
+    (is the endpoint live, and what is its concrete websocket) at the cost of
+    seconds when the endpoint is not up yet.
     """
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
@@ -540,7 +546,20 @@ def _get_cdp_override_raw() -> str:
 
 
 def _get_cdp_override() -> str:
-    """Return a normalized, connectable CDP URL override, or empty string."""
+    """Return the configured CDP override RESOLVED to a connectable websocket.
+
+    Discovery is a network probe, so this belongs at the point where a browser
+    connection is actually made — never on a routing or capability check, which
+    only needs to know that an override is configured (`_get_cdp_override_raw`).
+    The endpoint frequently is not listening yet when the agent boots (the paired
+    Toolbox that hosts Chrome comes up on its own schedule), and every probe that
+    finds nothing costs the retry ladder in `_resolve_cdp_override`.
+
+    Resolution is deliberately NOT cached. The websocket it returns is bound to
+    one browser INSTANCE (`/devtools/browser/<guid>`), so a value memoized here
+    would outlive a Chrome restart behind an unchanged discovery URL and hand out
+    a dead endpoint. Discovery is cheap once it is only reached at connect time.
+    """
     raw_override = _get_cdp_override_raw()
     if not raw_override:
         return ""
@@ -2363,7 +2382,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_vision",
-        "description": "Take a screenshot of the current page so you can inspect it visually. Use this when you need to understand what the page looks like - especially for CAPTCHAs, visual verification challenges, complex layouts, or cases where the text snapshot misses important visual information. When your active model has native vision, the screenshot is attached to your context directly and you inspect it on the next turn; otherwise Hermes falls back to an auxiliary vision model and returns a text analysis. Includes a screenshot_path that you can share with the user by including MEDIA:<screenshot_path> in your response. Requires browser_navigate to be called first.",
+        "description": "Take a screenshot of the current page so you can inspect it visually. Use this when you need to understand what the page looks like - especially for CAPTCHAs, visual verification challenges, complex layouts, or cases where the text snapshot misses important visual information. When your active model has native vision, the screenshot is attached to your context directly and you inspect it on the next turn; otherwise the runtime falls back to an auxiliary vision model and returns a text analysis. Includes a screenshot_path that you can share with the user by including MEDIA:<screenshot_path> in your response. Requires browser_navigate to be called first.",
         "parameters": {
             "type": "object",
             "properties": {

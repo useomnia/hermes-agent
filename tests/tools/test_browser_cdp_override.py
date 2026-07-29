@@ -387,3 +387,62 @@ class TestRedactCdpErrorText:
         out = _redact_cdp_error_text(err)
         assert "127.0.0.1:9222" in out
         assert "refused" in out
+
+
+class TestCdpOverrideProbeBoundary:
+    """Discovery is a network probe, so it must happen only where a browser
+    connection is actually made — never on a routing or capability check."""
+
+    def test_raw_lookup_returns_configured_url_without_probing(self, monkeypatch):
+        from tools.browser_tool import _get_cdp_override_raw
+
+        monkeypatch.setenv("BROWSER_CDP_URL", HTTP_URL)
+
+        with patch("tools.browser_tool.requests.get") as mock_get:
+            assert _get_cdp_override_raw() == HTTP_URL
+
+        mock_get.assert_not_called()
+
+    def test_raw_lookup_falls_back_to_config_without_probing(self, monkeypatch):
+        from tools.browser_tool import _get_cdp_override_raw
+
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+
+        with (
+            patch(
+                "hermes_cli.config.read_raw_config",
+                return_value={"browser": {"cdp_url": HTTP_URL}},
+            ),
+            patch("tools.browser_tool.requests.get") as mock_get,
+        ):
+            assert _get_cdp_override_raw() == HTTP_URL
+
+        mock_get.assert_not_called()
+
+    def test_backend_selection_never_probes(self, monkeypatch):
+        # Runs during turn init. When the browser host is not listening yet a
+        # probe here burns the whole retry ladder and then falls back anyway —
+        # latency for an answer the configuration already holds.
+        from tools.browser_tool import _is_local_mode
+
+        monkeypatch.setenv("BROWSER_CDP_URL", HTTP_URL)
+
+        with patch("tools.browser_tool.requests.get") as mock_get:
+            assert _is_local_mode() is False
+
+        mock_get.assert_not_called()
+
+    def test_capability_check_never_probes(self, monkeypatch):
+        # Gating the tool on liveness at registration says nothing about
+        # liveness at call time, and stalls registration when the host is down.
+        from tools.browser_cdp_tool import _browser_cdp_check
+
+        monkeypatch.setenv("BROWSER_CDP_URL", HTTP_URL)
+
+        with (
+            patch("tools.browser_tool.check_browser_requirements", return_value=True),
+            patch("tools.browser_tool.requests.get") as mock_get,
+        ):
+            assert _browser_cdp_check() is True
+
+        mock_get.assert_not_called()

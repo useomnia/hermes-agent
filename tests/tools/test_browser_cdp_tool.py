@@ -570,6 +570,8 @@ def test_check_fn_true_when_cdp_url_set(monkeypatch):
     import tools.browser_tool as bt
 
     monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
+    # The gate reads the CONFIGURED override; it must not depend on a discovery
+    # probe, whose answer at registration says nothing about call time.
     monkeypatch.setattr(
         bt, "_get_cdp_override_raw", lambda: "ws://localhost:9222/devtools/browser/x"
     )

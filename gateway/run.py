@@ -1639,6 +1639,18 @@ from hermes_constants import get_hermes_home, get_hermes_home_override
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
+
+def _boot_mark(name: str) -> None:
+    """Stamp a boot checkpoint. Silent on any failure — the boot matters, the
+    measurement does not."""
+    try:
+        from hermes_cli.boot_clock import mark
+
+        mark(name)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
@@ -3714,7 +3726,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.pairing import PairingStore
         self.pairing_store = PairingStore()
         self.pairing_stores: Dict[str, "PairingStore"] = {}
-        
+
         # Event hook system
         from gateway.hooks import HookRegistry
         self.hooks = HookRegistry()
@@ -7923,7 +7935,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         Returns True if at least one adapter connected successfully.
         """
-        logger.info("Starting Hermes Gateway...")
+        # Stamp the boot preamble on the first line the gateway logs, so the
+        # window between process spawn and this point stops being a blind spot.
+        try:
+            from hermes_cli.boot_clock import format_preamble
+
+            preamble = format_preamble()
+        except Exception:  # noqa: BLE001 — timing must never block a boot
+            preamble = ""
+        logger.info(
+            "Starting Hermes Gateway...%s", f" [{preamble}]" if preamble else ""
+        )
+
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
         # pythonw / detached service) — otherwise the gateway would die
@@ -8312,7 +8335,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _multiplex_skipped_platforms.append(platform)
                 continue
             enabled_platform_count += 1
-            
+
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
                 # Distinguish between missing builtin deps and missing plugin
@@ -16025,6 +16048,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
+                # Background tasks build their own agent and can fire before any
+                # user turn, so this snapshot needs the registry complete too —
+                # discovery is no longer guaranteed done by the time the gateway
+                # starts serving. Runs in the executor, so blocking is fine.
+                self._join_mcp_discovery()
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -20352,7 +20380,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_exists,
         )
         from hermes_constants import get_hermes_home
-        
+
         # Track whether a profile was explicitly requested (vs. falling back to default)
         explicit_profile = None
         try:
@@ -20365,7 +20393,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     explicit_profile = name  # Routing explicitly set this profile
             if not name:
                 name = get_active_profile_name() or "default"
-            
+
             profile_dir = get_profile_dir(name)
             # Warn if an explicit profile doesn't exist on disk
             if explicit_profile and not profile_exists(name):
@@ -20391,6 +20419,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 exc_info=True,
             )
             return get_hermes_home()
+
+    def _join_mcp_discovery(self) -> None:
+        """Wait for background MCP discovery before an agent snapshots its tools.
+
+        Thin wrapper over ``hermes_cli.mcp_startup.ensure_mcp_discovery_complete``
+        — the shared implementation, so this gateway, the api_server adapter and
+        anything added later cannot drift apart on the bound or on the
+        never-raise contract. Blocking and sync on purpose: see that docstring.
+        """
+        from hermes_cli.mcp_startup import ensure_mcp_discovery_complete
+
+        ensure_mcp_discovery_complete()
 
     async def _run_agent_inner(
         self,
@@ -21876,6 +21916,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
 
             if agent is None:
+                # About to snapshot the tool registry, so background MCP
+                # discovery has to be done. On a cold gateway this is where the
+                # boot-time discovery cost is actually paid — minus whatever
+                # overlapped with startup and this turn's setup. Safe to block:
+                # ``run_sync`` runs in the executor, not on the loop.
+                self._join_mcp_discovery()
                 # Config changed or first message — create fresh agent
                 agent = AIAgent(
                     model=turn_route["model"],
@@ -24023,7 +24069,7 @@ async def _await_thread_exit(
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
-    
+
     This is the main entry point for running the gateway.
     Returns True if the gateway ran successfully, False if it failed to start.
     A False return causes a non-zero exit code so systemd can auto-restart.
@@ -24040,6 +24086,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # in-memory module.
     from gateway.code_skew import record_boot_fingerprint
     record_boot_fingerprint()
+    _boot_mark("fingerprint")
 
     # ── Duplicate-instance guard ──────────────────────────────────────
     # Prevent two gateways from running under the same HERMES_HOME.
@@ -24203,18 +24250,22 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             )
             return False
 
+    _boot_mark("dup_guard")
+
     # Sync bundled skills on gateway start (fast -- skips unchanged)
     try:
         from tools.skills_sync import sync_skills
         sync_skills(quiet=True)
     except Exception:
         pass
+    _boot_mark("skills_resync")
 
     # Centralized logging — agent.log (INFO+), errors.log (WARNING+),
     # and gateway.log (INFO+, gateway-component records only).
     # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
     from hermes_logging import setup_logging, _safe_stderr
     setup_logging(hermes_home=_hermes_home, mode="gateway")
+    _boot_mark("logging")
 
     # Startup security posture audit — warn-on-load, never blocks. Surfaces
     # root / weak-SSH / ephemeral-container / unauthenticated-listener posture
@@ -24233,6 +24284,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         log_startup_security_warnings(hermes_home=_hermes_home, config=_audit_cfg)
     except Exception as _audit_exc:
         logger.debug("Startup security audit failed (non-fatal): %s", _audit_exc)
+    _boot_mark("audit")
 
     # Optional stderr handler — level driven by -v/-q flags on the CLI.
     # verbosity=None (-q/--quiet): no stderr output
@@ -24252,11 +24304,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logging.getLogger().setLevel(_stderr_level)
 
     runner = GatewayRunner(config)
+    _boot_mark("runner_init")
+
     # ``--replace`` is explicit startup authority, not a durable reconnect
     # policy. GatewayRunner scopes this bit to cold adapter connects and clears
     # it before the background reconnect watcher starts.
     runner._platform_lock_takeover_on_start = bool(replace)
-    
+
     # Track whether an unexpected signal initiated the shutdown. When an
     # unexpected SIGTERM kills the gateway, we exit non-zero so service
     # managers can revive the process. Planned stop paths write a marker
@@ -24443,6 +24497,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return False
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
+    _boot_mark("pid_lock")
 
     try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
@@ -24453,18 +24508,32 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     _ensure_windows_gateway_venv_imports()
 
-    # MCP tool discovery — run in an executor so the asyncio event loop
-    # stays responsive even when a configured MCP server is slow or
-    # unreachable.  discover_mcp_tools() uses a blocking 120s wait
-    # internally; calling it from the loop thread would freeze platform
-    # heartbeats (Discord shard, Telegram polling) until it returned.
-    # See #16856.
+    # MCP tool discovery — START it here, but do NOT wait for it: the join
+    # happens at the first agent build (``_await_mcp_discovery``), which is the
+    # first moment anything actually reads the tool registry.
+    #
+    # It used to be awaited in an executor right here. That kept the event loop
+    # responsive (#16856 — a blocking 120s discovery on the loop thread froze
+    # Discord/Telegram heartbeats), but it also put the full connect time of
+    # every configured server in front of ``runner.start()``, so the gateway
+    # served nothing until the slowest MCP server answered. Measured on a
+    # freshly provisioned Omnio sandbox: 8.83 s of a 12.3 s boot preamble, with
+    # the api_server unreachable for all of it.
+    #
+    # Backgrounding it overlaps that connect time with the rest of startup and
+    # with everything the first turn does before it snapshots tools (env load,
+    # cron scheduler, housekeeping, the shared provider client) — ~3.9 s of
+    # genuinely parallel work on the same measurement. Tool availability is
+    # unchanged: the first agent build still waits for discovery to finish, so
+    # no turn ever sees a partial tool set. This is the same
+    # background-then-join shape ``tui_gateway`` and the CLI already use.
     try:
-        from tools.mcp_tool import discover_mcp_tools
-        _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
+        from hermes_cli.mcp_startup import start_background_mcp_discovery
+
+        start_background_mcp_discovery(logger=logger, thread_name="gateway-mcp-discovery")
     except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
+        logger.debug("Background MCP tool discovery did not start: %s", e)
+    _boot_mark("mcp_discovery_start")
 
     # Start the gateway
     success = await runner.start()

@@ -119,10 +119,6 @@ DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
     "number",
 )
 
-_CONFIRMED_NOT_STARTED_MAX_RETRIES = 1
-_CONFIRMED_NOT_STARTED_RETRY_DELAY_SECONDS = 0.25
-
-
 def _check_disk_usage_warning():
     """Check if total disk usage exceeds warning threshold."""
     try:
@@ -2120,17 +2116,6 @@ def _resolve_command_cwd(
     return get_session_cwd(session_key) or default_cwd
 
 
-def _should_retry_execution_error(error: Exception) -> bool:
-    """Retry only a toolbox failure that proves no command began executing."""
-    from tools.environments.sprites import SpritesToolboxError
-
-    return (
-        isinstance(error, SpritesToolboxError)
-        and error.retryable is True
-        and error.command_started is False
-    )
-
-
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2738,81 +2723,62 @@ def terminal_tool(
                     "error": f"Failed to start background process: {str(e)}"
                 }, ensure_ascii=False)
         else:
-            # Retry only when the toolbox confirms the command never started.
-            retry_count = 0
-            result = None
-            command_cwd = None
-
-            # Clean interrupt slate for an approved command, ONCE before the
-            # retry loop: drop a stale bit that landed on this thread during the
-            # approval-wait so it can't SIGINT the just-approved run.  Do NOT
-            # re-clear inside the loop -- a genuine interrupt arriving during the
-            # backoff sleep between retries must survive and abort the command
-            # (caught by the next attempt's _wait_for_process poll loop -> 130).
+            # Drop a stale interrupt that landed on this thread while approval
+            # was pending so it cannot SIGINT the newly approved command.
             if _approved_run:
                 from tools.interrupt import clear_current_thread_interrupt
                 clear_current_thread_interrupt()
 
-            while True:
-                try:
-                    command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
-                        default_cwd=cwd,
-                        session_key=session_key,
+            command_cwd = _resolve_command_cwd(
+                workdir=workdir,
+                default_cwd=cwd,
+                session_key=session_key,
+            )
+            execute_kwargs = {
+                "timeout": effective_timeout,
+                "cwd": command_cwd,
+                # Foreground model-facing output: cap retention while
+                # streaming (head/tail window) so a verbose command cannot
+                # OOM the gateway before truncation (#64435).
+                "bounded_capture": True,
+            }
+            try:
+                result = env.execute(command, **execute_kwargs)
+            except Exception as e:
+                logger.error(
+                    "Execution failed - Command: %s - Error: %s: %s - "
+                    "Task: %s, Backend: %s",
+                    _safe_command_preview(command),
+                    type(e).__name__,
+                    e,
+                    effective_task_id,
+                    env_type,
+                )
+                agent_error = (
+                    f"Command execution failed: {type(e).__name__}: {str(e)}"
+                )
+                if env_type == "sprites":
+                    from tools.environments.sprites import (
+                        SpritesToolboxError,
+                        render_sprites_toolbox_error,
                     )
-                    execute_kwargs = {
-                        "timeout": effective_timeout,
-                        "cwd": command_cwd,
-                        # Foreground model-facing output: cap retention while
-                        # streaming (head/tail window) so a verbose command
-                        # can't OOM the gateway before truncation (#64435).
-                        # Internal env.execute() consumers (file ops cat
-                        # reads, RPC reads) intentionally stay unbounded.
-                        "bounded_capture": True,
-                    }
-                    result = env.execute(command, **execute_kwargs)
-                except Exception as e:
-                    if (
-                        _should_retry_execution_error(e)
-                        and retry_count < _CONFIRMED_NOT_STARTED_MAX_RETRIES
-                    ):
-                        retry_count += 1
-                        logger.warning(
-                            "Toolbox confirmed command did not start; retrying "
-                            "in %.2fs (attempt %d/%d) - Command: %s - Error: "
-                            "%s: %s - Task: %s, Backend: %s",
-                            _CONFIRMED_NOT_STARTED_RETRY_DELAY_SECONDS,
-                            retry_count,
-                            _CONFIRMED_NOT_STARTED_MAX_RETRIES,
-                            _safe_command_preview(command),
-                            type(e).__name__,
+
+                    if isinstance(e, SpritesToolboxError):
+                        request_cwd = e.request_cwd or execute_kwargs["cwd"]
+                        agent_error = render_sprites_toolbox_error(
                             e,
-                            effective_task_id,
-                            env_type,
+                            service="terminal",
+                            action="command",
+                            context=f"cwd {request_cwd!r}",
                         )
-                        time.sleep(_CONFIRMED_NOT_STARTED_RETRY_DELAY_SECONDS)
-                        continue
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": agent_error,
+                }, ensure_ascii=False)
 
-                    logger.error(
-                        "Execution failed - Command: %s - Error: %s: %s - "
-                        "Task: %s, Backend: %s",
-                        _safe_command_preview(command),
-                        type(e).__name__,
-                        e,
-                        effective_task_id,
-                        env_type,
-                    )
-                    return json.dumps({
-                        "output": "",
-                        "exit_code": -1,
-                        "error": f"Command execution failed: {type(e).__name__}: {str(e)}"
-                    }, ensure_ascii=False)
-                
-                # Got a result
-                break
-
-            # Dual-write (cwd rearch step 1): the env's post-command tracking
-            # (marker parse / local sync) has just updated env.cwd with the
+            # The env's post-command tracking (marker parse / local sync) has
+            # just updated env.cwd with the
             # directory this command finished in. That cwd belongs to THIS
             # session — record it under the session key so the durable record
             # never depends on the shared env surviving or on who drives the
