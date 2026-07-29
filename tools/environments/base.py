@@ -373,7 +373,11 @@ class BaseEnvironment(ABC):
         # backends) into every terminal-tool response.
         _quoted_snap = shlex.quote(self._snapshot_path)
         _quoted_cwd_file = shlex.quote(self._cwd_file)
+        # Backends may return a temp dir that doesn't exist yet (or that a
+        # sandbox restart wipes) — create it before writing session files.
+        _quoted_temp_dir = shlex.quote(self.get_temp_dir().rstrip("/") or "/")
         bootstrap = (
+            f"mkdir -p {_quoted_temp_dir}\n"
             f"export -p > {_quoted_snap}\n"
             f"declare -f | grep -vE '^_[^_]' >> {_quoted_snap}\n"
             f"alias -p >> {_quoted_snap}\n"
@@ -429,8 +433,14 @@ class BaseEnvironment(ABC):
         # :meth:`init_session` for the same fix on the bootstrap block.
         _quoted_snap = shlex.quote(self._snapshot_path)
         _quoted_cwd_file = shlex.quote(self._cwd_file)
+        _quoted_temp_dir = shlex.quote(self.get_temp_dir().rstrip("/") or "/")
 
         parts = []
+
+        # Recreate the session temp dir if a sandbox restart wiped it — the
+        # snapshot / cwd writes below fail otherwise, and a failed `>` prints
+        # to stderr before any `2>/dev/null` on the same command applies.
+        parts.append(f"mkdir -p {_quoted_temp_dir} 2>/dev/null || true")
 
         # Source snapshot (env vars from previous commands).
         # Redirect stdout to /dev/null: on macOS (bash 3.2 and certain
@@ -453,12 +463,15 @@ class BaseEnvironment(ABC):
         parts.append(f"eval '{escaped}'")
         parts.append("__hermes_ec=$?")
 
-        # Re-dump env vars to snapshot (last-writer-wins for concurrent calls)
+        # Re-dump env vars to snapshot (last-writer-wins for concurrent calls).
+        # The brace group keeps a failed `>` silent: redirections apply left
+        # to right, so `cmd > file 2>/dev/null` prints the redirect error to
+        # the original stderr before /dev/null takes effect.
         if self._snapshot_ready:
-            parts.append(f"export -p > {_quoted_snap} 2>/dev/null || true")
+            parts.append(f"{{ export -p > {_quoted_snap}; }} 2>/dev/null || true")
 
         # Write CWD to file (local reads this) and stdout marker (remote parses this)
-        parts.append(f"pwd -P > {_quoted_cwd_file} 2>/dev/null || true")
+        parts.append(f"{{ pwd -P > {_quoted_cwd_file}; }} 2>/dev/null || true")
         # Use a distinct line for the marker. The leading \n ensures
         # the marker starts on its own line even if the command doesn't
         # end with a newline (e.g. printf 'exact'). We'll strip this

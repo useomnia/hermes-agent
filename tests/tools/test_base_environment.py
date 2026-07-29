@@ -194,3 +194,85 @@ class TestCwdMarker:
         env1 = _TestableEnv()
         env2 = _TestableEnv()
         assert env1._cwd_marker != env2._cwd_marker
+
+
+class _MissingTempDirEnv(BaseEnvironment):
+    """Env whose temp dir does not exist yet (mirrors the Sprites toolbox,
+    where a sandbox restart wipes /tmp and the session dir with it)."""
+
+    def __init__(self, temp_dir, cwd="/tmp", timeout=10):
+        self._temp_dir = str(temp_dir)
+        super().__init__(cwd=cwd, timeout=timeout)
+
+    def get_temp_dir(self):
+        return self._temp_dir
+
+    def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+        raise NotImplementedError("Use subprocess directly")
+
+    def cleanup(self):
+        pass
+
+
+class TestSessionTempDirCreation:
+    """The session temp dir must be (re)created before snapshot/cwd writes,
+    and a failed write must never leak bash redirect errors into output."""
+
+    def test_wrapped_command_recreates_temp_dir(self, tmp_path):
+        env = _MissingTempDirEnv(tmp_path / "gone")
+        env._snapshot_ready = True
+        wrapped = env._wrap_command("echo hello", "/tmp")
+
+        mkdir_line = wrapped.splitlines()[0]
+        assert mkdir_line.startswith("mkdir -p ")
+        assert str(tmp_path / "gone") in mkdir_line
+
+    def test_missing_temp_dir_no_stderr_leak_and_state_written(self, tmp_path):
+        import subprocess
+
+        env = _MissingTempDirEnv(tmp_path / "wiped" / "session")
+        env._snapshot_ready = True
+        wrapped = env._wrap_command("echo hello", str(tmp_path))
+
+        result = subprocess.run(
+            ["bash", "-c", wrapped],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        assert result.returncode == 0
+        assert "hello" in result.stdout
+        assert "No such file or directory" not in result.stdout
+        assert "No such file or directory" not in result.stderr
+        # The dir was recreated and both session files were written.
+        assert (tmp_path / "wiped" / "session").is_dir()
+        assert env._snapshot_path.startswith(str(tmp_path / "wiped" / "session"))
+        import os
+        assert os.path.exists(env._snapshot_path)
+        assert os.path.exists(env._cwd_file)
+
+    def test_unwritable_temp_dir_stays_silent(self, tmp_path):
+        import subprocess
+
+        # A *file* where the temp dir should be: mkdir -p fails, and the
+        # snapshot/cwd redirects fail — none of it may reach the output.
+        blocker = tmp_path / "blocker"
+        blocker.write_text("")
+        env = _MissingTempDirEnv(blocker)
+        env._snapshot_ready = True
+        wrapped = env._wrap_command("echo hello", str(tmp_path))
+
+        result = subprocess.run(
+            ["bash", "-c", wrapped],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        assert result.returncode == 0
+        assert "hello" in result.stdout
+        assert "No such file or directory" not in result.stdout
+        assert "No such file or directory" not in result.stderr
+        assert "Not a directory" not in result.stdout
+        assert "Not a directory" not in result.stderr
