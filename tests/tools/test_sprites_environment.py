@@ -91,8 +91,27 @@ def test_sprites_environment_should_send_exec_to_toolbox():
 
     calls = []
 
-    def fake_request(path, payload=None, *, timeout=None, method="POST"):
-        calls.append({"path": path, "payload": payload, "timeout": timeout, "method": method})
+    def fake_request(
+        path,
+        payload=None,
+        *,
+        timeout=None,
+        method="POST",
+        retry_exec_predispatch=False,
+        retry_deadline_seconds=None,
+        cancel_event=None,
+    ):
+        calls.append(
+            {
+                "path": path,
+                "payload": payload,
+                "timeout": timeout,
+                "method": method,
+                "retry_exec_predispatch": retry_exec_predispatch,
+                "retry_deadline_seconds": retry_deadline_seconds,
+                "cancel_event": cancel_event is not None,
+            }
+        )
         return {"output": "ok\n", "returncode": 0}
 
     env._request_json = fake_request
@@ -112,6 +131,9 @@ def test_sprites_environment_should_send_exec_to_toolbox():
             },
             "timeout": 14,
             "method": "POST",
+            "retry_exec_predispatch": True,
+            "retry_deadline_seconds": 9,
+            "cancel_event": True,
         }
     ]
 
@@ -342,7 +364,11 @@ def test_sprites_request_should_parse_structured_toolbox_error(monkeypatch):
     )
 
     with pytest.raises(SpritesToolboxError) as exc_info:
-        env._request_json("/exec", timeout=5)
+        env._request_json(
+            "/exec",
+            {"command": "pwd", "cwd": "/"},
+            timeout=5,
+        )
 
     error = exc_info.value
     assert error.code == "EXEC_START_FAILED"
@@ -351,7 +377,9 @@ def test_sprites_request_should_parse_structured_toolbox_error(monkeypatch):
     assert error.command_started is False
     assert error.request_id == "req-123"
     assert error.http_status == 503
+    assert error.request_cwd == "/"
     assert "executor unavailable" in str(error)
+    assert '"retryable": true' in str(error)
     assert "code=EXEC_START_FAILED" in str(error)
     assert "phase=start" in str(error)
 
@@ -399,17 +427,427 @@ def test_sprites_request_should_treat_v4_error_as_nonretryable(monkeypatch):
     assert "toolbox is still resuming" in str(error)
 
 
-def test_terminal_should_retry_confirmed_not_started_error_once(monkeypatch):
-    import tools.terminal_tool as terminal_tool
+def test_sprites_exec_should_retry_twice_then_succeed(monkeypatch, caplog):
+    import io
+    import urllib.error
+    from email.message import Message
+
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.toolbox_url = "https://toolbox.example"
+    env.bearer_token = "pair-secret"
+    env.brand = "brand-123"
+    env.timeout = 60
+    attempts = 0
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, _limit):
+            return b'{"output":"ok\\n","returncode":0}'
+
+    def fake_open(request, timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            body = json.dumps(
+                {
+                    "error": {
+                        "code": "pre_dispatch_failed",
+                        "phase": "pre_dispatch",
+                        "retryable": True,
+                        "commandStarted": False,
+                        "requestId": f"req-{attempts}",
+                    }
+                }
+            ).encode()
+            raise urllib.error.HTTPError(
+                request.full_url,
+                503,
+                "Service Unavailable",
+                Message(),
+                io.BytesIO(body),
+            )
+        return FakeResponse()
+
+    sleeps = []
+    monkeypatch.setattr(sprites_module._URL_OPENER, "open", fake_open)
+    monkeypatch.setattr(sprites_module.time, "sleep", sleeps.append)
+
+    response = env._request_json(
+        "/exec",
+        {"command": "echo ok"},
+        retry_exec_predispatch=True,
+        retry_deadline_seconds=30,
+    )
+
+    assert response == {"output": "ok\n", "returncode": 0}
+    assert attempts == 3
+    assert sleeps == list(sprites_module._EXEC_PREDISPATCH_RETRY_DELAYS_SECONDS)
+    assert caplog.text.count("Retrying Toolbox API /exec") == 2
+    assert "code=pre_dispatch_failed" in caplog.text
+    assert "phase=pre_dispatch" in caplog.text
+    assert "requestId=req-1" in caplog.text
+    assert "requestId=req-2" in caplog.text
+
+
+def test_sprites_exec_should_stop_after_two_retries(monkeypatch):
+    import io
+    import urllib.error
+    from email.message import Message
+
+    import pytest
+
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment, SpritesToolboxError
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.toolbox_url = "https://toolbox.example"
+    env.bearer_token = "pair-secret"
+    env.brand = "brand-123"
+    env.timeout = 60
+    attempts = 0
+
+    def fake_open(request, timeout):
+        nonlocal attempts
+        attempts += 1
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "pre_dispatch_failed",
+                    "phase": "pre_dispatch",
+                    "retryable": True,
+                    "commandStarted": False,
+                    "requestId": f"req-{attempts}",
+                }
+            }
+        ).encode()
+        raise urllib.error.HTTPError(
+            request.full_url,
+            503,
+            "Service Unavailable",
+            Message(),
+            io.BytesIO(body),
+        )
+
+    sleeps = []
+    monkeypatch.setattr(sprites_module._URL_OPENER, "open", fake_open)
+    monkeypatch.setattr(sprites_module.time, "sleep", sleeps.append)
+
+    with pytest.raises(SpritesToolboxError) as exc_info:
+        env._request_json(
+            "/exec",
+            {"command": "echo ok"},
+            retry_exec_predispatch=True,
+        )
+
+    assert attempts == 3
+    assert sleeps == list(sprites_module._EXEC_PREDISPATCH_RETRY_DELAYS_SECONDS)
+    assert exc_info.value.request_id == "req-3"
+
+
+def test_sprites_exec_should_not_retry_past_command_deadline(monkeypatch):
+    import io
+    import urllib.error
+    from email.message import Message
+
+    import pytest
+
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment, SpritesToolboxError
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.toolbox_url = "https://toolbox.example"
+    env.bearer_token = "pair-secret"
+    env.brand = "brand-123"
+    env.timeout = 60
+    attempts = 0
+    clock = 0.0
+
+    def fake_open(request, timeout):
+        nonlocal attempts
+        attempts += 1
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "pre_dispatch_failed",
+                    "phase": "pre_dispatch",
+                    "retryable": True,
+                    "commandStarted": False,
+                    "requestId": f"req-{attempts}",
+                }
+            }
+        ).encode()
+        raise urllib.error.HTTPError(
+            request.full_url,
+            503,
+            "Service Unavailable",
+            Message(),
+            io.BytesIO(body),
+        )
+
+    def fake_sleep(delay):
+        nonlocal clock
+        clock += delay
+
+    monkeypatch.setattr(sprites_module._URL_OPENER, "open", fake_open)
+    monkeypatch.setattr(sprites_module.time, "monotonic", lambda: clock)
+    monkeypatch.setattr(sprites_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        sprites_module,
+        "_EXEC_PREDISPATCH_RETRY_DELAYS_SECONDS",
+        (0.0, 2.0),
+    )
+
+    with pytest.raises(SpritesToolboxError) as exc_info:
+        env._request_json(
+            "/exec",
+            {"command": "echo ok"},
+            retry_exec_predispatch=True,
+            retry_deadline_seconds=1,
+        )
+
+    assert attempts == 2
+    assert clock == 0.0
+    assert exc_info.value.request_id == "req-2"
+
+
+def test_sprites_run_bash_should_apply_short_command_deadline(monkeypatch):
+    import io
+    import urllib.error
+    from email.message import Message
+
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.cwd = "/brand"
+    env.toolbox_url = "https://toolbox.example"
+    env.bearer_token = "pair-secret"
+    env.brand = "brand-123"
+    env.timeout = 60
+    attempts = 0
+
+    def fake_open(request, timeout):
+        nonlocal attempts
+        attempts += 1
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "pre_dispatch_failed",
+                    "phase": "pre_dispatch",
+                    "retryable": True,
+                    "commandStarted": False,
+                    "requestId": f"req-{attempts}",
+                }
+            }
+        ).encode()
+        raise urllib.error.HTTPError(
+            request.full_url,
+            503,
+            "Service Unavailable",
+            Message(),
+            io.BytesIO(body),
+        )
+
+    monkeypatch.setattr(sprites_module._URL_OPENER, "open", fake_open)
+
+    handle = env._run_bash("echo ok", timeout=1)
+
+    assert handle.wait(timeout=1) == 1
+    assert attempts == 1
+
+
+def test_sprites_exec_should_stop_retrying_when_handle_is_killed(monkeypatch):
+    import io
+    import threading
+    import urllib.error
+    from email.message import Message
+
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.cwd = "/brand"
+    env.toolbox_url = "https://toolbox.example"
+    env.bearer_token = "pair-secret"
+    env.brand = "brand-123"
+    env.timeout = 60
+    attempts = 0
+    first_attempt = threading.Event()
+
+    def fake_open(request, timeout):
+        nonlocal attempts
+        attempts += 1
+        first_attempt.set()
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "pre_dispatch_failed",
+                    "phase": "pre_dispatch",
+                    "retryable": True,
+                    "commandStarted": False,
+                    "requestId": f"req-{attempts}",
+                }
+            }
+        ).encode()
+        raise urllib.error.HTTPError(
+            request.full_url,
+            503,
+            "Service Unavailable",
+            Message(),
+            io.BytesIO(body),
+        )
+
+    monkeypatch.setattr(sprites_module._URL_OPENER, "open", fake_open)
+
+    handle = env._run_bash("echo ok", timeout=30)
+    assert first_attempt.wait(timeout=1)
+    handle.kill()
+
+    assert handle.wait(timeout=1) == 1
+    assert attempts == 1
+
+
+def test_sprites_exec_should_not_retry_unsafe_http_errors(monkeypatch):
+    import io
+    import urllib.error
+    from email.message import Message
+
+    import pytest
+
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment, SpritesToolboxError
+
+    cases = [
+        (
+            503,
+            {
+                "code": "already_started",
+                "retryable": True,
+                "commandStarted": True,
+            },
+        ),
+        (
+            503,
+            {
+                "code": "permanent_failure",
+                "retryable": False,
+                "commandStarted": False,
+            },
+        ),
+        (
+            503,
+            {
+                "code": "ambiguous_failure",
+                "retryable": True,
+            },
+        ),
+        (
+            500,
+            {
+                "code": "wrong_status",
+                "retryable": True,
+                "commandStarted": False,
+            },
+        ),
+    ]
+
+    for status, error_payload in cases:
+        env = SpritesEnvironment.__new__(SpritesEnvironment)
+        env.toolbox_url = "https://toolbox.example"
+        env.bearer_token = "pair-secret"
+        env.brand = "brand-123"
+        env.timeout = 60
+        attempts = 0
+
+        def fake_open(request, timeout):
+            nonlocal attempts
+            attempts += 1
+            body = json.dumps({"error": error_payload}).encode()
+            raise urllib.error.HTTPError(
+                request.full_url,
+                status,
+                "HTTP error",
+                Message(),
+                io.BytesIO(body),
+            )
+
+        sleeps = []
+        monkeypatch.setattr(sprites_module._URL_OPENER, "open", fake_open)
+        monkeypatch.setattr(sprites_module.time, "sleep", sleeps.append)
+
+        with pytest.raises(SpritesToolboxError):
+            env._request_json(
+                "/exec",
+                {"command": "echo ok"},
+                retry_exec_predispatch=True,
+            )
+
+        assert attempts == 1
+        assert sleeps == []
+
+
+def test_sprites_exec_should_not_retry_unparseable_503(monkeypatch):
+    import io
+    import urllib.error
+    from email.message import Message
+
+    import pytest
+
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment, SpritesToolboxError
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.toolbox_url = "https://toolbox.example"
+    env.bearer_token = "pair-secret"
+    env.brand = "brand-123"
+    env.timeout = 60
+    attempts = 0
+
+    def fake_open(request, timeout):
+        nonlocal attempts
+        attempts += 1
+        raise urllib.error.HTTPError(
+            request.full_url,
+            503,
+            "Service Unavailable",
+            Message(),
+            io.BytesIO(b"not json"),
+        )
+
+    sleeps = []
+    monkeypatch.setattr(sprites_module._URL_OPENER, "open", fake_open)
+    monkeypatch.setattr(sprites_module.time, "sleep", sleeps.append)
+
+    with pytest.raises(SpritesToolboxError):
+        env._request_json(
+            "/exec",
+            {"command": "echo ok"},
+            retry_exec_predispatch=True,
+        )
+
+    assert attempts == 1
+    assert sleeps == []
+
+
+def test_terminal_should_render_exhausted_sprites_infra_error(monkeypatch, caplog):
     from tools.environments.sprites import SpritesToolboxError
 
     error = SpritesToolboxError(
         "Toolbox API /exec failed with HTTP 503: executor unavailable",
-        code="EXEC_START_FAILED",
-        phase="start",
+        detail="executor unavailable",
+        code="pre_dispatch_failed",
+        phase="pre_dispatch",
         retryable=True,
         command_started=False,
-        request_id="req-123",
+        request_id="req-final",
         http_status=503,
     )
 
@@ -424,17 +862,47 @@ def test_terminal_should_retry_confirmed_not_started_error_once(monkeypatch):
             raise error
 
     env = FakeEnv()
-    sleeps = []
-    monkeypatch.setattr(terminal_tool.time, "sleep", sleeps.append)
 
     result = _run_terminal_with_existing_env(monkeypatch, env)
 
-    assert env.calls == 2
-    assert sleeps == [terminal_tool._CONFIRMED_NOT_STARTED_RETRY_DELAY_SECONDS]
+    assert env.calls == 1
     assert result["exit_code"] == -1
-    assert "executor unavailable" in result["error"]
-    assert "code=EXEC_START_FAILED" in result["error"]
-    assert "phase=start" in result["error"]
+    assert result["error"] == (
+        "terminal temporarily unavailable "
+        "(infrastructure issue, code=pre_dispatch_failed); retry shortly"
+    )
+    assert "HTTP 503" not in result["error"]
+    assert "Toolbox API /exec failed with HTTP 503" in caplog.text
+
+
+def test_terminal_should_render_sprites_client_error_with_actual_cwd(monkeypatch, caplog):
+    from tools.environments.sprites import SpritesToolboxError
+
+    server_detail = (
+        "path must be under an available toolbox workspace"
+    )
+    error = SpritesToolboxError(
+        'Toolbox API /exec failed with HTTP 400: {"detail":"workspace rejected"}',
+        detail=server_detail,
+        http_status=400,
+        request_cwd="/",
+    )
+
+    class FakeEnv:
+        cwd = "/brand"
+
+        def execute(self, command, **kwargs):
+            raise error
+
+    result = _run_terminal_with_existing_env(monkeypatch, FakeEnv())
+
+    assert result["error"] == (
+        "command not run: cwd '/' - "
+        "path must be under an available toolbox workspace"
+    )
+    assert "HTTP 400" not in result["error"]
+    assert '{"detail"' not in result["error"]
+    assert 'HTTP 400: {"detail":"workspace rejected"}' in caplog.text
 
 
 def test_terminal_should_not_retry_ambiguous_timeout(monkeypatch):
@@ -462,7 +930,7 @@ def test_terminal_should_not_retry_ambiguous_timeout(monkeypatch):
     assert "read timed out after request was sent" in result["error"]
 
 
-def test_terminal_should_not_retry_unstructured_v4_error(monkeypatch):
+def test_terminal_should_render_unstructured_infra_error(monkeypatch):
     import tools.terminal_tool as terminal_tool
     from tools.environments.sprites import SpritesToolboxError
 
@@ -489,7 +957,10 @@ def test_terminal_should_not_retry_unstructured_v4_error(monkeypatch):
 
     assert env.calls == 1
     assert sleeps == []
-    assert "toolbox is still resuming" in result["error"]
+    assert result["error"] == (
+        "terminal temporarily unavailable (infrastructure issue); retry shortly"
+    )
+    assert "toolbox is still resuming" not in result["error"]
 
 
 def test_terminal_should_not_retry_user_command_exit_one(monkeypatch):
@@ -580,6 +1051,76 @@ def test_sprites_file_operations_should_use_files_endpoint_for_write():
             "encoding": "utf-8",
         },
     ]
+
+
+def test_sprites_file_operations_should_render_toolbox_errors(caplog):
+    from tools.environments.sprites import (
+        SpritesEnvironment,
+        SpritesFileOperations,
+        SpritesToolboxError,
+    )
+
+    class FakeEnv:
+        cwd = "/brand"
+        config = None
+
+        def file_request(self, payload):
+            raise SpritesToolboxError(
+                'Toolbox API /files failed with HTTP 400: {"detail":"bad path"}',
+                detail="path is outside the available workspace",
+                http_status=400,
+            )
+
+    ops = SpritesFileOperations(cast(SpritesEnvironment, FakeEnv()))
+
+    result = ops.read_file("/outside/example.txt")
+
+    assert result.error == (
+        "file operation not run: path '/outside/example.txt' - "
+        "path is outside the available workspace"
+    )
+    assert "HTTP 400" not in result.error
+    assert 'HTTP 400: {"detail":"bad path"}' in caplog.text
+
+
+def test_sprites_environment_should_write_content_through_files_endpoint():
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    requests = []
+
+    def file_request(payload):
+        requests.append(payload)
+        return {"bytesWritten": len(payload["content"].encode("utf-8")), "dirsCreated": True}
+
+    env.file_request = file_request
+
+    assert env.write_file_content("/tmp/hermes-results/large.txt", "full result") is True
+    assert requests == [
+        {
+            "operation": "write",
+            "path": "/tmp/hermes-results/large.txt",
+            "content": "full result",
+            "encoding": "utf-8",
+        }
+    ]
+
+
+def test_sprites_environment_should_reject_file_content_over_two_mib():
+    import pytest
+
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment, SpritesToolboxError
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    requests = []
+    env.file_request = requests.append
+    content = "x" * (sprites_module._MAX_FILE_CONTENT_BYTES + 1)
+
+    with pytest.raises(SpritesToolboxError, match="write content exceeded"):
+        env.write_file_content("/tmp/hermes-results/too-large.txt", content)
+
+    assert requests == []
 
 
 def test_execute_code_guard_should_approve_sprites_backend():

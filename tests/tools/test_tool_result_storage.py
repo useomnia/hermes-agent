@@ -81,8 +81,25 @@ class TestHeredocMarker:
 # ── _write_to_sandbox ─────────────────────────────────────────────────
 
 class TestWriteToSandbox:
+    def test_prefers_first_class_file_write_capability(self):
+        env = MagicMock(spec=["write_file_content", "execute"])
+        env.write_file_content.return_value = True
+
+        result = _write_to_sandbox(
+            "large connector result",
+            "/tmp/hermes-results/abc.txt",
+            env,
+        )
+
+        assert result is True
+        env.write_file_content.assert_called_once_with(
+            "/tmp/hermes-results/abc.txt",
+            "large connector result",
+        )
+        env.execute.assert_not_called()
+
     def test_success(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         result = _write_to_sandbox("hello world", "/tmp/hermes-results/abc.txt", env)
         assert result is True
@@ -96,7 +113,7 @@ class TestWriteToSandbox:
         assert env.execute.call_args[1]["stdin_data"] == "hello world"
 
     def test_failure_returns_false(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "error", "returncode": 1}
         result = _write_to_sandbox("content", "/tmp/hermes-results/abc.txt", env)
         assert result is False
@@ -104,7 +121,7 @@ class TestWriteToSandbox:
     def test_large_content_via_stdin(self):
         """Regression: 200 KB content exceeds Linux MAX_ARG_STRLEN (128 KB).
         It must travel via stdin, never inside the command string."""
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         big = "x" * 200_000
         _write_to_sandbox(big, "/tmp/hermes-results/big.txt", env)
@@ -113,13 +130,13 @@ class TestWriteToSandbox:
         assert env.execute.call_args[1]["stdin_data"] == big
 
     def test_timeout_passed(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         _write_to_sandbox("content", "/tmp/hermes-results/abc.txt", env)
         assert env.execute.call_args[1]["timeout"] == 30
 
     def test_uses_parent_dir_of_remote_path(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         remote_path = "/data/data/com.termux/files/usr/tmp/hermes-results/abc.txt"
         _write_to_sandbox("content", remote_path, env)
@@ -127,7 +144,7 @@ class TestWriteToSandbox:
         assert "mkdir -p /data/data/com.termux/files/usr/tmp/hermes-results" in cmd
 
     def test_path_with_spaces_is_quoted(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         remote_path = "/tmp/hermes results/abc file.txt"
         _write_to_sandbox("content", remote_path, env)
@@ -137,7 +154,7 @@ class TestWriteToSandbox:
 
     def test_shell_metacharacters_neutralized(self):
         """Paths with shell metacharacters must be quoted to prevent injection."""
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         malicious_path = "/tmp/hermes-results/$(whoami).txt"
         _write_to_sandbox("content", malicious_path, env)
@@ -146,7 +163,7 @@ class TestWriteToSandbox:
         assert "'/tmp/hermes-results/$(whoami).txt'" in cmd
 
     def test_semicolon_injection_neutralized(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         malicious_path = "/tmp/x; rm -rf /; echo .txt"
         _write_to_sandbox("content", malicious_path, env)
@@ -160,7 +177,7 @@ class TestResolveStorageDir:
         assert _resolve_storage_dir(None) == STORAGE_DIR
 
     def test_uses_env_temp_dir_when_available(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.get_temp_dir.return_value = "/data/data/com.termux/files/usr/tmp"
         assert _resolve_storage_dir(env) == "/data/data/com.termux/files/usr/tmp/hermes-results"
 
@@ -219,7 +236,7 @@ class TestMaybePersistToolResult:
         assert result == content
 
     def test_above_threshold_with_env_persists(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         content = "x" * 60_000
         result = maybe_persist_tool_result(
@@ -234,10 +251,41 @@ class TestMaybePersistToolResult:
         assert len(result) < len(content)
         env.execute.assert_called_once()
 
+    def test_sprites_persistence_uses_files_write(self):
+        from tools.environments.sprites import SpritesEnvironment
+
+        env = SpritesEnvironment.__new__(SpritesEnvironment)
+        requests = []
+
+        def file_request(payload):
+            requests.append(payload)
+            return {"bytesWritten": len(payload["content"].encode("utf-8"))}
+
+        env.file_request = file_request
+        content = "x" * 60_000
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="connector",
+            tool_use_id="tc_sprites",
+            env=env,
+            threshold=30_000,
+        )
+
+        assert PERSISTED_OUTPUT_TAG in result
+        assert requests == [
+            {
+                "operation": "write",
+                "path": "/tmp/.hermes-session/hermes-results/tc_sprites.txt",
+                "content": content,
+                "encoding": "utf-8",
+            }
+        ]
+
     def test_persists_full_content_as_is(self):
         """Content is persisted verbatim — no JSON extraction."""
         import json
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         raw = "line1\nline2\n" * 5_000
         content = json.dumps({"output": raw, "exit_code": 0, "error": None})
@@ -267,7 +315,7 @@ class TestMaybePersistToolResult:
         assert len(result) < len(content)
 
     def test_env_write_failure_falls_back_to_truncation(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "disk full", "returncode": 1}
         content = "x" * 60_000
         result = maybe_persist_tool_result(
@@ -281,7 +329,7 @@ class TestMaybePersistToolResult:
         assert "Truncated" in result
 
     def test_env_execute_exception_falls_back(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.side_effect = RuntimeError("connection lost")
         content = "x" * 60_000
         result = maybe_persist_tool_result(
@@ -293,9 +341,30 @@ class TestMaybePersistToolResult:
         )
         assert "Truncated" in result
 
+    def test_sprites_content_over_two_mib_keeps_inline_preview(self):
+        import tools.environments.sprites as sprites_module
+        from tools.environments.sprites import SpritesEnvironment
+
+        env = SpritesEnvironment.__new__(SpritesEnvironment)
+        env.file_request = MagicMock()
+        content = "x" * (sprites_module._MAX_FILE_CONTENT_BYTES + 1)
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="connector",
+            tool_use_id="tc_over_files_cap",
+            env=env,
+            threshold=1,
+        )
+
+        assert PERSISTED_OUTPUT_TAG not in result
+        assert "Truncated" in result
+        assert result.startswith("x" * DEFAULT_PREVIEW_SIZE_CHARS)
+        env.file_request.assert_not_called()
+
     def test_read_file_never_persisted(self):
         """read_file has threshold=inf, should never be persisted."""
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         content = "x" * 200_000
         result = maybe_persist_tool_result(
             content=content,
@@ -309,7 +378,7 @@ class TestMaybePersistToolResult:
 
     def test_uses_registry_threshold_when_not_provided(self):
         """When threshold=None, looks up from registry."""
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         content = "x" * 60_000
 
@@ -328,7 +397,7 @@ class TestMaybePersistToolResult:
         assert PERSISTED_OUTPUT_TAG in result or "Truncated" in result
 
     def test_unicode_content_survives(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         content = "日本語テスト " * 10_000  # ~60K chars of unicode
         result = maybe_persist_tool_result(
@@ -364,7 +433,7 @@ class TestMaybePersistToolResult:
         assert result == content
 
     def test_file_path_uses_tool_use_id(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         content = "x" * 60_000
         result = maybe_persist_tool_result(
@@ -377,7 +446,7 @@ class TestMaybePersistToolResult:
         assert "unique_id_abc.txt" in result
 
     def test_preview_included_in_persisted_output(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         # Create content with a distinctive start
         content = "DISTINCTIVE_START_MARKER" + "x" * 60_000
@@ -391,7 +460,7 @@ class TestMaybePersistToolResult:
         assert "DISTINCTIVE_START_MARKER" in result
 
     def test_env_temp_dir_changes_persisted_path(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         env.get_temp_dir.return_value = "/data/data/com.termux/files/usr/tmp"
         content = "x" * 60_000
@@ -407,7 +476,7 @@ class TestMaybePersistToolResult:
         assert "mkdir -p /data/data/com.termux/files/usr/tmp/hermes-results" in cmd
 
     def test_threshold_zero_forces_persist(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         content = "even short content"
         result = maybe_persist_tool_result(
@@ -434,7 +503,7 @@ class TestEnforceTurnBudget:
         assert result[1]["content"] == "also small"
 
     def test_over_budget_largest_persisted_first(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         msgs = [
             {"role": "tool", "tool_call_id": "t1", "content": "a" * 80_000},
@@ -446,7 +515,7 @@ class TestEnforceTurnBudget:
         assert PERSISTED_OUTPUT_TAG in msgs[1]["content"]
 
     def test_already_persisted_results_skipped(self):
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         msgs = [
             {"role": "tool", "tool_call_id": "t1",
@@ -462,7 +531,7 @@ class TestEnforceTurnBudget:
     def test_medium_result_regression(self):
         """6 results of 42K chars each (252K total) — each under 100K default
         threshold but aggregate exceeds 200K budget. L3 should persist."""
-        env = MagicMock()
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         msgs = [
             {"role": "tool", "tool_call_id": f"t{i}", "content": "x" * 42_000}

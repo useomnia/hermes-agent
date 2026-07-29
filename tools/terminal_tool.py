@@ -119,10 +119,6 @@ DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
     "number",
 )
 
-_CONFIRMED_NOT_STARTED_MAX_RETRIES = 1
-_CONFIRMED_NOT_STARTED_RETRY_DELAY_SECONDS = 0.25
-
-
 def _check_disk_usage_warning():
     """Check if total disk usage exceeds warning threshold."""
     try:
@@ -1859,16 +1855,6 @@ def _resolve_command_cwd(
     return default_cwd
 
 
-def _should_retry_execution_error(error: Exception) -> bool:
-    from tools.environments.sprites import SpritesToolboxError
-
-    return (
-        isinstance(error, SpritesToolboxError)
-        and error.retryable is True
-        and error.command_started is False
-    )
-
-
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2423,61 +2409,49 @@ def terminal_tool(
                     "error": f"Failed to start background process: {str(e)}"
                 }, ensure_ascii=False)
         else:
-            # Retry only when the toolbox confirms the command never started.
-            retry_count = 0
-            result = None
-
-            while True:
-                try:
-                    execute_kwargs = {
-                        "timeout": effective_timeout,
-                        "cwd": _resolve_command_cwd(
-                            workdir=workdir,
-                            env=env,
-                            default_cwd=cwd,
-                        ),
-                    }
-                    result = env.execute(command, **execute_kwargs)
-                except Exception as e:
-                    if (
-                        _should_retry_execution_error(e)
-                        and retry_count < _CONFIRMED_NOT_STARTED_MAX_RETRIES
-                    ):
-                        retry_count += 1
-                        logger.warning(
-                            "Toolbox confirmed command did not start; retrying in %.2fs "
-                            "(attempt %d/%d) - Command: %s - Error: %s: %s - "
-                            "Task: %s, Backend: %s",
-                            _CONFIRMED_NOT_STARTED_RETRY_DELAY_SECONDS,
-                            retry_count,
-                            _CONFIRMED_NOT_STARTED_MAX_RETRIES,
-                            _safe_command_preview(command),
-                            type(e).__name__,
-                            e,
-                            effective_task_id,
-                            env_type,
-                        )
-                        time.sleep(_CONFIRMED_NOT_STARTED_RETRY_DELAY_SECONDS)
-                        continue
-
-                    logger.error(
-                        "Execution failed - Command: %s - Error: %s: %s - "
-                        "Task: %s, Backend: %s",
-                        _safe_command_preview(command),
-                        type(e).__name__,
-                        e,
-                        effective_task_id,
-                        env_type,
+            try:
+                execute_kwargs = {
+                    "timeout": effective_timeout,
+                    "cwd": _resolve_command_cwd(
+                        workdir=workdir,
+                        env=env,
+                        default_cwd=cwd,
+                    ),
+                }
+                result = env.execute(command, **execute_kwargs)
+            except Exception as e:
+                logger.error(
+                    "Execution failed - Command: %s - Error: %s: %s - "
+                    "Task: %s, Backend: %s",
+                    _safe_command_preview(command),
+                    type(e).__name__,
+                    e,
+                    effective_task_id,
+                    env_type,
+                )
+                agent_error = (
+                    f"Command execution failed: {type(e).__name__}: {str(e)}"
+                )
+                if env_type == "sprites":
+                    from tools.environments.sprites import (
+                        SpritesToolboxError,
+                        render_sprites_toolbox_error,
                     )
-                    return json.dumps({
-                        "output": "",
-                        "exit_code": -1,
-                        "error": f"Command execution failed: {type(e).__name__}: {str(e)}"
-                    }, ensure_ascii=False)
 
-                # Got a result
-                break
-            
+                    if isinstance(e, SpritesToolboxError):
+                        request_cwd = e.request_cwd or execute_kwargs["cwd"]
+                        agent_error = render_sprites_toolbox_error(
+                            e,
+                            service="terminal",
+                            action="command",
+                            context=f"cwd {request_cwd!r}",
+                        )
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": agent_error,
+                }, ensure_ascii=False)
+
             # Extract output
             output = result.get("output", "")
             returncode = result.get("returncode", 0)

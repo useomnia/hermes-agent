@@ -11,6 +11,7 @@ Defense against context-window overflow operates at three levels:
    (registry.get_max_result_size), the full output is written INTO THE
    SANDBOX temp dir (for example /tmp/hermes-results/{tool_use_id}.txt on
    standard Linux, or $TMPDIR/hermes-results/{tool_use_id}.txt on Termux)
+   via a first-class file write when the backend provides one, otherwise
    via env.execute(). The in-context content is replaced with a preview +
    file path reference. The model can read_file to access the full output
    on any backend.
@@ -76,18 +77,18 @@ def _heredoc_marker(content: str) -> str:
 
 
 def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
-    """Write content into the sandbox via env.execute(). Returns True on success.
+    """Write content into the sandbox using the environment's safest transport.
 
-    Pushes ``content`` through stdin rather than embedding it in the command
-    string. Linux's ``MAX_ARG_STRLEN`` caps any single argv element at 128 KB
-    (32 * PAGE_SIZE), so the previous heredoc-in-the-command-string approach
-    silently failed with ``OSError: [Errno 7] Argument list too long`` for any
-    tool result over ~128 KB — exactly the case persistence exists to handle.
-    Routing through stdin removes that ceiling on local + ssh (``_stdin_mode
-    == "pipe"``); remote backends with ``_stdin_mode == "heredoc"`` keep their
-    existing API-body sized limit, which is orders of magnitude larger than
-    the exec-arg ceiling.
+    Environments with a first-class file-write capability avoid command-string
+    and stdin transport limits. Other backends retain the existing exec + stdin
+    path, which avoids Linux's per-argument ceiling on local and SSH backends.
+    A capability may reject content above its API's file-size limit; callers
+    then keep the in-context preview rather than silently truncating the file.
     """
+    write_file_content = getattr(env, "write_file_content", None)
+    if callable(write_file_content):
+        return bool(write_file_content(remote_path, content))
+
     storage_dir = os.path.dirname(remote_path)
     cmd = f"mkdir -p {shlex.quote(storage_dir)} && cat > {shlex.quote(remote_path)}"
     result = env.execute(cmd, timeout=30, stdin_data=content)
@@ -129,9 +130,9 @@ def maybe_persist_tool_result(
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
-    Writes via env.execute() so the file is accessible from any backend
-    (local, Docker, SSH, Modal, Daytona). Falls back to inline truncation
-    if write fails or no env is available.
+    Uses a backend's first-class file write when available and otherwise
+    writes via env.execute(), so the file is accessible from any backend.
+    Falls back to inline truncation if write fails or no env is available.
 
     Args:
         content: Raw tool result string.
