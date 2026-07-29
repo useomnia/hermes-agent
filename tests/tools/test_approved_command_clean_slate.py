@@ -162,40 +162,59 @@ def test_natural_exit_130_not_mislabeled_as_interrupt(monkeypatch):
 
 
 def test_confirmed_not_started_retry_does_not_clear_genuine_interrupt(monkeypatch):
-    """A genuine interrupt that lands during the retry backoff must survive
-    (the clear runs ONCE before the loop, never re-clearing on retries)."""
+    """A genuine interrupt during the transport retry backoff cancels it.
+
+    Sprites owns confirmed-not-started retries inside its process handle.  The
+    terminal layer must clear only the stale pre-dispatch bit, then let its
+    normal process polling propagate a later interrupt through ``kill()`` to
+    the transport's cancellation event.
+    """
+    from tools.environments.base import BaseEnvironment, _ThreadedProcessHandle
     from tools.environments.local import LocalEnvironment
-    from tools.environments.sprites import SpritesToolboxError
 
-    confirmed_not_started = SpritesToolboxError(
-        "executor unavailable",
-        code="EXEC_START_FAILED",
-        phase="start",
-        retryable=True,
-        command_started=False,
-    )
-
-    calls = {"n": 0, "interrupted_at_retry": None}
+    calls = {"outer": 0, "dispatch_attempts": 0, "cancelled": False}
 
     def fake_execute(self, command, **kw):
         if "sleep 1" not in command:  # ignore any incidental execute calls
             return {"output": "", "returncode": 0}
-        calls["n"] += 1
-        if calls["n"] == 1:
-            set_interrupt(True)  # Stop lands during the first attempt / backoff
-            raise confirmed_not_started
-        # Second attempt: the bit set during the backoff must NOT be re-cleared.
-        calls["interrupted_at_retry"] = is_interrupted()
-        return {"output": "partial\n[Command interrupted]", "returncode": 130}
+
+        calls["outer"] += 1
+        caller_thread_id = threading.get_ident()
+        cancelled = threading.Event()
+
+        def transport_retry():
+            calls["dispatch_attempts"] += 1
+            # A genuine Stop lands after dispatch, while the transport is in
+            # its retry backoff. BaseEnvironment._wait_for_process must observe
+            # it and kill the handle before a second request can be dispatched.
+            set_interrupt(True, thread_id=caller_thread_id)
+            if cancelled.wait(timeout=1):
+                calls["cancelled"] = True
+                return "", 1
+            calls["dispatch_attempts"] += 1
+            return "unexpected retry", 0
+
+        handle = _ThreadedProcessHandle(
+            transport_retry,
+            cancel_fn=cancelled.set,
+        )
+        return self._wait_for_process(handle, timeout=2)
 
     monkeypatch.setattr(LocalEnvironment, "execute", fake_execute)
-    monkeypatch.setattr("tools.terminal_tool.time.sleep", lambda *a, **k: None)
+    # The fake uses the same SDK-style handle as Sprites, not a local Popen
+    # process group, so route kill through the base handle contract.
+    monkeypatch.setattr(
+        LocalEnvironment,
+        "_kill_process",
+        BaseEnvironment._kill_process,
+    )
     set_interrupt(False)
 
     result = json.loads(tt.terminal_tool(command="sleep 1", force=True, task_id="retry-test"))
 
-    assert calls["n"] == 2, calls
-    assert calls["interrupted_at_retry"] is True, "retry must NOT re-clear a genuine interrupt"
+    assert calls["outer"] == 1, calls
+    assert calls["dispatch_attempts"] == 1, calls
+    assert calls["cancelled"] is True, calls
     assert result["exit_code"] == 130, result
 
 

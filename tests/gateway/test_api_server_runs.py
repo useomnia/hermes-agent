@@ -104,6 +104,18 @@ def _make_slow_agent(**kwargs):
     return mock_agent, ready, interrupted
 
 
+async def _wait_for_thread_event(
+    event: threading.Event,
+    timeout: float = 3.0,
+) -> bool:
+    """Wait for executor-thread progress without blocking the asyncio loop."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not event.is_set() and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+    return event.is_set()
+
+
 @pytest.fixture
 def adapter():
     return _make_adapter()
@@ -513,8 +525,8 @@ class TestRunEvents:
                 victim_run = (await victim_resp.json())["run_id"]
                 attacker_run = (await attacker_resp.json())["run_id"]
 
-                victim_ready.wait(timeout=3.0)
-                attacker_ready.wait(timeout=3.0)
+                assert await _wait_for_thread_event(victim_ready)
+                assert await _wait_for_thread_event(attacker_ready)
                 assert auth_adapter._run_approval_sessions[victim_run] == victim_run
                 assert auth_adapter._run_approval_sessions[attacker_run] == attacker_run
                 assert auth_adapter._run_approval_sessions[victim_run] != auth_adapter._run_approval_sessions[attacker_run]
@@ -606,7 +618,7 @@ class TestRunLifecycleSweep:
                 start_resp = await cli.post("/v1/runs", json={"input": "hello"})
                 assert start_resp.status == 202
                 run_id = (await start_resp.json())["run_id"]
-                assert agent_ready.wait(timeout=3.0)
+                assert await _wait_for_thread_event(agent_ready)
 
                 task = adapter._active_run_tasks[run_id]
                 assert isinstance(task, asyncio.Task)
@@ -663,7 +675,7 @@ class TestRunLifecycleSweep:
 
                 start_resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await start_resp.json())["run_id"]
-                assert agent_ready.wait(timeout=3.0)
+                assert await _wait_for_thread_event(agent_ready)
                 expired_queue = adapter._run_streams[run_id]
                 stream_delta = mock_create.call_args.kwargs["stream_delta_callback"]
 
@@ -776,7 +788,7 @@ class TestStopRun:
 
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await resp.json())["run_id"]
-                assert started.wait(timeout=3)
+                assert await _wait_for_thread_event(started)
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
@@ -813,7 +825,7 @@ class TestStopRun:
                 run_id = data["run_id"]
 
                 # Wait for agent to start running in the thread
-                agent_ready.wait(timeout=3.0)
+                assert await _wait_for_thread_event(agent_ready)
                 await asyncio.sleep(0.1)
 
                 # Verify agent ref is stored
@@ -905,7 +917,7 @@ class TestStopRun:
                 data = await resp.json()
                 run_id = data["run_id"]
 
-                agent_ready.wait(timeout=3.0)
+                assert await _wait_for_thread_event(agent_ready)
                 await asyncio.sleep(0.1)
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
@@ -928,7 +940,7 @@ class TestStopRun:
                 data = await resp.json()
                 run_id = data["run_id"]
 
-                agent_ready.wait(timeout=3.0)
+                assert await _wait_for_thread_event(agent_ready)
                 await asyncio.sleep(0.1)
 
                 # Subscribe to events in background

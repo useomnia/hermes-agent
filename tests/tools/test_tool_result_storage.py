@@ -460,7 +460,10 @@ class TestMaybePersistToolResult:
         assert "unique_id_abc.txt" in result
 
     def test_tool_use_id_cannot_escape_storage_dir(self):
-        env = MagicMock()
+        # This backend intentionally lacks Sprites' first-class
+        # ``write_file_content`` capability, so persistence must exercise the
+        # shell fallback whose path quoting this regression test verifies.
+        env = MagicMock(spec=["execute", "get_temp_dir"])
         env.execute.return_value = {"output": "", "returncode": 0}
         env.get_temp_dir.return_value = ""
         content = "x" * 60_000
