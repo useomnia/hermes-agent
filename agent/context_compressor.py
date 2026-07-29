@@ -5545,8 +5545,43 @@ This compaction should PRIORITISE preserving all information related to the focu
         # last_head_role reads the assembled (post-strip) head; first_tail_role
         # reads the assembled (post-strip) tail_messages — a stripped stale
         # handoff must not influence alternation-safe role selection.
-        last_head_role = compressed[-1].get("role", "user") if compressed else "user"
-        first_tail_role = tail_messages[0].get("role", "user") if tail_messages else None
+        # Both are TEMPLATE-VISIBLE roles (``_template_visible_role``), not the
+        # literal list neighbours: strict Mistral-style templates skip tool
+        # results and assistant tool-call messages when enforcing
+        # user/assistant alternation, so the summary must alternate against
+        # the nearest message the template actually counts. Selecting against
+        # the literal neighbour (previously ``compressed[-1]``) emitted the
+        # summary as role="user" behind a ``[user, assistant(tool_calls),
+        # tool]`` head — which every Mistral-strict backend rejects with a
+        # Jinja alternation 500, permanently poisoning the session.
+        last_head_role: Optional[str] = "user"
+        if compressed:
+            last_head_role = next(
+                (
+                    role
+                    for role in (
+                        _template_visible_role(m) for m in reversed(compressed)
+                    )
+                    if role is not None
+                ),
+                # Head holds only template-exempt messages: the summary will
+                # be the first message the template counts, and the sequence
+                # must open with "user" (handled below alongside the forced
+                # cases).
+                None,
+            )
+        first_tail_role = None
+        if tail_messages:
+            first_tail_role = next(
+                (
+                    role
+                    for role in (
+                        _template_visible_role(m) for m in tail_messages
+                    )
+                    if role is not None
+                ),
+                None,
+            )
         # When the only protected head message is the system prompt, the
         # summary becomes the first *visible* message in the API request
         # (most adapters — Anthropic, Bedrock — send the system prompt as
@@ -5580,9 +5615,15 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
             if not _user_survives:
                 _force_user_leading = True
-        # Pick a role that avoids consecutive same-role with both neighbors.
-        # Priority: avoid colliding with head (already committed), then tail.
-        if last_head_role in {"assistant", "tool"} or _force_user_leading:
+        # Pick a role that alternates with both template-visible neighbors.
+        # Priority: alternate against the head (already committed), then tail.
+        # ``None`` (all-exempt head) means the summary opens the visible
+        # sequence, which strict templates require to start with "user".
+        if (
+            last_head_role is None
+            or last_head_role in {"assistant", "tool"}
+            or _force_user_leading
+        ):
             summary_role = "user"
         else:
             summary_role = "assistant"
@@ -5590,7 +5631,14 @@ This compaction should PRIORITISE preserving all information related to the focu
         # collide with the head, flip it.
         if first_tail_role is not None and summary_role == first_tail_role:
             flipped = "assistant" if summary_role == "user" else "user"
-            if flipped != last_head_role and not _force_user_leading:
+            # ``last_head_role is None`` (all-exempt head) pins the summary to
+            # "user" above; flipping to "assistant" would make the visible
+            # sequence open with "assistant", which strict templates reject.
+            if (
+                flipped != last_head_role
+                and last_head_role is not None
+                and not _force_user_leading
+            ):
                 summary_role = flipped
             else:
                 # Both roles would create consecutive same-role messages
