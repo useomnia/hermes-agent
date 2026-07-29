@@ -11,9 +11,10 @@ import threading
 import contextvars
 from collections import OrderedDict
 from pathlib import Path
+from typing import Optional
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
-from typing import Optional
+from hermes_cli.default_soul import DEFAULT_SOUL_MD
 
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
@@ -129,6 +130,14 @@ DEFAULT_AGENT_IDENTITY = (
     "being genuinely useful over being verbose unless otherwise directed below. "
     "Be targeted and efficient in your exploration and investigations."
 )
+
+
+def agent_identity(fallback_identity: Optional[str] = None) -> str:
+    """Render the fallback identity while preserving the legacy default."""
+    if not fallback_identity or not fallback_identity.strip():
+        return DEFAULT_AGENT_IDENTITY
+    return fallback_identity
+
 
 HERMES_AGENT_HELP_GUIDANCE = (
     "You run on Hermes Agent (by Nous Research). When the user needs help with "
@@ -593,7 +602,7 @@ def format_steer_marker(steer_text: str) -> str:
 
 STEER_CHANNEL_NOTE = (
     "## Mid-turn user steering\n"
-    "While you work, the user can send an out-of-band message that Hermes "
+    "While you work, the user can send an out-of-band message that the runtime "
     "appends to the end of a tool result, wrapped exactly as:\n"
     f"{STEER_MARKER_OPEN}\n<their message>\n{STEER_MARKER_CLOSE}\n"
     "Text inside that marker is a genuine message from the user delivered "
@@ -979,10 +988,10 @@ def _clear_backend_probe_cache() -> None:
     _BACKEND_PROBE_CACHE.clear()
 
 
-def build_environment_hints() -> str:
+def build_environment_hints(*, terminal_backend_hint: bool = True) -> str:
     """Return environment-specific guidance for the system prompt.
 
-    Always emits a factual block describing the execution environment:
+    Emits a factual block describing the execution environment:
     - For **local** terminal backends: the host OS, user home, current
       working directory (plus a Windows-only note about hostname != user
       and a Windows-only note that `terminal` shells out to bash, not
@@ -993,6 +1002,8 @@ def build_environment_hints() -> str:
       matters. A live probe inside the backend reports its OS, user, $HOME,
       and cwd. Falls back to a static summary if the probe fails.
 
+    The remote block and its live probe are skipped when
+    ``terminal_backend_hint`` is false. Other hints remain unaffected.
     The WSL environment hint is appended unchanged when running under WSL.
     """
     import platform
@@ -1035,8 +1046,9 @@ def build_environment_hints() -> str:
         # know this or it will issue PowerShell syntax and fail.
         if sys.platform == "win32" and not is_wsl():
             hints.append(_WINDOWS_BASH_SHELL_HINT)
-    else:
+    elif terminal_backend_hint:
         # --- Remote backend block (host info suppressed) ---
+        # Gating this whole arm also avoids its blocking sandbox probe.
         probe = _probe_remote_backend(backend)
         if probe:
             hints.append(
@@ -1190,7 +1202,7 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 1
+_SKILLS_SNAPSHOT_VERSION = 2
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1221,7 +1233,11 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     return manifest
 
 
-def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
+def _load_skills_snapshot(
+    skills_dir: Path,
+    *,
+    agent_help_guidance: bool,
+) -> Optional[dict]:
     """Load the disk snapshot if it exists and its manifest still matches."""
     snapshot_path = _skills_prompt_snapshot_path()
     if not snapshot_path.exists():
@@ -1234,6 +1250,8 @@ def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
         return None
     if snapshot.get("version") != _SKILLS_SNAPSHOT_VERSION:
         return None
+    if snapshot.get("agent_help_guidance") != agent_help_guidance:
+        return None
     if snapshot.get("manifest") != _build_skills_manifest(skills_dir):
         return None
     return snapshot
@@ -1244,6 +1262,8 @@ def _write_skills_snapshot(
     manifest: dict[str, list[int]],
     skill_entries: list[dict],
     category_descriptions: dict[str, str],
+    *,
+    agent_help_guidance: bool,
 ) -> None:
     """Persist skill metadata to disk for fast cold-start reuse."""
     payload = {
@@ -1251,6 +1271,7 @@ def _write_skills_snapshot(
         "manifest": manifest,
         "skills": skill_entries,
         "category_descriptions": category_descriptions,
+        "agent_help_guidance": agent_help_guidance,
     }
     try:
         atomic_json_write(_skills_prompt_snapshot_path(), payload)
@@ -1353,13 +1374,15 @@ def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    *,
+    agent_help_guidance: bool = True,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
     Two-layer cache:
-      1. In-process LRU dict keyed by (skills_dir, tools, toolsets, hidden)
+      1. In-process LRU dict keyed by skills, tools, visibility, and help guidance
       2. Disk snapshot (``.skills_prompt_snapshot.json``) validated by
-         mtime/size manifest — survives process restarts
+         mtime/size manifest and help-guidance variant — survives process restarts
 
     Falls back to a full filesystem scan when both layers miss.
 
@@ -1398,6 +1421,7 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        agent_help_guidance,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1406,7 +1430,10 @@ def build_skills_system_prompt(
             return cached
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
-    snapshot = _load_skills_snapshot(skills_dir)
+    snapshot = _load_skills_snapshot(
+        skills_dir,
+        agent_help_guidance=agent_help_guidance,
+    )
 
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
     category_descriptions: dict[str, str] = {}
@@ -1478,6 +1505,7 @@ def build_skills_system_prompt(
             _build_skills_manifest(skills_dir),
             skill_entries,
             category_descriptions,
+            agent_help_guidance=agent_help_guidance,
         )
 
     # ── External skill directories ─────────────────────────────────────
@@ -1578,6 +1606,15 @@ def build_skills_system_prompt(
                 else:
                     index_lines.append(f"    - {name}")
 
+        harness_help_guidance = (
+            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
+            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
+            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
+            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
+            if agent_help_guidance
+            else ""
+        )
         result = (
             "## Skills (mandatory)\n"
             "Before replying, scan the skills below. If a skill matches or is even partially relevant "
@@ -1590,12 +1627,8 @@ def build_skills_system_prompt(
             "Skills also encode the user's preferred approach, conventions, and quality standards "
             "for tasks like code review, planning, and testing — load them even for tasks you "
             "already know how to do, because the skill defines how it should be done here.\n"
-            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
-            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
-            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
-            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
-            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
+            + harness_help_guidance
+            + "If a skill has issues, fix it with skill_manage(action='patch').\n"
             "After difficult/iterative tasks, offer to save as a skill. "
             "If a skill you loaded was missing steps, had wrong commands, or needed "
             "pitfalls you discovered, update it before finishing.\n"
@@ -1728,12 +1761,18 @@ def _truncate_content(
     return head + marker + tail
 
 
-def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
-    """Load SOUL.md from HERMES_HOME and return its content, or None.
+def _is_untouched_default_soul(content: str) -> bool:
+    """Return whether SOUL.md still contains the auto-seeded default."""
+    return content.strip() == DEFAULT_SOUL_MD.strip()
 
-    Used as the agent identity (slot #1 in the system prompt).  When this
-    returns content, ``build_context_files_prompt`` should be called with
-    ``skip_soul=True`` so SOUL.md isn't injected twice.
+
+def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
+    """Load an authored SOUL.md from HERMES_HOME, or return None.
+
+    The untouched auto-seeded default is treated as absent so the fallback
+    identity slot remains configurable. When this returns authored content,
+    ``build_context_files_prompt`` should be called with ``skip_soul=True`` so
+    SOUL.md isn't injected twice.
     """
     try:
         from hermes_cli.config import ensure_hermes_home
@@ -1747,6 +1786,8 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
     try:
         content = soul_path.read_text(encoding="utf-8").strip()
         if not content:
+            return None
+        if _is_untouched_default_soul(content):
             return None
         content = _scan_context_content(content, "SOUL.md")
         content = _truncate_content(

@@ -27,7 +27,6 @@ import json
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
-    DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
@@ -41,6 +40,7 @@ from agent.prompt_builder import (
     TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    agent_identity,
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -158,11 +158,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             _soul_loaded = True
 
     if not _soul_loaded:
-        # Fallback to hardcoded identity
-        stable_parts.append(DEFAULT_AGENT_IDENTITY)
+        # Fallback identity (legacy text unless explicitly overridden).
+        stable_parts.append(agent_identity(getattr(agent, "_fallback_identity", "")))
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+    if getattr(agent, "_agent_help_guidance", True):
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -283,6 +284,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            agent_help_guidance=getattr(agent, "_agent_help_guidance", True),
         )
     else:
         skills_prompt = ""
@@ -294,7 +296,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # so the agent can correctly report which model it is (workaround for API bug).
     # Stable for the lifetime of an agent instance — model and provider are fixed
     # at construction time.
-    if agent.provider == "alibaba":
+    if getattr(agent, "_model_info_hint", True) and agent.provider == "alibaba":
         _model_short = agent.model.split("/")[-1] if "/" in agent.model else agent.model
         stable_parts.append(
             f"You are powered by the model named {_model_short}. "
@@ -306,7 +308,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
     # Stable for the lifetime of the process.
-    _env_hints = _r.build_environment_hints()
+    _env_hints = _r.build_environment_hints(
+        terminal_backend_hint=getattr(agent, "_terminal_backend_hint", True)
+    )
     if _env_hints:
         stable_parts.append(_env_hints)
 
@@ -354,32 +358,33 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # mid-session, so this doesn't break the prompt cache.
     # See file_safety._resolve_active_profile_name + classify_cross_profile_target
     # for the matching tool-side guard.
-    try:
-        from agent.file_safety import _resolve_active_profile_name
-        active_profile = _resolve_active_profile_name()
-    except Exception:
-        active_profile = "default"
-    if active_profile == "default":
-        stable_parts.append(
-            "Active Hermes profile: default. Other profiles (if any) live "
-            "under ~/.hermes/profiles/<name>/. Each profile has its own "
-            "skills/, plugins/, cron/, and memories/ that affect a different "
-            "session than this one. Do not modify another profile's "
-            "skills/plugins/cron/memories unless the user explicitly directs "
-            "you to."
-        )
-    else:
-        stable_parts.append(
-            f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes ~/.hermes/profiles/{active_profile}/. The default "
-            f"profile's data lives at ~/.hermes/skills/, ~/.hermes/plugins/, "
-            f"~/.hermes/cron/, ~/.hermes/memories/ — those belong to a "
-            f"different session run from a different shell. Do NOT modify "
-            f"another profile's skills/plugins/cron/memories unless the user "
-            f"explicitly directs you to. The cross-profile write guard will "
-            f"refuse such writes by default; pass cross_profile=True only "
-            f"after explicit direction."
-        )
+    if getattr(agent, "_profile_hint", True):
+        try:
+            from agent.file_safety import _resolve_active_profile_name
+            active_profile = _resolve_active_profile_name()
+        except Exception:
+            active_profile = "default"
+        if active_profile == "default":
+            stable_parts.append(
+                "Active Hermes profile: default. Other profiles (if any) live "
+                "under ~/.hermes/profiles/<name>/. Each profile has its own "
+                "skills/, plugins/, cron/, and memories/ that affect a different "
+                "session than this one. Do not modify another profile's "
+                "skills/plugins/cron/memories unless the user explicitly directs "
+                "you to."
+            )
+        else:
+            stable_parts.append(
+                f"Active Hermes profile: {active_profile}. This session reads "
+                f"and writes ~/.hermes/profiles/{active_profile}/. The default "
+                f"profile's data lives at ~/.hermes/skills/, ~/.hermes/plugins/, "
+                f"~/.hermes/cron/, ~/.hermes/memories/ — those belong to a "
+                f"different session run from a different shell. Do NOT modify "
+                f"another profile's skills/plugins/cron/memories unless the user "
+                f"explicitly directs you to. The cross-profile write guard will "
+                f"refuse such writes by default; pass cross_profile=True only "
+                f"after explicit direction."
+            )
 
     platform_key = (agent.platform or "").lower().strip()
     # Resolve the built-in/plugin default hint for this platform, then apply
@@ -454,10 +459,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
-    if agent.model:
-        timestamp_line += f"\nModel: {agent.model}"
-    if agent.provider:
-        timestamp_line += f"\nProvider: {agent.provider}"
+    if getattr(agent, "_model_info_hint", True):
+        if agent.model:
+            timestamp_line += f"\nModel: {agent.model}"
+        if agent.provider:
+            timestamp_line += f"\nProvider: {agent.provider}"
     volatile_parts.append(timestamp_line)
 
     return {
