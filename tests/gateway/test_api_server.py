@@ -1430,7 +1430,13 @@ class TestSkillsEndpoint:
                 data = await resp.json()
                 assert data["object"] == "list"
                 names = sorted(s["name"] for s in data["data"])
-                assert names == ["ascii-art", "github"]
+                # Skills, plus the always-appended /learn built-in command entry.
+                # The full fork contract for this endpoint (command derivation,
+                # registry validation, /learn) is pinned in the fork-owned
+                # tests/gateway/test_api_server_skills_listing.py — keeping it
+                # out of this upstream-owned file so an upstream sync that
+                # rewrites this module can't silently revert it again (#42).
+                assert names == ["ascii-art", "github", "learn"]
                 for entry in data["data"]:
                     assert set(entry.keys()) >= {"name", "description", "category"}
 
