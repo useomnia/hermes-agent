@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.usage_pricing import extract_provider_cost_usd
+from agent.conversation_loop import _resolve_billable_cost_delta
 
 
 # ── extract_provider_cost_usd — the per-response REAL cost reader ────────────
@@ -40,6 +41,36 @@ class TestExtractProviderCost:
     def test_garbage_cost_values_are_none(self):
         for bad in ("0.01", True, float("nan"), float("inf"), -0.5, [], {}):
             assert extract_provider_cost_usd(SimpleNamespace(cost=bad)) is None, bad
+
+
+class TestResolveBillableCostDelta:
+    def test_should_prefer_reported_cost_when_provider_returns_usage_cost(self):
+        reported, billable = _resolve_billable_cost_delta(
+            SimpleNamespace(cost=0.0033),
+            estimated_cost=0.0012,
+        )
+
+        assert reported == pytest.approx(0.0033)
+        assert billable == pytest.approx(0.0033)
+
+    def test_should_use_estimate_when_provider_omits_usage_cost(self):
+        reported, billable = _resolve_billable_cost_delta(
+            SimpleNamespace(prompt_tokens=10),
+            estimated_cost=0.0012,
+        )
+
+        assert reported is None
+        assert billable == pytest.approx(0.0012)
+
+    def test_should_add_moa_advisor_estimate_to_aggregator_billable_cost(self):
+        reported, billable = _resolve_billable_cost_delta(
+            SimpleNamespace(cost=0.0033),
+            estimated_cost=0.0012,
+            additional_estimated_cost=0.0044,
+        )
+
+        assert reported == pytest.approx(0.0033)
+        assert billable == pytest.approx(0.0077)
 
 
 # ── OpenRouter request param — usage accounting must be requested ────────────

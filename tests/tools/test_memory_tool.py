@@ -330,6 +330,10 @@ class TestMemoryStoreReplace:
         store.add("memory", "fact A")
         result = store.replace("memory", "nonexistent", "new")
         assert result["success"] is False
+        assert "No entry matched" in result["error"]
+        # Zero-match must return current entries so the agent can self-correct
+        # instead of looping blindly (#42405, co-author #42417).
+        assert result["current_entries"] == ["fact A"]
 
     def test_replace_ambiguous_match(self, store):
         store.add("memory", "server A runs nginx")
@@ -361,12 +365,117 @@ class TestMemoryStoreRemove:
         assert len(store.memory_entries) == 0
 
     def test_remove_no_match(self, store):
+        store.add("memory", "fact A")
         result = store.remove("memory", "nonexistent")
         assert result["success"] is False
+        assert "No entry matched" in result["error"]
+        # Zero-match must return current entries (#42405, co-author #42417).
+        assert result["current_entries"] == ["fact A"]
 
     def test_remove_empty_old_text(self, store):
         result = store.remove("memory", "  ")
         assert result["success"] is False
+
+
+class TestMemoryConsolidationGracefulDegrade:
+    """Fix #3 for #42405: a failed at-capacity consolidation must never loop the
+    turn to budget exhaustion — after a per-turn cap of failures, memory ops
+    return a terminal 'stop, continue your reply' result instead of the
+    'retry — all in this turn' instruction."""
+
+    def test_zero_match_failures_degrade_after_cap(self, store):
+        store.add("memory", "fact A")
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        # First `cap` failures still hand back previews + the self-correct hint.
+        for _ in range(cap):
+            r = store.replace("memory", "nonexistent", "new")
+            assert r["success"] is False
+            assert "current_entries" in r  # actionable feedback, keep trying
+            assert "retry with the exact text" in r["error"]
+        # The next failure degrades: terminal, no retry instruction.
+        r = store.replace("memory", "nonexistent", "new")
+        assert r["success"] is False
+        assert r["done"] is True
+        assert "current_entries" not in r
+        assert "continue with your reply" in r["error"]
+
+    def test_add_overflow_degrades_after_cap(self, store):
+        # Fill near the 500-char user/memory limit so add() overflows.
+        store.add("memory", "x" * 200)
+        store.add("memory", "y" * 200)
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        big = "z" * 200
+        for _ in range(cap):
+            r = store.add("memory", big)
+            assert r["success"] is False
+            assert "retry this add" in r["error"]  # still instructs in-turn retry
+        r = store.add("memory", big)
+        assert r["success"] is False
+        assert r["done"] is True
+        assert "continue with your reply" in r["error"]
+
+    def test_failures_mix_across_actions_share_one_budget(self, store):
+        store.add("memory", "fact A")
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        # Interleave replace + remove failures — they share the per-turn counter.
+        actions = [lambda: store.replace("memory", "nope", "x"),
+                   lambda: store.remove("memory", "nope")]
+        for i in range(cap):
+            assert actions[i % 2]()["success"] is False
+        # cap+1th failure (any action) degrades.
+        r = store.remove("memory", "nope")
+        assert "continue with your reply" in r["error"]
+
+    def test_success_resets_failure_budget(self, store):
+        store.add("memory", "real entry")
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        for _ in range(cap):
+            store.replace("memory", "nonexistent", "new")
+        # A successful op resets the counter — progress was made.
+        ok = store.replace("memory", "real entry", "updated entry")
+        assert ok["success"] is True
+        # Now a fresh failure is treated as the first again (still actionable).
+        r = store.replace("memory", "nonexistent", "new")
+        assert "current_entries" in r
+        assert "continue with your reply" not in r["error"]
+
+    def test_reset_consolidation_failures_clears_budget(self, store):
+        store.add("memory", "fact A")
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        for _ in range(cap + 1):
+            store.replace("memory", "nonexistent", "new")
+        # New turn boundary resets the budget.
+        store.reset_consolidation_failures()
+        r = store.replace("memory", "nonexistent", "new")
+        assert "current_entries" in r  # actionable again, not degraded
+        assert "continue with your reply" not in r["error"]
+
+    def test_apply_batch_failures_count_toward_budget(self, store):
+        """apply_batch is the primary at-capacity consolidation path; its
+        failures must also degrade so a looping batch can't exhaust the turn
+        (#42405 whole-bug-class — sibling call path)."""
+        store.add("memory", "fact A")
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        bad_batch = [{"action": "replace", "old_text": "nope", "content": "x"}]
+        for _ in range(cap):
+            r = store.apply_batch("memory", bad_batch)
+            assert r["success"] is False
+            assert "current_entries" in r  # still actionable under cap
+        r = store.apply_batch("memory", bad_batch)
+        assert r["success"] is False
+        assert r["done"] is True
+        assert "continue with your reply" in r["error"]
+
+    def test_apply_batch_and_single_op_share_budget(self, store):
+        """A batch failure followed by single-op failures shares one counter."""
+        store.add("memory", "fact A")
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        store.apply_batch("memory", [{"action": "remove", "old_text": "nope"}])
+        for _ in range(cap - 1):
+            store.replace("memory", "nope", "x")
+        # cap reached across batch + single ops → next degrades.
+        r = store.replace("memory", "nope", "x")
+        assert "continue with your reply" in r["error"]
 
 
 class TestMemoryStorePersistence:
@@ -425,6 +534,26 @@ class TestMemoryToolDispatcher:
     def test_invalid_target(self, store):
         result = json.loads(memory_tool(action="add", target="invalid", content="x", store=store))
         assert result["success"] is False
+
+    def test_null_target_defaults_to_memory_store(self, store):
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target=None,
+                content="Project uses pytest with xdist.",
+                store=store,
+            )
+        )
+        assert result["success"] is True
+        assert store.memory_entries == ["Project uses pytest with xdist."]
+        assert store.user_entries == []
+
+    def test_invalid_non_string_target_still_rejected(self, store):
+        result = json.loads(
+            memory_tool(action="add", target=42, content="via tool", store=store)
+        )
+        assert result["success"] is False
+        assert "Invalid target" in result["error"]
 
     def test_unknown_action(self, store):
         result = json.loads(memory_tool(action="unknown", store=store))
@@ -604,16 +733,30 @@ class TestExternalDriftGuard:
         assert Path(bak).exists()
         assert "Vendor Master" in Path(bak).read_text()
 
-    def test_add_refuses_on_drift(self, store):
-        store.add("memory", "Existing.")
-        path = self._plant_drift(store)
-        original = path.read_text()
+    def test_add_succeeds_despite_drift(self, store):
+        """Add (append) should succeed even when on-disk content shows drift.
+
+        The drift guard protects replace/remove from clobbering un-roundtrippable
+        content, but add only appends — it never overwrites existing entries.
+        Issue #42874: prior-session add() writes shift the byte count, causing
+        the round-trip check to fire on subsequent adds in the same session.
+        """
+        store.add("memory", "Existing entry.")
+        # Plant a mild drift: append content that won't round-trip but stays
+        # under the char limit (500 chars in test fixture).
+        path = store._path_for("memory")
+        path.write_text(
+            path.read_text(encoding="utf-8") + "\nextra content no delimiter",
+            encoding="utf-8",
+        )
 
         result = store.add("memory", "New entry under drift.")
 
-        assert result["success"] is False
-        assert "drift_backup" in result
-        assert path.read_text() == original  # untouched
+        assert result["success"] is True
+        # The new entry is appended — existing drift content is preserved.
+        updated = path.read_text(encoding="utf-8")
+        assert "New entry under drift." in updated
+        assert "extra content no delimiter" in updated
 
     def test_remove_refuses_on_drift(self, store):
         store.add("memory", "Target entry to remove.")
@@ -668,18 +811,190 @@ class TestExternalDriftGuard:
         overwrite the first .bak. The current implementation accepts that
         — both files describe the same on-disk state — but pin the path
         format here so any future change has to think about it.
+
+        Note: add() no longer triggers drift detection (issue #42874) —
+        only replace/remove do.  Both r1 and r2 use replace/remove.
         """
         store.add("memory", "Initial.")
+        store.add("memory", "Second entry.")
         self._plant_drift(store)
 
         r1 = store.replace("memory", "Initial", "Replacement.")
-        r2 = store.add("memory", "Another.")
+        r2 = store.remove("memory", "Second entry")
         assert r1.get("drift_backup")
         assert r2.get("drift_backup")
         # Same epoch second is the expected collision case — both point
         # at the same snapshot. Different second is also fine.
         assert ".bak." in r1["drift_backup"]
         assert ".bak." in r2["drift_backup"]
+
+
+class TestUnreadableFileDoesNotWipeMemory:
+    """A file that exists but can't be read must NOT be treated as empty.
+
+    ``_read_file`` degraded a failed read to ``[]``, conflating "unreadable"
+    with "empty store". ``add`` rewrites the whole file from the parsed entries,
+    so a transient read failure (an external editor holding the file on Windows,
+    a permission blip, an I/O error) turned an append into a full-file rewrite
+    down to a single entry — silently wiping every prior memory while returning
+    success. replace/remove/apply_batch were shielded only incidentally (an
+    empty view means no match, so they abort); this pins the guarantee for all
+    of them explicitly.
+    """
+
+    @staticmethod
+    def _fail_read_once(monkeypatch, path):
+        """Make ``path.read_text`` raise OSError exactly once, else pass through."""
+        real = Path.read_text
+        state = {"failed": False}
+
+        def flaky(self, *a, **k):
+            if self == path and not state["failed"]:
+                state["failed"] = True
+                raise OSError("transient: file temporarily unavailable")
+            return real(self, *a, **k)
+
+        monkeypatch.setattr(Path, "read_text", flaky)
+
+    def test_add_refuses_and_preserves_memory_on_read_failure(
+        self, store, monkeypatch,
+    ):
+        store.add("memory", "User prefers dark mode.")
+        store.add("memory", "Deploy target is Ubuntu 24.04.")
+        path = store._path_for("memory")
+        before = path.read_text(encoding="utf-8")
+
+        self._fail_read_once(monkeypatch, path)
+        result = store.add("memory", "A brand new fact.")
+
+        # Refused, not a false success — and nothing on disk changed.
+        assert result["success"] is False
+        assert "could not be read" in result["error"]
+        assert path.read_text(encoding="utf-8") == before
+        assert "dark mode" in path.read_text(encoding="utf-8")
+        assert "Ubuntu 24.04" in path.read_text(encoding="utf-8")
+
+    def test_replace_reports_read_failure_not_missing_entry(
+        self, store, monkeypatch,
+    ):
+        store.add("memory", "Entry to replace later.")
+        path = store._path_for("memory")
+        before = path.read_text(encoding="utf-8")
+
+        self._fail_read_once(monkeypatch, path)
+        result = store.replace("memory", "Entry to replace", "New value.")
+
+        assert result["success"] is False
+        # The distinct read-failure error, NOT the confusing "no entry matched".
+        assert "could not be read" in result["error"]
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_remove_refuses_on_read_failure(self, store, monkeypatch):
+        store.add("memory", "Keep me safe.")
+        path = store._path_for("memory")
+        before = path.read_text(encoding="utf-8")
+
+        self._fail_read_once(monkeypatch, path)
+        result = store.remove("memory", "Keep me safe")
+
+        assert result["success"] is False
+        assert "could not be read" in result["error"]
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_apply_batch_refuses_on_read_failure(self, store, monkeypatch):
+        store.add("memory", "Original batch entry.")
+        path = store._path_for("memory")
+        before = path.read_text(encoding="utf-8")
+
+        self._fail_read_once(monkeypatch, path)
+        result = store.apply_batch(
+            "memory", [{"action": "add", "content": "batched addition"}]
+        )
+
+        assert result["success"] is False
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_absent_file_is_still_a_clean_empty_store(self, store):
+        """A genuinely missing file must NOT be mistaken for a read failure."""
+        path = store._path_for("memory")
+        if path.exists():
+            path.unlink()
+
+        result = store.add("memory", "First entry ever.")
+
+        assert result["success"] is True
+        assert "First entry ever." in path.read_text(encoding="utf-8")
+
+    def test_normal_add_still_works_when_read_succeeds(self, store):
+        """Control: the guard does not disturb the happy path."""
+        store.add("memory", "Fact one.")
+        result = store.add("memory", "Fact two.")
+        assert result["success"] is True
+        path = store._path_for("memory")
+        assert "Fact one." in path.read_text(encoding="utf-8")
+        assert "Fact two." in path.read_text(encoding="utf-8")
+
+    def test_user_store_add_refuses_on_read_failure(self, store, monkeypatch):
+        """USER.md shares the read-modify-write pattern and needs the same guard."""
+        store.add("user", "Name: Alice")
+        store.add("user", "Role: developer")
+        path = store._path_for("user")
+        before = path.read_text(encoding="utf-8")
+
+        self._fail_read_once(monkeypatch, path)
+        result = store.add("user", "Timezone: UTC")
+
+        assert result["success"] is False
+        assert "could not be read" in result["error"]
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_invalid_utf8_file_refuses_write_instead_of_crashing(self, store):
+        """Undecodable bytes are 'unreadable', not a crash and not an empty store.
+
+        A MEMORY.md with invalid UTF-8 used to raise UnicodeDecodeError out of
+        the mutation path. It must instead produce the same preservation
+        refusal as a failed read — the on-disk bytes can't be round-tripped,
+        so rewriting would corrupt or discard them.
+        """
+        store.add("memory", "Entry before corruption.")
+        path = store._path_for("memory")
+        original_bytes = b"\xff\xfe invalid utf-8 \x80\x81 memory content"
+        path.write_bytes(original_bytes)
+
+        result = store.add("memory", "New entry.")
+
+        assert result["success"] is False
+        assert "could not be read" in result["error"]
+        assert path.read_bytes() == original_bytes  # nothing rewritten
+
+    def test_mutations_read_the_file_exactly_once(self, store, monkeypatch):
+        """Drift detection must use the SAME snapshot as the reload parse.
+
+        The drift guard used to re-read the file itself and swallow a failed
+        second read as "no drift" — a read failure between the checked reload
+        and the drift check let `replace` rewrite the file from a stale view,
+        discarding externally added entries. Pin the invariant structurally:
+        one mutation, one read.
+        """
+        store.add("memory", "Only entry.")
+        path = store._path_for("memory")
+
+        real = Path.read_text
+        counts = {"n": 0}
+
+        def counting(self, *a, **k):
+            if self == path:
+                counts["n"] += 1
+            return real(self, *a, **k)
+
+        monkeypatch.setattr(Path, "read_text", counting)
+        result = store.replace("memory", "Only entry", "Replaced entry.")
+
+        assert result["success"] is True
+        assert counts["n"] == 1, (
+            f"replace() read the memory file {counts['n']} times; drift "
+            f"detection must reuse the single checked-read snapshot"
+        )
 
 
 # =========================================================================

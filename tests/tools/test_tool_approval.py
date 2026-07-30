@@ -38,9 +38,10 @@ from tools.tool_approval import (
     unregister_tool_approval_notify,
 )
 
-GATED = "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT"
-SIBLING = "mcp_connectors_GMAIL_SEND_EMAIL"
-READ = "mcp_connectors_GOOGLE_ANALYTICS_RUN_REPORT"
+GATED = "mcp__connectors__GMAIL_CREATE_EMAIL_DRAFT"
+SIBLING = "mcp__connectors__GMAIL_SEND_EMAIL"
+READ = "mcp__connectors__GOOGLE_ANALYTICS_RUN_REPORT"
+LEGACY_GATED = "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT"
 CREDIT_GATED = "mcp_omnia_create_prompts_insights"
 CREDIT_DESCRIPTOR = {
     "workflow": "insights",
@@ -129,7 +130,12 @@ class TestIsGatedTool:
     def test_should_gate_an_unadvertised_connectors_tool_fail_closed(self):
         # No readOnlyHint recorded (e.g. the route hasn't advertised it yet) →
         # gate rather than risk running a write ungated.
-        assert is_gated_tool("mcp_connectors_SOME_NEW_ACTION") is True
+        assert is_gated_tool("mcp__connectors__SOME_NEW_ACTION") is True
+
+    def test_should_gate_a_legacy_connector_name_for_durable_grants(self):
+        mcp_tool._track_mcp_tool_read_only(LEGACY_GATED, False)
+
+        assert is_gated_tool(LEGACY_GATED) is True
 
     def test_should_not_gate_when_the_killswitch_is_set(self, monkeypatch):
         monkeypatch.setattr(tool_approval, "_DISABLED_FROZEN", True)

@@ -131,6 +131,16 @@ class TestDiscoverBundledSkills:
         skills = _discover_bundled_skills(tmp_path)
         assert len(skills) == 0
 
+    @pytest.mark.parametrize("support_dir", ["references", "scripts", "templates", "assets"])
+    def test_ignores_nested_skill_packages_in_support_dirs(self, tmp_path, support_dir):
+        real = tmp_path / "category" / "umbrella"
+        nested = real / support_dir / "archived-skill"
+        nested.mkdir(parents=True)
+        (real / "SKILL.md").write_text("---\nname: umbrella\n---\n")
+        (nested / "SKILL.md").write_text("---\nname: archived-skill\n---\n")
+
+        assert [name for name, _ in _discover_bundled_skills(tmp_path)] == ["umbrella"]
+
     def test_nonexistent_dir_returns_empty(self, tmp_path):
         skills = _discover_bundled_skills(tmp_path / "nonexistent")
         assert skills == []
@@ -270,6 +280,262 @@ class TestRmtreeWritableScopeGuard:
 
         assert skills.exists()
         assert not sub.exists()
+
+
+class TestExternalDirsIndexing:
+    """Tests for external_dirs awareness in sync_skills (#28126)."""
+
+    def _setup_bundled(self, tmp_path):
+        """Create a fake bundled skills directory."""
+        bundled = tmp_path / "bundled_skills"
+        (bundled / "devops" / "clair-qa").mkdir(parents=True)
+        (bundled / "devops" / "clair-qa" / "SKILL.md").write_text("# bundled clair")
+        (bundled / "creative" / "ascii-art").mkdir(parents=True)
+        (bundled / "creative" / "ascii-art" / "SKILL.md").write_text("# bundled ascii")
+        return bundled
+
+    def _setup_external(self, tmp_path):
+        """Create a fake external skills directory."""
+        ext_dir = tmp_path / "external_skills"
+        (ext_dir / "devops" / "clair-qa").mkdir(parents=True)
+        (ext_dir / "devops" / "clair-qa" / "SKILL.md").write_text("# external clair")
+        (ext_dir / "devops" / "clair-qa" / "main.py").write_text("print('ext')")
+        return ext_dir
+
+    def _patches(self, bundled, skills_dir, manifest_file):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+        stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
+        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
+        stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+        return stack
+
+    def test_shadowed_skill_skipped_and_deferred(self, tmp_path):
+        """When external dir provides the skill, sync_skills should not write it locally."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        ext_dir = self._setup_external(tmp_path)
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch("agent.skill_utils.get_external_skills_dirs", return_value=[ext_dir]):
+                result = sync_skills(quiet=True)
+
+        assert "clair-qa" in result["shadowed_by_external"]
+        assert "clair-qa" not in result["copied"]
+        assert "ascii-art" in result["copied"]
+        assert not (skills_dir / "devops" / "clair-qa").exists()
+
+    def test_shadowed_skill_not_recorded_in_manifest(self, tmp_path):
+        """A skill we never wrote locally must NOT be baselined in the manifest.
+
+        Recording bundled_hash for a deferred skill would later make the
+        loader misclassify the external copy as a user-deleted bundled skill
+        and poison update detection. The shadowed name stays out of the
+        manifest entirely.
+        """
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        ext_dir = self._setup_external(tmp_path)
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch("agent.skill_utils.get_external_skills_dirs", return_value=[ext_dir]):
+                sync_skills(quiet=True)
+                manifest = _read_manifest()
+
+        assert "clair-qa" not in manifest
+        # The non-shadowed skill is still synced and baselined normally.
+        assert "ascii-art" in manifest
+
+    def test_stale_shadow_self_healed(self, tmp_path):
+        """A byte-identical-to-bundled local shadow is removed when the same
+        skill is now provided by external_dirs (heals profiles broken by an
+        earlier sync that ran before external_dirs was configured)."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        ext_dir = self._setup_external(tmp_path)
+
+        # Pre-seed a shadow identical to the bundled source.
+        shadow = skills_dir / "devops" / "clair-qa"
+        shadow.mkdir(parents=True)
+        (shadow / "SKILL.md").write_text("# bundled clair")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch("agent.skill_utils.get_external_skills_dirs", return_value=[ext_dir]):
+                result = sync_skills(quiet=True)
+
+        assert "clair-qa" in result["shadowed_by_external"]
+        assert not shadow.exists()
+
+    def test_user_customized_shadow_preserved(self, tmp_path):
+        """A local skill that DIFFERS from bundled is the user's own — it must
+        never be deleted even when external_dirs provides the same name."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        ext_dir = self._setup_external(tmp_path)
+
+        custom = skills_dir / "devops" / "clair-qa"
+        custom.mkdir(parents=True)
+        (custom / "SKILL.md").write_text("# my own customized clair")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch("agent.skill_utils.get_external_skills_dirs", return_value=[ext_dir]):
+                result = sync_skills(quiet=True)
+
+        assert "clair-qa" in result["shadowed_by_external"]
+        assert custom.exists()
+        assert (custom / "SKILL.md").read_text() == "# my own customized clair"
+
+    def test_no_external_dirs_unchanged(self, tmp_path):
+        """Without external_dirs, all bundled skills should be copied normally."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch("agent.skill_utils.get_external_skills_dirs", return_value=[]):
+                result = sync_skills(quiet=True)
+
+        assert "clair-qa" in result["copied"]
+        assert "ascii-art" in result["copied"]
+        assert result["shadowed_by_external"] == []
+
+
+class TestRenamedBundledSkillRecovery:
+    """Upstream renames/recategorizations must not strand the user's copy.
+
+    ``sync_skills()`` keys the manifest by frontmatter *name*, but computes the
+    destination from the bundled *path*. When upstream moves a skill, the name
+    still matches while the new dest does not exist yet — the pre-fix code fell
+    into its "in manifest but not on disk" branch, misread the skill as
+    user-deleted, and left the old directory stranded at the stale path forever.
+    """
+
+    def _patches(self, bundled, skills_dir, manifest_file):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+        stack.enter_context(
+            patch(
+                "tools.skills_sync._get_optional_dir",
+                return_value=bundled.parent / "optional-skills",
+            )
+        )
+        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
+        stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+        return stack
+
+    def _skill(self, root, rel, body="# Body\n"):
+        d = root / rel
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(f"---\nname: moved-skill\n---\n{body}")
+        return d
+
+    def test_rename_relocates_unmodified_copy(self, tmp_path):
+        """The stale copy is moved to the new path and updated, not stranded."""
+        bundled = tmp_path / "bundled"
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        # User's copy sits at the OLD path, byte-identical to what sync wrote.
+        old = self._skill(skills_dir, "oldcat/moved-skill")
+        origin_hash = _dir_hash(old)
+        manifest_file.parent.mkdir(parents=True, exist_ok=True)
+        manifest_file.write_text(f"moved-skill:{origin_hash}\n")
+
+        # Upstream moved it to a NEW category and changed the content.
+        self._skill(bundled, "newcat/moved-skill", body="# Updated upstream\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+            # Manifest now tracks the current bundled hash (read inside the
+            # patch context — MANIFEST_FILE is a module global).
+            recorded = _read_manifest()["moved-skill"]
+
+        new = skills_dir / "newcat" / "moved-skill"
+        assert new.exists(), "renamed skill was not relocated to the new path"
+        assert not old.exists(), "stale copy left behind — would shadow forever"
+        assert "moved-skill" in result["relocated"]
+        # Having been relocated, it then takes the normal update path.
+        assert "moved-skill" in result["updated"]
+        assert "Updated upstream" in (new / "SKILL.md").read_text()
+        # Future syncs can now detect further upstream changes.
+        assert recorded == _dir_hash(bundled / "newcat" / "moved-skill")
+
+    def test_rename_preserves_user_modified_copy(self, tmp_path):
+        """A user-edited copy at the old path is never moved or overwritten."""
+        bundled = tmp_path / "bundled"
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        old = self._skill(skills_dir, "oldcat/moved-skill")
+        origin_hash = _dir_hash(old)
+        # User then edits their copy, so it no longer matches the origin hash.
+        (old / "SKILL.md").write_text("---\nname: moved-skill\n---\n# MY EDITS\n")
+        manifest_file.parent.mkdir(parents=True, exist_ok=True)
+        manifest_file.write_text(f"moved-skill:{origin_hash}\n")
+
+        self._skill(bundled, "newcat/moved-skill", body="# Updated upstream\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        assert old.exists(), "user's modified copy must not be moved"
+        assert "MY EDITS" in (old / "SKILL.md").read_text()
+        assert "moved-skill" not in result.get("relocated", [])
+
+    def test_rename_does_not_move_hub_installed_skill(self, tmp_path):
+        """A hub-owned path is never relocated — the hub lock owns it."""
+        bundled = tmp_path / "bundled"
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        old = self._skill(skills_dir, "oldcat/moved-skill")
+        origin_hash = _dir_hash(old)
+        manifest_file.parent.mkdir(parents=True, exist_ok=True)
+        manifest_file.write_text(f"moved-skill:{origin_hash}\n")
+
+        lock = skills_dir / ".hub" / "lock.json"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "installed": {
+                        "moved-skill": {"install_path": "oldcat/moved-skill"}
+                    },
+                }
+            )
+        )
+
+        self._skill(bundled, "newcat/moved-skill", body="# Updated upstream\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        assert old.exists(), "hub-installed skill must not be relocated"
+        assert "moved-skill" not in result.get("relocated", [])
+
+    def test_genuine_user_deletion_still_respected(self, tmp_path):
+        """No copy anywhere on disk = a real deletion; must not be resurrected."""
+        bundled = tmp_path / "bundled"
+        skills_dir = tmp_path / "user_skills"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        manifest_file = skills_dir / ".bundled_manifest"
+        manifest_file.write_text("moved-skill:deadbeef\n")
+
+        self._skill(bundled, "newcat/moved-skill")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        assert not (skills_dir / "newcat" / "moved-skill").exists()
+        assert "moved-skill" not in result["copied"]
+        assert "moved-skill" not in result.get("relocated", [])
 
 
 class TestSyncSkills:
@@ -649,6 +915,87 @@ class TestSyncSkills:
 
         assert result["optional_provenance_backfilled"] == []
         assert not (skills_dir / ".hub" / "lock.json").exists()
+
+    def test_backfills_optional_provenance_for_relocated_skill(self, tmp_path):
+        """Upstream recategorization must not blind provenance repair.
+
+        When a skill was installed at ``mlops/chroma`` and upstream later moved
+        it to ``mlops/vector-databases/chroma``, the repo-derived install path
+        no longer exists in the active tree. A path-only lookup skips it
+        forever, so `hermes skills repair-optional` can never fix it. The
+        recorded install_path must be the ACTUAL location, not the repo's.
+        """
+        bundled = self._setup_bundled(tmp_path)
+        optional = tmp_path / "optional-skills"
+        optional_skill = optional / "mlops" / "vector-databases" / "chroma"
+        optional_skill.mkdir(parents=True)
+        (optional_skill / "SKILL.md").write_text("---\nname: chroma\n---\n# Chroma\n")
+
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        # Installed under the OLD category path.
+        active = skills_dir / "mlops" / "chroma"
+        active.mkdir(parents=True)
+        (active / "SKILL.md").write_text("---\nname: chroma\n---\n# Chroma\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch("tools.skills_sync._get_optional_dir", return_value=optional):
+                result = sync_skills(quiet=True)
+
+        assert result["optional_provenance_backfilled"] == ["chroma"]
+        data = json.loads((skills_dir / ".hub" / "lock.json").read_text())
+        entry = data["installed"]["chroma"]
+        assert entry["source"] == "official"
+        assert entry["install_path"] == "mlops/chroma"
+
+    def test_relocated_backfill_still_requires_identical_content(self, tmp_path):
+        """The name fallback must not weaken the content check.
+
+        Finding the skill by name is only a locator; a locally-edited copy is
+        still the user's and must not be claimed as official.
+        """
+        bundled = self._setup_bundled(tmp_path)
+        optional = tmp_path / "optional-skills"
+        optional_skill = optional / "mlops" / "vector-databases" / "chroma"
+        optional_skill.mkdir(parents=True)
+        (optional_skill / "SKILL.md").write_text("---\nname: chroma\n---\n# upstream\n")
+
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        active = skills_dir / "mlops" / "chroma"
+        active.mkdir(parents=True)
+        (active / "SKILL.md").write_text("---\nname: chroma\n---\n# LOCALLY EDITED\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch("tools.skills_sync._get_optional_dir", return_value=optional):
+                result = sync_skills(quiet=True)
+
+        assert result["optional_provenance_backfilled"] == []
+
+    def test_relocated_backfill_refuses_ambiguous_names(self, tmp_path):
+        """Two installed dirs sharing a name give no basis to pick one.
+
+        Guessing would write official provenance onto the wrong skill, so the
+        fallback must decline rather than choose.
+        """
+        bundled = self._setup_bundled(tmp_path)
+        optional = tmp_path / "optional-skills"
+        optional_skill = optional / "cat" / "dupe"
+        optional_skill.mkdir(parents=True)
+        (optional_skill / "SKILL.md").write_text("---\nname: dupe\n---\n# D\n")
+
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        for parent in ("x", "y"):
+            d = skills_dir / parent / "dupe"
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text("---\nname: dupe\n---\n# D\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch("tools.skills_sync._get_optional_dir", return_value=optional):
+                result = sync_skills(quiet=True)
+
+        assert result["optional_provenance_backfilled"] == []
 
     def test_repair_official_optional_restores_reorganized_skill_with_backup(self, tmp_path):
         bundled = self._setup_bundled(tmp_path)

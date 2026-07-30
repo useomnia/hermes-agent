@@ -22,6 +22,16 @@ def _cdp_failure(
     }
 
 
+def test_navigation_timeout_preserves_cold_start_and_bounds_warm_pages(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(browser_tool, "_get_command_timeout", lambda: 30)
+    monkeypatch.setattr(browser_tool, "_get_navigation_timeout", lambda: 15)
+
+    assert browser_tool._get_open_command_timeout(first_open=True) == 120
+    assert browser_tool._get_navigation_timeout() == 15
+
+
 def test_navigate_returns_partial_success_when_open_times_out_but_page_is_ready(
     monkeypatch,
 ) -> None:
@@ -93,6 +103,7 @@ def test_navigate_returns_partial_success_when_open_times_out_but_page_is_ready(
             "open",
             ["https://example.com"],
             timeout=15,
+            _defer_session_reset_on_timeout=True,
         ),
         call(
             "nav-ready",
@@ -321,7 +332,13 @@ def test_navigate_retryable_failure_recovers_and_retries_once(
         "element_count": 1,
     }
     assert mock_run.call_args_list == [
-        call("nav-recover", "open", ["https://example.com"], timeout=15),
+        call(
+            "nav-recover",
+            "open",
+            ["https://example.com"],
+            timeout=15,
+            _defer_session_reset_on_timeout=True,
+        ),
         call(
             "nav-recover",
             "eval",
@@ -332,7 +349,13 @@ def test_navigate_retryable_failure_recovers_and_retries_once(
             timeout=5,
         ),
         call("nav-recover", "snapshot", ["-c"], timeout=5),
-        call("nav-recover", "open", ["https://example.com"], timeout=15),
+        call(
+            "nav-recover",
+            "open",
+            ["https://example.com"],
+            timeout=15,
+            _defer_session_reset_on_timeout=True,
+        ),
         call("nav-recover", "snapshot", ["-c"], timeout=90),
     ]
     mock_recover.assert_called_once_with()

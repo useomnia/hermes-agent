@@ -11,11 +11,6 @@
 # Or with options:
 #   curl -fsSL ... | bash -s -- --no-venv --skip-setup
 #
-# Environment overrides (useful when piping through curl, where flags are
-# awkward to pass):
-#   HERMES_REPO=owner/repo   install from a different fork (default: useomnia/hermes-agent)
-#   HERMES_BRANCH=name       install a specific branch     (default: main; --branch overrides)
-#
 # ============================================================================
 
 set -e
@@ -48,12 +43,6 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Configuration
-#
-# Repository: defaults to the useomnia fork.  Override without editing this
-# file via environment variables (handy for programmatic installs):
-#   HERMES_REPO            owner/repo slug, e.g. "NousResearch/hermes-agent"
-#   HERMES_REPO_URL_SSH    full SSH clone URL   (takes precedence over HERMES_REPO)
-#   HERMES_REPO_URL_HTTPS  full HTTPS clone URL (takes precedence over HERMES_REPO)
 HERMES_REPO="${HERMES_REPO:-useomnia/hermes-agent}"
 REPO_URL_SSH="${HERMES_REPO_URL_SSH:-git@github.com:${HERMES_REPO}.git}"
 REPO_URL_HTTPS="${HERMES_REPO_URL_HTTPS:-https://github.com/${HERMES_REPO}.git}"
@@ -83,27 +72,15 @@ USE_VENV=true
 RUN_SETUP=true
 SKIP_BROWSER=false
 NO_SKILLS=false
-# Branch to install.  Defaults to $HERMES_BRANCH when set (lets callers pick a
-# branch programmatically without passing flags), else "main".  The --branch
-# flag below overrides both.
 BRANCH="${HERMES_BRANCH:-main}"
 INSTALL_COMMIT=""
 ENSURE_DEPS=""
-POSTINSTALL_MODE=false
+
 MANIFEST_MODE=false
 STAGE_NAME=""
 JSON_OUTPUT=false
 NON_INTERACTIVE=false
 INCLUDE_DESKTOP=false
-# Lean-install knobs (all default to today's full behavior). Aimed at headless
-# / server / sandbox installs that don't use the desktop app, TUI, or voice:
-#   PYTHON_EXTRAS    which [project.optional-dependencies] set `uv sync` /
-#                    the pip fallback tiers install. "all" = the curated
-#                    default; a CSV (e.g. "mcp" or "mcp,web") narrows it;
-#                    "none" installs core dependencies only.
-#   SKIP_FFMPEG      skip the ffmpeg system package (TTS voice messages only).
-#   NODE_WORKSPACES  false = root `npm install --workspaces=false` (keeps the
-#                    browser tools) and skip the TUI dependency install.
 PYTHON_EXTRAS="all"
 SKIP_FFMPEG=false
 NODE_WORKSPACES=true
@@ -165,8 +142,8 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --extras)
-            if [[ ! "$2" =~ ^[A-Za-z0-9_,-]+$ ]]; then
-                echo "Invalid --extras value: '$2' (expected a comma-separated extras list, 'all', or 'none')"
+            if [ -z "${2:-}" ] || [[ ! "$2" =~ ^[A-Za-z0-9_,-]+$ ]]; then
+                echo "Invalid --extras value: '${2:-}'"
                 exit 1
             fi
             PYTHON_EXTRAS="$2"
@@ -193,10 +170,7 @@ while [[ $# -gt 0 ]]; do
             ENSURE_DEPS="$2"
             shift 2
             ;;
-        --postinstall)
-            POSTINSTALL_MODE=true
-            shift
-            ;;
+
         -h|--help)
             echo "Hermes Agent Installer"
             echo ""
@@ -216,27 +190,16 @@ while [[ $# -gt 0 ]]; do
             echo "  --json         Print a JSON result frame for --stage"
             echo "  --non-interactive  Skip stages that require user input"
             echo "  --include-desktop  Also build the desktop app (apps/desktop -> Hermes.app)"
-            echo "  --extras LIST  Python extras to install (default: all)"
-            echo "                   'all' = the curated [all] set from pyproject.toml,"
-            echo "                   a CSV picks specific extras (e.g. --extras mcp,web),"
-            echo "                   'none' = core dependencies only."
-            echo "                   For lean server/sandbox installs; the Termux install"
-            echo "                   path keeps its own curated profiles."
-            echo "  --skip-ffmpeg  Skip the ffmpeg system package (only TTS voice"
-            echo "                   messages need it)"
-            echo "  --no-node-workspaces  Install root Node deps only (browser tools);"
-            echo "                   skip the workspace packages (desktop app, TUI, web UI)."
-            echo "                   'hermes --tui' won't work until they are installed."
+            echo "  --extras LIST  Python extras profile: all, none, or CSV (for example mcp,web)"
+            echo "  --skip-ffmpeg  Skip the optional ffmpeg system package"
+            echo "  --no-node-workspaces  Install root browser dependencies without UI workspaces"
             echo "  --dir PATH     Installation directory"
             echo "                   default (non-root):  ~/.hermes/hermes-agent"
             echo "                   default (root, Linux): /usr/local/lib/hermes-agent"
             echo "  --hermes-home PATH  Data directory (default: ~/.hermes, or \$HERMES_HOME)"
             echo "  -h, --help     Show this help"
             echo ""
-            echo "Environment overrides:"
-            echo "  HERMES_REPO=owner/repo   Install from a different fork"
-            echo "                             (default: useomnia/hermes-agent)"
-            echo "  HERMES_BRANCH=name       Branch to install (default: main; --branch overrides)"
+            echo "Environment overrides: HERMES_REPO=owner/repo and HERMES_BRANCH=name"
             echo ""
             echo "Notes:"
             echo "  When running as root on Linux, Hermes installs the code under"
@@ -249,9 +212,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --ensure DEPS  Install only specified deps (comma-separated)"
             echo "                   Supported: node, browser, ripgrep, ffmpeg"
             echo "                   Does NOT clone repo or create venv"
-            echo "  --postinstall  Run post-install setup only (for pip users)"
-            echo "                   Installs optional deps + runs hermes setup"
-            echo "                   Does NOT clone repo or create venv"
+
             exit 0
             ;;
         *)
@@ -315,6 +276,58 @@ restore_dirty_lockfiles() {
     echo "$dirty" | while IFS= read -r f; do
         [ -n "$f" ] && git -C "$repo" checkout -- "$f" 2>/dev/null || true
     done
+}
+
+# npm rewrites tracked package-lock.json files non-deterministically during
+# local builds. On a managed install those diffs are usually runtime churn, not
+# intentional user edits, so discard them before the repository-stage stash.
+# If package.json in the same directory is also dirty we keep both changes.
+discard_update_lockfile_churn() {
+    local repo="${1:-$INSTALL_DIR}"
+    [ -n "$repo" ] && [ -d "$repo/.git" ] || return 0
+    command -v git >/dev/null 2>&1 || return 0
+
+    local dirty_diff
+    dirty_diff=$(git -C "$repo" diff --name-only 2>/dev/null) || return 0
+    [ -n "$dirty_diff" ] || return 0
+
+    local dirty_package_dirs=""
+    while IFS= read -r path; do
+        case "$path" in
+            *package.json)
+                dirty_package_dirs="${dirty_package_dirs}$(dirname "$path")"$'\n'
+                ;;
+        esac
+    done <<EOF
+$dirty_diff
+EOF
+
+    local dirty_locks=""
+    local dirty_count=0
+    while IFS= read -r path; do
+        case "$path" in
+            *package-lock.json)
+                local lock_dir
+                lock_dir=$(dirname "$path")
+                case $'\n'"$dirty_package_dirs" in
+                    *$'\n'"$lock_dir"$'\n'*) continue ;;
+                esac
+                dirty_locks="${dirty_locks}${path}"$'\n'
+                dirty_count=$((dirty_count + 1))
+                ;;
+        esac
+    done <<EOF
+$dirty_diff
+EOF
+
+    [ "$dirty_count" -gt 0 ] || return 0
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        git -C "$repo" checkout -- "$path" 2>/dev/null || true
+    done <<EOF
+$dirty_locks
+EOF
+    log_info "Discarded npm lockfile churn (${dirty_count} file(s))"
 }
 
 emit_manifest() {
@@ -516,8 +529,13 @@ detect_os() {
                 if [ -f /etc/os-release ]; then
                     . /etc/os-release
                     DISTRO="$ID"
+                    # VERSION_ID (e.g. "26.04", "14") lets us tell whether the
+                    # apt release is newer than the newest one Playwright's
+                    # platform resolver recognizes — the #35166 hang condition.
+                    DISTRO_VERSION="${VERSION_ID:-}"
                 else
                     DISTRO="unknown"
+                    DISTRO_VERSION=""
                 fi
             fi
             ;;
@@ -529,7 +547,7 @@ detect_os() {
             OS="windows"
             DISTRO="windows"
             log_error "Windows detected. Please use the PowerShell installer:"
-            log_info "  iex (irm https://raw.githubusercontent.com/useomnia/hermes-agent/main/scripts/install.ps1)"
+            log_info "  iex (irm https://hermes-agent.nousresearch.com/install.ps1)"
             exit 1
             ;;
         *)
@@ -994,22 +1012,19 @@ install_system_packages() {
         need_ripgrep=true
     fi
 
-    log_info "Checking ffmpeg (TTS voice messages)..."
-    if command -v ffmpeg &> /dev/null; then
+    if [ "$SKIP_FFMPEG" = true ]; then
+        log_info "Skipping ffmpeg (--skip-ffmpeg)"
+    else
+        log_info "Checking ffmpeg (TTS voice messages)..."
+    fi
+    if [ "$SKIP_FFMPEG" = true ]; then
+        :
+    elif command -v ffmpeg &> /dev/null; then
         local ffmpeg_ver=$(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')
         log_success "ffmpeg $ffmpeg_ver found"
         HAS_FFMPEG=true
     else
         need_ffmpeg=true
-    fi
-
-    # Honor --skip-ffmpeg BEFORE the per-distro install branches (including
-    # Termux) so none of them ever adds the package. An explicit
-    # `--ensure ffmpeg` run still installs it — that path doesn't go through
-    # this needs-detection.
-    if [ "$SKIP_FFMPEG" = true ] && [ "$need_ffmpeg" = true ]; then
-        log_info "Skipping ffmpeg install (--skip-ffmpeg) — TTS voice messages will be limited"
-        need_ffmpeg=false
     fi
 
     # Termux always needs the Android build toolchain for the tested pip path,
@@ -1204,6 +1219,7 @@ clone_repo() {
             cd "$INSTALL_DIR"
 
             local autostash_ref=""
+            discard_update_lockfile_churn "$INSTALL_DIR"
             if [ -n "$(git status --porcelain)" ]; then
                 # A previously interrupted update can leave the index with
                 # unmerged entries. In that state `git stash` aborts with
@@ -1232,7 +1248,14 @@ clone_repo() {
             git remote set-branches origin "$BRANCH" 2>/dev/null || true
             git fetch origin "$BRANCH"
             git checkout "$BRANCH"
-            git pull --ff-only origin "$BRANCH"
+            # Managed installs should follow origin/$BRANCH exactly. If the
+            # checkout has diverged (or has local-only commits), ff-only pull
+            # cannot succeed — mirror ``hermes update`` and reset to the
+            # fetched remote so bootstrap/install can recover.
+            if ! git pull --ff-only origin "$BRANCH"; then
+                log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
+                git reset --hard "origin/$BRANCH"
+            fi
 
             if [ -n "$autostash_ref" ]; then
                 local restore_now="yes"
@@ -1250,14 +1273,38 @@ clone_repo() {
 
                 if [ "$restore_now" = "yes" ]; then
                     log_info "Restoring local changes..."
-                    if git stash apply "$autostash_ref"; then
+                    local restore_output=""
+                    local restore_ok="yes"
+                    if restore_output="$(git stash apply "$autostash_ref" 2>&1)"; then
+                        restore_ok="yes"
+                    else
+                        restore_ok="no"
+                    fi
+                    local conflicted_files=""
+                    conflicted_files="$(git diff --name-only --diff-filter=U || true)"
+                    if [ "$restore_ok" = "yes" ] && [ -z "$conflicted_files" ]; then
                         git stash drop "$autostash_ref" >/dev/null
                         log_warn "Local changes were restored on top of the updated codebase."
                         log_warn "Review git diff / git status if Hermes behaves unexpectedly."
                     else
-                        log_error "Update succeeded, but restoring local changes failed. Your changes are still preserved in git stash."
-                        log_info "Resolve manually with: git stash apply $autostash_ref"
-                        exit 1
+                        log_error "Update pulled new code, but restoring local changes hit conflicts."
+                        if [ -n "$restore_output" ]; then
+                            printf '%s\n' "$restore_output"
+                        fi
+                        if [ -n "$conflicted_files" ]; then
+                            printf '\nConflicted files:\n'
+                            while IFS= read -r file; do
+                                [ -n "$file" ] && printf '  • %s\n' "$file"
+                            done <<EOF
+$conflicted_files
+EOF
+                        fi
+                        printf '\n'
+                        log_info "Your stashed changes are preserved — nothing is lost."
+                        log_info "  Stash ref: $autostash_ref"
+                        git reset --hard HEAD >/dev/null 2>&1 || true
+                        log_info "Working tree reset to clean state."
+                        log_info "Restore your changes later with: git stash apply $autostash_ref"
                     fi
                 else
                     log_info "Skipped restoring local changes."
@@ -1447,35 +1494,14 @@ install_deps() {
         fi
     fi
 
-    # Install the main package in editable mode with the selected extras
-    # ($PYTHON_EXTRAS — "all" unless the caller narrowed it via --extras).
-    # Both the uv sync tier and the pip fallback tiers below honor it, so a
-    # lean install never silently falls back to a fatter set than requested.
-    local _EXTRAS_LABEL="$PYTHON_EXTRAS"
-    local _UV_EXTRA_ARGS=()
-    local _TIER1_SPEC="."
-    if [ "$PYTHON_EXTRAS" != "none" ]; then
-        local _extras_arr=() _x
-        IFS=',' read -ra _extras_arr <<< "$PYTHON_EXTRAS"
-        for _x in "${_extras_arr[@]}"; do
-            _UV_EXTRA_ARGS+=(--extra "$_x")
-        done
+    # Install the main package in editable mode with the selected extras.
+    local _TIER1_SPEC=".[all]"
+    if [ "$PYTHON_EXTRAS" = "none" ]; then
+        _TIER1_SPEC="."
+    elif [ "$PYTHON_EXTRAS" != "all" ]; then
         _TIER1_SPEC=".[$PYTHON_EXTRAS]"
     fi
-
-    # Record the extras profile next to the venv so `hermes update` (and the
-    # interrupted-install recovery) reinstalls the SAME set instead of
-    # re-fattening a lean install back to [all]. Written before the install
-    # attempts so an interrupted install recovers to the requested profile
-    # too. Default installs remove it — re-running the installer without
-    # --extras is the documented way back to [all]. See INSTALL_EXTRAS_MARKER
-    # in hermes_cli/main.py.
-    if [ "$PYTHON_EXTRAS" != "all" ]; then
-        printf '%s\n' "$PYTHON_EXTRAS" > "$INSTALL_DIR/.install-extras"
-    else
-        rm -f "$INSTALL_DIR/.install-extras"
-    fi
-
+    #
     # Hash-verified install (Tier 0) — when uv.lock is present, prefer
     # `uv sync --locked`. The lockfile records SHA256 hashes for every
     # transitive, so a compromised transitive (different hash than what
@@ -1486,9 +1512,9 @@ install_deps() {
     # hash verification — they exist to keep installs working when the
     # lockfile is stale, missing, or out-of-sync with the current
     # extras spec, NOT because they're equivalent in posture.
-    if [ -f "uv.lock" ]; then
+    if [ -f "uv.lock" ] && [ "$PYTHON_EXTRAS" = "all" ]; then
         log_info "Trying tier: hash-verified (uv.lock) ..."
-        log_info "(this resolves + downloads the '$_EXTRAS_LABEL' extras set — first run on a"
+        log_info "(this resolves + downloads the curated [all] set — first run on a"
         log_info " fresh venv can take 1-5 minutes; uv prints progress below)"
         # Stream uv's progress directly to the user instead of swallowing
         # it with `2>"$(mktemp)"`.  Two reasons:
@@ -1501,25 +1527,27 @@ install_deps() {
         #      uv error message was unreachable — the user just got the
         #      generic "lockfile may be stale" warning.
         #
-        # Critical flag choice: explicit `--extra` flags, NOT `--all-extras`.
+        # Critical flag choice: `--extra all`, NOT `--all-extras`.
         #   --all-extras = every [project.optional-dependencies] key.
         #                  This bypasses the curated `[all]` extra
         #                  entirely and pulls e.g. [matrix] (which
         #                  needs python-olm + make on Windows) and
         #                  [rl] (git+https deps that fail offline).
-        #   --extra all  = install just the `[all]` extra's contents
-        #                  (the default; --extras swaps in a narrower set).
+        #   --extra all  = install just the `[all]` extra's contents.
         #                  This respects the curation in pyproject.toml.
         # uv's own progress UI handles TTY detection and downgrades
         # gracefully when stdout/stderr aren't terminals.
-        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync ${_UV_EXTRA_ARGS[@]+"${_UV_EXTRA_ARGS[@]}"} --locked; then
+        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
             log_success "Main package installed (hash-verified via uv.lock)"
+            rm -f "$INSTALL_DIR/.install-extras"
             log_success "All dependencies installed"
             return 0
         fi
         log_warn "uv.lock sync failed (see uv output above), falling back to PyPI resolve..."
-    else
+    elif [ ! -f "uv.lock" ]; then
         log_info "uv.lock not found — falling back to PyPI resolve (no hash verification)"
+    else
+        log_info "Skipping uv.lock tier for selected extras profile: $PYTHON_EXTRAS"
     fi
 
     # Multi-tier fallback. The point of the tiers is that ONE compromised
@@ -1528,9 +1556,8 @@ install_deps() {
     # fresh install all the way down to "core only" — the user should keep
     # everything else they signed up for.
     #
-    # Tier 1: the requested extras set — the curated [all] extra by default,
-    #         or the narrower --extras selection when one was given.
-    # Tier 2: that same set minus the currently-broken extras list (_BROKEN_EXTRAS).
+    # Tier 1: [all] — the curated extra in pyproject.toml.
+    # Tier 2: [all] minus the currently-broken extras list (_BROKEN_EXTRAS).
     #         Edit _BROKEN_EXTRAS below when something on PyPI breaks; this
     #         lets users keep the rest of [all] when one transitive is
     #         unavailable. The list of [all]'s contents is parsed from
@@ -1544,17 +1571,12 @@ install_deps() {
     #         a separate PyPI-only tier had no remaining content.
     local _BROKEN_EXTRAS=()  # populate when an extra becomes unresolvable
 
-    # Resolve the extras list the broken-extras filter below operates on.
-    # For a caller-narrowed set (--extras) it IS the list; for the default
-    # "all" (or "none"), parse [project.optional-dependencies].all from
-    # pyproject.toml. tomllib is stdlib on Python 3.11+ which uv's bootstrap
-    # guarantees. Falls back to a hand list if parse fails — defensive only.
+    # Parse [project.optional-dependencies].all from pyproject.toml.
+    # tomllib is stdlib on Python 3.11+ which uv's bootstrap guarantees.
+    # Falls back to a hand list if parse fails — defensive only.
     local _ALL_EXTRAS_CSV
-    if [ "$PYTHON_EXTRAS" != "all" ]; then
-        [ "$PYTHON_EXTRAS" = "none" ] && _ALL_EXTRAS_CSV="" || _ALL_EXTRAS_CSV="$PYTHON_EXTRAS"
-    else
-        _ALL_EXTRAS_CSV="$(
-            "$PYTHON_PATH" - <<'PY' 2>/dev/null
+    _ALL_EXTRAS_CSV="$(
+        "$PYTHON_PATH" - <<'PY' 2>/dev/null
 import re, sys, tomllib
 try:
     with open("pyproject.toml", "rb") as fh:
@@ -1570,16 +1592,15 @@ except Exception as e:
     print("", file=sys.stderr)
     sys.exit(1)
 PY
-        )"
-        if [ -z "$_ALL_EXTRAS_CSV" ]; then
-            log_warn "Could not parse [all] from pyproject.toml; falling back to .[all] only."
-            _ALL_EXTRAS_CSV=""
-        fi
+    )"
+    if [ -z "$_ALL_EXTRAS_CSV" ]; then
+        log_warn "Could not parse [all] from pyproject.toml; falling back to .[all] only."
+        _ALL_EXTRAS_CSV=""
     fi
 
-    # Build "requested extras minus broken" spec by filtering the list.
+    # Build "[all] minus broken" spec by filtering the parsed list.
     local _SAFE_SPEC="$_TIER1_SPEC"
-    if [ -n "$_ALL_EXTRAS_CSV" ] && [ "${#_BROKEN_EXTRAS[@]}" -gt 0 ]; then
+    if [ "$PYTHON_EXTRAS" = "all" ] && [ -n "$_ALL_EXTRAS_CSV" ] && [ "${#_BROKEN_EXTRAS[@]}" -gt 0 ]; then
         local _SAFE_EXTRAS=()
         local _e _b _skip
         IFS=',' read -ra _ALL_EXTRAS_ARR <<< "$_ALL_EXTRAS_CSV"
@@ -1611,8 +1632,8 @@ PY
         return 1
     }
 
-    install_tier "$_EXTRAS_LABEL" "$_TIER1_SPEC" \
-        || install_tier "$_EXTRAS_LABEL minus known-broken (${_BROKEN_EXTRAS[*]:-none})" "$_SAFE_SPEC" \
+    install_tier "$PYTHON_EXTRAS" "$_TIER1_SPEC" \
+        || install_tier "all minus known-broken (${_BROKEN_EXTRAS[*]:-none})" "$_SAFE_SPEC" \
         || install_tier "core only (no extras)" "."
 
     rm -f "$ALL_INSTALL_LOG"
@@ -1632,6 +1653,12 @@ PY
 
     log_success "Main package installed"
 
+    if [ "$PYTHON_EXTRAS" = "all" ]; then
+        rm -f "$INSTALL_DIR/.install-extras"
+    else
+        printf '%s\n' "$PYTHON_EXTRAS" > "$INSTALL_DIR/.install-extras"
+    fi
+
     log_success "All dependencies installed"
 }
 
@@ -1639,7 +1666,8 @@ setup_path() {
     log_info "Setting up hermes command..."
 
     if [ "$USE_VENV" = true ]; then
-        HERMES_BIN="$INSTALL_DIR/venv/bin/hermes"
+        HERMES_BIN="$INSTALL_DIR/venv/bin/python"
+        HERMES_ENTRYPOINT="$INSTALL_DIR/hermes"
     else
         HERMES_BIN="$(which hermes 2>/dev/null || echo "")"
         if [ -z "$HERMES_BIN" ]; then
@@ -1648,10 +1676,10 @@ setup_path() {
         fi
     fi
 
-    # Verify the entry point script was actually generated
-    if [ ! -x "$HERMES_BIN" ]; then
-        log_warn "hermes entry point not found at $HERMES_BIN"
-        log_info "This usually means the pip install didn't complete successfully."
+    # Verify the interpreter and the checked-in entrypoint needed by the launcher.
+    if [ ! -x "$HERMES_BIN" ] || { [ "$USE_VENV" = true ] && [ ! -f "$HERMES_ENTRYPOINT" ]; }; then
+        log_warn "Hermes launcher prerequisites not found"
+        log_info "This usually means the Python package install didn't complete successfully."
         if [ "$DISTRO" = "termux" ]; then
             log_info "Try: cd $INSTALL_DIR && python -m pip install -e '.[termux-all]' -c constraints-termux.txt"
         else
@@ -1673,12 +1701,25 @@ setup_path() {
     # the rm, `cat >` follows the symlink and overwrites the venv pip entry
     # point with this shim — making `exec "$HERMES_BIN"` self-recurse. (#21454)
     rm -f "$command_link_dir/hermes"
-    cat > "$command_link_dir/hermes" <<EOF
+    if [ "$USE_VENV" = true ]; then
+        # uv-generated console scripts resolve themselves through `realpath`,
+        # which stock macOS does not provide. Run the checked-in entrypoint
+        # with the venv interpreter instead, so the public launcher remains
+        # independent of non-standard shell utilities.
+        cat > "$command_link_dir/hermes" <<EOF
+#!/usr/bin/env bash
+unset PYTHONPATH
+unset PYTHONHOME
+exec "$HERMES_BIN" "$HERMES_ENTRYPOINT" "\$@"
+EOF
+    else
+        cat > "$command_link_dir/hermes" <<EOF
 #!/usr/bin/env bash
 unset PYTHONPATH
 unset PYTHONHOME
 exec "$HERMES_BIN" "\$@"
 EOF
+    fi
     chmod +x "$command_link_dir/hermes"
     log_success "Installed hermes launcher → $command_link_display_dir/hermes"
 
@@ -1830,24 +1871,14 @@ copy_config_templates() {
         log_info "~/.hermes/config.yaml already exists, keeping it"
     fi
 
-    # Create SOUL.md if it doesn't exist (global persona file)
+    # Create SOUL.md if it doesn't exist (global persona file).
+    # This MUST match DEFAULT_SOUL_MD in hermes_cli/default_soul.py — the
+    # runtime (_ensure_default_soul_md) treats the old comment-only scaffold as
+    # "never customized" and upgrades it to this text on next run, so any drift
+    # here is self-healing, but keep them in sync to avoid a churn on first run.
     if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
         cat > "$HERMES_HOME/SOUL.md" << 'SOUL_EOF'
-# Hermes Agent Persona
-
-<!--
-This file defines the agent's personality and tone.
-The agent will embody whatever you write here.
-Edit this to customize how Hermes communicates with you.
-
-Examples:
-  - "You are a warm, playful assistant who uses kaomoji occasionally."
-  - "You are a concise technical expert. No fluff, just facts."
-  - "You speak like a friendly coworker who happens to know everything."
-
-This file is loaded fresh each message -- no restart needed.
-Delete the contents (or this file) to use the default personality.
--->
+You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.
 SOUL_EOF
         log_success "Created ~/.hermes/SOUL.md (edit to customize personality)"
     fi
@@ -1941,14 +1972,192 @@ strip_snap_browser_override() {
 }
 
 run_browser_install_with_timeout() {
+    run_with_timeout "$@"
+}
+
+# Run a command with a hard wall-clock timeout, returning non-zero if it is
+# killed. Prefers GNU coreutils `timeout` (Linux) or `gtimeout` (macOS via
+# Homebrew) for an external-command target; otherwise (and always for a shell
+# function target, which the `timeout` binary cannot exec) it uses a pure-shell
+# watchdog: launch the command in its own process group, poll until it finishes,
+# and SIGTERM (then SIGKILL) the whole group on timeout. The pure-shell path is
+# what protects the bug-#39219 case — a stalled Electron download on macOS,
+# where `timeout` is usually absent — turning an indefinite hang into a non-zero
+# exit so callers (install_desktop) can self-heal via the mirror fallback.
+#
+# $1 (timeout) must be a bare integer number of seconds — the pure-shell loop
+# compares it arithmetically (the `timeout` binary would also accept suffixes
+# like 15m, but we normalize so both paths share one contract). On timeout the
+# return code is 124, matching GNU `timeout`.
+run_with_timeout() {
     local timeout_seconds="$1"
     shift
 
-    if command -v timeout >/dev/null 2>&1; then
-        timeout "$timeout_seconds" "$@"
-    else
-        "$@"
+    # Normalize to a bare integer; fall back to the desktop default if a caller
+    # ever passes a suffixed/empty value (the pure-shell loop needs an int).
+    case "$timeout_seconds" in
+        ''|*[!0-9]*) timeout_seconds=900 ;;
+    esac
+
+    # The `timeout` binary can only exec an external command, not a shell
+    # function. Use it only when the target is NOT a function; functions always
+    # go through the pure-shell watchdog (which runs them in a subshell of the
+    # current shell and sees them directly — no fragile env export needed).
+    if [ "$(type -t "$1" 2>/dev/null)" != "function" ]; then
+        local timeout_bin=""
+        if command -v timeout >/dev/null 2>&1; then
+            timeout_bin="timeout"
+        elif command -v gtimeout >/dev/null 2>&1; then
+            timeout_bin="gtimeout"
+        fi
+        if [ -n "$timeout_bin" ]; then
+            # GNU `timeout` runs the command in its own process group, so a
+            # terminal Ctrl+C is delivered to `timeout` but never reaches the
+            # child — the download looks frozen and ignores Ctrl+C (#35166).
+            # `--foreground` keeps the command in the shell's foreground group
+            # so Ctrl+C reaches it; `-k 10` sends SIGKILL 10s after the deadline
+            # so a wedged download can't outlive the timeout. Both flags are
+            # GNU-only — probe once and fall back to plain `timeout` on BusyBox
+            # (Alpine). When neither binary exists (stock macOS) we drop to the
+            # pure-shell watchdog below.
+            if "$timeout_bin" --foreground -k 10 1 true >/dev/null 2>&1; then
+                "$timeout_bin" --foreground -k 10 "$timeout_seconds" "$@"
+            else
+                "$timeout_bin" "$timeout_seconds" "$@"
+            fi
+            return $?
+        fi
     fi
+
+    # Pure-shell fallback: run in a new process group so we can kill the whole
+    # subtree (npm spawns node + the Electron downloader as children).
+    set -m
+    ( "$@" ) &
+    local cmd_pid=$!
+    set +m
+
+    local waited=0
+    local rc
+    while [ "$waited" -lt "$timeout_seconds" ]; do
+        if ! kill -0 "$cmd_pid" 2>/dev/null; then
+            # `|| rc=$?` keeps the non-zero child status without letting `set -e`
+            # abort the caller here (this would fire if run_with_timeout were
+            # ever called outside an if/|| context).
+            rc=0; wait "$cmd_pid" 2>/dev/null || rc=$?
+            return "$rc"
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    # Final boundary recheck: the command may have finished during the last
+    # poll interval — don't kill (and mislabel as 124) a process that already
+    # exited cleanly in the last second of the budget.
+    if ! kill -0 "$cmd_pid" 2>/dev/null; then
+        rc=0; wait "$cmd_pid" 2>/dev/null || rc=$?
+        return "$rc"
+    fi
+
+    # Timed out: kill the process group (negative PID), escalate to KILL.
+    kill -TERM "-$cmd_pid" 2>/dev/null || kill -TERM "$cmd_pid" 2>/dev/null || true
+    sleep 2
+    kill -KILL "-$cmd_pid" 2>/dev/null || kill -KILL "$cmd_pid" 2>/dev/null || true
+    wait "$cmd_pid" 2>/dev/null || true
+    return 124
+}
+
+# Return success only when the host is an apt release NEWER than the newest one
+# Playwright's platform resolver recognizes — the exact condition that makes
+# `playwright install` hang uninterruptibly (#35166). We scope the override
+# retry to this case rather than retrying on *any* failure, so a genuine
+# network/disk/permission failure doesn't get a mismatched-glibc build forced
+# onto it. Newest Playwright-known apt releases as of this writing: Ubuntu
+# 24.04, Debian 13. Anything above triggers the fallback; everything Playwright
+# already handles (and every non-apt distro) does not.
+playwright_host_unrecognized() {
+    # Compare dotted versions: returns 0 if $1 > $2.
+    _ver_gt() {
+        [ "$1" = "$2" ] && return 1
+        [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+    }
+    case "$DISTRO" in
+        ubuntu) _ver_gt "${DISTRO_VERSION:-0}" "24.04" ;;
+        debian) _ver_gt "${DISTRO_VERSION:-0}" "13" ;;
+        *) return 1 ;;  # Non-apt or unknown — not the #35166 hang condition.
+    esac
+}
+
+# Compute the PLAYWRIGHT_HOST_PLATFORM_OVERRIDE value to retry an install with
+# when Playwright's platform resolver rejects the host. ubuntu24.04 is the
+# newest Linux build Playwright has shipped across recent releases and runs on
+# newer apt releases (its binaries are dynamically linked); we point too-new /
+# unrecognized hosts at it. Only x64/arm64 Linux have Playwright builds — emit
+# nothing for anything else so the caller skips the retry. Echoes the value
+# (e.g. "ubuntu24.04-x64") or nothing.
+playwright_fallback_platform() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "ubuntu24.04-x64" ;;
+        aarch64|arm64) echo "ubuntu24.04-arm64" ;;
+        *) : ;;  # No Playwright Linux build for this arch.
+    esac
+}
+
+# Run a `playwright install ...` command, and if it fails or hangs (the
+# uninterruptible "Installing Playwright Chromium with system dependencies"
+# stall on apt releases Playwright doesn't recognize yet — Ubuntu 26.04,
+# Debian 14, future distros — see #35166), retry it ONCE with
+# PLAYWRIGHT_HOST_PLATFORM_OVERRIDE pinned to the newest known build.
+#
+# The override retry is scoped to the actual hang condition: it fires only when
+# the host is an apt release NEWER than Playwright recognizes
+# (playwright_host_unrecognized). On every release Playwright already supports
+# (Ubuntu <=24.04, Debian <=13) and every non-apt distro, the first attempt is
+# authoritative and a failure is reported as-is — we never force a
+# mismatched-glibc build (microsoft/playwright#35114) onto a host Playwright
+# handles correctly. This is deliberately narrower than a retry-on-any-failure:
+# a network/disk/permission error on a supported host should surface, not get
+# papered over with a platform override. Playwright's maintainers bless this
+# env var as the supported escape hatch for unrecognized platforms
+# (microsoft/playwright#33434); a hardcoded full distro/version table was
+# rejected upstream (microsoft/playwright#33432), so we only need the
+# newest-known floor here.
+#
+# An operator-provided PLAYWRIGHT_HOST_PLATFORM_OVERRIDE is always respected:
+# it is inherited by the first attempt, and the retry is skipped.
+#
+# Usage: run_playwright_install <timeout_seconds> npx playwright install [args...]
+run_playwright_install() {
+    local timeout_seconds="$1"
+    shift
+
+    # First attempt: native platform resolution (inherits any operator override).
+    if run_browser_install_with_timeout "$timeout_seconds" "$@" 2>/dev/null; then
+        return 0
+    fi
+
+    # Operator already pinned the platform — their choice already applied to the
+    # attempt above; a second identical run won't help.
+    if [ -n "${PLAYWRIGHT_HOST_PLATFORM_OVERRIDE:-}" ]; then
+        return 1
+    fi
+
+    # Only retry with an override on the apt releases too new for Playwright to
+    # recognize (the #35166 hang). Any other failure is a real failure and is
+    # surfaced unchanged.
+    if ! playwright_host_unrecognized; then
+        return 1
+    fi
+
+    local fallback
+    fallback="$(playwright_fallback_platform)"
+    if [ -z "$fallback" ]; then
+        return 1  # No usable fallback build for this arch.
+    fi
+
+    log_warn "Playwright doesn't recognize ${DISTRO} ${DISTRO_VERSION} yet — retrying with PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=$fallback"
+    log_info "(apt releases newer than Playwright knows hang at this step; see #35166)"
+    PLAYWRIGHT_HOST_PLATFORM_OVERRIDE="$fallback" \
+        run_browser_install_with_timeout "$timeout_seconds" "$@"
 }
 
 configure_browser_env_from_system_browser() {
@@ -1996,20 +2205,15 @@ install_node_deps() {
 
     if [ -f "$INSTALL_DIR/package.json" ]; then
         cd "$INSTALL_DIR"
-        # The root package.json declares npm workspaces (apps/*, ui-tui, web),
-        # so a bare `npm install` also materialises the desktop app, TUI, and
-        # web UI dependency trees. Headless/server installs only need the root
-        # deps (the agent-browser tooling): --no-node-workspaces scopes the
-        # install to those with `--workspaces=false`.
         if [ "$NODE_WORKSPACES" = false ]; then
-            log_info "Installing root Node.js dependencies only (browser tools; --no-node-workspaces)..."
-            npm install --workspaces=false --silent 2>/dev/null || {
-                log_warn "npm install failed (browser tools may not work)"
+            log_info "Installing root Node.js dependencies only (--no-node-workspaces)..."
+            run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --workspaces=false --silent || {
+                log_warn "npm install failed or timed out (browser tools may not work)"
             }
         else
             log_info "Installing Node.js dependencies (browser tools)..."
-            npm install --silent 2>/dev/null || {
-                log_warn "npm install failed (browser tools may not work)"
+            run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
+                log_warn "npm install failed or timed out (browser tools may not work)"
             }
         fi
         log_success "Node.js dependencies installed"
@@ -2043,7 +2247,7 @@ install_node_deps() {
                     # exact command the admin needs to run separately.
                     if [ "$(id -u)" -eq 0 ] || (command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null); then
                         log_info "Installing Playwright Chromium with system dependencies..."
-                        cd "$INSTALL_DIR" && run_browser_install_with_timeout 600 npx playwright install --with-deps chromium 2>/dev/null || {
+                        cd "$INSTALL_DIR" && run_playwright_install 600 npx playwright install --with-deps chromium || {
                             log_warn "Playwright browser installation failed — browser tools will not work."
                             log_warn "Try running manually: cd $INSTALL_DIR && npx playwright install --with-deps chromium"
                         }
@@ -2053,7 +2257,7 @@ install_node_deps() {
                         log_info "  sudo npx playwright install-deps chromium"
                         log_info "  (from $INSTALL_DIR, after Node.js deps are installed)"
                         log_info "Installing Chromium binary into this user's Playwright cache..."
-                        cd "$INSTALL_DIR" && run_browser_install_with_timeout 600 npx playwright install chromium 2>/dev/null || {
+                        cd "$INSTALL_DIR" && run_playwright_install 600 npx playwright install chromium || {
                             log_warn "Playwright browser installation failed — browser tools will not work."
                             log_warn "Try running manually: cd $INSTALL_DIR && npx playwright install chromium"
                         }
@@ -2073,7 +2277,7 @@ install_node_deps() {
                             log_warn "  sudo pacman -S nss atk at-spi2-core cups libdrm libxkbcommon mesa pango cairo alsa-lib"
                         fi
                     fi
-                    cd "$INSTALL_DIR" && run_browser_install_with_timeout 600 npx playwright install chromium 2>/dev/null || {
+                    cd "$INSTALL_DIR" && run_playwright_install 600 npx playwright install chromium || {
                         log_warn "Playwright browser installation failed — browser tools will not work."
                     }
                     ;;
@@ -2081,7 +2285,7 @@ install_node_deps() {
                     log_warn "Playwright does not support automatic dependency installation on RPM-based systems."
                     log_info "Install Chromium system dependencies manually before using browser tools:"
                     log_info "  sudo dnf install nss atk at-spi2-core cups-libs libdrm libxkbcommon mesa-libgbm pango cairo alsa-lib"
-                    cd "$INSTALL_DIR" && run_browser_install_with_timeout 600 npx playwright install chromium 2>/dev/null || {
+                    cd "$INSTALL_DIR" && run_playwright_install 600 npx playwright install chromium || {
                         log_warn "Playwright browser installation failed — install dependencies above and retry."
                     }
                     ;;
@@ -2089,7 +2293,7 @@ install_node_deps() {
                     log_warn "Playwright does not support automatic dependency installation on zypper-based systems."
                     log_info "Install Chromium system dependencies manually before using browser tools:"
                     log_info "  sudo zypper install mozilla-nss libatk-1_0-0 at-spi2-core cups-libs libdrm2 libxkbcommon0 Mesa-libgbm1 pango cairo libasound2"
-                    cd "$INSTALL_DIR" && run_browser_install_with_timeout 600 npx playwright install chromium 2>/dev/null || {
+                    cd "$INSTALL_DIR" && run_playwright_install 600 npx playwright install chromium || {
                         log_warn "Playwright browser installation failed — install dependencies above and retry."
                     }
                     ;;
@@ -2098,7 +2302,7 @@ install_node_deps() {
                     log_info "Install Chromium/browser system dependencies for your distribution, then run:"
                     log_info "  cd $INSTALL_DIR && npx playwright install chromium"
                     log_info "Browser tools will not work until dependencies are installed."
-                    cd "$INSTALL_DIR" && run_browser_install_with_timeout 600 npx playwright install chromium 2>/dev/null || true
+                    cd "$INSTALL_DIR" && run_playwright_install 600 npx playwright install chromium || true
                     ;;
             esac
         fi
@@ -2108,12 +2312,13 @@ install_node_deps() {
 
     # Install TUI dependencies
     if [ "$NODE_WORKSPACES" = false ]; then
-        log_info "Skipping TUI dependencies (--no-node-workspaces) — 'hermes --tui' needs them"
+        log_info "Skipping TUI dependencies (--no-node-workspaces)"
     elif [ -f "$INSTALL_DIR/ui-tui/package.json" ]; then
         log_info "Installing TUI dependencies..."
         cd "$INSTALL_DIR/ui-tui"
-        npm install --silent 2>/dev/null || {
-            log_warn "TUI npm install failed (hermes --tui may not work)"
+        # Time-boxed: a stalled registry fetch would otherwise hang here (#39219).
+        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
+            log_warn "TUI npm install failed or timed out (hermes --tui may not work)"
         }
         log_success "TUI dependencies installed"
     fi
@@ -2253,6 +2458,48 @@ maybe_start_gateway() {
     fi
 }
 
+write_bootstrap_marker() {
+    # Writes $INSTALL_DIR/.hermes-bootstrap-complete, which tells the Hermes
+    # desktop app (apps/desktop/electron/main.ts) and the macOS launcher fast
+    # path (apps/bootstrap-installer) "a real install finished here -- don't
+    # re-run first-run bootstrap."
+    #
+    # Schema mirrors install.ps1's Write-BootstrapMarker and main.ts's
+    # writeBootstrapMarker(). Keep the three in lockstep:
+    #   schemaVersion 1 + pinnedCommit (length >= 7) are what the desktop
+    #   validator requires; desktopVersion is omitted because only the desktop
+    #   app knows its own version.
+    if [ ! -d "$INSTALL_DIR" ]; then
+        log_warn "Skipping bootstrap marker: $INSTALL_DIR doesn't exist"
+        return 0
+    fi
+
+    # Explicit --commit wins; otherwise read HEAD from the checkout we just
+    # installed. If neither resolves, skip the marker entirely rather than
+    # write one the desktop will reject -- an absent marker is a clean
+    # "bootstrap needed", a malformed one is a confusing half-state.
+    local pinned_commit="$INSTALL_COMMIT"
+    if [ -z "$pinned_commit" ]; then
+        pinned_commit=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null) || pinned_commit=""
+    fi
+
+    if [ -z "$pinned_commit" ]; then
+        log_warn "Skipping bootstrap marker: could not resolve HEAD in $INSTALL_DIR"
+        return 0
+    fi
+
+    local marker_path="$INSTALL_DIR/.hermes-bootstrap-complete"
+    local tmp_path="$marker_path.tmp"
+
+    # Atomic publish: the macOS launcher predicate only checks existence, so a
+    # torn write would arm the fast path against a half-written marker.
+    printf '{\n  "schemaVersion": 1,\n  "pinnedCommit": "%s",\n  "pinnedBranch": "%s",\n  "completedAt": "%s"\n}\n' \
+        "$pinned_commit" \
+        "$BRANCH" \
+        "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" > "$tmp_path"
+    mv -f "$tmp_path" "$marker_path"
+}
+
 print_success() {
     echo ""
     echo -e "${GREEN}${BOLD}"
@@ -2355,11 +2602,13 @@ ensure_browser() {
     log_info "Installing agent-browser..."
     local log_file
     log_file="$(mktemp)"
-    if ! "$npm_bin" install -g --prefix "$HERMES_HOME/node" --silent --ignore-scripts \
+    # Time-boxed (#39219): a stalled npm registry fetch here would otherwise
+    # hang the installer with no progress, same class as the desktop build.
+    if ! run_with_timeout "$NODE_DEPS_TIMEOUT" "$npm_bin" install -g --prefix "$HERMES_HOME/node" --silent --ignore-scripts \
         "agent-browser@^0.26.0" \
         "@askjo/camofox-browser@^1.5.2" \
         >"$log_file" 2>&1; then
-        log_error "npm install failed:"
+        log_error "npm install failed or timed out:"
         cat "$log_file" >&2
         rm -f "$log_file"
         return 1
@@ -2439,29 +2688,6 @@ ensure_mode() {
     done
 }
 
-postinstall_mode() {
-    print_banner
-    detect_os
-
-    log_info "Post-install mode: setting up Hermes for pip install"
-
-    check_node
-    check_network_prerequisites
-    install_system_packages
-
-    if [ "$HAS_NODE" = true ] && [ "$SKIP_BROWSER" = false ]; then
-        ensure_browser
-    fi
-
-    HERMES_CMD="$(command -v hermes 2>/dev/null || echo "")"
-    if [ -n "$HERMES_CMD" ]; then
-        log_info "Running hermes setup..."
-        "$HERMES_CMD" setup
-    else
-        log_warn "hermes command not found on PATH"
-        log_info "Try: python -m hermes_cli.main setup"
-    fi
-}
 
 # Clear the cached Electron download + any half-written unpacked output so the
 # next `npm run pack` re-downloads and re-stages from scratch. A corrupt zip in
@@ -2544,6 +2770,18 @@ _desktop_pack() {
 # Last-resort Electron mirror after GitHub download fails (#47266).
 DESKTOP_ELECTRON_FALLBACK_MIRROR="https://npmmirror.com/mirrors/electron/"
 
+# Per-attempt wall-clock cap for the desktop npm install / electron-builder pack
+# (#39219). A stalled (not failed) Electron download on a throttled/blocked link
+# never returns, so without this the installer hangs forever on "Build desktop
+# app". 900s is generous enough for a slow-but-progressing ~150MB fetch + build;
+# override with DESKTOP_BUILD_TIMEOUT for very slow links.
+DESKTOP_BUILD_TIMEOUT="${DESKTOP_BUILD_TIMEOUT:-900}"
+
+# Wall-clock cap for the plain registry `npm install`s (browser-tools + TUI
+# deps). Same #39219 stall class but no ~150MB Electron binary, so a shorter
+# default; override with NODE_DEPS_TIMEOUT for very slow links.
+NODE_DEPS_TIMEOUT="${NODE_DEPS_TIMEOUT:-600}"
+
 # Electron package dir — workspace-local nest first, then root hoist.
 _electron_dir() {
     local install_dir="$1"
@@ -2554,7 +2792,7 @@ _electron_dir() {
     fi
 }
 
-# True when dist/ holds a usable Electron binary (#38673 / run-electron-builder.cjs).
+# True when dist/ holds a usable Electron binary (#38673 / run-electron-builder.mjs).
 _electron_dist_ok() {
     local install_dir="$1"
     local electron_dir
@@ -2641,8 +2879,28 @@ install_desktop() {
     #    flake) — leaving tsc/typescript unresolved and `npm run pack`'s
     #    `tsc -b` failing with no obvious cause. Fall back to `npm install`
     #    only if `npm ci` is unavailable or the lockfile is out of sync.
+    #
+    #    Both the install and the build below are wrapped in a hard wall-clock
+    #    timeout (#39219): the Electron binary (~150MB) is fetched from GitHub,
+    #    and on a throttled/blocked connection that download can *stall* — npm
+    #    neither errors nor exits, so the installer sits on "Build desktop app"
+    #    forever with only `npm warn deprecated` lines visible. A stall now
+    #    converts to a non-zero exit, which feeds the existing self-heal /
+    #    mirror-fallback escalation instead of hanging the whole install.
+    #
+    #    The `npm ci` and its `npm install` fallback SHARE one budget: a stalled
+    #    link wedges both identically, so giving each a full DESKTOP_BUILD_TIMEOUT
+    #    would double the worst-case hang. We compute a single deadline and pass
+    #    the remaining seconds to the fallback (min 30s so it still gets a real
+    #    attempt if `npm ci` failed fast rather than stalling).
     log_info "Installing desktop workspace dependencies (includes Electron ~150MB, 1-3min)..."
-    if ( cd "$INSTALL_DIR" && npm ci ) || ( cd "$INSTALL_DIR" && npm install ); then
+    local _deps_start _deps_remaining
+    _deps_start=$(date +%s)
+    if run_with_timeout "$DESKTOP_BUILD_TIMEOUT" bash -c 'cd "$1" && npm ci' _ "$INSTALL_DIR"; then
+        log_success "Desktop workspace dependencies installed"
+    elif _deps_remaining=$(( DESKTOP_BUILD_TIMEOUT - ($(date +%s) - _deps_start) )); \
+         [ "$_deps_remaining" -lt 30 ] && _deps_remaining=30; \
+         run_with_timeout "$_deps_remaining" bash -c 'cd "$1" && npm install' _ "$INSTALL_DIR"; then
         log_success "Desktop workspace dependencies installed"
     elif _electron_pkg_staged_missing_dist "$INSTALL_DIR"; then
         log_warn "Desktop dependency install failed with a missing Electron dist; attempting self-heal..."
@@ -2671,7 +2929,7 @@ install_desktop() {
     #         the GitHub-blocked/throttled case (the repeating "retrying" log).
     log_info "Building desktop app (this takes 1-3 minutes)..."
     local pack_ok=false
-    if _desktop_pack "$desktop_dir"; then
+    if run_with_timeout "$DESKTOP_BUILD_TIMEOUT" _desktop_pack "$desktop_dir"; then
         pack_ok=true
     else
         local purged=""
@@ -2682,7 +2940,7 @@ install_desktop() {
         fi
         if [ "$restored" = true ]; then
             log_warn "Desktop build failed; refreshed the Electron download and retrying once..."
-            if _desktop_pack "$desktop_dir"; then
+            if run_with_timeout "$DESKTOP_BUILD_TIMEOUT" _desktop_pack "$desktop_dir"; then
                 pack_ok=true
             fi
         fi
@@ -2694,7 +2952,7 @@ install_desktop() {
         log_warn "Re-downloading Electron via a public mirror ($DESKTOP_ELECTRON_FALLBACK_MIRROR), then rebuilding..."
         log_warn "  (set ELECTRON_MIRROR yourself to use a different/trusted mirror)"
         _electron_dist_ok "$INSTALL_DIR" || _restore_electron_dist "$INSTALL_DIR" "$DESKTOP_ELECTRON_FALLBACK_MIRROR" || true
-        if _desktop_pack "$desktop_dir" "$DESKTOP_ELECTRON_FALLBACK_MIRROR"; then
+        if run_with_timeout "$DESKTOP_BUILD_TIMEOUT" _desktop_pack "$desktop_dir" "$DESKTOP_ELECTRON_FALLBACK_MIRROR"; then
             pack_ok=true
         fi
     fi
@@ -2875,6 +3133,7 @@ run_stage_body() {
             detect_os
             resolve_install_layout
             print_success
+            write_bootstrap_marker
             # Code-scoped stamp: write next to the install tree, not into
             # $HERMES_HOME. $HERMES_HOME is a shared data dir (it can be
             # bind-mounted into a Docker gateway too), so a stamp there gets
@@ -2959,6 +3218,8 @@ main() {
 
     print_success
 
+    write_bootstrap_marker
+
     # Code-scoped stamp: write next to the install tree, not into $HERMES_HOME.
     # $HERMES_HOME is a shared data dir (it can be bind-mounted into a Docker
     # gateway too), so a stamp there gets clobbered by the container's 'docker'
@@ -2973,8 +3234,6 @@ elif [ -n "$STAGE_NAME" ]; then
     run_stage_protocol "$STAGE_NAME"
 elif [ -n "$ENSURE_DEPS" ]; then
     ensure_mode
-elif [ "$POSTINSTALL_MODE" = true ]; then
-    postinstall_mode
 else
     main
 fi

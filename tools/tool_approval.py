@@ -55,10 +55,10 @@ _ENV_DISABLED = "OMNIO_TOOL_APPROVAL_DISABLED"
 # tools/approval.py's gateway_timeout default; the chat keepalive holds the SSE.
 _ENV_TIMEOUT = "OMNIO_TOOL_APPROVAL_TIMEOUT"
 _DEFAULT_TIMEOUT_S = 300
-# Registered MCP names for the per-brand connectors server are
-# ``mcp_connectors_<slug>``. The write gate is scoped to this prefix so only
-# connector tools are gated through the connector-approval card.
-CONNECTORS_TOOL_PREFIX = "mcp_connectors_"
+# Native MCP names use ``mcp__<server>__<tool>``. Existing durable approval
+# records may still contain the earlier flattened connector names, so both
+# forms remain in the connector-write trust boundary.
+CONNECTORS_TOOL_PREFIXES = ("mcp__connectors__", "mcp_connectors_")
 
 # User-facing option labels and the scope each one grants. Index-aligned so the
 # Omnia frontend can map a chosen label back to its scope.
@@ -122,19 +122,19 @@ def _approval_timeout() -> int:
 def is_gated_tool(function_name: str) -> bool:
     """Whether *function_name* needs connector-write or credit approval.
 
-    Gates a connectors-server tool (``mcp_connectors_<slug>``) unless the route
-    advertised it as read-only (MCP ``readOnlyHint=True``). The route stamps that
-    per tool from its write allowlist, so the gated set tracks exactly what the
-    route exposes — no provision-time snapshot to drift. FAILS CLOSED: a
-    connectors tool with no read-only hint (e.g. a route that hasn't advertised
-    it yet) is gated rather than run as an ungated write. Any MCP tool with an
-    Omnia credit-spend descriptor is gated regardless of its server prefix.
+    Gates a connectors-server tool unless the route advertised it as read-only
+    (MCP ``readOnlyHint=True``). The route stamps that per tool from its write
+    allowlist, so the gated set tracks exactly what the route exposes — no
+    provision-time snapshot to drift. FAILS CLOSED: a connectors tool with no
+    read-only hint (e.g. a route that hasn't advertised it yet) is gated rather
+    than run as an ungated write. Any MCP tool with an Omnia credit-spend
+    descriptor is gated regardless of its server prefix.
     """
     if _DISABLED_FROZEN:
         return False
     if mcp_tool_credits_meta(function_name) is not None:
         return True
-    if not function_name or not function_name.startswith(CONNECTORS_TOOL_PREFIX):
+    if not function_name or not function_name.startswith(CONNECTORS_TOOL_PREFIXES):
         return False
     return not mcp_tool_is_read_only(function_name)
 
@@ -421,7 +421,7 @@ def _approved_tool_names(function_name: str, tools: list[str] | None) -> set[str
 
 
 def _is_recordable_tool_name(function_name: str, *, require_hint: bool) -> bool:
-    if not function_name.startswith(CONNECTORS_TOOL_PREFIX):
+    if not function_name.startswith(CONNECTORS_TOOL_PREFIXES):
         return False
     if require_hint and not mcp_tool_has_read_only_hint(function_name):
         return False
