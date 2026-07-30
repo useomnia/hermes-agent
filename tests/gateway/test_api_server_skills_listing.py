@@ -169,6 +169,46 @@ async def test_listing_preserves_hub_metadata_alongside_command(adapter, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_every_listed_command_resolves_on_the_chat_expansion_path(
+    adapter, monkeypatch
+):
+    """The cross-path invariant: what the palette LISTS, the chat path EXPANDS.
+
+    A listed `command` is a promise that sending `/<command>` expands server-side
+    into the skill payload instead of reaching the model as literal text. Both
+    sides settle it with the same membership test against the same
+    `get_skill_commands()` registry — the listing checks `f"/{slug}" in registry`,
+    and `resolve_skill_command_key` checks `f"/{cmd}" in registry` — so they
+    cannot disagree. This pins that: deriving the slug and resolving it must stay
+    a single source of truth, not two parallel reimplementations that can drift.
+    """
+    from agent.skill_commands import resolve_skill_command_key
+
+    _stub_skills(
+        monkeypatch,
+        [
+            {"name": "Site Audit", "description": "d", "category": "omnio"},
+            {"name": "Profile the Brand", "description": "d", "category": "omnio"},
+            {"name": "Orphan Skill", "description": "d", "category": "omnio"},
+        ],
+        ["site-audit", "profile-the-brand"],
+    )
+
+    data = await _get_skills(adapter)
+
+    listed = [entry for entry in data if entry["command"] and entry["category"] != "command"]
+    assert listed, "expected at least one invocable skill in the listing"
+    for entry in listed:
+        # The exact resolver the chat path calls before building the payload.
+        assert resolve_skill_command_key(entry["command"]) is not None, (
+            f"listing advertised /{entry['command']} but the chat path would not "
+            "expand it — the slug would reach the model as literal text"
+        )
+    # The unregistered skill is withheld rather than advertised as invocable.
+    assert {entry["name"] for entry in listed} == {"Site Audit", "Profile the Brand"}
+
+
+@pytest.mark.asyncio
 async def test_enumeration_failure_is_reported_as_500(adapter, monkeypatch):
     def _boom(**_):
         raise RuntimeError("scan failed")
