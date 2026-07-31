@@ -2,7 +2,7 @@
 
 Two strategies:
 * push-capable adapters keep the synthetic MessageEvent / handle_message path;
-* the stateless API server (supports_async_delivery=False) self-POSTs
+* the stateless API server (supports_push_delivery=False) self-POSTs
   /v1/chat/completions with the RAW session id in X-Hermes-Session-Id, so the
   wake turn resumes the REAL session instead of a parallel invisible one
   keyed by build_session_key().
@@ -51,6 +51,14 @@ def _source():
 def test_adapter_supports_push_default_true():
     assert adapter_supports_push(PushAdapter()) is True
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
+
+
+def test_explicit_push_capability_is_independent_from_async_capability():
+    adapter = ApiServerLikeAdapter()
+    adapter.supports_async_delivery = True
+    adapter.supports_push_delivery = False
+
+    assert adapter_supports_push(adapter) is False
 
 
 def test_deliver_wake_push_adapter_uses_handle_message():
