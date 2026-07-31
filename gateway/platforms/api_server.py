@@ -207,6 +207,14 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
 
 _REQUEST_OPTION_MISSING = object()
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+_PROVIDER_ROUTING_KEYS = frozenset(
+    {"only", "ignore", "order", "sort", "require_parameters", "data_collection"}
+)
+_PROVIDER_ROUTING_LIST_KEYS = frozenset({"only", "ignore", "order"})
+_PROVIDER_ROUTING_ENUM_VALUES = {
+    "sort": frozenset({"price", "throughput", "latency"}),
+    "data_collection": frozenset({"allow", "deny"}),
+}
 _RUNTIME_AGENT_OVERRIDE_KEYS = (
     "api_key",
     "base_url",
@@ -269,6 +277,66 @@ def _request_service_tier(model_options: Any) -> Any:
     if "fast" in model_options:
         return "priority" if _coerce_request_bool(model_options.get("fast"), default=False) else None
     return _REQUEST_OPTION_MISSING
+
+
+def _request_provider_routing(model_options: Any) -> Any:
+    """Return a validated request routing block or _REQUEST_OPTION_MISSING.
+
+    The override replaces the config block for one request. Reject the whole
+    override when its shape is malformed so a partial value can never weaken a
+    configured provider pin unexpectedly.
+    """
+    if not isinstance(model_options, dict) or "provider_routing" not in model_options:
+        return _REQUEST_OPTION_MISSING
+
+    raw_routing = model_options.get("provider_routing")
+    invalid_reason = None
+    if not isinstance(raw_routing, dict):
+        invalid_reason = "expected an object"
+    else:
+        unknown_keys = sorted(
+            (key for key in raw_routing if key not in _PROVIDER_ROUTING_KEYS),
+            key=str,
+        )
+        if unknown_keys:
+            invalid_reason = f"unknown keys: {', '.join(str(key) for key in unknown_keys)}"
+        else:
+            for key, value in raw_routing.items():
+                if value is None:
+                    continue
+                if key in _PROVIDER_ROUTING_LIST_KEYS and (
+                    not isinstance(value, list)
+                    or any(not isinstance(item, str) for item in value)
+                ):
+                    invalid_reason = f"{key} must be an array of strings"
+                    break
+                if key in _PROVIDER_ROUTING_ENUM_VALUES:
+                    if not isinstance(value, str):
+                        invalid_reason = f"{key} must be a string"
+                        break
+                    allowed_values = _PROVIDER_ROUTING_ENUM_VALUES[key]
+                    if value not in allowed_values:
+                        invalid_reason = (
+                            f"{key} must be one of: "
+                            f"{', '.join(sorted(allowed_values))}"
+                        )
+                        break
+                if key == "require_parameters" and not isinstance(value, bool):
+                    invalid_reason = "require_parameters must be a boolean"
+                    break
+
+    if invalid_reason:
+        logger.warning(
+            "Ignoring invalid model_options.provider_routing override (%s); "
+            "using config.yaml provider_routing",
+            invalid_reason,
+        )
+        return _REQUEST_OPTION_MISSING
+
+    return {
+        key: list(value) if isinstance(value, list) else value
+        for key, value in raw_routing.items()
+    }
 
 
 def _apply_runtime_agent_overrides(
@@ -2435,6 +2503,7 @@ class APIServerAdapter(BasePlatformAdapter):
             _resolve_runtime_agent_kwargs,
             _resolve_gateway_model,
             _load_gateway_config,
+            _load_gateway_runtime_config,
             GatewayRunner,
         )
         from hermes_cli.tools_config import _get_platform_tools
@@ -2469,7 +2538,25 @@ class APIServerAdapter(BasePlatformAdapter):
         request_reasoning_config = _request_reasoning_config(model_options)
         if request_reasoning_config is not None:
             reasoning_config = request_reasoning_config
+        runtime_config = _load_gateway_runtime_config()
+        raw_provider_routing = runtime_config.get("provider_routing")
+        if raw_provider_routing is None:
+            provider_routing = {}
+        elif isinstance(raw_provider_routing, dict):
+            provider_routing = raw_provider_routing
+        else:
+            logger.warning(
+                "Ignoring invalid provider_routing config: expected an object, got %s",
+                type(raw_provider_routing).__name__,
+            )
+            provider_routing = {}
+        request_provider_routing = _request_provider_routing(model_options)
+        if request_provider_routing is not _REQUEST_OPTION_MISSING:
+            provider_routing = request_provider_routing
+        service_tier = GatewayRunner._load_service_tier()
         request_service_tier = _request_service_tier(model_options)
+        if request_service_tier is not _REQUEST_OPTION_MISSING:
+            service_tier = request_service_tier
 
         request_model = _clean_request_string(requested_model)
         request_provider = _clean_request_string(requested_provider)
@@ -2655,6 +2742,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._last_resolved_model[_resolved_key] = model
             self._last_resolved_model["*"] = model
 
+        # ``service_tier`` remains on the agent for turn reporting, but the
+        # attribute alone is inert: provider transports consume request_overrides.
+        request_overrides = {}
+        if service_tier == "priority":
+            try:
+                from hermes_cli.models import resolve_fast_mode_overrides
+
+                request_overrides = resolve_fast_mode_overrides(model) or {}
+            except Exception:
+                request_overrides = {}
+
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
@@ -2698,11 +2796,19 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_db": self._ensure_session_db(),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
+            "service_tier": service_tier,
+            "request_overrides": request_overrides,
+            "providers_allowed": provider_routing.get("only"),
+            "providers_ignored": provider_routing.get("ignore"),
+            "providers_order": provider_routing.get("order"),
+            "provider_sort": provider_routing.get("sort"),
+            "provider_require_parameters": provider_routing.get(
+                "require_parameters", False
+            ),
+            "provider_data_collection": provider_routing.get("data_collection"),
             "gateway_session_key": gateway_session_key,
             "prefill_messages": prefill_messages,
         }
-        if request_service_tier is not _REQUEST_OPTION_MISSING:
-            agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
         agent._gateway_response_format = response_format
