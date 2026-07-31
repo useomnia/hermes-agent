@@ -135,7 +135,7 @@ def cdp_server(monkeypatch):
     server = _CDPServer()
     ws_url = server.start()
     monkeypatch.setattr(
-        browser_cdp_tool, "_resolve_cdp_endpoint", lambda: ws_url
+        browser_cdp_tool, "_resolve_cdp_endpoint", lambda *_: ws_url
     )
     try:
         yield server
@@ -163,7 +163,7 @@ def test_non_string_method_returns_error():
 
 def test_non_dict_params_returns_error(monkeypatch):
     monkeypatch.setattr(
-        browser_cdp_tool, "_resolve_cdp_endpoint", lambda: "ws://localhost:9999"
+        browser_cdp_tool, "_resolve_cdp_endpoint", lambda *_: "ws://localhost:9999"
     )
     result = json.loads(
         browser_cdp_tool.browser_cdp(method="Target.getTargets", params="not-a-dict")  # type: ignore[arg-type]
@@ -178,7 +178,7 @@ def test_non_dict_params_returns_error(monkeypatch):
 
 
 def test_no_endpoint_returns_helpful_error(monkeypatch):
-    monkeypatch.setattr(browser_cdp_tool, "_resolve_cdp_endpoint", lambda: "")
+    monkeypatch.setattr(browser_cdp_tool, "_resolve_cdp_endpoint", lambda *_: "")
     result = json.loads(browser_cdp_tool.browser_cdp(method="Target.getTargets"))
     assert "error" in result
     assert "/browser connect" in result["error"]
@@ -187,7 +187,7 @@ def test_no_endpoint_returns_helpful_error(monkeypatch):
 
 def test_non_ws_endpoint_returns_error(monkeypatch):
     monkeypatch.setattr(
-        browser_cdp_tool, "_resolve_cdp_endpoint", lambda: "http://localhost:9222"
+        browser_cdp_tool, "_resolve_cdp_endpoint", lambda *_: "http://localhost:9222"
     )
     result = json.loads(browser_cdp_tool.browser_cdp(method="Target.getTargets"))
     assert "error" in result
@@ -230,6 +230,14 @@ def test_browser_level_success(cdp_server):
 
 def test_browser_level_redacts_secret_result(cdp_server):
     fake_key = "sk-" + "CDPSECRETRESULT1234567890"
+    cdp_server.on(
+        "Target.getTargets",
+        lambda params, sid: {"targetInfos": [{"targetId": "tab-A", "type": "page"}]},
+    )
+    cdp_server.on(
+        "Target.attachToTarget",
+        lambda params, sid: {"sessionId": "sess-tab-A"},
+    )
     cdp_server.on(
         "Runtime.evaluate",
         lambda params, sid: {"result": {"type": "string", "value": fake_key}},
@@ -285,6 +293,50 @@ def test_target_attach_then_call(cdp_server):
     assert calls[1]["sessionId"] == "sess-tab-A"
 
 
+def test_page_method_without_target_auto_selects_page(cdp_server):
+    cdp_server.on(
+        "Target.getTargets",
+        lambda params, sid: {
+            "targetInfos": [
+                {"targetId": "worker-A", "type": "service_worker"},
+                {"targetId": "tab-A", "type": "page"},
+            ]
+        },
+    )
+    cdp_server.on(
+        "Target.attachToTarget",
+        lambda params, sid: {"sessionId": f"sess-{params['targetId']}"},
+    )
+    cdp_server.on("Page.reload", lambda params, sid: {"reloaded": sid})
+
+    result = json.loads(browser_cdp_tool.browser_cdp(method="Page.reload"))
+
+    assert result["success"] is True
+    assert result["result"] == {"reloaded": "sess-tab-A"}
+    assert [call["method"] for call in cdp_server.received()] == [
+        "Target.getTargets",
+        "Target.attachToTarget",
+        "Page.reload",
+    ]
+
+
+def test_page_method_requires_target_when_multiple_pages_are_open(cdp_server):
+    cdp_server.on(
+        "Target.getTargets",
+        lambda params, sid: {
+            "targetInfos": [
+                {"targetId": "tab-A", "type": "page"},
+                {"targetId": "tab-B", "type": "page"},
+            ]
+        },
+    )
+
+    result = json.loads(browser_cdp_tool.browser_cdp(method="Page.reload"))
+
+    assert "Multiple page targets" in result["error"]
+    assert "target_id" in result["error"]
+
+
 # ---------------------------------------------------------------------------
 # CDP error responses
 # ---------------------------------------------------------------------------
@@ -324,6 +376,14 @@ def test_timeout_when_server_never_replies(cdp_server):
         time.sleep(10)
         return {}
 
+    cdp_server.on(
+        "Target.getTargets",
+        lambda params, sid: {"targetInfos": [{"targetId": "tab-A", "type": "page"}]},
+    )
+    cdp_server.on(
+        "Target.attachToTarget",
+        lambda params, sid: {"sessionId": "sess-tab-A"},
+    )
     cdp_server.on("Page.slowMethod", slow)
     result = json.loads(
         browser_cdp_tool.browser_cdp(
@@ -402,7 +462,7 @@ def test_runtime_evaluate_blocked_when_current_page_is_private(monkeypatch):
     monkeypatch.setattr(
         browser_cdp_tool,
         "_resolve_cdp_endpoint",
-        lambda: "ws://127.0.0.1:9222/devtools/browser/mock",
+        lambda *_: "ws://127.0.0.1:9222/devtools/browser/mock",
     )
 
     import tools.browser_tool as bt
@@ -500,7 +560,7 @@ def test_page_navigate_to_private_url_blocked_before_cdp(monkeypatch):
     monkeypatch.setattr(
         browser_cdp_tool,
         "_resolve_cdp_endpoint",
-        lambda: "ws://127.0.0.1:9222/devtools/browser/mock",
+        lambda *_: "ws://127.0.0.1:9222/devtools/browser/mock",
     )
 
     import tools.browser_tool as bt
@@ -527,6 +587,14 @@ def test_page_navigate_to_private_url_blocked_before_cdp(monkeypatch):
 
 
 def test_private_guard_inactive_does_not_probe(monkeypatch, cdp_server):
+    cdp_server.on(
+        "Target.getTargets",
+        lambda params, sid: {"targetInfos": [{"targetId": "tab-A", "type": "page"}]},
+    )
+    cdp_server.on(
+        "Target.attachToTarget",
+        lambda params, sid: {"sessionId": "sess-tab-A"},
+    )
     cdp_server.on("Runtime.evaluate", lambda params, sid: {"result": {"value": "ok"}})
 
     import tools.browser_tool as bt

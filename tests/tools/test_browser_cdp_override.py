@@ -125,7 +125,7 @@ class TestResolveCdpOverride:
         monkeypatch.setattr(browser_tool, "_session_last_activity", {})
         monkeypatch.setattr(browser_tool, "_start_browser_cleanup_thread", lambda: None)
         monkeypatch.setattr(browser_tool, "_update_session_activity", lambda task_id: None)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda *_: "")
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
 
         with patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
@@ -140,6 +140,52 @@ class TestResolveCdpOverride:
 
 
 class TestGetCdpOverride:
+    def test_template_routes_each_conversation_to_its_own_endpoint(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.setenv(
+            "BROWSER_CDP_URL_TEMPLATE",
+            "ws://toolbox.test/sessions/{session_id}",
+        )
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda _name: "",
+        )
+
+        assert browser_tool._get_cdp_override_raw("conversation-a") == (
+            "ws://toolbox.test/sessions/conversation-a"
+        )
+        assert browser_tool._get_cdp_override_raw("conversation-b") == (
+            "ws://toolbox.test/sessions/conversation-b"
+        )
+
+    def test_template_url_encodes_session_id(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.setenv(
+            "BROWSER_CDP_URL_TEMPLATE",
+            "ws://toolbox.test/sessions/{session_id}",
+        )
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda _name: "",
+        )
+
+        assert browser_tool._get_cdp_override_raw("child/task 1") == (
+            "ws://toolbox.test/sessions/child%2Ftask%201"
+        )
+
+    def test_template_without_session_placeholder_is_rejected(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.setenv(
+            "BROWSER_CDP_URL_TEMPLATE",
+            "ws://toolbox.test/shared-browser",
+        )
+
+        assert browser_tool._get_cdp_override_raw("conversation-a") == ""
+
     def test_prefers_env_var_over_config(self, monkeypatch):
         import tools.browser_tool as browser_tool
 
@@ -199,6 +245,15 @@ class TestGetCdpOverride:
 
         # The env override still suppresses camofox.
         monkeypatch.setenv("BROWSER_CDP_URL", HTTP_URL)
+        with patch("hermes_cli.config.read_raw_config", return_value={}):
+            assert bc.is_camofox_mode() is False
+
+        # A conversation-scoped gateway also suppresses camofox.
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+        monkeypatch.setenv(
+            "BROWSER_CDP_URL_TEMPLATE",
+            "ws://toolbox.test/sessions/{session_id}",
+        )
         with patch("hermes_cli.config.read_raw_config", return_value={}):
             assert bc.is_camofox_mode() is False
 
