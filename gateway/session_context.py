@@ -100,8 +100,10 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # True  — long-lived CLI sessions (in-process completion_queue drain) and the
 #         real gateway platforms (Telegram/Discord/Slack/...), which hold a
 #         persistent outbound channel and run the watcher/drain loops.
-# False — finite runtimes that can end before a detached completion returns:
-#         stateless API-server requests and dispatcher-spawned Kanban workers.
+# False — finite runtimes that cannot arrange any later wake, such as
+#         dispatcher-spawned one-shot Kanban workers. The API server is
+#         stateless but supports wake delivery through an authenticated
+#         self-post to the raw session, so it binds True.
 #
 # Tools that promise async delivery (terminal notify_on_complete /
 # watch_patterns, delegate_task background=True) read this via
@@ -109,7 +111,7 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # can't keep — turning a silent no-op into an explicit contract.
 #
 # Default _UNSET => treated as supported, so CLI (which never sets a platform)
-# and any contextvar-unaware path keep working. Stateless adapters opt OUT by
+# and any contextvar-unaware path keep working. Non-delivering adapters opt OUT by
 # setting ``supports_async_delivery = False`` on the adapter class; the gateway
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)

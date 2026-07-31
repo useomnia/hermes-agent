@@ -67,6 +67,23 @@ class TestBrowserCleanup:
         mock_stop.assert_called_once_with("task-1")
         mock_run.assert_called_once_with("task-1", "close", [], timeout=10)
 
+    def test_cleanup_remote_cdp_never_closes_provider_browser(self):
+        browser_tool = self.browser_tool
+        browser_tool._active_sessions["task-remote"] = {
+            "session_name": "cdp-remote",
+            "bb_session_id": None,
+            "cdp_url": "ws://toolbox/sessions/conversation-a",
+        }
+
+        with (
+            patch("tools.browser_tool._maybe_stop_recording"),
+            patch("tools.browser_tool._run_browser_command") as mock_run,
+            patch("tools.browser_tool.os.path.exists", return_value=False),
+        ):
+            browser_tool.cleanup_browser("task-remote")
+
+        mock_run.assert_not_called()
+
     def test_cleanup_camofox_managed_persistence_skips_close(self):
         """When camofox mode + managed persistence, soft_cleanup fires instead of close."""
         browser_tool = self.browser_tool

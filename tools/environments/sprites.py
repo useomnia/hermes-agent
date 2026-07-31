@@ -519,6 +519,14 @@ class SpritesFileOperations(ShellFileOperations):
         self.env: SpritesEnvironment = terminal_env
 
     def _files(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # The Toolbox file API does not perform shell expansion. Resolve tilde
+        # paths through the Sprite terminal so file tools and `cd ~` agree on
+        # the sandbox user's home instead of leaking the gateway host HOME.
+        payload = dict(payload)
+        for key in ("path", "src", "dst"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.startswith("~"):
+                payload[key] = self._expand_path(value)
         try:
             return self.env.file_request(payload)
         except SpritesToolboxError as error:

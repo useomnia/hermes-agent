@@ -1083,6 +1083,40 @@ def test_sprites_file_operations_should_render_toolbox_errors(caplog):
     assert 'HTTP 400: {"detail":"bad path"}' in caplog.text
 
 
+def test_sprites_file_operations_expand_tilde_with_sprite_home():
+    from tools.environments.sprites import SpritesEnvironment, SpritesFileOperations
+
+    class FakeEnv:
+        cwd = "/brand"
+        config = None
+
+        def __init__(self):
+            self.requests = []
+
+        def execute(self, command, cwd=None, **kwargs):
+            assert command == "echo $HOME"
+            return {"output": "/home/oai/share\n", "returncode": 0}
+
+        def file_request(self, payload):
+            self.requests.append(payload)
+            return {"content": "brief", "totalLines": 1, "fileSize": 5}
+
+    env = FakeEnv()
+    ops = SpritesFileOperations(cast(SpritesEnvironment, env))
+
+    result = ops.read_file("~/brand/brief.md")
+
+    assert result.error is None
+    assert env.requests == [
+        {
+            "operation": "read",
+            "path": "/home/oai/share/brand/brief.md",
+            "offset": 1,
+            "limit": 500,
+        }
+    ]
+
+
 def test_sprites_environment_should_write_content_through_files_endpoint():
     from tools.environments.sprites import SpritesEnvironment
 
