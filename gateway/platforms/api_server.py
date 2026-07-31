@@ -207,14 +207,6 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
 
 _REQUEST_OPTION_MISSING = object()
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
-_PROVIDER_ROUTING_KEYS = frozenset(
-    {"only", "ignore", "order", "sort", "require_parameters", "data_collection"}
-)
-_PROVIDER_ROUTING_LIST_KEYS = frozenset({"only", "ignore", "order"})
-_PROVIDER_ROUTING_ENUM_VALUES = {
-    "sort": frozenset({"price", "throughput", "latency"}),
-    "data_collection": frozenset({"allow", "deny"}),
-}
 _RUNTIME_AGENT_OVERRIDE_KEYS = (
     "api_key",
     "base_url",
@@ -277,66 +269,6 @@ def _request_service_tier(model_options: Any) -> Any:
     if "fast" in model_options:
         return "priority" if _coerce_request_bool(model_options.get("fast"), default=False) else None
     return _REQUEST_OPTION_MISSING
-
-
-def _request_provider_routing(model_options: Any) -> Any:
-    """Return a validated request routing block or _REQUEST_OPTION_MISSING.
-
-    The override replaces the config block for one request. Reject the whole
-    override when its shape is malformed so a partial value can never weaken a
-    configured provider pin unexpectedly.
-    """
-    if not isinstance(model_options, dict) or "provider_routing" not in model_options:
-        return _REQUEST_OPTION_MISSING
-
-    raw_routing = model_options.get("provider_routing")
-    invalid_reason = None
-    if not isinstance(raw_routing, dict):
-        invalid_reason = "expected an object"
-    else:
-        unknown_keys = sorted(
-            (key for key in raw_routing if key not in _PROVIDER_ROUTING_KEYS),
-            key=str,
-        )
-        if unknown_keys:
-            invalid_reason = f"unknown keys: {', '.join(str(key) for key in unknown_keys)}"
-        else:
-            for key, value in raw_routing.items():
-                if value is None:
-                    continue
-                if key in _PROVIDER_ROUTING_LIST_KEYS and (
-                    not isinstance(value, list)
-                    or any(not isinstance(item, str) for item in value)
-                ):
-                    invalid_reason = f"{key} must be an array of strings"
-                    break
-                if key in _PROVIDER_ROUTING_ENUM_VALUES:
-                    if not isinstance(value, str):
-                        invalid_reason = f"{key} must be a string"
-                        break
-                    allowed_values = _PROVIDER_ROUTING_ENUM_VALUES[key]
-                    if value not in allowed_values:
-                        invalid_reason = (
-                            f"{key} must be one of: "
-                            f"{', '.join(sorted(allowed_values))}"
-                        )
-                        break
-                if key == "require_parameters" and not isinstance(value, bool):
-                    invalid_reason = "require_parameters must be a boolean"
-                    break
-
-    if invalid_reason:
-        logger.warning(
-            "Ignoring invalid model_options.provider_routing override (%s); "
-            "using config.yaml provider_routing",
-            invalid_reason,
-        )
-        return _REQUEST_OPTION_MISSING
-
-    return {
-        key: list(value) if isinstance(value, list) else value
-        for key, value in raw_routing.items()
-    }
 
 
 def _apply_runtime_agent_overrides(
@@ -2550,9 +2482,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 type(raw_provider_routing).__name__,
             )
             provider_routing = {}
-        request_provider_routing = _request_provider_routing(model_options)
-        if request_provider_routing is not _REQUEST_OPTION_MISSING:
-            provider_routing = request_provider_routing
         service_tier = GatewayRunner._load_service_tier()
         request_service_tier = _request_service_tier(model_options)
         if request_service_tier is not _REQUEST_OPTION_MISSING:

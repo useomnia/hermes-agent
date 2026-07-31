@@ -221,51 +221,37 @@ def test_config_service_tier_is_inert_for_unsupported_model(monkeypatch):
     assert "service_tier" not in _built_chat_completion_body(agent)
 
 
-def test_request_override_is_scoped_then_config_is_restored(monkeypatch):
+def test_request_provider_routing_is_ignored_and_config_wins(monkeypatch):
+    """A caller cannot steer provider routing — config.yaml is the only source.
+
+    Routing is a per-model pin (Omnio pins DeepSeek first-party because cheap
+    third-party OpenRouter hosts mangle V4's DSML tool-call format), so honoring
+    a request-supplied block would let a caller silently unpin it.
+    """
     config_routing = {
         "order": ["config-provider"],
         "sort": "price",
         "require_parameters": True,
         "data_collection": "deny",
     }
-    request_routing = {
-        "only": ["request-provider"],
-        "ignore": [],
-        "order": ["request-provider"],
-        "sort": "latency",
-        "require_parameters": False,
-        "data_collection": "allow",
-    }
-    adapter = _create_adapter(
-        monkeypatch,
-        provider_routing=config_routing,
-        service_tier="priority",
-    )
+    adapter = _create_adapter(monkeypatch, provider_routing=config_routing)
 
-    overridden = adapter._create_agent(
+    agent = adapter._create_agent(
         session_id="request-routing",
         model_options={
-            "provider_routing": request_routing,
-            "service_tier": None,
+            "provider_routing": {
+                "only": ["request-provider"],
+                "order": ["request-provider"],
+                "sort": "latency",
+            }
         },
     )
-    restored = adapter._create_agent(session_id="config-routing-again")
 
-    assert overridden.providers_allowed == ["request-provider"]
-    assert overridden.providers_ignored == []
-    assert overridden.providers_order == ["request-provider"]
-    assert overridden.provider_sort == "latency"
-    assert overridden.provider_require_parameters is False
-    assert overridden.provider_data_collection == "allow"
-    assert _emitted_provider_body(overridden)["provider"] == {
-        "only": ["request-provider"],
-        "order": ["request-provider"],
-        "sort": "latency",
-        "data_collection": "allow",
-    }
-    assert overridden.service_tier is None
-    assert _emitted_provider_body(restored)["provider"] == config_routing
-    assert restored.service_tier == "priority"
+    assert agent.providers_allowed is None
+    assert agent.providers_order == ["config-provider"]
+    assert agent.provider_sort == "price"
+    assert agent.provider_data_collection == "deny"
+    assert _emitted_provider_body(agent)["provider"] == config_routing
     assert config_routing["order"] == ["config-provider"]
 
 
@@ -310,28 +296,8 @@ def test_config_routing_uses_profile_runtime_config_with_env_expansion(
     assert agent.provider_sort == "latency"
 
 
-@pytest.mark.parametrize(
-    "malformed_override",
-    [
-        "deepseek",
-        {"unknown": ["deepseek"]},
-        {"order": "deepseek"},
-        {"sort": "cheapest"},
-        {"data_collection": "sometimes"},
-    ],
-    ids=[
-        "not-an-object",
-        "unknown-key",
-        "wrong-value-type",
-        "invalid-sort-enum",
-        "invalid-data-collection-enum",
-    ],
-)
-def test_malformed_request_override_warns_and_falls_back(
-    monkeypatch,
-    caplog,
-    malformed_override,
-):
+def test_config_routing_survives_malformed_request_block(monkeypatch):
+    """A malformed request block is inert, not a way to clear the config pin."""
     config_routing = {
         "order": ["config-provider"],
         "sort": "price",
@@ -339,12 +305,9 @@ def test_malformed_request_override_warns_and_falls_back(
     }
     adapter = _create_adapter(monkeypatch, provider_routing=config_routing)
 
-    with caplog.at_level(logging.WARNING):
-        agent = adapter._create_agent(
-            session_id="malformed-routing",
-            model_options={"provider_routing": malformed_override},
-        )
+    agent = adapter._create_agent(
+        session_id="malformed-routing",
+        model_options={"provider_routing": "deepseek"},
+    )
 
     assert _emitted_provider_body(agent)["provider"] == config_routing
-    assert "Ignoring invalid model_options.provider_routing override" in caplog.text
-    assert "using config.yaml provider_routing" in caplog.text
