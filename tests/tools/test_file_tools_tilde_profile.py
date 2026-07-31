@@ -108,3 +108,15 @@ class TestResolvePathUsesProfileHome:
 
         assert str(profile_home) in str(resolved)
         assert str(process_home) not in str(resolved)
+
+    def test_container_tilde_is_preserved_for_remote_home_expansion(self, monkeypatch):
+        monkeypatch.setattr(ft, "_uses_container_paths", lambda _task: True)
+
+        with patch(
+            "hermes_constants.get_subprocess_home",
+            return_value="/Users/host-user",
+        ):
+            resolved = ft._resolve_path_for_task("~/brand/brief.md", task_id="sprite")
+
+        assert resolved == ft.PurePosixPath("~/brand/brief.md")
+        assert "/Users/host-user" not in str(resolved)
