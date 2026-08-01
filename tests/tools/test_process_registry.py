@@ -1208,6 +1208,16 @@ class TestCheckpoint:
             assert recovered == 1
             assert len(registry.pending_watchers) == 0
 
+    def test_pending_watcher_drain_transfers_exact_batch(self, registry):
+        first = {"session_id": "proc_first"}
+        second = {"session_id": "proc_second"}
+        registry.enqueue_pending_watcher(first)
+        registry.enqueue_pending_watcher(second)
+
+        assert registry.drain_pending_watchers() == [first, second]
+        assert registry.drain_pending_watchers() == []
+        assert registry.pending_watchers == []
+
     def test_recovery_keeps_live_checkpoint_entries(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{

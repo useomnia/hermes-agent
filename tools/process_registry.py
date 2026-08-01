@@ -162,7 +162,10 @@ class ProcessRegistry:
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
 
-        # Side-channel for check_interval watchers (gateway reads after agent run)
+        # Side-channel for check_interval watchers. Producers run in executor
+        # threads while the gateway drains from its asyncio loop, so list
+        # ownership changes must be protected separately from process state.
+        self._watcher_lock = threading.Lock()
         self.pending_watchers: List[Dict[str, Any]] = []
 
         # Notification queue — unified queue for all background process events.
@@ -220,6 +223,18 @@ class ProcessRegistry:
         while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
             lines.pop(0)
         return "\n".join(lines)
+
+    def enqueue_pending_watcher(self, watcher: Dict[str, Any]) -> None:
+        """Queue one gateway watcher without racing the gateway drain."""
+        with self._watcher_lock:
+            self.pending_watchers.append(watcher)
+
+    def drain_pending_watchers(self) -> List[Dict[str, Any]]:
+        """Atomically transfer ownership of every queued gateway watcher."""
+        with self._watcher_lock:
+            watchers = self.pending_watchers
+            self.pending_watchers = []
+            return watchers
 
     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
         """Forward a freshly-read chunk to the live-output sink, if one is set.
@@ -2103,7 +2118,7 @@ class ProcessRegistry:
 
             # Re-enqueue watcher so gateway can resume notifications
             if session.watcher_interval > 0:
-                self.pending_watchers.append({
+                self.enqueue_pending_watcher({
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
                     "session_key": session.session_key,
