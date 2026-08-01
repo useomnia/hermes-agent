@@ -3160,6 +3160,10 @@ def estimate_tokens_rough(text: str) -> int:
     return dense + ((sparse + 3) // 4)
 
 
+# Shared by request budgeting, preflight and the compression tail walk.
+IMAGE_TOKEN_COST = 1500
+
+
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     """Rough token estimate for a message list (pre-flight only).
 
@@ -3168,12 +3172,11 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     character length. Without this, a single ~1MB screenshot would be
     estimated at ~250K tokens and trigger premature context compression.
     """
-    _IMAGE_TOKEN_COST = 1500
     text_tokens = 0
     image_tokens = 0
     for msg in messages:
         text_tokens += _estimate_message_tokens_without_images(msg)
-        image_tokens += _count_image_tokens(msg, _IMAGE_TOKEN_COST)
+        image_tokens += _count_image_tokens(msg, IMAGE_TOKEN_COST)
     return text_tokens + image_tokens
 
 
