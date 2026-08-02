@@ -18,6 +18,18 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _stop_reason(result):
+    """Read a sampling result's stop reason across the mcp 1.x -> 2.x rename.
+
+    ``CreateMessageResult.stopReason`` became ``.stop_reason`` in mcp 2.0
+    (camelCase survives only as the serialization alias, which pydantic does
+    not expose to attribute access).
+    """
+    from tools.mcp_tool import mcp_field
+
+    return mcp_field(result, "stop_reason", "stopReason")
+
+
 def _make_mcp_tool(name="read_file", description="Read a file", input_schema=None):
     """Create a fake MCP Tool object matching the SDK interface."""
     tool = SimpleNamespace()
@@ -3227,7 +3239,7 @@ class TestSamplingCallbackText:
         assert result.content.text == "Hello from LLM"
         assert result.model == "test-model"
         assert result.role == "assistant"
-        assert result.stopReason == "endTurn"
+        assert _stop_reason(result) == "endTurn"
 
     def test_system_prompt_prepended(self):
         """System prompt is inserted as the first message."""
@@ -3311,7 +3323,7 @@ class TestSamplingCallbackToolUse:
             result = asyncio.run(self.handler(None, params))
 
         assert isinstance(result, CreateMessageResultWithTools)
-        assert result.stopReason == "toolUse"
+        assert _stop_reason(result) == "toolUse"
         assert result.model == "test-model"
         assert len(result.content) == 1
         tc = result.content[0]

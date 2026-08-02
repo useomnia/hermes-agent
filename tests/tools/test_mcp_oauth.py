@@ -555,9 +555,11 @@ class TestCallbackPortReservation:
             t.start()
             return await asyncio.wait_for(task, timeout=10)
 
-        code, state = asyncio.run(drive())
-        assert code == "abc123"
-        assert state == "xyz"
+        # mcp 2.0's callback_handler contract returns an
+        # AuthorizationCodeResult, not the legacy (code, state) tuple.
+        result = asyncio.run(drive())
+        assert result.code == "abc123"
+        assert result.state == "xyz"
         # Reservation was consumed by adoption.
         assert port not in mod._reserved_sockets
 
@@ -601,13 +603,13 @@ class TestCallbackPortReservation:
             return await asyncio.wait_for(task, timeout=10)
 
         try:
-            code, state = asyncio.run(drive())
+            result = asyncio.run(drive())
         finally:
             leftover = mod._reserved_sockets.pop(port_b, None)
             if leftover is not None:
                 leftover.close()
-        assert code == "flowA"
-        assert state == "sA"
+        assert result.code == "flowA"
+        assert result.state == "sA"
 
 
 # ---------------------------------------------------------------------------
