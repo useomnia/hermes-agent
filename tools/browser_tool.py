@@ -2029,6 +2029,9 @@ def _terminate_timed_out_browser_daemon(
     try:
         daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
     except (ValueError, OSError):
+        if session_info.get("cdp_url"):
+            shutil.rmtree(socket_dir, ignore_errors=True)
+            return False
         logger.warning(
             "Could not reset timed-out browser session %s: daemon PID unavailable",
             session_name,

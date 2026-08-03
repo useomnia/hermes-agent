@@ -138,6 +138,54 @@ def test_sprites_environment_should_send_exec_to_toolbox():
     ]
 
 
+def test_sprites_environment_should_stream_raw_file_bytes(monkeypatch):
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.toolbox_url = "https://toolbox.example/internal/toolbox"
+    env.bearer_token = "pair-secret"
+    env.brand = "brand-123"
+    env.timeout = 60
+    observed = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, limit):
+            observed["limit"] = limit
+            return b"raw-image-bytes"[:limit]
+
+    def fake_open(request, timeout):
+        observed["url"] = request.full_url
+        observed["authorization"] = request.get_header("Authorization")
+        observed["brand"] = request.get_header("X-omnio-brand")
+        observed["method"] = request.get_method()
+        observed["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(sprites_module._URL_OPENER, "open", fake_open)
+
+    result = env.read_file_bytes("/home/image with spaces.png", max_bytes=7)
+
+    assert result == b"raw-ima"
+    assert observed == {
+        "url": (
+            "https://toolbox.example/internal/toolbox/files?"
+            "path=%2Fhome%2Fimage+with+spaces.png"
+        ),
+        "authorization": "Bearer pair-secret",
+        "brand": "brand-123",
+        "method": "GET",
+        "timeout": 60,
+        "limit": 7,
+    }
+
+
 def test_sprites_environment_should_use_toolbox_temp_session_dir():
     from tools.environments.sprites import SpritesEnvironment
 
@@ -1081,6 +1129,40 @@ def test_sprites_file_operations_should_render_toolbox_errors(caplog):
     )
     assert "HTTP 400" not in result.error
     assert 'HTTP 400: {"detail":"bad path"}' in caplog.text
+
+
+def test_sprites_file_operations_expand_tilde_with_sprite_home():
+    from tools.environments.sprites import SpritesEnvironment, SpritesFileOperations
+
+    class FakeEnv:
+        cwd = "/brand"
+        config = None
+
+        def __init__(self):
+            self.requests = []
+
+        def execute(self, command, cwd=None, **kwargs):
+            assert command == "echo $HOME"
+            return {"output": "/home/oai/share\n", "returncode": 0}
+
+        def file_request(self, payload):
+            self.requests.append(payload)
+            return {"content": "brief", "totalLines": 1, "fileSize": 5}
+
+    env = FakeEnv()
+    ops = SpritesFileOperations(cast(SpritesEnvironment, env))
+
+    result = ops.read_file("~/brand/brief.md")
+
+    assert result.error is None
+    assert env.requests == [
+        {
+            "operation": "read",
+            "path": "/home/oai/share/brand/brief.md",
+            "offset": 1,
+            "limit": 500,
+        }
+    ]
 
 
 def test_sprites_environment_should_write_content_through_files_endpoint():

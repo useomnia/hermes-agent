@@ -540,6 +540,28 @@ class TestBrowserCleanup:
         mock_tree_kill.assert_called_once_with(9876)
         assert not socket_dir.exists()
 
+    def test_remote_cdp_cleanup_without_daemon_pid_removes_transport(
+        self, tmp_path, caplog
+    ):
+        browser_tool = self.browser_tool
+        session_info = {
+            "session_name": "cdp_remote123",
+            "cdp_url": "ws://toolbox/sessions/conversation-a",
+        }
+        socket_dir = tmp_path / "agent-browser-cdp_remote123"
+        socket_dir.mkdir()
+        (socket_dir / "client.sock").write_text("stale")
+
+        assert (
+            browser_tool._terminate_timed_out_browser_daemon(
+                session_info, str(socket_dir)
+            )
+            is False
+        )
+
+        assert not socket_dir.exists()
+        assert "daemon PID unavailable" not in caplog.text
+
     def test_timeout_reset_does_not_drop_replacement_session(self, tmp_path):
         browser_tool = self.browser_tool
         timed_out = {"session_name": "cdp_old", "cdp_url": "ws://old"}

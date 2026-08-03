@@ -24,6 +24,7 @@ while container-only images (tmpfs ``/workspace``, root-owned) are still
 deliverable. This is the unified delivery + confinement model: the same
 mechanism that fixes "vision can't see container files" also closes the escape.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -108,8 +109,10 @@ async def resolve_image_source(src: str, ctx: ResolveContext) -> ResolvedImage:
 
     # Everything else is a filesystem path — including bare relative names
     # like "pic.png" (accepted on main; a path-shape gate here regressed them).
-    candidate = s[len("file://"):] if s.lower().startswith("file://") else s
-    p = Path(os.path.expanduser(candidate))
+    candidate = s[len("file://") :] if s.lower().startswith("file://") else s
+    p = Path(
+        candidate if _is_sprites_terminal_backend() else os.path.expanduser(candidate)
+    )
     # Confinement decision (see module docstring). Under a non-local backend
     # a path is host-readable ONLY if it lands in a media cache (after
     # translating a container-visible cache path back to its host mount);
@@ -142,14 +145,16 @@ async def resolve_image_source(src: str, ctx: ResolveContext) -> ResolvedImage:
     # Not a permitted host read (or the host file is absent) -> read the
     # bytes inside the sandbox. Under a sandbox this reads the container's
     # filesystem, never the host's.
-    return await _resolve_container_fallback(p, ctx, s)
+    return await _resolve_sandbox_file(p, ctx, s)
 
 
 def _resolve_data_url(s: str) -> tuple[bytes, str]:
     header, _, payload = s.partition(",")
     if ";base64" not in header:
         raise NotAnImage("data: URL must be base64-encoded", src=s[:64])
-    declared = header[len("data:"):].split(";", 1)[0].strip() or "application/octet-stream"
+    declared = (
+        header[len("data:") :].split(";", 1)[0].strip() or "application/octet-stream"
+    )
     # Cheap pre-decode size gate on the encoded length (~4/3 expansion).
     if (len(payload) * 3) // 4 > _MAX_INGEST_BYTES:
         raise SourceTooLarge("data: URL exceeds size limit", src=s[:64])
@@ -207,6 +212,10 @@ def _is_local_terminal_backend() -> bool:
     return os.getenv("TERMINAL_ENV", "local").strip().lower() in ("local", "")
 
 
+def _is_sprites_terminal_backend() -> bool:
+    return os.getenv("TERMINAL_ENV", "local").strip().lower() == "sprites"
+
+
 def _media_cache_roots() -> list:
     """Agent-managed media cache directories under HERMES_HOME (host side).
 
@@ -259,26 +268,28 @@ def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
     return None
 
 
-def _get_active_env(task_id: Optional[str]):
-    if not task_id:
-        return None
-    try:
-        from tools.terminal_tool import get_active_env
+def _acquire_sandbox_env(task_id: Optional[str]):
+    resolved_task_id = task_id or "default"
+    from tools.terminal_tool import get_active_env
 
-        return get_active_env(task_id)
-    except Exception:
-        return None
+    env = get_active_env(resolved_task_id)
+    if env is not None or not _is_sprites_terminal_backend():
+        return env
+
+    from tools.file_tools import _get_file_ops
+
+    return _get_file_ops(resolved_task_id).env
 
 
-async def _resolve_container_fallback(p: Path, ctx: ResolveContext, src: str) -> ResolvedImage:
+async def _resolve_sandbox_file(
+    p: Path, ctx: ResolveContext, src: str
+) -> ResolvedImage:
     """Read the image bytes inside the sandbox (fail-closed when none exists).
 
-    Reached when a host read is not permitted or the host file is absent. The
-    agent can already ``cat`` any container file (file_operations.py reads
-    root-owned mode-600 files this way), so this stays within the same sandbox
-    boundary and never touches the host filesystem. ``--`` stops a leading-dash
-    path from being parsed as a ``base64`` option; ``base64 -w0`` is GNU-only,
-    so pipe through ``tr -d`` for BusyBox.
+    Reached when a host read is not permitted or the host file is absent.
+    Sprites use their bounded raw-file transport as the authoritative path;
+    other sandbox backends retain command-based reads. Both paths stay within
+    the same sandbox boundary and never touch the host filesystem.
 
     Fail-closed: if there is no active sandbox env we refuse rather than falling
     back to a host read, so a non-cache host path under a sandbox never leaks.
@@ -286,12 +297,39 @@ async def _resolve_container_fallback(p: Path, ctx: ResolveContext, src: str) ->
     import asyncio
     import shlex
 
-    env = _get_active_env(ctx.task_id)
+    env = _acquire_sandbox_env(ctx.task_id)
     if env is None:
         raise SourceNotFound(
             f"'{p}' is not reachable inside the sandbox and no active sandbox "
             f"session is available to read it",
-            src=src, origin="container")
+            src=src,
+            origin="container",
+        )
+
+    read_file_bytes = getattr(env, "read_file_bytes", None)
+    if _is_sprites_terminal_backend():
+        if not callable(read_file_bytes):
+            raise SourceNotFound(
+                "the Sprites sandbox does not provide raw file reads",
+                src=src,
+                origin="container",
+            )
+        data = await asyncio.to_thread(
+            read_file_bytes,
+            str(p),
+            max_bytes=_MAX_INGEST_BYTES + 1,
+        )
+        if not isinstance(data, (bytes, bytearray)):
+            raise NotAnImage(
+                f"sandbox returned non-image data for '{p}'",
+                src=src,
+            )
+        data = bytes(data)
+        if len(data) > _MAX_INGEST_BYTES:
+            raise SourceTooLarge(
+                "image exceeds size limit", src=src, origin="container"
+            )
+        return _finalize(data, "", "container", src)
 
     # Bound the read INSIDE the sandbox: head -c caps at ingest-limit+1 bytes
     # so a huge file (or /dev/zero) can't stream unbounded base64 into host
@@ -303,10 +341,12 @@ async def _resolve_container_fallback(p: Path, ctx: ResolveContext, src: str) ->
     # multi-MB base64 read doesn't stall every other coroutine.
     qp = shlex.quote(str(p))
     res = await asyncio.to_thread(
-        env.execute,
-        f"head -c {_MAX_INGEST_BYTES + 1} < {qp} | base64 | tr -d '\\n'")
+        env.execute, f"head -c {_MAX_INGEST_BYTES + 1} < {qp} | base64 | tr -d '\\n'"
+    )
     if res.get("returncode", 1) != 0:
-        raise SourceNotFound(f"could not read '{p}' inside the sandbox", src=src, origin="container")
+        raise SourceNotFound(
+            f"could not read '{p}' inside the sandbox", src=src, origin="container"
+        )
     try:
         data = base64.b64decode(res.get("output", ""), validate=True)
     except Exception as exc:

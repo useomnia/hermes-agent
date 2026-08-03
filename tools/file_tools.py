@@ -373,6 +373,11 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     """
     container_paths = _uses_container_paths(task_id)
     if container_paths:
+        # Preserve the tilde until ShellFileOperations can expand it against
+        # the sandbox's HOME. Expanding here would use the gateway host HOME
+        # and turn ~/foo into an invalid host path inside Sprites/Docker/SSH.
+        if filepath == "~" or filepath.startswith("~/"):
+            return PurePosixPath(filepath)
         expanded = _expand_tilde(filepath)
         if posixpath.isabs(expanded):
             return _normalize_without_host_deref(expanded)
