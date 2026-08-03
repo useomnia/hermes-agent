@@ -192,6 +192,71 @@ class TestNonLocalBackendConfinement:
 
 class TestExecReadSafety:
     @pytest.mark.asyncio
+    async def test_sprites_backend_reads_raw_bytes_without_shell_encoding(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "sprites")
+        calls = {}
+
+        def read_file_bytes(path, max_bytes):
+            calls["path"] = path
+            calls["max_bytes"] = max_bytes
+            return PNG
+
+        def fail_execute(*_args, **_kwargs):
+            raise AssertionError("Sprites image reads must not use shell stdout")
+
+        env = SimpleNamespace(
+            read_file_bytes=read_file_bytes,
+            execute=fail_execute,
+        )
+        with patch("tools.image_source._get_active_env", return_value=env):
+            result = await isrc.resolve_image_source(
+                "/home/shot.png", isrc.ResolveContext(task_id="task-1")
+            )
+
+        assert result.data == PNG
+        assert result.origin == "container"
+        assert calls == {
+            "path": "/home/shot.png",
+            "max_bytes": isrc._MAX_INGEST_BYTES + 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_sprites_backend_falls_back_when_raw_transport_is_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "sprites")
+        calls = []
+
+        def read_file_bytes(_path, max_bytes):
+            calls.append(("raw", max_bytes))
+            raise RuntimeError("older toolbox")
+
+        def execute(_cmd, **_kwargs):
+            calls.append(("exec", None))
+            return {"returncode": 0, "output": base64.b64encode(PNG).decode()}
+
+        env = SimpleNamespace(
+            read_file_bytes=read_file_bytes,
+            execute=execute,
+        )
+        with patch("tools.image_source._get_active_env", return_value=env):
+            result = await isrc.resolve_image_source(
+                "/home/shot.png", isrc.ResolveContext(task_id="task-1")
+            )
+
+        assert result.data == PNG
+        assert calls == [
+            ("raw", isrc._MAX_INGEST_BYTES + 1),
+            ("exec", None),
+        ]
+
+    @pytest.mark.asyncio
     async def test_exec_read_is_bounded_and_redirect_safe(self, tmp_path, monkeypatch):
         """Leading-dash paths go through an input redirect (no argv exposure)
         and the read is size-bounded via head -c."""

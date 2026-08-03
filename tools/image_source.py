@@ -273,12 +273,10 @@ def _get_active_env(task_id: Optional[str]):
 async def _resolve_container_fallback(p: Path, ctx: ResolveContext, src: str) -> ResolvedImage:
     """Read the image bytes inside the sandbox (fail-closed when none exists).
 
-    Reached when a host read is not permitted or the host file is absent. The
-    agent can already ``cat`` any container file (file_operations.py reads
-    root-owned mode-600 files this way), so this stays within the same sandbox
-    boundary and never touches the host filesystem. ``--`` stops a leading-dash
-    path from being parsed as a ``base64`` option; ``base64 -w0`` is GNU-only,
-    so pipe through ``tr -d`` for BusyBox.
+    Reached when a host read is not permitted or the host file is absent.
+    Backends with a bounded raw-file transport use it directly; other backends
+    retain the existing sandbox command fallback. Both paths stay within the
+    same sandbox boundary and never touch the host filesystem.
 
     Fail-closed: if there is no active sandbox env we refuse rather than falling
     back to a host read, so a non-cache host path under a sandbox never leaks.
@@ -292,6 +290,31 @@ async def _resolve_container_fallback(p: Path, ctx: ResolveContext, src: str) ->
             f"'{p}' is not reachable inside the sandbox and no active sandbox "
             f"session is available to read it",
             src=src, origin="container")
+
+    read_file_bytes = getattr(env, "read_file_bytes", None)
+    if callable(read_file_bytes):
+        try:
+            data = await asyncio.to_thread(
+                read_file_bytes,
+                str(p),
+                max_bytes=_MAX_INGEST_BYTES + 1,
+            )
+        except Exception:
+            # Preserve mixed-version operation when an older or temporarily
+            # degraded backend cannot provide the preferred raw transport.
+            pass
+        else:
+            if not isinstance(data, (bytes, bytearray)):
+                raise NotAnImage(
+                    f"sandbox returned non-image data for '{p}'",
+                    src=src,
+                )
+            data = bytes(data)
+            if len(data) > _MAX_INGEST_BYTES:
+                raise SourceTooLarge(
+                    "image exceeds size limit", src=src, origin="container"
+                )
+            return _finalize(data, "", "container", src)
 
     # Bound the read INSIDE the sandbox: head -c caps at ingest-limit+1 bytes
     # so a huge file (or /dev/zero) can't stream unbounded base64 into host
