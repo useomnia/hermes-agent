@@ -4820,6 +4820,15 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
+# A page with no network origin. ``browser_preview`` renders a workspace file by
+# writing the document into a blank page over CDP, so ``location.href`` stays
+# "about:blank" — there is no fetched origin for the vision URL guard below to
+# protect, and without this exemption vision could never read a preview at all
+# (``_is_safe_url`` accepts only http/https). An eval-navigation to a private
+# address still leaves that address in ``location.href`` and stays blocked.
+_ORIGINLESS_PAGE_URL = "about:blank"
+
+
 def browser_vision(
     question: str,
     annotate: bool = False,
@@ -4879,7 +4888,11 @@ def browser_vision(
                     _url_result.get("data", {}).get("result", "")
                     .strip().strip('"').strip("'")
                 )
-                if _current_url and not _is_safe_url(_current_url):
+                if (
+                    _current_url
+                    and _current_url.lower() != _ORIGINLESS_PAGE_URL
+                    and not _is_safe_url(_current_url)
+                ):
                     return json.dumps({
                         "success": False,
                         "error": (
