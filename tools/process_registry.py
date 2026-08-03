@@ -162,7 +162,10 @@ class ProcessRegistry:
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
 
-        # Side-channel for check_interval watchers (gateway reads after agent run)
+        # Side-channel for check_interval watchers. Producers run in executor
+        # threads while the gateway drains from its asyncio loop, so list
+        # ownership changes must be protected separately from process state.
+        self._watcher_lock = threading.Lock()
         self.pending_watchers: List[Dict[str, Any]] = []
 
         # Notification queue — unified queue for all background process events.
@@ -220,6 +223,18 @@ class ProcessRegistry:
         while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
             lines.pop(0)
         return "\n".join(lines)
+
+    def enqueue_pending_watcher(self, watcher: Dict[str, Any]) -> None:
+        """Queue one gateway watcher without racing the gateway drain."""
+        with self._watcher_lock:
+            self.pending_watchers.append(watcher)
+
+    def drain_pending_watchers(self) -> List[Dict[str, Any]]:
+        """Atomically transfer ownership of every queued gateway watcher."""
+        with self._watcher_lock:
+            watchers = self.pending_watchers
+            self.pending_watchers = []
+            return watchers
 
     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
         """Forward a freshly-read chunk to the live-output sink, if one is set.
@@ -1055,9 +1070,25 @@ class ProcessRegistry:
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
         prev_output_len = 0  # track delta for watch pattern scanning
+        consecutive_backend_failures = 0
+        dead_without_exit_marker = 0
         while not session.exited:
             time.sleep(2)  # Poll every 2 seconds
+            recorded_exit = None
             try:
+                # The exit marker is the source of truth. Read it before a
+                # liveness probe so PID reuse, a delayed kill -0 result, or a
+                # transient backend response cannot turn a completed job into
+                # an invented exit_code=-1.
+                exit_result = env.execute(
+                    f"cat {quoted_exit_path} 2>/dev/null",
+                    timeout=5,
+                )
+                exit_str = exit_result.get("output", "").strip()
+                try:
+                    recorded_exit = int(exit_str.splitlines()[-1].strip())
+                except (ValueError, IndexError):
+                    recorded_exit = None
                 # Read new output from the log file
                 result = env.execute(f"cat {quoted_log_path} 2>/dev/null", timeout=10)
                 new_output = result.get("output", "")
@@ -1073,6 +1104,14 @@ class ProcessRegistry:
                         self._check_watch_patterns(session, delta)
                         self._emit_output(session, delta)
 
+                if recorded_exit is not None:
+                    session.exit_code = recorded_exit
+                    session.exited = True
+                    if session.completion_reason != "killed":
+                        session.completion_reason = "exited"
+                    self._move_to_finished(session)
+                    return
+
                 # Check if process is still running
                 check = env.execute(
                     f"kill -0 \"$(cat {quoted_pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
@@ -1080,30 +1119,46 @@ class ProcessRegistry:
                 )
                 check_output = check.get("output", "").strip()
                 if check_output and check_output.splitlines()[-1].strip() != "0":
-                    # Process has exited -- get exit code captured by the wrapper shell.
-                    exit_result = env.execute(
-                        f"cat {quoted_exit_path} 2>/dev/null",
-                        timeout=5,
-                    )
-                    exit_str = exit_result.get("output", "").strip()
-                    try:
-                        session.exit_code = int(exit_str.splitlines()[-1].strip())
-                    except (ValueError, IndexError):
+                    # The wrapper writes the marker before it exits. Allow a
+                    # few polls for storage visibility instead of fabricating
+                    # an exit code when the marker briefly lags the PID state.
+                    dead_without_exit_marker += 1
+                    if dead_without_exit_marker >= 3:
+                        session.exited = True
                         session.exit_code = -1
+                        session.completion_reason = "lost"
+                        session.termination_source = "exit_marker_missing"
+                        self._move_to_finished(session)
+                        return
+                else:
+                    dead_without_exit_marker = 0
+                consecutive_backend_failures = 0
+
+            except Exception as exc:
+                if recorded_exit is not None:
+                    session.exit_code = recorded_exit
                     session.exited = True
                     if session.completion_reason != "killed":
                         session.completion_reason = "exited"
                     self._move_to_finished(session)
                     return
-
-            except Exception:
-                # Environment might be gone (sandbox reaped, etc.)
-                session.exited = True
-                session.exit_code = -1
-                session.completion_reason = "lost"
-                session.termination_source = "backend_lost"
-                self._move_to_finished(session)
-                return
+                # One failed Toolbox/backend poll is not evidence that the
+                # sandbox or process disappeared. Require repeated failures;
+                # the next successful poll can still observe the exit marker.
+                consecutive_backend_failures += 1
+                logger.warning(
+                    "Background process poll failed (%d/3, session=%s): %s",
+                    consecutive_backend_failures,
+                    session.id,
+                    exc,
+                )
+                if consecutive_backend_failures >= 3:
+                    session.exited = True
+                    session.exit_code = -1
+                    session.completion_reason = "lost"
+                    session.termination_source = "backend_lost"
+                    self._move_to_finished(session)
+                    return
 
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
@@ -2063,7 +2118,7 @@ class ProcessRegistry:
 
             # Re-enqueue watcher so gateway can resume notifications
             if session.watcher_interval > 0:
-                self.pending_watchers.append({
+                self.enqueue_pending_watcher({
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
                     "session_key": session.session_key,
