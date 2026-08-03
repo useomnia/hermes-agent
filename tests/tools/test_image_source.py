@@ -150,7 +150,7 @@ class TestNonLocalBackendConfinement:
             return {"returncode": 0, "output": container_png_b64}
 
         with patch(
-            "tools.image_source._get_active_env",
+            "tools.image_source._acquire_sandbox_env",
             return_value=SimpleNamespace(execute=fake_execute),
         ):
             res = await isrc.resolve_image_source(
@@ -177,7 +177,7 @@ class TestNonLocalBackendConfinement:
         secret = tmp_path / "id_rsa"
         secret.write_bytes(b"HOST-PRIVATE-KEY")
 
-        with patch("tools.image_source._get_active_env", return_value=None):
+        with patch("tools.image_source._acquire_sandbox_env", return_value=None):
             with pytest.raises(isrc.SourceNotFound):
                 await isrc.resolve_image_source(
                     str(secret), isrc.ResolveContext(task_id="t1")
@@ -204,7 +204,7 @@ class TestNonLocalBackendConfinement:
             pytest.skip("symlinks unsupported")
 
         # Fails closed (no sandbox) rather than host-reading the symlink target.
-        with patch("tools.image_source._get_active_env", return_value=None):
+        with patch("tools.image_source._acquire_sandbox_env", return_value=None):
             with pytest.raises(isrc.SourceNotFound):
                 await isrc.resolve_image_source(
                     str(link), isrc.ResolveContext(task_id="t1")
@@ -212,6 +212,100 @@ class TestNonLocalBackendConfinement:
 
 
 class TestExecReadSafety:
+    @pytest.mark.asyncio
+    async def test_sprites_backend_creates_environment_for_first_image_read(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "sprites")
+        env = SimpleNamespace(read_file_bytes=lambda *_args, **_kwargs: PNG)
+
+        with (
+            patch("tools.terminal_tool.get_active_env", return_value=None),
+            patch(
+                "tools.file_tools._get_file_ops",
+                return_value=SimpleNamespace(env=env),
+            ),
+        ):
+            result = await isrc.resolve_image_source(
+                "/tmp/screenshots/shot.png",
+                isrc.ResolveContext(task_id="task-1"),
+            )
+
+        assert result.data == PNG
+        assert result.origin == "container"
+
+    @pytest.mark.asyncio
+    async def test_sprites_backend_uses_default_environment_for_top_level_image_read(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "sprites")
+        env = SimpleNamespace(read_file_bytes=lambda *_args, **_kwargs: PNG)
+        requested_tasks = []
+
+        def get_file_ops(task_id):
+            requested_tasks.append(task_id)
+            return SimpleNamespace(env=env)
+
+        with (
+            patch("tools.terminal_tool.get_active_env", return_value=None),
+            patch("tools.file_tools._get_file_ops", side_effect=get_file_ops),
+        ):
+            result = await isrc.resolve_image_source(
+                "/tmp/screenshots/shot.png",
+                isrc.ResolveContext(),
+            )
+
+        assert result.data == PNG
+        assert requested_tasks == ["default"]
+
+    @pytest.mark.asyncio
+    async def test_sprites_backend_reuses_active_environment_for_image_read(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "sprites")
+        env = SimpleNamespace(read_file_bytes=lambda *_args, **_kwargs: PNG)
+
+        with (
+            patch("tools.terminal_tool.get_active_env", return_value=env),
+            patch(
+                "tools.file_tools._get_file_ops",
+                side_effect=AssertionError("active environment must be reused"),
+            ),
+        ):
+            result = await isrc.resolve_image_source(
+                "/tmp/screenshots/shot.png",
+                isrc.ResolveContext(task_id="task-1"),
+            )
+
+        assert result.data == PNG
+
+    @pytest.mark.asyncio
+    async def test_sprites_backend_surfaces_environment_creation_failure(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "sprites")
+
+        with (
+            patch("tools.terminal_tool.get_active_env", return_value=None),
+            patch(
+                "tools.file_tools._get_file_ops",
+                side_effect=RuntimeError("toolbox environment unavailable"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="toolbox environment unavailable"):
+                await isrc.resolve_image_source(
+                    "/tmp/screenshots/shot.png",
+                    isrc.ResolveContext(task_id="task-1"),
+                )
+
     @pytest.mark.asyncio
     async def test_sprites_backend_reads_raw_bytes_without_shell_encoding(
         self, tmp_path, monkeypatch
@@ -233,7 +327,7 @@ class TestExecReadSafety:
             read_file_bytes=read_file_bytes,
             execute=fail_execute,
         )
-        with patch("tools.image_source._get_active_env", return_value=env):
+        with patch("tools.image_source._acquire_sandbox_env", return_value=env):
             result = await isrc.resolve_image_source(
                 "/home/shot.png", isrc.ResolveContext(task_id="task-1")
             )
@@ -259,7 +353,7 @@ class TestExecReadSafety:
             return PNG
 
         env = SimpleNamespace(read_file_bytes=read_file_bytes)
-        with patch("tools.image_source._get_active_env", return_value=env):
+        with patch("tools.image_source._acquire_sandbox_env", return_value=env):
             result = await isrc.resolve_image_source(
                 "~/shot.png", isrc.ResolveContext(task_id="task-1")
             )
@@ -284,7 +378,7 @@ class TestExecReadSafety:
             )
 
         env = SimpleNamespace(read_file_bytes=read_file_bytes, execute=fail_execute)
-        with patch("tools.image_source._get_active_env", return_value=env):
+        with patch("tools.image_source._acquire_sandbox_env", return_value=env):
             with pytest.raises(RuntimeError, match="raw read failed"):
                 await isrc.resolve_image_source(
                     "/home/shot.png", isrc.ResolveContext(task_id="task-1")
@@ -299,7 +393,7 @@ class TestExecReadSafety:
         monkeypatch.setenv("TERMINAL_ENV", "sprites")
 
         with patch(
-            "tools.image_source._get_active_env",
+            "tools.image_source._acquire_sandbox_env",
             return_value=SimpleNamespace(execute=pytest.fail),
         ):
             with pytest.raises(
@@ -318,7 +412,7 @@ class TestExecReadSafety:
         monkeypatch.setenv("TERMINAL_ENV", "sprites")
         env = SimpleNamespace(read_file_bytes=lambda *_args, **_kwargs: "not bytes")
 
-        with patch("tools.image_source._get_active_env", return_value=env):
+        with patch("tools.image_source._acquire_sandbox_env", return_value=env):
             with pytest.raises(
                 isrc.NotAnImage, match="sandbox returned non-image data"
             ):
@@ -336,7 +430,7 @@ class TestExecReadSafety:
         monkeypatch.setattr(isrc, "_MAX_INGEST_BYTES", len(PNG) - 1)
         env = SimpleNamespace(read_file_bytes=lambda *_args, **_kwargs: PNG)
 
-        with patch("tools.image_source._get_active_env", return_value=env):
+        with patch("tools.image_source._acquire_sandbox_env", return_value=env):
             with pytest.raises(isrc.SourceTooLarge, match="image exceeds size limit"):
                 await isrc.resolve_image_source(
                     "/home/shot.png", isrc.ResolveContext(task_id="task-1")
@@ -356,7 +450,7 @@ class TestExecReadSafety:
             return {"returncode": 0, "output": base64.b64encode(PNG).decode()}
 
         with patch(
-            "tools.image_source._get_active_env",
+            "tools.image_source._acquire_sandbox_env",
             return_value=SimpleNamespace(execute=fake_execute),
         ):
             await isrc.resolve_image_source(
@@ -383,7 +477,7 @@ class TestExecReadSafety:
             return {"returncode": 0, "output": over}
 
         with patch(
-            "tools.image_source._get_active_env",
+            "tools.image_source._acquire_sandbox_env",
             return_value=SimpleNamespace(execute=fake_execute),
         ):
             with pytest.raises(isrc.SourceTooLarge):
@@ -401,7 +495,7 @@ class TestExecReadSafety:
             return {"returncode": 1, "output": ""}
 
         with patch(
-            "tools.image_source._get_active_env",
+            "tools.image_source._acquire_sandbox_env",
             return_value=SimpleNamespace(execute=fake_execute),
         ):
             with pytest.raises(isrc.SourceNotFound):

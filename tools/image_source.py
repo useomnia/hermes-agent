@@ -268,15 +268,17 @@ def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
     return None
 
 
-def _get_active_env(task_id: Optional[str]):
-    if not task_id:
-        return None
-    try:
-        from tools.terminal_tool import get_active_env
+def _acquire_sandbox_env(task_id: Optional[str]):
+    resolved_task_id = task_id or "default"
+    from tools.terminal_tool import get_active_env
 
-        return get_active_env(task_id)
-    except Exception:
-        return None
+    env = get_active_env(resolved_task_id)
+    if env is not None or not _is_sprites_terminal_backend():
+        return env
+
+    from tools.file_tools import _get_file_ops
+
+    return _get_file_ops(resolved_task_id).env
 
 
 async def _resolve_sandbox_file(
@@ -295,7 +297,7 @@ async def _resolve_sandbox_file(
     import asyncio
     import shlex
 
-    env = _get_active_env(ctx.task_id)
+    env = _acquire_sandbox_env(ctx.task_id)
     if env is None:
         raise SourceNotFound(
             f"'{p}' is not reachable inside the sandbox and no active sandbox "
