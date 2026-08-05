@@ -216,6 +216,29 @@ class TurnEventLogStore:
         if failure_reason is not None:
             log.failure_reason = failure_reason
 
+    @staticmethod
+    def _stored_event(payload: Dict[str, Any], sequence_number: int) -> StoredTurnEvent:
+        event = dict(payload)
+        event["sequence_number"] = sequence_number
+        serialized = json.dumps(
+            event,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return StoredTurnEvent(
+            sequence_number=sequence_number,
+            frame=b"data: " + serialized + b"\n\n",
+        )
+
+    def _mark_cap_exceeded(self, log: RunEventLog) -> None:
+        if log.cap_exceeded:
+            return
+        log.cap_exceeded = True
+        log.failure_reason = "log_cap_exceeded"
+        callback = self.on_cap_exceeded
+        if callback is not None:
+            callback(log.run_id)
+
     def append_payload(
         self,
         run_id: str,
@@ -231,40 +254,61 @@ class TurnEventLogStore:
         if log.cap_exceeded and not force_terminal:
             return None
 
-        event = dict(payload)
-        event["sequence_number"] = log.sequence_number_high_water + 1
-        serialized = json.dumps(
-            event,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        frame = b"data: " + serialized + b"\n\n"
+        stored = self._stored_event(
+            payload,
+            log.sequence_number_high_water + 1,
+        )
 
         ordinary_limit = max(0, self.run_log_cap_bytes - TERMINAL_FRAME_RESERVE_BYTES)
-        if not force_terminal and log.wire_bytes + len(frame) > ordinary_limit:
-            if not log.cap_exceeded:
-                log.cap_exceeded = True
-                log.failure_reason = "log_cap_exceeded"
-                callback = self.on_cap_exceeded
-                if callback is not None:
-                    callback(run_id)
+        if not force_terminal and log.wire_bytes + len(stored.frame) > ordinary_limit:
+            self._mark_cap_exceeded(log)
             return None
 
-        if force_terminal and log.wire_bytes + len(frame) > self.run_log_cap_bytes:
+        if (
+            force_terminal
+            and log.wire_bytes + len(stored.frame) > self.run_log_cap_bytes
+        ):
             # Production's 2 KiB reserve is comfortably larger than the
             # compact terminal shapes minted below. This guard keeps the byte
             # cap absolute even under a test-only tiny cap or future schema
             # growth; callers must never write more than the configured cap.
             return None
 
-        stored = StoredTurnEvent(
-            sequence_number=event["sequence_number"],
-            frame=frame,
-        )
         log.events.append(stored)
-        log.wire_bytes += len(frame)
+        log.wire_bytes += len(stored.frame)
         log.wake_waiters()
         return stored
+
+    def append_payloads(
+        self,
+        run_id: str,
+        payloads: Iterable[Dict[str, Any]],
+    ) -> List[StoredTurnEvent]:
+        """Atomically append ordinary events or reject the complete batch."""
+        log = self._logs.get(run_id)
+        if log is None:
+            raise UnknownRunError(run_id)
+        if log.terminal or log.cap_exceeded:
+            return []
+
+        start = log.sequence_number_high_water + 1
+        stored_events = [
+            self._stored_event(payload, start + index)
+            for index, payload in enumerate(payloads)
+        ]
+        if not stored_events:
+            return []
+
+        batch_bytes = sum(len(stored.frame) for stored in stored_events)
+        ordinary_limit = max(0, self.run_log_cap_bytes - TERMINAL_FRAME_RESERVE_BYTES)
+        if log.wire_bytes + batch_bytes > ordinary_limit:
+            self._mark_cap_exceeded(log)
+            return []
+
+        log.events.extend(stored_events)
+        log.wire_bytes += batch_bytes
+        log.wake_waiters()
+        return stored_events
 
     def mark_terminal(
         self,
@@ -375,6 +419,7 @@ class TurnEventEmitter:
         self.created_at = int(self.clock())
         self._next_output_index = 0
         self._messages: Dict[str, Dict[str, Any]] = {}
+        self._message_output_indexes: Dict[str, int] = {}
         self._reasoning_items: Dict[str, Dict[str, Any]] = {}
         self._function_calls: Dict[str, Dict[str, Any]] = {}
 
@@ -423,6 +468,7 @@ class TurnEventEmitter:
             "output_index": output_index,
             "text": "",
         }
+        self._message_output_indexes[item_id] = output_index
         self._emit(
             "response.output_item.added",
             output_index=output_index,
@@ -482,6 +528,32 @@ class TurnEventEmitter:
             output_index=output_index,
             item=item,
         )
+
+    def output_text_annotations_added(
+        self,
+        item_id: str,
+        annotations: Iterable[Dict[str, Any]],
+    ) -> List[StoredTurnEvent]:
+        output_index = self._message_output_indexes.get(item_id)
+        if output_index is None:
+            return []
+        return self.store.append_payloads(
+            self.run_id,
+            (
+                {
+                    "type": "response.output_text.annotation.added",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "annotation_index": annotation_index,
+                    "annotation": annotation,
+                }
+                for annotation_index, annotation in enumerate(annotations)
+            ),
+        )
+
+    def output_index_for_message(self, item_id: str) -> Optional[int]:
+        return self._message_output_indexes.get(item_id)
 
     def reasoning_start(self, item_id: str) -> None:
         output_index = self._allocate_output_index()

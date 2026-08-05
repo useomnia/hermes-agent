@@ -79,10 +79,13 @@ def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> lis
 
 
 try:
+    import aiohttp
     from aiohttp import web
+
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
+    aiohttp = None  # type: ignore[assignment]
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
@@ -115,6 +118,47 @@ logger = logging.getLogger(__name__)
 
 _OMNIO_DURABLE_APPROVALS_DISABLED_ENV = "OMNIO_TOOL_APPROVAL_DURABLE_DISABLED"
 _OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS = 5.0
+_OMNIO_TURN_FINALIZE_HOOK_ENV = "OMNIO_TURN_FINALIZE_HOOK"
+_OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS = 5.0
+
+
+async def _request_turn_finalize_annotations(
+    hook_url: str,
+    payload: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    timeout = aiohttp.ClientTimeout(total=_OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS)
+    headers = {
+        "X-Omnio-Service-Token": os.environ.get("OMNIO_INTERNAL_TOKEN", ""),
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                hook_url, headers=headers, json=payload
+            ) as response:
+                if response.status != 200:
+                    logger.info(
+                        "Turn finalize hook returned status=%s for run=%s",
+                        response.status,
+                        payload.get("run_id"),
+                    )
+                    return []
+                body = await response.json()
+    except Exception:
+        logger.info(
+            "Turn finalize hook failed for run=%s",
+            payload.get("run_id"),
+            exc_info=True,
+        )
+        return []
+
+    annotations = body.get("annotations") if isinstance(body, dict) else None
+    if not isinstance(annotations, list):
+        logger.info(
+            "Turn finalize hook returned invalid annotations for run=%s",
+            payload.get("run_id"),
+        )
+        return []
+    return [annotation for annotation in annotations if isinstance(annotation, dict)]
 
 
 def _parse_omnio_connector_toolkit_approval_tools(payload: Any) -> list[str]:
@@ -6896,6 +6940,7 @@ class APIServerAdapter(BasePlatformAdapter):
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
         explicit_session_id = body.get("session_id")
+        turn_id = body.get("turn_id")
 
         if explicit_session_id is not None:
             if not isinstance(explicit_session_id, str) or not explicit_session_id.strip():
@@ -7349,6 +7394,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         _emit_tool_start(call_id, name, args)
                     _emit_tool_end(call_id, name)
 
+                emitted_text = "".join(text_parts)
                 if text_started:
                     emitter.output_text_done(message_id)
                 if reasoning_started:
@@ -7359,7 +7405,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 was_interrupted = bool(
                     isinstance(result, dict) and result.get("interrupted")
                 )
-                if failure_reason == "log_cap_exceeded":
+                run_failed = bool(isinstance(result, dict) and result.get("failed"))
+
+                def _close_log_cap_exceeded() -> None:
                     error_msg = "Turn event log exceeded the 8 MiB cap"
                     self._set_run_status(
                         run_id,
@@ -7374,7 +7422,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         code="log_cap_exceeded",
                     )
                     _legacy_terminal("run.failed", error=error_msg)
-                elif run_id in self._stopping_run_ids or was_interrupted:
+
+                def _close_cancelled() -> None:
                     emitter.omnio_event(
                         "response.omnio.interrupted_history",
                         message=self._interrupted_history_marker(
@@ -7389,10 +7438,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     emitter.response_incomplete()
                     _legacy_terminal("run.cancelled")
+
+                if failure_reason == "log_cap_exceeded":
+                    _close_log_cap_exceeded()
+                elif run_id in self._stopping_run_ids or was_interrupted:
+                    _close_cancelled()
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
-                elif isinstance(result, dict) and result.get("failed"):
+                elif run_failed:
                     error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
                     self._set_run_status(
                         run_id,
@@ -7408,20 +7462,48 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     _legacy_terminal("run.failed", error=error_msg)
                 else:
-                    self._set_run_status(
-                        run_id,
-                        "completed",
-                        output=final_response,
-                        usage=usage,
-                        last_event="run.completed",
-                        completed_at=time.time(),
+                    hook_url = os.environ.get(_OMNIO_TURN_FINALIZE_HOOK_ENV)
+                    if text_started and emitted_text and hook_url:
+                        output_index = emitter.output_index_for_message(message_id)
+                        if output_index is not None:
+                            annotations = await _request_turn_finalize_annotations(
+                                hook_url,
+                                {
+                                    "run_id": run_id,
+                                    "turn_id": turn_id,
+                                    "session_id": session_id,
+                                    "final_text": emitted_text,
+                                    "message_item_id": message_id,
+                                    "output_index": output_index,
+                                },
+                            )
+                            if run_id in self._stopping_run_ids:
+                                _close_cancelled()
+                                return
+                            emitter.output_text_annotations_added(
+                                message_id, annotations
+                            )
+                    log = self._turn_event_logs.get_log(run_id)
+                    annotation_failure_reason = (
+                        log.failure_reason if log is not None else None
                     )
-                    emitter.response_completed()
-                    _legacy_terminal(
-                        "run.completed",
-                        output=final_response,
-                        usage=usage,
-                    )
+                    if annotation_failure_reason == "log_cap_exceeded":
+                        _close_log_cap_exceeded()
+                    else:
+                        self._set_run_status(
+                            run_id,
+                            "completed",
+                            output=final_response,
+                            usage=usage,
+                            last_event="run.completed",
+                            completed_at=time.time(),
+                        )
+                        emitter.response_completed()
+                        _legacy_terminal(
+                            "run.completed",
+                            output=final_response,
+                            usage=usage,
+                        )
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,

@@ -19,10 +19,12 @@ from aiohttp import ClientResponse, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, PlatformConfig
+from gateway.platforms import api_server as api_server_module
 from gateway.platforms.api_server import APIServerAdapter, _api_request_profile
 from gateway.turn_event_log import (
     CursorExpiredError,
     OMNIO_EXTENSION_EVENT_TYPES,
+    TERMINAL_FRAME_RESERVE_BYTES,
     TurnEventEmitter,
     TurnEventLogStore,
     UnknownRunError,
@@ -141,6 +143,32 @@ async def _wait_for_terminal(
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"run did not become terminal: {run_id}")
+
+
+class _JsonRequest:
+    headers: Dict[str, str] = {}
+
+    def __init__(self, body: Dict[str, Any]) -> None:
+        self.body = body
+
+    async def json(self) -> Dict[str, Any]:
+        return self.body
+
+
+async def _run_without_http_server(
+    adapter: APIServerAdapter, body: Dict[str, Any]
+) -> tuple[web.Response, List[Dict[str, Any]]]:
+    response = await adapter._handle_runs(_JsonRequest(body))  # type: ignore[arg-type]
+    payload = json.loads(response.text)
+    run_id = payload["run_id"]
+    await _wait_for_terminal(adapter, run_id)
+    log = adapter._turn_event_logs.get_log(run_id)
+    assert log is not None
+    events = [
+        json.loads(stored.frame.removeprefix(b"data: ").strip())
+        for stored in log.events
+    ]
+    return response, events
 
 
 async def _wait_for_thread_event(
@@ -589,6 +617,401 @@ async def test_none_final_response_does_not_mask_structured_run_failure() -> Non
     assert events[-1]["type"] == "response.failed"
     assert events[-1]["response"]["error"]["code"] == "run_failed"
     assert adapter._run_statuses[run_id]["error"] == "original agent failure"
+
+
+@pytest.mark.asyncio
+async def test_successful_run_emits_file_annotations_before_terminal_with_contiguous_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final_response = "The final report is at `/brand/final report.pdf`."
+    annotation = {
+        "type": "file_path",
+        "path": "/brand/final report.pdf",
+        "filename": "final report.pdf",
+        "content_type": "application/pdf",
+        "size_label": "2 KB",
+        "size_bytes": 1536,
+    }
+    finalize = AsyncMock(return_value=[annotation])
+    monkeypatch.setenv(
+        api_server_module._OMNIO_TURN_FINALIZE_HOOK_ENV,
+        "http://127.0.0.1:8642/internal/turn-finalize",
+    )
+    monkeypatch.setattr(
+        api_server_module, "_request_turn_finalize_annotations", finalize
+    )
+    adapter = _make_adapter()
+
+    with patch.object(
+        adapter,
+        "_create_agent",
+        return_value=_agent(
+            lambda **_kwargs: {
+                "final_response": final_response,
+                "messages": [],
+            }
+        ),
+    ):
+        started, events = await _run_without_http_server(
+            adapter,
+            {
+                "input": "make report",
+                "turn_id": "turn-1",
+                "session_id": "session-1",
+            },
+        )
+
+    assert started.status == 202
+    annotation_event = next(
+        event
+        for event in events
+        if event["type"] == "response.output_text.annotation.added"
+    )
+    message_event = next(
+        event
+        for event in events
+        if event["type"] == "response.output_item.done"
+        and event["item"]["type"] == "message"
+    )
+    assert events[-2] == annotation_event
+    assert events[-1]["type"] == "response.completed"
+    assert [event["sequence_number"] for event in events] == list(
+        range(1, len(events) + 1)
+    )
+    assert annotation_event == {
+        "type": "response.output_text.annotation.added",
+        "item_id": message_event["item"]["id"],
+        "output_index": message_event["output_index"],
+        "content_index": 0,
+        "annotation_index": 0,
+        "annotation": annotation,
+        "sequence_number": annotation_event["sequence_number"],
+    }
+    finalize.assert_awaited_once_with(
+        "http://127.0.0.1:8642/internal/turn-finalize",
+        {
+            "run_id": json.loads(started.text)["run_id"],
+            "turn_id": "turn-1",
+            "session_id": "session-1",
+            "final_text": final_response,
+            "message_item_id": message_event["item"]["id"],
+            "output_index": message_event["output_index"],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_hook_uses_the_exact_emitted_message_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted_text = "Download `/brand/emitted.pdf`."
+    finalize = AsyncMock(return_value=[])
+    monkeypatch.setenv(
+        api_server_module._OMNIO_TURN_FINALIZE_HOOK_ENV,
+        "http://127.0.0.1:8642/internal/turn-finalize",
+    )
+    monkeypatch.setattr(
+        api_server_module, "_request_turn_finalize_annotations", finalize
+    )
+    adapter = _make_adapter()
+
+    def create_agent(**kwargs: Any) -> MagicMock:
+        stream = kwargs["stream_delta_callback"]
+
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            stream(emitted_text)
+            return {
+                "final_response": "Different result text at /brand/result.pdf",
+                "messages": [],
+            }
+
+        return _agent(run)
+
+    with patch.object(adapter, "_create_agent", side_effect=create_agent):
+        started, events = await _run_without_http_server(
+            adapter,
+            {"input": "make report", "turn_id": "turn-1"},
+        )
+
+    message_event = next(
+        event
+        for event in events
+        if event["type"] == "response.output_item.done"
+        and event["item"]["type"] == "message"
+    )
+    assert message_event["item"]["content"][0]["text"] == emitted_text
+    assert finalize.await_args.args[1]["final_text"] == emitted_text
+    assert json.loads(started.text)["run_id"] == finalize.await_args.args[1]["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_stop_accepted_during_finalize_hook_cancels_without_annotations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    annotation = {
+        "type": "file_path",
+        "path": "/brand/report.pdf",
+        "filename": "report.pdf",
+        "content_type": "application/pdf",
+        "size_label": "2 KB",
+        "size_bytes": 1536,
+    }
+    monkeypatch.setenv(
+        api_server_module._OMNIO_TURN_FINALIZE_HOOK_ENV,
+        "http://127.0.0.1:8642/internal/turn-finalize",
+    )
+    adapter = _make_adapter()
+
+    async def finalize(_hook_url: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        adapter._stopping_run_ids.add(payload["run_id"])
+        await asyncio.sleep(0)
+        return [annotation]
+
+    monkeypatch.setattr(
+        api_server_module, "_request_turn_finalize_annotations", finalize
+    )
+    with patch.object(
+        adapter,
+        "_create_agent",
+        return_value=_agent(
+            lambda **_kwargs: {
+                "final_response": "Download /brand/report.pdf",
+                "messages": [],
+            }
+        ),
+    ):
+        started, events = await _run_without_http_server(
+            adapter,
+            {"input": "make report", "turn_id": "turn-1"},
+        )
+
+    run_id = json.loads(started.text)["run_id"]
+    assert events[-1]["type"] == "response.incomplete"
+    assert adapter._run_statuses[run_id]["status"] == "cancelled"
+    assert not any(
+        event["type"] == "response.output_text.annotation.added" for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_successful_run_without_finalize_hook_does_not_call_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(api_server_module._OMNIO_TURN_FINALIZE_HOOK_ENV, raising=False)
+    finalize = AsyncMock()
+    monkeypatch.setattr(
+        api_server_module, "_request_turn_finalize_annotations", finalize
+    )
+    adapter = _make_adapter()
+
+    with patch.object(
+        adapter,
+        "_create_agent",
+        return_value=_agent(
+            lambda **_kwargs: {
+                "final_response": "Report: /brand/report.pdf",
+                "messages": [],
+            }
+        ),
+    ):
+        started, events = await _run_without_http_server(
+            adapter, {"input": "make report"}
+        )
+
+    assert started.status == 202
+    assert not any(
+        event["type"] == "response.output_text.annotation.added" for event in events
+    )
+    finalize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_successful_run_without_message_item_emits_no_file_annotations() -> None:
+    adapter = _make_adapter()
+
+    with patch.object(
+        adapter,
+        "_create_agent",
+        return_value=_agent(
+            lambda **_kwargs: {
+                "final_response": "",
+                "messages": [],
+            }
+        ),
+    ):
+        started, events = await _run_without_http_server(adapter, {"input": "do work"})
+
+    assert started.status == 202
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.in_progress",
+        "response.completed",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("result_fields", "terminal_type"),
+    [
+        ({"failed": True, "error": "agent failed"}, "response.failed"),
+        ({"interrupted": True}, "response.incomplete"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_failed_and_cancelled_runs_do_not_emit_file_annotations(
+    monkeypatch: pytest.MonkeyPatch,
+    result_fields: Dict[str, Any],
+    terminal_type: str,
+) -> None:
+    monkeypatch.setenv(
+        api_server_module._OMNIO_TURN_FINALIZE_HOOK_ENV,
+        "http://127.0.0.1:8642/internal/turn-finalize",
+    )
+    finalize = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        api_server_module, "_request_turn_finalize_annotations", finalize
+    )
+    adapter = _make_adapter()
+    result = {
+        "final_response": "Report: /brand/report.txt",
+        "messages": [],
+        **result_fields,
+    }
+
+    with patch.object(
+        adapter,
+        "_create_agent",
+        return_value=_agent(lambda **_kwargs: result),
+    ):
+        started, events = await _run_without_http_server(
+            adapter, {"input": "make report"}
+        )
+
+    assert started.status == 202
+    assert events[-1]["type"] == terminal_type
+    assert not any(
+        event["type"] == "response.output_text.annotation.added" for event in events
+    )
+    finalize.assert_not_awaited()
+
+
+@pytest.mark.parametrize("hook_status", [500, "timeout"])
+@pytest.mark.asyncio
+async def test_finalize_hook_failure_still_emits_terminal_promptly(
+    monkeypatch: pytest.MonkeyPatch,
+    hook_status: int | str,
+) -> None:
+    async def finalize(_request: web.Request) -> web.Response:
+        if hook_status == "timeout":
+            await asyncio.sleep(1.0)
+            return web.json_response({"annotations": []})
+        return web.json_response({"annotations": []}, status=hook_status)
+
+    hook_app = web.Application()
+    hook_app.router.add_post("/internal/turn-finalize", finalize)
+    monkeypatch.setattr(api_server_module, "_OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS", 0.02)
+    adapter = _make_adapter()
+
+    async with TestServer(hook_app) as server:
+        monkeypatch.setenv(
+            api_server_module._OMNIO_TURN_FINALIZE_HOOK_ENV,
+            str(server.make_url("/internal/turn-finalize")),
+        )
+        started_at = asyncio.get_running_loop().time()
+        with patch.object(
+            adapter,
+            "_create_agent",
+            return_value=_agent(
+                lambda **_kwargs: {
+                    "final_response": "Report: /brand/report.pdf",
+                    "messages": [],
+                }
+            ),
+        ):
+            started, events = await _run_without_http_server(
+                adapter,
+                {"input": "make report", "turn_id": "turn-1"},
+            )
+        elapsed = asyncio.get_running_loop().time() - started_at
+
+    assert started.status == 202
+    assert elapsed < 0.5
+    assert events[-1]["type"] == "response.completed"
+    assert not any(
+        event["type"] == "response.output_text.annotation.added" for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_annotation_batch_cap_exhaustion_fails_run_without_partial_annotations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final_response = "Reports: /brand/first.txt and /brand/second.txt"
+    annotations = [
+        {
+            "type": "file_path",
+            "path": f"/brand/{name}.txt",
+            "filename": f"{name}.txt",
+            "content_type": "text/plain",
+            "size_label": "11 B",
+            "size_bytes": 11,
+        }
+        for name in ("first", "second")
+    ]
+    monkeypatch.setenv(
+        api_server_module._OMNIO_TURN_FINALIZE_HOOK_ENV,
+        "http://127.0.0.1:8642/internal/turn-finalize",
+    )
+    monkeypatch.setattr(
+        api_server_module,
+        "_request_turn_finalize_annotations",
+        AsyncMock(return_value=annotations),
+    )
+
+    clock = _Clock(now=1_000_000_000.0)
+    dry_store = TurnEventLogStore(clock=clock)
+    dry_store.create_run("run_" + "a" * 32, "run_" + "a" * 32)
+    dry_emitter = TurnEventEmitter(
+        dry_store,
+        "run_" + "a" * 32,
+        "run_" + "a" * 32,
+    )
+    dry_emitter.response_started()
+    dry_emitter.output_text_start("msg_" + "b" * 32)
+    dry_emitter.output_text_delta("msg_" + "b" * 32, final_response)
+    dry_emitter.output_text_done("msg_" + "b" * 32)
+    dry_log = dry_store.get_log("run_" + "a" * 32)
+    assert dry_log is not None
+    base_wire_bytes = dry_log.wire_bytes
+    dry_emitter.output_text_annotations_added("msg_" + "b" * 32, annotations)
+    first_annotation_bytes = dry_log.events[-2].frame
+
+    adapter = _make_adapter()
+    cap = base_wire_bytes + len(first_annotation_bytes) + TERMINAL_FRAME_RESERVE_BYTES
+    _install_log_store(adapter, clock=clock, cap=cap)
+    with patch.object(
+        adapter,
+        "_create_agent",
+        return_value=_agent(
+            lambda **_kwargs: {
+                "final_response": final_response,
+                "messages": [],
+            }
+        ),
+    ):
+        started, events = await _run_without_http_server(
+            adapter, {"input": "make reports"}
+        )
+
+    run_id = json.loads(started.text)["run_id"]
+    log = adapter._turn_event_logs.get_log(run_id)
+    assert log is not None
+    assert events[-1]["type"] == "response.failed"
+    assert events[-1]["response"]["error"]["code"] == "log_cap_exceeded"
+    assert adapter._run_statuses[run_id]["status"] == "failed"
+    assert log.failure_reason == "log_cap_exceeded"
+    assert not any(
+        event["type"] == "response.output_text.annotation.added" for event in events
+    )
 
 
 @pytest.mark.asyncio
