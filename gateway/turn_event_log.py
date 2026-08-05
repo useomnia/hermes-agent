@@ -459,17 +459,20 @@ class TurnEventEmitter:
 
     def output_text_start(self, item_id: str) -> None:
         output_index = self._allocate_output_index()
+        started_at = self.clock()
         item = {
             "id": item_id,
             "type": "message",
             "status": "in_progress",
             "role": "assistant",
             "content": [],
+            "started_at": started_at,
         }
         part = {"type": "output_text", "text": ""}
         self._messages[item_id] = {
             "output_index": output_index,
             "text": "",
+            "started_at": started_at,
         }
         self._message_output_indexes[item_id] = output_index
         self._emit(
@@ -511,6 +514,8 @@ class TurnEventEmitter:
             "status": "completed",
             "role": "assistant",
             "content": [part],
+            "started_at": state["started_at"],
+            "completed_at": self.clock(),
         }
         self._emit(
             "response.output_text.done",
@@ -560,16 +565,19 @@ class TurnEventEmitter:
 
     def reasoning_start(self, item_id: str) -> None:
         output_index = self._allocate_output_index()
+        started_at = self.clock()
         item = {
             "id": item_id,
             "type": "reasoning",
             "status": "in_progress",
             "summary": [],
             "content": [],
+            "started_at": started_at,
         }
         self._reasoning_items[item_id] = {
             "output_index": output_index,
             "text": "",
+            "started_at": started_at,
         }
         self._emit(
             "response.output_item.added",
@@ -612,17 +620,21 @@ class TurnEventEmitter:
                 "status": "completed",
                 "summary": [],
                 "content": [{"type": "reasoning_text", "text": text}],
+                "started_at": state["started_at"],
+                "completed_at": self.clock(),
             },
         )
 
     def function_call_start(self, call_id: str, name: str) -> None:
         item_id = f"fc_{call_id}"
         output_index = self._allocate_output_index()
+        started_at = self.clock()
         self._function_calls[call_id] = {
             "item_id": item_id,
             "name": name,
             "output_index": output_index,
             "arguments": None,
+            "started_at": started_at,
         }
         self._emit(
             "response.output_item.added",
@@ -633,6 +645,7 @@ class TurnEventEmitter:
                 "status": "in_progress",
                 "name": name,
                 "call_id": call_id,
+                "started_at": started_at,
             },
         )
 
@@ -671,6 +684,8 @@ class TurnEventEmitter:
             "status": "completed",
             "name": state["name"],
             "call_id": call_id,
+            "started_at": state["started_at"],
+            "completed_at": self.clock(),
         }
         arguments = state["arguments"]
         if arguments is not None:

@@ -355,10 +355,17 @@ async def test_two_concurrent_subscribers_receive_the_same_complete_stream() -> 
         "status": "in_progress",
         "role": "assistant",
         "content": [],
+        "started_at": first_events[2]["item"]["started_at"],
     }
+    assert isinstance(first_events[2]["item"]["started_at"], float)
     assert first_events[7]["item"]["content"] == [
         {"type": "output_text", "text": "hello"}
     ]
+    # The closed item reports the real interval: started when it opened,
+    # completed no earlier than that.
+    done_item = first_events[7]["item"]
+    assert done_item["started_at"] == first_events[2]["item"]["started_at"]
+    assert done_item["completed_at"] >= done_item["started_at"]
     assert all("seq" not in event for event in first_events)
     assert all(
         "runId" not in event and "threadId" not in event for event in first_events
