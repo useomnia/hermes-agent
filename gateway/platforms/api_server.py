@@ -120,14 +120,28 @@ logger = logging.getLogger(__name__)
 _OMNIO_DURABLE_APPROVALS_DISABLED_ENV = "OMNIO_TOOL_APPROVAL_DURABLE_DISABLED"
 _OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS = 5.0
 _OMNIO_TURN_FINALIZE_HOOK_ENV = "OMNIO_TURN_FINALIZE_HOOK"
-_OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS = 5.0
+_OMNIO_TURN_FINALIZE_TIMEOUT_ENV = "OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS"
+# The hook may persist deliverables to durable storage before returning, so its
+# budget covers uploads, not just the path scan.
+_OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS = 30.0
+
+
+def _turn_finalize_timeout_seconds() -> float:
+    raw = os.environ.get(_OMNIO_TURN_FINALIZE_TIMEOUT_ENV, "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return _OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS
+    if value <= 0:
+        return _OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS
+    return value
 
 
 async def _request_turn_finalize_annotations(
     hook_url: str,
     payload: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    timeout = aiohttp.ClientTimeout(total=_OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS)
+    timeout = aiohttp.ClientTimeout(total=_turn_finalize_timeout_seconds())
     headers = {
         "X-Omnio-Service-Token": os.environ.get("OMNIO_INTERNAL_TOKEN", ""),
     }
