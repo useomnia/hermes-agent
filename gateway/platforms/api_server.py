@@ -54,6 +54,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -214,6 +215,20 @@ def _project_custom_tool_inputs(function_name: str, function_args: Any) -> dict[
     if output_key is None or not isinstance(function_args, dict):
         return {}
     return {output_key: copy.deepcopy(function_args)}
+
+
+def _redact_response_extension_value(value: Any) -> Any:
+    """Recursively redact string values before they enter a Turn extension."""
+    if isinstance(value, str):
+        return redact_sensitive_text(value, force=True)
+    if isinstance(value, dict):
+        return {
+            key: _redact_response_extension_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_response_extension_value(item) for item in value]
+    return value
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1867,6 +1882,19 @@ class APIServerAdapter(BasePlatformAdapter):
             return "default"
         return None
 
+    @staticmethod
+    def _scoped_tool_approval_session_key(
+        session_id: str,
+        request_profile: Optional[str],
+    ) -> str:
+        """Keep conversation grants isolated across multiplexed profile stores."""
+        if not request_profile:
+            return session_id
+        return (
+            f"api-profile:{len(request_profile)}:{request_profile}:"
+            f"{session_id}"
+        )
+
     def _make_profile_prefix_middleware(self):
         """Reject unknown /p/<profile>/ prefixes and scope the request home."""
 
@@ -3485,6 +3513,15 @@ class APIServerAdapter(BasePlatformAdapter):
             return err
         db = await self._ensure_session_db_async()
         deleted = await asyncio.to_thread(db.delete_session, session_id)
+        if deleted:
+            from tools.tool_approval import clear_session
+
+            clear_session(
+                self._scoped_tool_approval_session_key(
+                    session_id,
+                    self._effective_request_profile(),
+                )
+            )
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
@@ -4279,6 +4316,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
+            tool_approval_surface_key = completion_id
 
             def _on_delta(delta):
                 # Filter out None — the agent fires stream_delta_callback(None)
@@ -4400,7 +4438,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         from tools.tool_approval import consume_tool_approval_decision
 
                         decision = consume_tool_approval_decision(
-                            session_id, tool_call_id
+                            tool_approval_surface_key, tool_call_id
                         )
                     except Exception:
                         decision = None
@@ -4416,7 +4454,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             )
 
                             completion_reason = consume_tool_approval_completion_reason(
-                                session_id, tool_call_id
+                                tool_approval_surface_key, tool_call_id
                             )
                         except Exception:
                             completion_reason = None
@@ -4499,6 +4537,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 response_format=response_format,
                 approval_session_key=session_id,
+                approval_surface_key=tool_approval_surface_key,
                 approval_notify=_approval_notify,
                 **agent_overrides,
                 route=route,
@@ -6386,6 +6425,7 @@ class APIServerAdapter(BasePlatformAdapter):
         confirmed_runtime_lock: bool = False,
         response_format: Optional[Dict[str, Any]] = None,
         approval_session_key: Optional[str] = None,
+        approval_surface_key: Optional[str] = None,
         approval_notify: Optional[Any] = None,
         prefill_messages: Optional[List[Dict[str, str]]] = None,
         prefill_before_current_user: bool = False,
@@ -6414,12 +6454,26 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
+
+        *approval_session_key* owns conversation-scoped grants;
+        *approval_surface_key* optionally separates one streaming request's
+        mechanical waiter/notify ownership from that stable grant namespace.
         """
         loop = asyncio.get_running_loop()
         # Capture before hopping to the executor — ContextVars do not follow
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        approval_request_profile = self._effective_request_profile()
+        tool_approval_grant_session_key = (
+            self._scoped_tool_approval_session_key(
+                approval_session_key,
+                approval_request_profile,
+            )
+            if approval_session_key
+            else None
+        )
+        tool_approval_surface_key = approval_surface_key or approval_session_key
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -6432,17 +6486,35 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 approval_token = None
                 approval_notify_token = None
+                tool_approval_session_token = None
+                tool_approval_surface_token = None
                 user_input_token = None
                 try:
                     if approval_session_key:
                         from tools.approval import set_current_session_key
-                        from tools.tool_approval import register_tool_approval_notify
+                        from tools.tool_approval import (
+                            register_tool_approval_notify,
+                            set_current_tool_approval_session_key,
+                            set_current_tool_approval_surface_key,
+                        )
                         from tools.user_input import register_user_input_session
 
                         approval_token = set_current_session_key(approval_session_key)
+                        tool_approval_session_token = (
+                            set_current_tool_approval_session_key(
+                                tool_approval_grant_session_key or approval_session_key
+                            )
+                        )
+                        tool_approval_surface_token = (
+                            set_current_tool_approval_surface_key(
+                                tool_approval_surface_key or approval_session_key
+                            )
+                        )
                         if approval_notify is not None:
                             approval_notify_token = register_tool_approval_notify(
-                                approval_session_key, approval_notify
+                                tool_approval_surface_key or approval_session_key,
+                                approval_notify,
+                                grant_session_key=tool_approval_grant_session_key,
                             )
                         user_input_token = register_user_input_session(
                             approval_session_key
@@ -6594,10 +6666,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 finally:
                     if approval_session_key:
                         if approval_notify_token is not None:
-                            from tools.tool_approval import unregister_tool_approval_notify
+                            from tools.tool_approval import (
+                                unregister_tool_approval_notify,
+                            )
 
                             unregister_tool_approval_notify(
-                                approval_session_key, approval_notify_token
+                                tool_approval_surface_key or approval_session_key,
+                                approval_notify_token,
                             )
                         if user_input_token is not None:
                             from tools.user_input import unregister_user_input_session
@@ -6609,6 +6684,22 @@ class APIServerAdapter(BasePlatformAdapter):
                             from tools.approval import reset_current_session_key
 
                             reset_current_session_key(approval_token)
+                        if tool_approval_session_token is not None:
+                            from tools.tool_approval import (
+                                reset_current_tool_approval_session_key,
+                            )
+
+                            reset_current_tool_approval_session_key(
+                                tool_approval_session_token
+                            )
+                        if tool_approval_surface_token is not None:
+                            from tools.tool_approval import (
+                                reset_current_tool_approval_surface_key,
+                            )
+
+                            reset_current_tool_approval_surface_key(
+                                tool_approval_surface_token
+                            )
                     clear_session_vars(tokens)
 
         self._activate_admitted_request()
@@ -6686,12 +6777,37 @@ class APIServerAdapter(BasePlatformAdapter):
     ):
         """Project low-volume progress as native namespaced Responses events."""
 
+        interaction_tool_call_ids: set[str] = set()
+        missing = object()
+
         def _emit_custom(name: str, value: Dict[str, Any]) -> None:
             event_type = {
                 "subagent.start": "response.omnio.subagent_start",
                 "subagent.complete": "response.omnio.subagent_complete",
             }[name]
             emitter.omnio_event(event_type, **value)
+
+        def _emit_interaction(tool_call_id: str, interaction: Dict[str, Any]) -> None:
+            emitter.omnio_event(
+                "response.omnio.interaction",
+                interaction=interaction,
+                tool_call_id=tool_call_id,
+            )
+
+        def _emit_interaction_completed(
+            tool_call_id: str,
+            choice: Any,
+            timed_out: Any,
+        ) -> None:
+            fields: Dict[str, Any] = {"tool_call_id": tool_call_id}
+            if choice is not missing and choice is not None:
+                fields["choice"] = _redact_response_extension_value(choice)
+            if timed_out is not missing:
+                fields["timed_out"] = bool(timed_out)
+            emitter.omnio_event(
+                "response.omnio.interaction_completed",
+                **fields,
+            )
 
         def _callback(
             event_type: str,
@@ -6700,43 +6816,88 @@ class APIServerAdapter(BasePlatformAdapter):
             args=None,
             **kwargs,
         ) -> None:
-            if event_type not in {"subagent.start", "subagent.complete"}:
-                return
-            value: Dict[str, Any] = {}
-            if preview is not None:
-                value["preview"] = redact_sensitive_text(str(preview), force=True)
-            for source_key, wire_key in (
-                ("goal", "goal"),
-                ("task_count", "taskCount"),
-                ("task_index", "taskIndex"),
-                ("subagent_id", "subagentId"),
-                ("child_session_id", "childSessionId"),
-                ("parent_id", "parentId"),
-                ("depth", "depth"),
-                ("model", "model"),
-                ("tool_count", "toolCount"),
-                ("status", "status"),
-                ("summary", "summary"),
-                ("duration_seconds", "durationSeconds"),
-                ("input_tokens", "inputTokens"),
-                ("output_tokens", "outputTokens"),
-                ("reasoning_tokens", "reasoningTokens"),
-                ("api_calls", "apiCalls"),
-                ("cost_usd", "costUsd"),
-                ("files_read", "filesRead"),
-                ("files_written", "filesWritten"),
-                ("output_tail", "outputTail"),
-            ):
-                item = kwargs.get(source_key)
-                if item is None:
-                    continue
-                if source_key in {"goal", "summary", "output_tail"} and isinstance(
-                    item, str
+            if event_type in {"subagent.start", "subagent.complete"}:
+                value: Dict[str, Any] = {}
+                if preview is not None:
+                    value["preview"] = redact_sensitive_text(str(preview), force=True)
+                for source_key, wire_key in (
+                    ("goal", "goal"),
+                    ("task_count", "taskCount"),
+                    ("task_index", "taskIndex"),
+                    ("subagent_id", "subagentId"),
+                    ("child_session_id", "childSessionId"),
+                    ("parent_id", "parentId"),
+                    ("depth", "depth"),
+                    ("model", "model"),
+                    ("tool_count", "toolCount"),
+                    ("status", "status"),
+                    ("summary", "summary"),
+                    ("duration_seconds", "durationSeconds"),
+                    ("input_tokens", "inputTokens"),
+                    ("output_tokens", "outputTokens"),
+                    ("reasoning_tokens", "reasoningTokens"),
+                    ("api_calls", "apiCalls"),
+                    ("cost_usd", "costUsd"),
+                    ("files_read", "filesRead"),
+                    ("files_written", "filesWritten"),
+                    ("output_tail", "outputTail"),
                 ):
-                    item = redact_sensitive_text(item, force=True)
-                value[wire_key] = item
+                    item = kwargs.get(source_key)
+                    if item is None:
+                        continue
+                    if source_key in {"goal", "summary", "output_tail"} and isinstance(
+                        item, str
+                    ):
+                        item = redact_sensitive_text(item, force=True)
+                    value[wire_key] = item
+                try:
+                    loop.call_soon_threadsafe(_emit_custom, event_type, value)
+                except RuntimeError:
+                    pass
+                return
+
+            projected_tool_name = tool_name or kwargs.get("tool")
+            if projected_tool_name in _CUSTOM_TOOL_INPUT_KEYS:
+                return
+            raw_call_id = kwargs.get("toolCallId") or kwargs.get("tool_call_id")
+            if not isinstance(raw_call_id, str) or not raw_call_id:
+                return
+            interaction = kwargs.get("interaction")
+            answered = kwargs.get("answered", missing)
+            timed_out = kwargs.get("timedOut", kwargs.get("timed_out", missing))
+            completed = kwargs.get("completed") is True
+            if isinstance(interaction, dict):
+                if answered is missing:
+                    answered = interaction.get("answered", missing)
+                if timed_out is missing:
+                    timed_out = interaction.get(
+                        "timedOut", interaction.get("timed_out", missing)
+                    )
+
+            if raw_call_id in interaction_tool_call_ids and (
+                completed or answered is not missing or timed_out is not missing
+            ):
+                interaction_tool_call_ids.discard(raw_call_id)
+                try:
+                    loop.call_soon_threadsafe(
+                        _emit_interaction_completed,
+                        raw_call_id,
+                        answered,
+                        timed_out,
+                    )
+                except RuntimeError:
+                    pass
+                return
+            if not isinstance(interaction, dict):
+                return
+
+            interaction_tool_call_ids.add(raw_call_id)
             try:
-                loop.call_soon_threadsafe(_emit_custom, event_type, value)
+                loop.call_soon_threadsafe(
+                    _emit_interaction,
+                    raw_call_id,
+                    _redact_response_extension_value(interaction),
+                )
             except RuntimeError:
                 pass
 
@@ -6783,6 +6944,13 @@ class APIServerAdapter(BasePlatformAdapter):
             args=None,
             **kwargs,
         ) -> None:
+            canonical_callback(
+                event_type,
+                tool_name=tool_name,
+                preview=preview,
+                args=args,
+                **kwargs,
+            )
             timestamp = time.time()
             event: Optional[Dict[str, Any]] = None
             if event_type == "tool.started":
@@ -6847,13 +7015,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     ):
                         value = redact_sensitive_text(value, force=True)
                     event[key] = value
-                canonical_callback(
-                    event_type,
-                    tool_name=tool_name,
-                    preview=preview,
-                    args=args,
-                    **kwargs,
-                )
             if event is not None:
                 _push_legacy(event)
 
@@ -7060,9 +7221,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # concurrent runs can intentionally share them, and resolving an
         # approval for one run must not unblock another run's dangerous command.
         approval_session_key = run_id
+        tool_approval_surface_key = run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         request_profile = self._effective_request_profile()
+        tool_approval_grant_session_key = self._scoped_tool_approval_session_key(
+            session_id,
+            request_profile,
+        )
         self._turn_event_logs.create_run(
             run_id,
             session_id,
@@ -7085,11 +7251,17 @@ class APIServerAdapter(BasePlatformAdapter):
         event_cb = self._make_run_event_callback(run_id, loop)
         message_id = f"msg_{uuid.uuid4().hex}"
         reasoning_message_id = f"rs_{uuid.uuid4().hex}"
-        text_parts: List[str] = []
+        current_message_text_parts: List[str] = []
         text_started = False
         reasoning_started = False
+        last_message_id: Optional[str] = None
+        last_message_text = ""
+        strip_tool_separator_on_next_message = False
         started_tool_calls: Dict[str, tuple[str, Dict[str, Any]]] = {}
         ended_tool_calls: set[str] = set()
+        tool_approval_registration_lock = threading.Lock()
+        tool_approval_registration_cancelled = [False]
+        tool_approval_notify_token_ref: List[Any] = [None]
 
         def _put_legacy_event_if_active(event: Optional[Dict[str, Any]]) -> None:
             """Write only while this run still owns its compatibility queue."""
@@ -7104,15 +7276,50 @@ class APIServerAdapter(BasePlatformAdapter):
                 **fields,
             })
 
-        def _emit_text(delta: Optional[str]) -> None:
-            nonlocal text_started
+        def _close_text_item() -> None:
+            nonlocal message_id, text_started, last_message_id, last_message_text
+            if not text_started:
+                return
+            emitter.output_text_done(message_id)
+            last_message_id = message_id
+            last_message_text = "".join(current_message_text_parts)
+            current_message_text_parts.clear()
+            text_started = False
+            message_id = f"msg_{uuid.uuid4().hex}"
+
+        def _close_reasoning_item() -> None:
+            nonlocal reasoning_message_id, reasoning_started
+            if not reasoning_started:
+                return
+            emitter.reasoning_text_done(reasoning_message_id)
+            reasoning_started = False
+            reasoning_message_id = f"rs_{uuid.uuid4().hex}"
+
+        def _emit_text(
+            delta: Optional[str],
+            *,
+            from_stream: bool = True,
+        ) -> None:
+            nonlocal text_started, strip_tool_separator_on_next_message
             if not isinstance(delta, str) or not delta:
                 return
+            if not text_started:
+                if (
+                    from_stream
+                    and strip_tool_separator_on_next_message
+                    and delta.startswith("\n\n")
+                ):
+                    delta = delta[2:]
+                strip_tool_separator_on_next_message = False
+                if not delta:
+                    return
+            if reasoning_started:
+                _close_reasoning_item()
             if not text_started:
                 emitter.output_text_start(message_id)
                 text_started = True
             emitter.output_text_delta(message_id, delta)
-            text_parts.append(delta)
+            current_message_text_parts.append(delta)
             _put_legacy_event_if_active({
                 "event": "message.delta",
                 "run_id": run_id,
@@ -7130,6 +7337,8 @@ class APIServerAdapter(BasePlatformAdapter):
             nonlocal reasoning_started
             if not isinstance(delta, str) or not delta:
                 return
+            if text_started:
+                _close_text_item()
             if not reasoning_started:
                 emitter.reasoning_start(reasoning_message_id)
                 reasoning_started = True
@@ -7144,8 +7353,12 @@ class APIServerAdapter(BasePlatformAdapter):
         def _emit_tool_start(
             tool_call_id: str, tool_name: str, function_args: Dict[str, Any]
         ) -> None:
+            nonlocal strip_tool_separator_on_next_message
             if not tool_call_id or not tool_name or tool_name.startswith("_"):
                 return
+            _close_text_item()
+            _close_reasoning_item()
+            strip_tool_separator_on_next_message = True
             args_copy = copy.deepcopy(function_args) if isinstance(function_args, dict) else {}
             started_tool_calls[tool_call_id] = (tool_name, args_copy)
             emitter.function_call_start(tool_call_id, tool_name)
@@ -7162,22 +7375,108 @@ class APIServerAdapter(BasePlatformAdapter):
             except RuntimeError:
                 pass
 
-        def _emit_tool_end(tool_call_id: str, tool_name: str) -> None:
+        def _tool_interaction_notify(interaction_event: Dict[str, Any]) -> None:
+            event = copy.deepcopy(interaction_event) if isinstance(
+                interaction_event, dict
+            ) else {}
+            tool_name = event.pop("tool", None)
+            event_cb(
+                "tool.progress",
+                tool_name=str(tool_name or ""),
+                **event,
+            )
+
+        def _emit_tool_end(
+            tool_call_id: str,
+            tool_name: str,
+            todos: Optional[List[Dict[str, Any]]] = None,
+        ) -> None:
             if tool_call_id not in started_tool_calls or tool_call_id in ended_tool_calls:
                 return
+            started_tool_name = started_tool_calls[tool_call_id][0]
+            if started_tool_name == "todo" and isinstance(todos, list):
+                emitter.task_list(todos)
             emitter.function_call_done(tool_call_id)
             ended_tool_calls.add(tool_call_id)
 
         def _tool_complete_cb(
             tool_call_id, tool_name, function_args, function_result
         ) -> None:
-            # function_result is intentionally ignored. Tool results are not a
-            # Turn-log event in API version 2.
+            projected_todos: Optional[List[Dict[str, Any]]] = None
+            approval_timed_out = False
+            normalized_tool_call_id = str(tool_call_id or "")
+            normalized_tool_name = str(tool_name or "")
+            try:
+                parsed_result = json.loads(function_result or "{}")
+            except Exception:
+                parsed_result = {}
+            if normalized_tool_name == "todo":
+                raw_todos = (
+                    parsed_result.get("todos")
+                    if isinstance(parsed_result, dict)
+                    else None
+                )
+                if isinstance(raw_todos, list):
+                    projected_todos = _redact_response_extension_value(raw_todos)
+            elif normalized_tool_name not in _CUSTOM_TOOL_INPUT_KEYS:
+                try:
+                    from tools.tool_approval import (
+                        consume_tool_approval_completion_reason,
+                        consume_tool_approval_decision,
+                        is_gated_tool,
+                    )
+
+                    if is_gated_tool(normalized_tool_name):
+                        completion: Dict[str, Any] = {}
+                        decision = consume_tool_approval_decision(
+                            tool_approval_surface_key,
+                            normalized_tool_call_id,
+                        )
+                        if decision is not None:
+                            completion["answered"] = decision
+                            completion["timedOut"] = False
+                        if (
+                            isinstance(parsed_result, dict)
+                            and parsed_result.get("status") == "approval_no_response"
+                        ):
+                            reason = consume_tool_approval_completion_reason(
+                                tool_approval_surface_key,
+                                normalized_tool_call_id,
+                            )
+                            if reason == "expired":
+                                completion["timedOut"] = True
+                                approval_timed_out = True
+                            completion["completed"] = True
+                        if completion:
+                            event_cb(
+                                "tool.progress",
+                                tool_name=normalized_tool_name,
+                                toolCallId=normalized_tool_call_id,
+                                **completion,
+                            )
+                except Exception:
+                    pass
+            if approval_timed_out:
+                agent = self._active_run_agents.get(run_id)
+                if agent is not None:
+                    try:
+                        agent.interrupt(
+                            "awaiting user approval (tool approval timed out)"
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[api_server] failed to interrupt agent for timed-out "
+                            "tool approval (run_id=%s, tool_call_id=%s)",
+                            run_id,
+                            normalized_tool_call_id,
+                            exc_info=True,
+                        )
             try:
                 loop.call_soon_threadsafe(
                     _emit_tool_end,
-                    str(tool_call_id or ""),
-                    str(tool_name or ""),
+                    normalized_tool_call_id,
+                    normalized_tool_name,
+                    projected_todos,
                 )
             except RuntimeError:
                 pass
@@ -7314,9 +7613,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         set_current_session_key,
                         unregister_gateway_notify,
                     )
+                    from tools.tool_approval import (
+                        register_tool_approval_notify,
+                        reset_current_tool_approval_surface_key,
+                        reset_current_tool_approval_session_key,
+                        set_current_tool_approval_surface_key,
+                        set_current_tool_approval_session_key,
+                        unregister_tool_approval_notify,
+                    )
 
                     effective_task_id = session_id or run_id
                     approval_token = None
+                    tool_approval_session_token = None
+                    tool_approval_surface_token = None
+                    tool_approval_notify_token = None
                     session_tokens = []
                     with self._profile_scope(request_profile):
                         try:
@@ -7324,6 +7634,16 @@ class APIServerAdapter(BasePlatformAdapter):
                             # contextvars so concurrent runs do not share process
                             # environment state.
                             approval_token = set_current_session_key(approval_session_key)
+                            tool_approval_session_token = (
+                                set_current_tool_approval_session_key(
+                                    tool_approval_grant_session_key
+                                )
+                            )
+                            tool_approval_surface_token = (
+                                set_current_tool_approval_surface_key(
+                                    tool_approval_surface_key
+                                )
+                            )
                             session_tokens = self._bind_api_server_session(
                                 # chat_id carries the raw session id (the
                                 # X-Hermes-Session-Id equivalent) exactly like
@@ -7338,25 +7658,80 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_id=session_id or "",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
-                            r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
+                            tool_approval_notify_token = register_tool_approval_notify(
+                                tool_approval_surface_key,
+                                _tool_interaction_notify,
+                                grant_session_key=tool_approval_grant_session_key,
                             )
+                            with tool_approval_registration_lock:
+                                cancelled_before_publish = (
+                                    tool_approval_registration_cancelled[0]
+                                )
+                                if not cancelled_before_publish:
+                                    tool_approval_notify_token_ref[0] = (
+                                        tool_approval_notify_token
+                                    )
+                            if cancelled_before_publish:
+                                if tool_approval_notify_token is not None:
+                                    unregister_tool_approval_notify(
+                                        tool_approval_surface_key,
+                                        tool_approval_notify_token,
+                                    )
+                                    tool_approval_notify_token = None
+                                r = {
+                                    "final_response": "",
+                                    "interrupted": True,
+                                    "messages": [],
+                                }
+                            else:
+                                r = agent.run_conversation(
+                                    user_message=user_message,
+                                    conversation_history=conversation_history,
+                                    task_id=effective_task_id,
+                                )
                         finally:
                             try:
-                                unregister_gateway_notify(approval_session_key)
+                                if tool_approval_notify_token is not None:
+                                    with tool_approval_registration_lock:
+                                        worker_owns_token = (
+                                            tool_approval_notify_token_ref[0]
+                                            is tool_approval_notify_token
+                                        )
+                                        if worker_owns_token:
+                                            tool_approval_notify_token_ref[0] = None
+                                    if worker_owns_token:
+                                        unregister_tool_approval_notify(
+                                            tool_approval_surface_key,
+                                            tool_approval_notify_token,
+                                        )
                             finally:
-                                if approval_token is not None:
-                                    try:
-                                        reset_current_session_key(approval_token)
-                                    except Exception:
-                                        pass
-                                if session_tokens:
-                                    try:
-                                        clear_session_vars(session_tokens)
-                                    except Exception:
-                                        pass
+                                try:
+                                    unregister_gateway_notify(approval_session_key)
+                                finally:
+                                    if approval_token is not None:
+                                        try:
+                                            reset_current_session_key(approval_token)
+                                        except Exception:
+                                            pass
+                                    if tool_approval_session_token is not None:
+                                        try:
+                                            reset_current_tool_approval_session_key(
+                                                tool_approval_session_token
+                                            )
+                                        except Exception:
+                                            pass
+                                    if tool_approval_surface_token is not None:
+                                        try:
+                                            reset_current_tool_approval_surface_key(
+                                                tool_approval_surface_token
+                                            )
+                                        except Exception:
+                                            pass
+                                    if session_tokens:
+                                        try:
+                                            clear_session_vars(session_tokens)
+                                        except Exception:
+                                            pass
                         u = {
                             "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                             "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -7379,13 +7754,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 final_response = (
                     raw_final_response if isinstance(raw_final_response, str) else ""
                 )
-                streamed_text = "".join(text_parts)
-                if final_response and not streamed_text:
-                    _emit_text(final_response)
-                elif final_response.startswith(streamed_text) and len(final_response) > len(
-                    streamed_text
+                response_previewed = bool(
+                    isinstance(result, dict) and result.get("response_previewed")
+                )
+                streamed_final_block = "".join(current_message_text_parts)
+                if final_response and not streamed_final_block and not response_previewed:
+                    _emit_text(final_response, from_stream=False)
+                elif (
+                    not response_previewed
+                    and final_response.startswith(streamed_final_block)
+                    and len(final_response) > len(streamed_final_block)
                 ):
-                    _emit_text(final_response[len(streamed_text):])
+                    _emit_text(
+                        final_response[len(streamed_final_block):],
+                        from_stream=False,
+                    )
 
                 for call_id, name, args in self._run_result_tool_calls(
                     result, len(conversation_history)
@@ -7394,11 +7777,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         _emit_tool_start(call_id, name, args)
                     _emit_tool_end(call_id, name)
 
-                emitted_text = "".join(text_parts)
-                if text_started:
-                    emitter.output_text_done(message_id)
-                if reasoning_started:
-                    emitter.reasoning_text_done(reasoning_message_id)
+                _close_text_item()
+                _close_reasoning_item()
 
                 log = self._turn_event_logs.get_log(run_id)
                 failure_reason = log.failure_reason if log is not None else None
@@ -7463,8 +7843,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     _legacy_terminal("run.failed", error=error_msg)
                 else:
                     hook_url = os.environ.get(_OMNIO_TURN_FINALIZE_HOOK_ENV)
-                    if text_started and emitted_text and hook_url:
-                        output_index = emitter.output_index_for_message(message_id)
+                    if last_message_id and last_message_text and hook_url:
+                        output_index = emitter.output_index_for_message(last_message_id)
                         if output_index is not None:
                             annotations = await _request_turn_finalize_annotations(
                                 hook_url,
@@ -7472,8 +7852,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                     "run_id": run_id,
                                     "turn_id": turn_id,
                                     "session_id": session_id,
-                                    "final_text": emitted_text,
-                                    "message_item_id": message_id,
+                                    "final_text": last_message_text,
+                                    "message_item_id": last_message_id,
                                     "output_index": output_index,
                                 },
                             )
@@ -7481,7 +7861,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _close_cancelled()
                                 return
                             emitter.output_text_annotations_added(
-                                message_id, annotations
+                                last_message_id, annotations
                             )
                     log = self._turn_event_logs.get_log(run_id)
                     annotation_failure_reason = (
@@ -7559,6 +7939,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 # on an approval Event.  Unregistering here releases those
                 # waits immediately; the in-thread unregister is harmlessly
                 # idempotent on normal completion.
+                with tool_approval_registration_lock:
+                    tool_approval_registration_cancelled[0] = True
+                    tool_approval_notify_token = (
+                        tool_approval_notify_token_ref[0]
+                    )
+                    tool_approval_notify_token_ref[0] = None
+                if tool_approval_notify_token is not None:
+                    try:
+                        from tools.tool_approval import (
+                            unregister_tool_approval_notify,
+                        )
+
+                        unregister_tool_approval_notify(
+                            tool_approval_surface_key,
+                            tool_approval_notify_token,
+                        )
+                    except Exception:
+                        pass
                 try:
                     from tools.approval import unregister_gateway_notify
 
@@ -7835,20 +8233,35 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_call_id = str(
             body.get("toolCallId", "") or body.get("tool_call_id", "")
         ).strip()
+        surface_key = str(
+            body.get("surfaceId", "")
+            or body.get("surface_id", "")
+            or body.get("runId", "")
+        ).strip()
         if not tool:
             return web.json_response(
                 _openai_error("Missing 'tool'", code="approval_missing_tool"),
                 status=400,
             )
-
-        session_key = request.headers.get("X-Hermes-Session-Id", "").strip()
-        if not session_key:
+        if surface_key and not tool_call_id:
+            return web.json_response(
+                _openai_error(
+                    "Missing 'toolCallId'", code="approval_missing_tool_call"
+                ),
+                status=400,
+            )
+        session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if not session_id:
             return web.json_response(
                 _openai_error(
                     "Missing X-Hermes-Session-Id", code="approval_no_session"
                 ),
                 status=400,
             )
+        grant_session_key = self._scoped_tool_approval_session_key(
+            session_id,
+            self._effective_request_profile(),
+        )
 
         try:
             from tools.tool_approval import APPROVAL_SCOPES, resolve_tool_approval
@@ -7883,7 +8296,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 tools = [item.strip() for item in raw_tools if item.strip()]
             recorded = resolve_tool_approval(
-                session_key, tool, scope, tool_call_id, tools
+                grant_session_key,
+                tool,
+                scope,
+                tool_call_id,
+                tools,
+                surface_key=surface_key or None,
             )
         except Exception as exc:
             logger.exception("[api_server] tool approval resolution failed")

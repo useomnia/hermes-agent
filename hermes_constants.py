@@ -12,6 +12,11 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 
 
+# Shared by the todo store and client-visible task-list projection. Keeping the
+# cap here avoids importing a tool module (and triggering tool registration)
+# from low-level event infrastructure.
+MAX_TODO_ITEMS = 256
+
 _profile_fallback_warned: bool = False
 _UNSET = object()
 _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(

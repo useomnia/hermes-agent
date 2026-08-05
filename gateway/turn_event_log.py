@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
+from hermes_constants import MAX_TODO_ITEMS
+
 
 TURN_EVENT_LOG_API_VERSION = 2
 DEFAULT_RUN_LOG_CAP_BYTES = 8 * 1024 * 1024
@@ -44,6 +46,7 @@ OMNIO_EXTENSION_EVENT_TYPES = frozenset({
     "response.omnio.interaction_completed",
     "response.omnio.client_event",
     "response.omnio.gen_ui",
+    "response.omnio.task_list",
     "response.omnio.warmup",
     # Native replacements for surfaces carried by the former CUSTOM set.
     "response.omnio.subagent_start",
@@ -683,6 +686,22 @@ class TurnEventEmitter:
             output_index=state["output_index"],
             item=item,
         )
+
+    def task_list(self, todos: list) -> None:
+        """Emit the bounded canonical todo snapshot without exposing its result."""
+        bounded: List[Dict[str, str]] = []
+        if isinstance(todos, list):
+            for item in todos[:MAX_TODO_ITEMS]:
+                if not isinstance(item, dict):
+                    continue
+                clean = {
+                    key: item[key]
+                    for key in ("id", "content", "status")
+                    if isinstance(item.get(key), str)
+                }
+                if clean:
+                    bounded.append(clean)
+        self.omnio_event("response.omnio.task_list", todos=bounded)
 
     def omnio_event(self, event_type: str, **fields: Any) -> Optional[StoredTurnEvent]:
         if event_type not in OMNIO_EXTENSION_EVENT_TYPES:
