@@ -212,6 +212,30 @@ def _uses_container_paths(task_id: str = "default") -> bool:
     return _terminal_env_type_for_task(task_id) in container_backends
 
 
+def _container_home_for_task(task_id: str) -> str | None:
+    """The container's own home directory, when the backend defines one."""
+    if _terminal_env_type_for_task(task_id) == "sprites":
+        return "/home"
+    return None
+
+
+def _expand_tilde_for_container(path: str, task_id: str) -> str:
+    """Expand ``~`` against the CONTAINER's home, never the process home.
+
+    A container-pathed task speaks the container's namespace: on the sprites
+    toolbox, home is ``/home`` and the brand tree is mounted at ``/home/brand``,
+    while the hermes PROCESS home (e.g. ``/home/sprite``) is an ordinary
+    scratch subpath there — expanding with the process home silently reroutes
+    ``~/brand`` writes into container scratch.
+    """
+    home = _container_home_for_task(task_id)
+    if home is None:
+        return _expand_tilde(path)
+    if path == "~" or path.startswith("~/"):
+        return home if path == "~" else posixpath.join(home, path[2:])
+    return path
+
+
 def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
     """Normalize path syntax without following host symlinks.
 
@@ -334,7 +358,11 @@ def _resolve_base_dir(
     if container_paths is None:
         container_paths = _uses_container_paths(task_id)
     if root:
-        base_text = _expand_tilde(root)
+        base_text = (
+            _expand_tilde_for_container(root, task_id)
+            if container_paths
+            else _expand_tilde(root)
+        )
     else:
         base_text = os.getcwd()
     if container_paths:
@@ -425,7 +453,9 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
         if not workspace_root:
             return None  # No authoritative workspace root to compare against.
         if _uses_container_paths(task_id):
-            root = _normalize_without_host_deref(Path(_expand_tilde(workspace_root)))
+            root = _normalize_without_host_deref(
+                Path(_expand_tilde_for_container(workspace_root, task_id))
+            )
         else:
             root = Path(_expand_tilde(workspace_root)).resolve()
         # Is `resolved` inside `root`?

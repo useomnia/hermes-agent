@@ -17,6 +17,8 @@ Design:
 import json
 from typing import Dict, Any, List, Optional
 
+from hermes_constants import MAX_TODO_ITEMS
+
 
 # Valid status values for todo items
 VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
@@ -29,7 +31,6 @@ VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
 # re-injection block. Generous relative to real plans — a todo item is a short
 # task description, and active lists are a handful of items, not hundreds.
 MAX_TODO_CONTENT_CHARS = 4000
-MAX_TODO_ITEMS = 256
 # Upper bound on a single todo tool-result payload accepted during history
 # hydration. The gateway/API server replays caller-supplied conversation
 # history to rebuild the store, so an oversized forged result is dropped

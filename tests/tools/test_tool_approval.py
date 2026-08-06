@@ -803,6 +803,35 @@ class TestResolveToolApproval:
         assert resolve_tool_approval(SESSION, GATED, "session", "call-A") is False
         assert consume_tool_approval_decision(SESSION, "call-A") is None
 
+    def test_should_record_late_session_grant_after_surface_cleanup(
+        self,
+        monkeypatch,
+    ):
+        surface_key = "run-timed-out"
+        monkeypatch.setattr(tool_approval, "_approval_timeout", lambda: 0)
+        notify_token = register_tool_approval_notify(
+            surface_key,
+            lambda _event: None,
+            grant_session_key=SESSION,
+        )
+        assert await_tool_approval(
+            surface_key,
+            GATED,
+            {},
+            "call-timed-out",
+        ) is None
+        unregister_tool_approval_notify(surface_key, notify_token)
+
+        assert resolve_tool_approval(
+            SESSION,
+            GATED,
+            "session",
+            "call-timed-out",
+            surface_key=surface_key,
+        ) is False
+        assert is_tool_approved(SESSION, GATED) is True
+        assert maybe_require_tool_approval(GATED, "call-next") is None
+
     def test_should_scope_grants_per_session(self):
         resolve_tool_approval(SESSION, GATED, "session")
         assert is_tool_approved("other-session", GATED) is False

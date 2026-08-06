@@ -23,15 +23,16 @@ used to instruct a re-call — and the agent would confabulate success instead o
 re-issuing. Blocking keeps the result trustworthy and the agent honest. A skip
 also fails closed when the user sends a new message instead of deciding.
 
-The chat surface registers a per-session notify callback
+The chat surface registers a per-run notify callback
 (``register_tool_approval_notify``) that pushes the interaction onto the chat
 stream; the resolve endpoint (``resolve_tool_approval``) unblocks the waiter.
-State is module-level, keyed by the approval session key (stable per
-conversation), matching ``tools.approval``'s shape so a session reset clears it.
+Mechanical surface/wait ownership is run-scoped so concurrent turns cannot
+replace or release each other, while session grants remain conversation-scoped.
 """
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -97,11 +98,22 @@ _always_approval_authority: Callable[[str], bool] | None = None
 _wait_registry: BlockingWaitRegistry[
     str, Callable[[dict], None], str
 ] = BlockingWaitRegistry()
-# (session_key, tool_call_id) -> the resolved decision
+# surface_key -> (ownership token, conversation grant key). This lets the
+# conversation-scoped resolve endpoint locate the exact run-owned waiter.
+_surface_grant_sessions: dict[str, tuple[object, str]] = {}
+# (surface_key, tool_call_id) -> the resolved decision
 # (once/session/always/deny/skip) for a released waiter, consumed by the
 # gateway's tool-complete callback to echo `interaction.answered` on the gated
 # call's completed event.
 _decisions: dict[tuple[str, str], str] = {}
+_tool_approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "tool_approval_session_key",
+    default="",
+)
+_tool_approval_surface_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "tool_approval_surface_key",
+    default="",
+)
 
 
 # Frozen at import — same rationale as tools/approval.py's _YOLO_MODE_FROZEN:
@@ -117,6 +129,46 @@ def _approval_timeout() -> int:
         return int(os.environ.get(_ENV_TIMEOUT, "") or _DEFAULT_TIMEOUT_S)
     except (ValueError, TypeError):
         return _DEFAULT_TIMEOUT_S
+
+
+def set_current_tool_approval_session_key(
+    session_key: str,
+) -> contextvars.Token[str]:
+    """Bind the conversation namespace used by connector approval grants."""
+    return _tool_approval_session_key.set(session_key or "")
+
+
+def reset_current_tool_approval_session_key(
+    token: contextvars.Token[str],
+) -> None:
+    """Restore the prior connector-approval conversation namespace."""
+    _tool_approval_session_key.reset(token)
+
+
+def get_current_tool_approval_session_key(default: str = "default") -> str:
+    """Return the connector grant namespace, falling back for legacy callers."""
+    return _tool_approval_session_key.get() or get_current_session_key(default)
+
+
+def set_current_tool_approval_surface_key(
+    surface_key: str,
+) -> contextvars.Token[str]:
+    """Bind the run-owned surface namespace used by connector approval waits."""
+    return _tool_approval_surface_key.set(surface_key or "")
+
+
+def reset_current_tool_approval_surface_key(
+    token: contextvars.Token[str],
+) -> None:
+    """Restore the prior connector-approval surface namespace."""
+    _tool_approval_surface_key.reset(token)
+
+
+def get_current_tool_approval_surface_key(default: str = "default") -> str:
+    """Return the run-owned surface key, falling back for legacy callers."""
+    return _tool_approval_surface_key.get() or get_current_tool_approval_session_key(
+        default
+    )
 
 
 def is_gated_tool(function_name: str) -> bool:
@@ -226,39 +278,51 @@ def replace_injected_always_approvals(function_names: list[str]) -> None:
 
 
 def register_tool_approval_notify(
-    session_key: str, cb: Callable[[dict], None]
+    surface_key: str,
+    cb: Callable[[dict], None],
+    *,
+    grant_session_key: str | None = None,
 ) -> object | None:
-    """Register the chat surface callback and return its ownership token."""
-    if not session_key:
+    """Register one run-owned chat surface and its conversation grant scope."""
+    if not surface_key:
         return None
-    return _wait_registry.register_surface(session_key, cb)
+    token = _wait_registry.register_surface(surface_key, cb)
+    with _lock:
+        _surface_grant_sessions[surface_key] = (
+            token,
+            grant_session_key or surface_key,
+        )
+    return token
 
 
-def unregister_tool_approval_notify(session_key: str, token: object) -> None:
+def unregister_tool_approval_notify(surface_key: str, token: object) -> None:
     """Drop an owned surface and release any still-blocked waiters."""
-    if not session_key:
+    if not surface_key:
         return
 
     def clear_decisions() -> None:
         with _lock:
-            for key in [key for key in _decisions if key[0] == session_key]:
+            owner = _surface_grant_sessions.get(surface_key)
+            if owner is not None and owner[0] is token:
+                _surface_grant_sessions.pop(surface_key, None)
+            for key in [key for key in _decisions if key[0] == surface_key]:
                 _decisions.pop(key, None)
 
     _wait_registry.unregister_surface(
-        session_key,
+        surface_key,
         token,
         on_unregister=clear_decisions,
     )
 
 
 def consume_tool_approval_completion_reason(
-    session_key: str,
+    surface_key: str,
     tool_call_id: str,
 ) -> Optional[str]:
     """Return and clear the unresolved wait reason for one approval call."""
-    if not session_key:
+    if not surface_key:
         return None
-    return _wait_registry.consume_completion_reason(session_key, tool_call_id)
+    return _wait_registry.consume_completion_reason(surface_key, tool_call_id)
 
 
 def await_tool_approval(
@@ -306,20 +370,45 @@ def await_tool_approval(
     return result
 
 
+def _legacy_surface_key_for_waiter(
+    grant_session_key: str,
+    tool_call_id: str,
+) -> str:
+    """Find the matching or FIFO run surface for a pre-surface-id client."""
+    with _lock:
+        surface_keys = [
+            surface_key
+            for surface_key, (_, owner_grant_session_key) in (
+                _surface_grant_sessions.items()
+            )
+            if owner_grant_session_key == grant_session_key
+        ]
+    for surface_key in surface_keys:
+        if _wait_registry.waiter_payload(surface_key, tool_call_id) is not None:
+            return surface_key
+    return grant_session_key
+
+
 def resolve_tool_approval(
     session_key: str,
     function_name: str,
     scope: str,
     tool_call_id: str = "",
     tools: list[str] | None = None,
+    *,
+    surface_key: str | None = None,
 ) -> bool:
     """Apply a decision posted from the Omnia chat: unblock the waiting tool
     call and, for ``session`` scope, remember it for the rest of the chat.
 
-    When ``tool_call_id`` is given, the MATCHING waiter is resolved — not the
-    queue head — so two writes blocked in one turn can't cross-talk (the user's
-    decision on one card releasing the other). Falls back to FIFO only when no
-    id is supplied (a legacy / single-call caller).
+    New interactive callers provide both ``surface_key`` and ``tool_call_id``
+    from the approval interaction. The surface must belong to this
+    conversation's grant namespace, and only the matching waiter on that exact
+    surface can be released. Older clients omit ``surface_key``; for them,
+    search this conversation's run surfaces for the first matching call id, or
+    the first surface with a pending waiter when the id is also omitted. That
+    fallback deliberately preserves the legacy call-id/FIFO ambiguity while
+    never crossing conversation/profile grants.
 
     Returns True only when a blocked waiter was actually found and released —
     i.e. the tool call that showed the card is still live to receive the
@@ -334,9 +423,31 @@ def resolve_tool_approval(
     """
     if not session_key or scope not in APPROVAL_SCOPES:
         return False
+    resolved_surface_key = (
+        surface_key
+        if surface_key is not None
+        else _legacy_surface_key_for_waiter(session_key, tool_call_id)
+    )
+    if surface_key is not None:
+        if not surface_key or not tool_call_id:
+            return False
+        with _lock:
+            owner = _surface_grant_sessions.get(surface_key)
+        if owner is not None and owner[1] != session_key:
+            return False
+        if owner is not None:
+            waiting_tool = _wait_registry.waiter_payload(surface_key, tool_call_id)
+            if waiting_tool is not None and waiting_tool != function_name:
+                return False
+        elif scope not in {"session", "always"}:
+            # Run cleanup removes the surface after a timeout. A late durable
+            # grant still belongs to the authenticated conversation namespace,
+            # but no one-shot/denial decision can target a vanished waiter.
+            return False
     if scope in {"session", "always"}:
         approval_tool = (
-            _wait_registry.waiter_payload(session_key, tool_call_id) or function_name
+            _wait_registry.waiter_payload(resolved_surface_key, tool_call_id)
+            or function_name
         )
         try:
             credit_gated = is_credit_gated_tool(approval_tool)
@@ -357,10 +468,10 @@ def resolve_tool_approval(
         # worker. Once signalled, that worker can finish the tool and consume
         # this value immediately.
         with _lock:
-            _decisions[(session_key, entry.tool_call_id)] = scope
+            _decisions[(resolved_surface_key, entry.tool_call_id)] = scope
 
     return _wait_registry.resolve(
-        session_key,
+        resolved_surface_key,
         tool_call_id,
         scope,
         on_release=commit_decision,
@@ -368,14 +479,14 @@ def resolve_tool_approval(
 
 
 def consume_tool_approval_decision(
-    session_key: str, tool_call_id: str = ""
+    surface_key: str, tool_call_id: str = ""
 ) -> Optional[str]:
     """Pop the recorded decision (once/session/always/deny/skip) for a released
     gated call, or None when the wait ended without one (timeout/interrupt)."""
-    if not session_key:
+    if not surface_key:
         return None
     with _lock:
-        return _decisions.pop((session_key, tool_call_id or ""), None)
+        return _decisions.pop((surface_key, tool_call_id or ""), None)
 
 
 def clear_session(session_key: str) -> None:
@@ -384,9 +495,18 @@ def clear_session(session_key: str) -> None:
         return
     with _lock:
         _session_approved.pop(session_key, None)
-        for key in [key for key in _decisions if key[0] == session_key]:
+        surface_keys = {
+            surface_key
+            for surface_key, (_, grant_session_key) in _surface_grant_sessions.items()
+            if grant_session_key == session_key
+        }
+        surface_keys.add(session_key)
+        for surface_key in surface_keys:
+            _surface_grant_sessions.pop(surface_key, None)
+        for key in [key for key in _decisions if key[0] in surface_keys]:
             _decisions.pop(key, None)
-    _wait_registry.clear(session_key)
+    for surface_key in surface_keys:
+        _wait_registry.clear(surface_key)
 
 
 def _readable_tool(function_name: str) -> str:
@@ -566,11 +686,12 @@ def maybe_require_tool_approval(
     if not is_gated_tool(function_name):
         return None
     credits_descriptor = mcp_tool_credits_meta(function_name)
-    session_key = get_current_session_key()
+    grant_session_key = get_current_tool_approval_session_key()
+    surface_key = get_current_tool_approval_surface_key()
     if credits_descriptor is None:
         if is_always_approved(function_name):
             return None  # granted for every conversation on this gateway
-        if is_tool_approved(session_key, function_name):
+        if is_tool_approved(grant_session_key, function_name):
             return None  # approved for the whole session earlier
         options = APPROVAL_OPTIONS
         option_scopes = APPROVAL_OPTION_SCOPES
@@ -590,6 +711,7 @@ def maybe_require_tool_approval(
     approval: dict[str, object] = {
         "tool": function_name,
         "tool_call_id": tool_call_id or "",
+        "surface_id": surface_key,
         "option_scopes": list(option_scopes),
         "skip_scope": True,
     }
@@ -609,7 +731,7 @@ def maybe_require_tool_approval(
     }
 
     choice = await_tool_approval(
-        session_key, function_name, interaction_event, tool_call_id or ""
+        surface_key, function_name, interaction_event, tool_call_id or ""
     )
     if choice in ("session", "always"):
         # resolve_tool_approval already recorded the grant; proceed.

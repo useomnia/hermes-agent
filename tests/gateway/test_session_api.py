@@ -6,6 +6,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+import tools.tool_approval as tool_approval
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_state import SessionDB
@@ -172,6 +173,29 @@ async def test_session_crud_and_message_history(adapter, session_db):
         deleted = await delete_resp.json()
         assert deleted == {"object": "hermes.session.deleted", "id": session_id, "deleted": True}
         assert session_db.get_session(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_session_clears_tool_approval_grants_before_id_reuse(
+    adapter,
+    session_db,
+):
+    session_id = session_db.create_session("reused-session", "api_server")
+    tool_name = "mcp_connectors_TEST_WRITE"
+    tool_approval.clear_session(session_id)
+    tool_approval.record_session_approval(session_id, tool_name)
+    assert tool_approval.is_tool_approved(session_id, tool_name) is True
+
+    try:
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.delete(f"/api/sessions/{session_id}")
+            assert response.status == 200
+
+        session_db.create_session(session_id, "api_server")
+        assert tool_approval.is_tool_approved(session_id, tool_name) is False
+    finally:
+        tool_approval.clear_session(session_id)
 
 
 @pytest.mark.asyncio
