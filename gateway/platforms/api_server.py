@@ -8403,6 +8403,18 @@ class APIServerAdapter(BasePlatformAdapter):
             from tools.user_input import resolve_user_input
 
             resolved = resolve_user_input(session_key, response, tool_call_id)
+            if not resolved:
+                # Turn-path runs park their wait under the run id (the run's
+                # session context), while callers key answers by conversation
+                # session — translate across the two namespaces here, where
+                # both are known.
+                for run_id in list(self._active_run_agents):
+                    run_session = self._run_statuses.get(run_id, {}).get("session_id")
+                    if run_session != session_key:
+                        continue
+                    if resolve_user_input(run_id, response, tool_call_id):
+                        resolved = True
+                        break
         except Exception as exc:
             logger.exception("[api_server] user input resolution failed")
             return web.json_response(_openai_error(str(exc)), status=500)

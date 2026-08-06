@@ -98,6 +98,52 @@ async def test_delivers_the_answer_to_a_blocked_waiter(adapter):
 
 
 @pytest.mark.asyncio
+async def test_resolves_a_wait_parked_under_the_active_run_id(adapter):
+    # Turn-path runs park the wait under the run id (the run's session
+    # context), while the answer arrives keyed by conversation session — the
+    # endpoint must translate across the two namespaces.
+    run_id = "run_user_input_ns"
+    user_input.clear_session(run_id)
+    user_input.register_user_input_session(run_id)
+    adapter._active_run_agents[run_id] = object()
+    adapter._run_statuses[run_id] = {"session_id": SESSION}
+    result: dict[str, str | None] = {}
+    thread = threading.Thread(
+        target=lambda: result.setdefault(
+            "answer", user_input.await_user_input(run_id, "call-1")
+        )
+    )
+    thread.start()
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if user_input._wait_registry.pending_count(run_id):
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("the user-input waiter should be parked")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/omnio/user-input",
+                json={"response": "Brand A", "toolCallId": "call-1"},
+                headers={"X-Hermes-Session-Id": SESSION},
+            )
+            assert resp.status == 200
+            body = await resp.json()
+
+        assert body["resolved"] is True
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+        assert result["answer"] == "Brand A"
+    finally:
+        user_input.clear_session(run_id)
+        adapter._active_run_agents.pop(run_id, None)
+        adapter._run_statuses.pop(run_id, None)
+
+
+@pytest.mark.asyncio
 async def test_reports_not_resolved_when_no_call_is_waiting(adapter):
     # Stale card (already answered / timed out / turn ended): a valid request,
     # but nothing is parked — the chat treats resolved:false as a stale card.
