@@ -8688,28 +8688,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
-        # Drain any recovered process watchers (from crash recovery checkpoint)
-        try:
-            from tools.process_registry import process_registry
-            # Detach the current batch atomically: reassigning to a fresh list
-            # takes ownership of exactly the watchers present now, so any watcher
-            # appended concurrently during the yield below isn't silently dropped
-            # by a clear() on the shared list.
-            watchers = process_registry.pending_watchers
-            process_registry.pending_watchers = []
-            # Process in batches of 100 with event-loop yield points to avoid
-            # O(n^2) event-loop blocking when recovering thousands of watchers.
-            for i, watcher in enumerate(watchers):
-                self._spawn_supervised(
-                    lambda w=watcher: self._run_process_watcher(w),
-                    f"process_watcher:{watcher.get('session_id')}",
-                    restart=False,
-                )
-                logger.info("Resumed watcher for recovered process %s", watcher.get("session_id"))
-                if i % 100 == 99:
-                    await asyncio.sleep(0)
-        except Exception as e:
-            logger.error("Recovered watcher setup error: %s", e)
+        # Own terminal-process watcher dispatch for the gateway lifetime. This
+        # covers API-server turns as well as messaging adapters: API requests do
+        # not pass through the messaging post-turn drain that historically
+        # launched these watchers.
+        self._spawn_supervised(
+            self._process_watcher_dispatcher,
+            "process_watcher_dispatcher",
+        )
 
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
@@ -14418,21 +14404,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "response": (response or "")[:500],
             })
             
-            # Check for pending process watchers (check_interval on background processes)
-            try:
-                from tools.process_registry import process_registry
-                # Detach the current batch atomically (see crash-recovery drain
-                # above): reassign to a fresh list so a watcher appended by a
-                # concurrent session during the yield isn't dropped by clear().
-                watchers = process_registry.pending_watchers
-                process_registry.pending_watchers = []
-                for i, watcher in enumerate(watchers):
-                    asyncio.create_task(self._run_process_watcher(watcher))
-                    if i % 100 == 99:
-                        await asyncio.sleep(0)
-            except Exception as e:
-                logger.error("Process watcher setup error: %s", e)
-
             # Drain watch pattern notifications that arrived during the agent run.
             # Watch events and completions share the same queue; process
             # completions are already handled by the per-process watcher task
@@ -17660,7 +17631,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (terminal notify_on_complete / watch_patterns, delegate_task
         # background=True) know whether this channel can wake a later turn.
         # Default True keeps CLI / unknown paths working; stateless adapters
-        # (api_server) declare supports_async_delivery=False. Use getattr so
+        # that cannot arrange any later wake declare supports_async_delivery=False.
+        # The API server supports self-post wakes while remaining non-push. Use getattr so
         # bare runners built via object.__new__ (tests) without self.adapters
         # don't blow up — they simply default to supported.
         _adapters = getattr(self, "adapters", None) or {}
@@ -18544,6 +18516,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.error("Async delegation injection error: %s", e)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
+            await asyncio.sleep(interval)
+
+    async def _process_watcher_dispatcher(self, interval: float = 0.5) -> None:
+        """Launch terminal-process watchers independently of message turns.
+
+        ``terminal`` runs in executor threads and queues watcher descriptors in
+        the process registry. A gateway-lifetime consumer is required because
+        API-server sessions bypass the messaging adapter's post-turn path.
+        """
+        from tools.process_registry import process_registry
+
+        while self._running:
+            try:
+                watchers = process_registry.drain_pending_watchers()
+                for i, watcher in enumerate(watchers):
+                    self._spawn_supervised(
+                        lambda w=watcher: self._run_process_watcher(w),
+                        f"process_watcher:{watcher.get('session_id')}",
+                        restart=False,
+                    )
+                    if i % 100 == 99:
+                        await asyncio.sleep(0)
+            except Exception as exc:
+                logger.error("Process watcher dispatch error: %s", exc)
             await asyncio.sleep(interval)
 
     async def _run_process_watcher(self, watcher: dict) -> None:

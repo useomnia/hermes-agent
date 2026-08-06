@@ -382,6 +382,39 @@ class SpritesEnvironment(BaseEnvironment):
         """Send a file operation to the toolbox Sprite."""
         return self._request_json("/files", payload)
 
+    def read_file_bytes(self, path: str, *, max_bytes: int) -> bytes:
+        """Read at most ``max_bytes`` from a Toolbox file as raw bytes."""
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be positive")
+        query = urllib.parse.urlencode({"path": path})
+        request = urllib.request.Request(
+            f"{self.toolbox_url}/files?{query}",
+            headers={
+                "Authorization": f"Bearer {self.bearer_token}",
+                "X-Omnio-Brand": self.brand,
+            },
+            method="GET",
+        )
+        try:
+            with _URL_OPENER.open(request, timeout=self.timeout) as response:
+                return response.read(max_bytes)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(_MAX_ERROR_BYTES).decode("utf-8", errors="replace")
+            raise SpritesToolboxError(
+                f"Toolbox API /files failed with HTTP {exc.code}: "
+                f"{detail or exc.reason}",
+                detail=detail or str(exc.reason),
+                http_status=exc.code,
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise SpritesToolboxError(
+                f"Toolbox API /files is unreachable: {exc}"
+            ) from exc
+        except (OSError, http.client.HTTPException) as exc:
+            raise SpritesToolboxError(
+                f"Toolbox API /files is unreachable: {exc}"
+            ) from exc
+
     def get_temp_dir(self) -> str:
         return "/tmp/.hermes-session"
 
@@ -519,6 +552,14 @@ class SpritesFileOperations(ShellFileOperations):
         self.env: SpritesEnvironment = terminal_env
 
     def _files(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # The Toolbox file API does not perform shell expansion. Resolve tilde
+        # paths through the Sprite terminal so file tools and `cd ~` agree on
+        # the sandbox user's home instead of leaking the gateway host HOME.
+        payload = dict(payload)
+        for key in ("path", "src", "dst"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.startswith("~"):
+                payload[key] = self._expand_path(value)
         try:
             return self.env.file_request(payload)
         except SpritesToolboxError as error:

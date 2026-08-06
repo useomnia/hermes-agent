@@ -250,6 +250,48 @@ async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_dispatcher_launches_watcher_queued_outside_messaging_turn(
+    monkeypatch, tmp_path
+):
+    """API sessions queue terminal watchers without a messaging post-turn."""
+    from tools.process_registry import process_registry
+
+    process_registry.drain_pending_watchers()
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._running = True
+    runner._run_process_watcher = AsyncMock()
+    spawned = []
+
+    def _capture_spawn(factory, name, *, restart=True, **_kwargs):
+        spawned.append((factory, name, restart))
+        return None
+
+    async def _stop_after_dispatch(_interval):
+        runner._running = False
+
+    monkeypatch.setattr(runner, "_spawn_supervised", _capture_spawn)
+    monkeypatch.setattr(asyncio, "sleep", _stop_after_dispatch)
+    watcher = {
+        "session_id": "proc_api_idle",
+        "check_interval": 5,
+        "platform": "api_server",
+        "chat_id": "api-session",
+        "notify_on_complete": True,
+    }
+    process_registry.enqueue_pending_watcher(watcher)
+
+    await runner._process_watcher_dispatcher(interval=0)
+
+    assert process_registry.drain_pending_watchers() == []
+    assert len(spawned) == 1
+    factory, name, restart = spawned[0]
+    assert name == "process_watcher:proc_api_idle"
+    assert restart is False
+    await factory()
+    runner._run_process_watcher.assert_awaited_once_with(watcher)
+
+
+@pytest.mark.asyncio
 async def test_consumed_completion_skips_raw_notification(monkeypatch, tmp_path):
     """#65379: after process(wait) already returned the completion inline,
     the gateway watcher must NOT also push the raw

@@ -1,14 +1,14 @@
 """Wake an existing agent session from a background completion event.
 
 Two delivery strategies, selected by the target adapter's
-``supports_async_delivery`` capability flag:
+``supports_push_delivery`` capability flag:
 
 * Push-capable adapters (telegram, discord, plugin platforms, ...): inject a
   synthetic ``MessageEvent(internal=True)`` through ``adapter.handle_message``
   — the pre-existing wake path, preserved exactly.
 
 * Stateless request/response adapters (the API server,
-  ``supports_async_delivery = False``): ``handle_message`` would run the wake
+  ``supports_push_delivery = False``): ``handle_message`` would run the wake
   turn under a ``build_session_key()``-derived key
   (``agent:main:api_server:group:<sid>``) that NEVER matches the raw
   ``X-Hermes-Session-Id`` key real gateway/HQ turns run under
@@ -45,11 +45,12 @@ _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
 def adapter_supports_push(adapter: Any) -> bool:
     """Whether this adapter can push a message to the user after a turn ends.
 
-    Mirrors ``gateway.session_context.async_delivery_supported`` but reads the
-    capability off the adapter class (``supports_async_delivery``) instead of
-    the request-scoped contextvar — background watchers run outside any bound
-    session context. Adapters that don't declare the flag are push-capable.
+    ``supports_async_delivery`` answers whether a later wake is possible;
+    ``supports_push_delivery`` answers how it is delivered. Older adapters
+    that only declare the former retain their previous behavior.
     """
+    if hasattr(adapter, "supports_push_delivery"):
+        return bool(getattr(adapter, "supports_push_delivery"))
     return bool(getattr(adapter, "supports_async_delivery", True))
 
 
@@ -88,7 +89,7 @@ async def deliver_wake(
 
     if not session_id:
         raise ValueError(
-            "deliver_wake: non-push adapter (supports_async_delivery=False) "
+            "deliver_wake: non-push adapter "
             "requires the raw session id to self-post the wake turn"
         )
     await _self_post_chat_completion(adapter, text=text, session_id=session_id)
