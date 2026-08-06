@@ -111,6 +111,66 @@ def test_already_present_outcome_leaves_disk_untouched_message(
     assert "nothing was fetched" in result
 
 
+def test_version_is_forwarded_and_reported(hook_env, monkeypatch: pytest.MonkeyPatch):
+    captured: dict = {}
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return _ok_response(
+            {
+                "path": "/brand/report.pdf",
+                "filename": "report.pdf",
+                "size": 512,
+                "content_type": "application/pdf",
+                "version": 2,
+                "outcome": "restored",
+            }
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    result = file_tools._handle_fetch_file({"path": "/brand/report.pdf", "version": 2})
+
+    assert captured["payload"] == {
+        "path": "/brand/report.pdf",
+        "brand": "brand-uuid-1",
+        "version": 2,
+    }
+    assert "version 2" in result
+
+
+def test_invalid_version_is_a_tool_error(hook_env):
+    for bad in (0, -1, "two", 1.5):
+        result = file_tools._handle_fetch_file({"path": "/brand/report.pdf", "version": bad})
+        assert "'version' must be a positive integer" in result
+
+
+def test_versioned_404_explains_versioning(hook_env, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda request, timeout: (_ for _ in ()).throw(_http_error(404))
+    )
+    result = file_tools._handle_fetch_file({"path": "/brand/report.pdf", "version": 9})
+    assert "No stored version 9 of /brand/report.pdf" in result
+
+
+def test_versioned_already_present_suggests_moving_the_disk_copy(
+    hook_env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda request, timeout: _ok_response(
+            {
+                "path": "/brand/report.pdf",
+                "size": 512,
+                "content_type": "application/pdf",
+                "outcome": "already_present",
+            }
+        ),
+    )
+    result = file_tools._handle_fetch_file({"path": "/brand/report.pdf", "version": 1})
+    assert "move the on-disk copy aside first" in result
+
+
 def test_store_miss_404_names_the_path_and_recoverability_rule(
     hook_env, monkeypatch: pytest.MonkeyPatch
 ):

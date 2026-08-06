@@ -2155,11 +2155,12 @@ _FETCH_FILE_TIMEOUT_SECONDS = 60.0
 
 FETCH_FILE_SCHEMA = {
     "name": "fetch_file",
-    "description": "Restore a previously delivered or uploaded file from durable storage onto disk at its original path. Use when a path referenced earlier in the conversation is missing from disk (for example after the sandbox was replaced). Files that were delivered to the user or uploaded by them are always recoverable by path; scratch files that were never delivered are not. If the file already exists on disk it is left untouched.",
+    "description": "Restore a previously delivered or uploaded file from durable storage onto disk at its original path. Use when a path referenced earlier in the conversation is missing from disk (for example after the sandbox was replaced). Files that were delivered to the user or uploaded by them are always recoverable by path; scratch files that were never delivered are not. If the file already exists on disk it is left untouched — that also holds when asking for an older version: move the on-disk copy aside first, then fetch.",
     "parameters": {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "The missing file's path as previously referenced (e.g. ~/report.xlsx or /brand/assets/logo.png)"},
+            "version": {"type": "integer", "minimum": 1, "description": "A specific stored version to restore (1 is the oldest). Omit for the newest. Each re-delivery of a path with changed content stores the next version."},
         },
         "required": ["path"],
     },
@@ -2191,16 +2192,23 @@ def _handle_fetch_file(args, **kw):
             "fetch_file: missing required field 'path'. Re-emit the tool call with "
             "the missing file's path."
         )
+    version = args.get("version")
+    if version is not None and (not isinstance(version, int) or version < 1):
+        return tool_error(
+            "fetch_file: 'version' must be a positive integer (1 is the oldest version). "
+            "Omit it to fetch the newest."
+        )
     hook_url = (os.environ.get(FETCH_FILE_HOOK_ENV) or "").strip()
     if not hook_url:
         return tool_error("fetch_file is unavailable: durable-file storage is not configured.")
 
-    payload = json.dumps(
-        {
-            "path": path,
-            "brand": (os.environ.get("OMNIO_TOOLBOX_BRAND") or "").strip(),
-        }
-    ).encode("utf-8")
+    payload_dict = {
+        "path": path,
+        "brand": (os.environ.get("OMNIO_TOOLBOX_BRAND") or "").strip(),
+    }
+    if version is not None:
+        payload_dict["version"] = version
+    payload = json.dumps(payload_dict).encode("utf-8")
     request = urllib.request.Request(
         hook_url,
         data=payload,
@@ -2215,6 +2223,11 @@ def _handle_fetch_file(args, **kw):
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
+            if version is not None:
+                return tool_error(
+                    f"No stored version {version} of {path} was found. Versions start at 1 "
+                    "and grow by one for each re-delivery whose content changed."
+                )
             return tool_error(
                 f"No stored copy of {path} was found. Only files that were delivered to "
                 "the user or uploaded by them are recoverable; scratch files are not."
@@ -2236,8 +2249,18 @@ def _handle_fetch_file(args, **kw):
     size_label = _format_fetch_size(size) if isinstance(size, int) else "unknown size"
     content_type = body.get("content_type") or "unknown type"
     if body.get("outcome") == "already_present":
+        if version is not None:
+            return (
+                f"{restored_path} already exists on disk ({size_label}, {content_type}); nothing "
+                f"was fetched. To restore version {version}, move the on-disk copy aside first, "
+                "then fetch again."
+            )
         return f"{restored_path} already exists on disk ({size_label}, {content_type}); nothing was fetched."
-    return f"Restored {restored_path} ({size_label}, {content_type}) from durable storage."
+    restored_version = body.get("version")
+    version_label = (
+        f" (version {restored_version})" if isinstance(restored_version, int) and restored_version > 0 else ""
+    )
+    return f"Restored {restored_path}{version_label} ({size_label}, {content_type}) from durable storage."
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
