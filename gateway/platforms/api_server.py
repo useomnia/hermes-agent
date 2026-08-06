@@ -7404,6 +7404,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ) -> None:
             projected_todos: Optional[List[Dict[str, Any]]] = None
             approval_timed_out = False
+            user_input_turn_ending = False
             normalized_tool_call_id = str(tool_call_id or "")
             normalized_tool_name = str(tool_name or "")
             try:
@@ -7418,6 +7419,51 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 if isinstance(raw_todos, list):
                     projected_todos = _redact_response_extension_value(raw_todos)
+            elif normalized_tool_name == "request_user_input":
+                status = (
+                    parsed_result.get("status")
+                    if isinstance(parsed_result, dict)
+                    else None
+                )
+                # An answered card is recorded by the answer's own delivery
+                # path; only the silent expiry has no other recorder.
+                completion_fields: Optional[Dict[str, Any]] = None
+                if status == "no_response":
+                    try:
+                        from tools.user_input import (
+                            consume_user_input_completion_reason,
+                        )
+
+                        reason = consume_user_input_completion_reason(session_id)
+                    except Exception:
+                        reason = None
+                    # Only an expired wait closes the card; a stop or disconnect
+                    # leaves it open and answerable.
+                    if reason == "expired":
+                        completion_fields = {"timed_out": True}
+                # The question is now waiting on the chat, not on this run: the
+                # card stays answerable and a late answer arrives as the next
+                # Turn's user message, so the run must end instead of letting
+                # the agent keep working without the answer.
+                user_input_turn_ending = status in {"presented", "no_response"}
+                if completion_fields is not None:
+                    fields = {
+                        "tool_call_id": normalized_tool_call_id,
+                        **completion_fields,
+                    }
+
+                    def _emit_user_input_completed(
+                        completed_fields: Dict[str, Any],
+                    ) -> None:
+                        emitter.omnio_event(
+                            "response.omnio.interaction_completed",
+                            **completed_fields,
+                        )
+
+                    try:
+                        loop.call_soon_threadsafe(_emit_user_input_completed, fields)
+                    except RuntimeError:
+                        pass
             elif normalized_tool_name not in _CUSTOM_TOOL_INPUT_KEYS:
                 try:
                     from tools.tool_approval import (
@@ -7456,17 +7502,20 @@ class APIServerAdapter(BasePlatformAdapter):
                             )
                 except Exception:
                     pass
-            if approval_timed_out:
+            if approval_timed_out or user_input_turn_ending:
+                interrupt_message = (
+                    "awaiting user approval (tool approval timed out)"
+                    if approval_timed_out
+                    else "awaiting user interaction (request_user_input)"
+                )
                 agent = self._active_run_agents.get(run_id)
                 if agent is not None:
                     try:
-                        agent.interrupt(
-                            "awaiting user approval (tool approval timed out)"
-                        )
+                        agent.interrupt(interrupt_message)
                     except Exception:
                         logger.warning(
-                            "[api_server] failed to interrupt agent for timed-out "
-                            "tool approval (run_id=%s, tool_call_id=%s)",
+                            "[api_server] failed to interrupt agent for an "
+                            "unanswered interaction (run_id=%s, tool_call_id=%s)",
                             run_id,
                             normalized_tool_call_id,
                             exc_info=True,

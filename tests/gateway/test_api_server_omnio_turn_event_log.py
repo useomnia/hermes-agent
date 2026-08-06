@@ -2050,6 +2050,115 @@ async def test_tool_approval_timeout_interrupts_the_turn_before_another_iteratio
 
 
 @pytest.mark.asyncio
+async def test_user_input_timeout_interrupts_the_run_and_stamps_timed_out() -> None:
+    adapter = _make_adapter()
+    session_id = "conversation-user-input-timeout"
+    continued_after_timeout = False
+    interrupted = threading.Event()
+    built_agent: Optional[MagicMock] = None
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        nonlocal built_agent, continued_after_timeout
+
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            nonlocal continued_after_timeout
+            callbacks["tool_start_callback"]("call-ask", "request_user_input", {})
+            callbacks["tool_progress_callback"](
+                "tool.progress",
+                tool="request_user_input",
+                toolCallId="call-ask",
+                status="running",
+                interaction={"kind": "choice", "question": "Which one?", "options": []},
+            )
+            callbacks["tool_complete_callback"](
+                "call-ask",
+                "request_user_input",
+                {},
+                json.dumps({"status": "no_response"}),
+            )
+            continued_after_timeout = not interrupted.is_set()
+            return {
+                "final_response": "",
+                "messages": [],
+                "interrupted": interrupted.is_set(),
+            }
+
+        built_agent = _agent(run, interrupt=lambda _message=None: interrupted.set())
+        return built_agent
+
+    with (
+        patch.object(adapter, "_create_agent", side_effect=build_agent),
+        patch(
+            "tools.user_input.consume_user_input_completion_reason",
+            return_value="expired",
+        ),
+    ):
+        _, events = await _run_without_http_server(
+            adapter,
+            {"input": "ask the user", "session_id": session_id},
+        )
+
+    assert built_agent is not None
+    built_agent.interrupt.assert_called_once_with(
+        "awaiting user interaction (request_user_input)"
+    )
+    assert continued_after_timeout is False
+    completed = next(
+        event
+        for event in events
+        if event["type"] == "response.omnio.interaction_completed"
+        and event.get("tool_call_id") == "call-ask"
+    )
+    assert completed["timed_out"] is True
+    assert events[-1]["type"] == "response.incomplete"
+
+
+@pytest.mark.asyncio
+async def test_answered_user_input_completes_the_card_without_interrupting() -> None:
+    adapter = _make_adapter()
+    session_id = "conversation-user-input-answered"
+    built_agent: Optional[MagicMock] = None
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        nonlocal built_agent
+
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            callbacks["tool_start_callback"]("call-ask", "request_user_input", {})
+            callbacks["tool_progress_callback"](
+                "tool.progress",
+                tool="request_user_input",
+                toolCallId="call-ask",
+                status="running",
+                interaction={"kind": "choice", "question": "Which one?", "options": []},
+            )
+            callbacks["tool_complete_callback"](
+                "call-ask",
+                "request_user_input",
+                {},
+                json.dumps({"status": "answered", "response": "Brand A"}),
+            )
+            return {"final_response": "picked", "messages": []}
+
+        built_agent = _agent(run)
+        return built_agent
+
+    with patch.object(adapter, "_create_agent", side_effect=build_agent):
+        _, events = await _run_without_http_server(
+            adapter,
+            {"input": "ask the user", "session_id": session_id},
+        )
+
+    assert built_agent is not None
+    built_agent.interrupt.assert_not_called()
+    # The answered card is recorded by the answer's own delivery path — the run
+    # emits no completion of its own.
+    assert not any(
+        event["type"] == "response.omnio.interaction_completed" for event in events
+    )
+    assert events[-1]["type"] == "response.completed"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_gated_tool_closes_interaction_without_timeout() -> None:
     adapter = _make_adapter()
     session_id = "conversation-cancelled-approval"
