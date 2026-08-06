@@ -511,12 +511,31 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return ws_url
 
 
-def _get_cdp_override_raw() -> str:
+def _browser_session_id(task_id: Optional[str] = None) -> str:
+    """Return the conversation identity used by an Omnio browser process.
+
+    API-server tool calls carry the raw Hermes session id in a ContextVar.  It
+    is the stable conversation identity, whereas a delegated tool call may use
+    a child task id.  Non-gateway callers fall back to their task id.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        session_id = str(get_session_env("HERMES_SESSION_ID") or "").strip()
+        if session_id:
+            return session_id
+    except Exception:
+        pass
+    return str(task_id or "").strip()
+
+
+def _get_cdp_override_raw(task_id: Optional[str] = None) -> str:
     """Return the CONFIGURED CDP URL override verbatim, or empty string.
 
     Precedence is:
-    1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
-    2. ``browser.cdp_url`` in config.yaml (persistent config)
+    1. ``BROWSER_CDP_URL_TEMPLATE`` env var (conversation-scoped Omnio relay)
+    2. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
+    3. ``browser.cdp_url`` in config.yaml (persistent config)
 
     When either is set, we skip both Browserbase and the local headless
     launcher and connect directly to the supplied Chrome DevTools Protocol
@@ -528,6 +547,21 @@ def _get_cdp_override_raw() -> str:
     (is the endpoint live, and what is its concrete websocket) at the cost of
     seconds when the endpoint is not up yet.
     """
+    template = os.environ.get("BROWSER_CDP_URL_TEMPLATE", "").strip()
+    if template:
+        if "{session_id}" not in template:
+            logger.warning(
+                "Ignoring BROWSER_CDP_URL_TEMPLATE because it does not contain "
+                "the required {session_id} placeholder"
+            )
+            return ""
+        session_id = _browser_session_id(task_id)
+        if session_id:
+            from urllib.parse import quote
+
+            return template.replace("{session_id}", quote(session_id, safe=""))
+        return template
+
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
         return env_override
@@ -545,7 +579,7 @@ def _get_cdp_override_raw() -> str:
     return ""
 
 
-def _get_cdp_override() -> str:
+def _get_cdp_override(task_id: Optional[str] = None) -> str:
     """Return the configured CDP override RESOLVED to a connectable websocket.
 
     Discovery is a network probe, so this belongs at the point where a browser
@@ -560,13 +594,33 @@ def _get_cdp_override() -> str:
     would outlive a Chrome restart behind an unchanged discovery URL and hand out
     a dead endpoint. Discovery is cheap once it is only reached at connect time.
     """
-    raw_override = _get_cdp_override_raw()
+    raw_override = _get_cdp_override_raw(task_id)
     if not raw_override:
+        return ""
+    if "{session_id}" in raw_override:
+        logger.warning(
+            "BROWSER_CDP_URL_TEMPLATE is configured but no Hermes session id "
+            "is available; refusing to connect to an unresolved endpoint"
+        )
         return ""
     return _resolve_cdp_override(raw_override)
 
 
-def _toolbox_browser_binding() -> Optional[Tuple[str, Dict[str, str]]]:
+def _get_task_cdp_override(task_id: str) -> str:
+    """Resolve a task only when the configured endpoint is session-templated.
+
+    Legacy static overrides have no task dimension. Keeping their zero-argument
+    path also preserves compatibility for downstream browser integrations that
+    wrap or monkeypatch ``_get_cdp_override``.
+    """
+    if os.environ.get("BROWSER_CDP_URL_TEMPLATE", "").strip():
+        return _get_cdp_override(task_id)
+    return _get_cdp_override()
+
+
+def _toolbox_browser_binding(
+    task_id: Optional[str] = None,
+) -> Optional[Tuple[str, Dict[str, str]]]:
     """Return the paired Toolbox browser endpoint and authenticated headers."""
     base_url = os.environ.get("OMNIO_TOOLBOX_URL", "").strip().rstrip("/")
     bearer = os.environ.get("OMNIO_TOOLBOX_BEARER", "").strip()
@@ -577,19 +631,23 @@ def _toolbox_browser_binding() -> Optional[Tuple[str, Dict[str, str]]]:
         or os.environ.get("OMNIO_BRAND_ID", "").strip()
         or "__default__"
     )
+    headers = {
+        "Authorization": f"Bearer {bearer}",
+        "Content-Type": "application/json",
+        "X-Omnio-Brand": brand,
+    }
+    session_id = _browser_session_id(task_id)
+    if session_id:
+        headers["X-Hermes-Session-Id"] = session_id
     return (
         f"{base_url}/browser",
-        {
-            "Authorization": f"Bearer {bearer}",
-            "Content-Type": "application/json",
-            "X-Omnio-Brand": brand,
-        },
+        headers,
     )
 
 
-def _recover_omnio_browser() -> bool:
-    """Ask a recovery-capable paired Toolbox to replace the Brand context."""
-    binding = _toolbox_browser_binding()
+def _recover_omnio_browser(task_id: Optional[str] = None) -> bool:
+    """Ask a recovery-capable paired Toolbox to replace this conversation's browser."""
+    binding = _toolbox_browser_binding(task_id)
     if binding is None:
         return False
     browser_url, headers = binding
@@ -732,13 +790,14 @@ def _recover_browser_after_failure(
     result: Dict[str, Any],
     *,
     cdp_backed: bool,
+    task_id: Optional[str] = None,
 ) -> bool:
     """Recover once after a structured retryable renderer failure."""
     if result.get("success") or not cdp_backed:
         return False
     if not _should_recover_browser_failure(result):
         return False
-    return _recover_omnio_browser()
+    return _recover_omnio_browser(task_id)
 
 
 def _retry_navigation_after_recovery(
@@ -750,7 +809,11 @@ def _retry_navigation_after_recovery(
     cdp_backed: bool,
 ) -> Dict[str, Any]:
     """Recover an Omnio CDP browser and retry one navigation once."""
-    if not _recover_browser_after_failure(result, cdp_backed=cdp_backed):
+    if not _recover_browser_after_failure(
+        result,
+        cdp_backed=cdp_backed,
+        task_id=task_id,
+    ):
         return result
     logger.warning(
         "Recovered paired browser after navigation failure; retrying once "
@@ -815,8 +878,9 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
     double-attach.
 
     Resolves the CDP URL in this order:
-      1. ``BROWSER_CDP_URL`` / ``browser.cdp_url`` — covers ``/browser connect``
-         and config-set overrides.
+      1. ``BROWSER_CDP_URL_TEMPLATE`` / ``BROWSER_CDP_URL`` /
+         ``browser.cdp_url`` — covers conversation-scoped gateways,
+         ``/browser connect``, and config-set overrides.
       2. ``_active_sessions[task_id]["cdp_url"]`` — covers Browserbase + any
          other cloud provider whose ``create_session`` returns a raw CDP URL.
 
@@ -824,7 +888,7 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
     the browser session itself.  The agent simply won't see
     ``pending_dialogs`` / ``frame_tree`` fields in snapshots.
     """
-    cdp_url = _get_cdp_override()
+    cdp_url = _get_task_cdp_override(task_id)
     if not cdp_url:
         # Fallback: active session may carry a per-session CDP URL from a
         # cloud provider (Browserbase sets this).
@@ -1965,6 +2029,9 @@ def _terminate_timed_out_browser_daemon(
     try:
         daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
     except (ValueError, OSError):
+        if session_info.get("cdp_url"):
+            shutil.rmtree(socket_dir, ignore_errors=True)
+            return False
         logger.warning(
             "Could not reset timed-out browser session %s: daemon PID unavailable",
             session_name,
@@ -2496,7 +2563,7 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     force_local = _is_local_sidecar_key(task_id)
 
     # Create session outside the lock (network call in cloud mode)
-    cdp_override = _get_cdp_override()
+    cdp_override = _get_task_cdp_override(task_id)
     if cdp_override and not force_local:
         session_info = _create_cdp_session(task_id, cdp_override)
     elif force_local:
@@ -3280,7 +3347,7 @@ def _session_is_cdp_backed(
         return bool(active_session.get("cdp_url"))
     if _is_local_sidecar_key(task_id):
         return False
-    return bool(os.environ.get("BROWSER_CDP_URL", "").strip())
+    return bool(_get_cdp_override_raw(task_id))
 
 
 def _decode_navigation_probe(result: Dict[str, Any]) -> Dict[str, str]:
@@ -3764,6 +3831,7 @@ def browser_snapshot(
     session_reset = _recover_browser_after_failure(
         result,
         cdp_backed=cdp_backed,
+        task_id=effective_task_id,
     )
     if session_reset:
         return json.dumps(
@@ -4909,6 +4977,27 @@ def browser_vision(
             )
 
         if not result.get("success"):
+            session_reset = _recover_browser_after_failure(
+                result,
+                cdp_backed=_session_is_cdp_backed(effective_task_id),
+                task_id=effective_task_id,
+            )
+            if session_reset:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            "The browser renderer became unresponsive and the "
+                            "session was reset; re-open the page with "
+                            "browser_navigate to continue."
+                        ),
+                        "code": "browser_session_reset",
+                        "retryable": True,
+                        "session_reset": True,
+                        "next_action": "browser_navigate",
+                    },
+                    ensure_ascii=False,
+                )
             error_detail = result.get("error", "Unknown error")
             _cp = _get_cloud_provider()
             mode = "local" if _cp is None else f"cloud ({_cp.provider_name()})"
@@ -5194,12 +5283,15 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         # Stop auto-recording before closing (saves the file)
         _maybe_stop_recording(task_id)
 
-        # Try to close via agent-browser first (needs session in _active_sessions)
-        try:
-            _run_browser_command(task_id, "close", [], timeout=10)
-            logger.debug("agent-browser close command completed for task %s", task_id)
-        except Exception as e:
-            logger.warning("agent-browser close failed for task %s: %s", task_id, e)
+        # A CDP-backed session is owned by its provider (Omnio Toolbox or a
+        # cloud browser). ``agent-browser close`` may issue Browser.close and
+        # kill that remote browser, so only use it for a locally-owned Chrome.
+        if not session_info.get("cdp_url"):
+            try:
+                _run_browser_command(task_id, "close", [], timeout=10)
+                logger.debug("agent-browser close command completed for task %s", task_id)
+            except Exception as e:
+                logger.warning("agent-browser close failed for task %s: %s", task_id, e)
 
         # Now remove from tracking under lock
         with _cleanup_lock:
@@ -5221,17 +5313,7 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         if session_name:
             socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{session_name}")
             if os.path.exists(socket_dir):
-                # agent-browser writes {session}.pid in the socket dir
-                pid_file = os.path.join(socket_dir, f"{session_name}.pid")
-                if os.path.isfile(pid_file):
-                    try:
-                        from tools.process_registry import ProcessRegistry
-                        daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
-                        ProcessRegistry._terminate_host_pid(daemon_pid)
-                        logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
-                    except (ProcessLookupError, ValueError, PermissionError, OSError):
-                        logger.debug("Could not kill daemon pid for %s (already dead or inaccessible)", session_name)
-                shutil.rmtree(socket_dir, ignore_errors=True)
+                _terminate_timed_out_browser_daemon(session_info, socket_dir)
 
         logger.debug("Removed task %s from active sessions", task_id)
     else:

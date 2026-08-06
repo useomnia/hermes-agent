@@ -108,3 +108,53 @@ class TestResolvePathUsesProfileHome:
 
         assert str(profile_home) in str(resolved)
         assert str(process_home) not in str(resolved)
+
+    def test_container_tilde_is_preserved_for_remote_home_expansion(self, monkeypatch):
+        monkeypatch.setattr(ft, "_uses_container_paths", lambda _task: True)
+
+        with patch(
+            "hermes_constants.get_subprocess_home",
+            return_value="/Users/host-user",
+        ):
+            resolved = ft._resolve_path_for_task("~/brand/brief.md", task_id="sprite")
+
+        assert resolved == ft.PurePosixPath("~/brand/brief.md")
+        assert "/Users/host-user" not in str(resolved)
+
+
+# ---------------------------------------------------------------------------
+# Container-derived roots: config paths expand against the CONTAINER's home
+# ---------------------------------------------------------------------------
+
+class TestContainerTildeExpansion:
+    """On the sprites toolbox the brand tree is mounted at /home/brand and the
+    hermes process home (/home/sprite) is an ordinary scratch subpath there, so
+    expanding ~ with the process home reroutes ~/brand writes into scratch."""
+
+    def test_sprites_task_expands_tilde_to_container_home(self):
+        with patch.object(ft, "_terminal_env_type_for_task", return_value="sprites"):
+            result = ft._expand_tilde_for_container("~/brand/knowledge/report.md", "default")
+        assert result == "/home/brand/knowledge/report.md"
+
+    def test_sprites_task_expands_bare_tilde_to_container_home(self):
+        with patch.object(ft, "_terminal_env_type_for_task", return_value="sprites"):
+            assert ft._expand_tilde_for_container("~", "default") == "/home"
+
+    def test_sprites_task_never_uses_the_process_home(self):
+        with patch.object(ft, "_terminal_env_type_for_task", return_value="sprites"), \
+                patch("hermes_constants.get_subprocess_home", return_value="/home/sprite"):
+            result = ft._expand_tilde_for_container("~/brand/file.md", "default")
+        assert "/home/sprite" not in result
+        assert result == "/home/brand/file.md"
+
+    def test_sprites_task_leaves_absolute_paths_alone(self):
+        with patch.object(ft, "_terminal_env_type_for_task", return_value="sprites"):
+            result = ft._expand_tilde_for_container("/home/brand/file.md", "default")
+        assert result == "/home/brand/file.md"
+
+    def test_non_sprites_container_keeps_profile_home_expansion(self):
+        with patch.object(ft, "_terminal_env_type_for_task", return_value="docker"), \
+                patch("hermes_constants.get_subprocess_home", return_value="/root"):
+            result = ft._expand_tilde_for_container("~/file.md", "default")
+        assert result == "/root/file.md"
+

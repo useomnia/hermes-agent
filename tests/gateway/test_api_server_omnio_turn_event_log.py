@@ -2050,6 +2050,115 @@ async def test_tool_approval_timeout_interrupts_the_turn_before_another_iteratio
 
 
 @pytest.mark.asyncio
+async def test_user_input_timeout_interrupts_the_run_and_stamps_timed_out() -> None:
+    adapter = _make_adapter()
+    session_id = "conversation-user-input-timeout"
+    continued_after_timeout = False
+    interrupted = threading.Event()
+    built_agent: Optional[MagicMock] = None
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        nonlocal built_agent, continued_after_timeout
+
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            nonlocal continued_after_timeout
+            callbacks["tool_start_callback"]("call-ask", "request_user_input", {})
+            callbacks["tool_progress_callback"](
+                "tool.progress",
+                tool="request_user_input",
+                toolCallId="call-ask",
+                status="running",
+                interaction={"kind": "choice", "question": "Which one?", "options": []},
+            )
+            callbacks["tool_complete_callback"](
+                "call-ask",
+                "request_user_input",
+                {},
+                json.dumps({"status": "no_response"}),
+            )
+            continued_after_timeout = not interrupted.is_set()
+            return {
+                "final_response": "",
+                "messages": [],
+                "interrupted": interrupted.is_set(),
+            }
+
+        built_agent = _agent(run, interrupt=lambda _message=None: interrupted.set())
+        return built_agent
+
+    with (
+        patch.object(adapter, "_create_agent", side_effect=build_agent),
+        patch(
+            "tools.user_input.consume_user_input_completion_reason",
+            return_value="expired",
+        ),
+    ):
+        _, events = await _run_without_http_server(
+            adapter,
+            {"input": "ask the user", "session_id": session_id},
+        )
+
+    assert built_agent is not None
+    built_agent.interrupt.assert_called_once_with(
+        "awaiting user interaction (request_user_input)"
+    )
+    assert continued_after_timeout is False
+    completed = next(
+        event
+        for event in events
+        if event["type"] == "response.omnio.interaction_completed"
+        and event.get("tool_call_id") == "call-ask"
+    )
+    assert completed["timed_out"] is True
+    assert events[-1]["type"] == "response.incomplete"
+
+
+@pytest.mark.asyncio
+async def test_answered_user_input_completes_the_card_without_interrupting() -> None:
+    adapter = _make_adapter()
+    session_id = "conversation-user-input-answered"
+    built_agent: Optional[MagicMock] = None
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        nonlocal built_agent
+
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            callbacks["tool_start_callback"]("call-ask", "request_user_input", {})
+            callbacks["tool_progress_callback"](
+                "tool.progress",
+                tool="request_user_input",
+                toolCallId="call-ask",
+                status="running",
+                interaction={"kind": "choice", "question": "Which one?", "options": []},
+            )
+            callbacks["tool_complete_callback"](
+                "call-ask",
+                "request_user_input",
+                {},
+                json.dumps({"status": "answered", "response": "Brand A"}),
+            )
+            return {"final_response": "picked", "messages": []}
+
+        built_agent = _agent(run)
+        return built_agent
+
+    with patch.object(adapter, "_create_agent", side_effect=build_agent):
+        _, events = await _run_without_http_server(
+            adapter,
+            {"input": "ask the user", "session_id": session_id},
+        )
+
+    assert built_agent is not None
+    built_agent.interrupt.assert_not_called()
+    # The answered card is recorded by the answer's own delivery path — the run
+    # emits no completion of its own.
+    assert not any(
+        event["type"] == "response.omnio.interaction_completed" for event in events
+    )
+    assert events[-1]["type"] == "response.completed"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_gated_tool_closes_interaction_without_timeout() -> None:
     adapter = _make_adapter()
     session_id = "conversation-cancelled-approval"
@@ -2615,3 +2724,57 @@ def test_turn_finalize_timeout_defaults_and_env_override(
             api_server_module._turn_finalize_timeout_seconds()
             == api_server_module._OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS
         )
+
+
+@pytest.mark.asyncio
+async def test_runs_register_the_user_input_surface_so_questions_park_and_resolve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without a registered interactive surface the blocking wait returns
+    # "no_surface" instantly and every question degrades to no_response — the
+    # run worker must register the run's session key for the run's lifetime.
+    # The answer arrives keyed by conversation session and must translate to
+    # the run-scoped wait.
+    monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "5")
+    adapter = _make_adapter()
+    captured: Dict[str, Any] = {}
+
+    def run(**_kwargs: Any) -> Dict[str, Any]:
+        import tools.user_input as user_input
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key()
+        captured["surface"] = user_input._wait_registry.has_surface(session_key)
+        captured["answer"] = user_input.await_user_input(session_key, "call-q")
+        return {"final_response": "done", "messages": []}
+
+    app = _make_app(adapter)
+    app.router.add_post("/v1/omnio/user-input", adapter._handle_omnio_user_input)
+    async with TestClient(TestServer(app)) as client:
+        with patch.object(adapter, "_create_agent", return_value=_agent(run)):
+            started = await client.post(
+                "/v1/runs", json={"input": "ask me", "session_id": "conv-session-1"}
+            )
+            run_id = (await started.json())["run_id"]
+
+            import tools.user_input as user_input
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 3.0
+            while loop.time() < deadline:
+                if user_input._wait_registry.pending_count(run_id):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("the question never parked on the run surface")
+
+            answered = await client.post(
+                "/v1/omnio/user-input",
+                json={"response": "Option B", "toolCallId": "call-q"},
+                headers={"X-Hermes-Session-Id": "conv-session-1"},
+            )
+            assert (await answered.json())["resolved"] is True
+            await _wait_for_terminal(adapter, run_id)
+
+    assert captured["surface"] is True
+    assert captured["answer"] == "Option B"

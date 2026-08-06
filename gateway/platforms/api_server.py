@@ -1323,15 +1323,11 @@ class APIServerAdapter(BasePlatformAdapter):
     and routes them through hermes-agent's AIAgent.
     """
 
-    # Stateless request/response: every route (the OpenAI-spec
-    # /v1/chat/completions and /v1/responses, and the proprietary /v1/runs SSE
-    # stream) tears down its channel when the turn ends. There is no persistent
-    # outbound channel to push a background completion to a client that already
-    # received its response, and ``send()`` is a no-op stub. So async-delivery
-    # tools (terminal notify_on_complete / watch_patterns, delegate_task
-    # background=True) must NOT promise delivery on this path — see
-    # ``async_delivery_supported()``.
-    supports_async_delivery: bool = False
+    # The HTTP response channel is stateless, but the gateway can wake the raw
+    # session by self-POSTing through /v1/chat/completions. Async jobs are
+    # therefore supported even though direct push via handle_message is not.
+    supports_async_delivery: bool = True
+    supports_push_delivery: bool = False
 
     # Same statelessness applies to the startup auto-resume prompt: no client
     # is waiting to answer "session restored — what next?", so a resumed turn
@@ -6393,12 +6389,9 @@ class APIServerAdapter(BasePlatformAdapter):
         """Bind session contextvars for an API-server agent run.
 
         This is the SINGLE structural chokepoint every API-server agent-entry
-        path must use to seed session context — it hardwires
-        ``platform="api_server"`` and ``async_delivery=False`` so a new route
-        physically cannot reintroduce the silent-no-op bug (#10760) by
-        forgetting to mark the channel as non-delivering. There is no
-        ``async_delivery`` parameter to get wrong; the stateless HTTP path can
-        never wake the agent after the turn ends, on ANY route.
+        path must use to seed session context. API sessions support asynchronous
+        completion via the gateway's authenticated self-post wake path, while
+        remaining non-push adapters.
 
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive
@@ -6412,7 +6405,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
-            async_delivery=False,
+            async_delivery=True,
         )
 
     async def _run_agent(
@@ -7418,6 +7411,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ) -> None:
             projected_todos: Optional[List[Dict[str, Any]]] = None
             approval_timed_out = False
+            user_input_turn_ending = False
             normalized_tool_call_id = str(tool_call_id or "")
             normalized_tool_name = str(tool_name or "")
             try:
@@ -7432,6 +7426,51 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 if isinstance(raw_todos, list):
                     projected_todos = _redact_response_extension_value(raw_todos)
+            elif normalized_tool_name == "request_user_input":
+                status = (
+                    parsed_result.get("status")
+                    if isinstance(parsed_result, dict)
+                    else None
+                )
+                # An answered card is recorded by the answer's own delivery
+                # path; only the silent expiry has no other recorder.
+                completion_fields: Optional[Dict[str, Any]] = None
+                if status == "no_response":
+                    try:
+                        from tools.user_input import (
+                            consume_user_input_completion_reason,
+                        )
+
+                        reason = consume_user_input_completion_reason(session_id)
+                    except Exception:
+                        reason = None
+                    # Only an expired wait closes the card; a stop or disconnect
+                    # leaves it open and answerable.
+                    if reason == "expired":
+                        completion_fields = {"timed_out": True}
+                # The question is now waiting on the chat, not on this run: the
+                # card stays answerable and a late answer arrives as the next
+                # Turn's user message, so the run must end instead of letting
+                # the agent keep working without the answer.
+                user_input_turn_ending = status in {"presented", "no_response"}
+                if completion_fields is not None:
+                    fields = {
+                        "tool_call_id": normalized_tool_call_id,
+                        **completion_fields,
+                    }
+
+                    def _emit_user_input_completed(
+                        completed_fields: Dict[str, Any],
+                    ) -> None:
+                        emitter.omnio_event(
+                            "response.omnio.interaction_completed",
+                            **completed_fields,
+                        )
+
+                    try:
+                        loop.call_soon_threadsafe(_emit_user_input_completed, fields)
+                    except RuntimeError:
+                        pass
             elif normalized_tool_name not in _CUSTOM_TOOL_INPUT_KEYS:
                 try:
                     from tools.tool_approval import (
@@ -7470,17 +7509,20 @@ class APIServerAdapter(BasePlatformAdapter):
                             )
                 except Exception:
                     pass
-            if approval_timed_out:
+            if approval_timed_out or user_input_turn_ending:
+                interrupt_message = (
+                    "awaiting user approval (tool approval timed out)"
+                    if approval_timed_out
+                    else "awaiting user interaction (request_user_input)"
+                )
                 agent = self._active_run_agents.get(run_id)
                 if agent is not None:
                     try:
-                        agent.interrupt(
-                            "awaiting user approval (tool approval timed out)"
-                        )
+                        agent.interrupt(interrupt_message)
                     except Exception:
                         logger.warning(
-                            "[api_server] failed to interrupt agent for timed-out "
-                            "tool approval (run_id=%s, tool_call_id=%s)",
+                            "[api_server] failed to interrupt agent for an "
+                            "unanswered interaction (run_id=%s, tool_call_id=%s)",
                             run_id,
                             normalized_tool_call_id,
                             exc_info=True,
@@ -7627,6 +7669,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         set_current_session_key,
                         unregister_gateway_notify,
                     )
+                    from tools.user_input import (
+                        register_user_input_session,
+                        unregister_user_input_session,
+                    )
                     from tools.tool_approval import (
                         register_tool_approval_notify,
                         reset_current_tool_approval_surface_key,
@@ -7641,6 +7687,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_approval_session_token = None
                     tool_approval_surface_token = None
                     tool_approval_notify_token = None
+                    user_input_token = None
                     session_tokens = []
                     with self._profile_scope(request_profile):
                         try:
@@ -7672,6 +7719,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_id=session_id or "",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
+                            # Mark this run's session as an interactive surface so
+                            # request_user_input can PARK for an answer; without it
+                            # the blocking wait returns "no_surface" instantly and
+                            # every question degrades to no_response.
+                            user_input_token = register_user_input_session(
+                                approval_session_key
+                            )
                             tool_approval_notify_token = register_tool_approval_notify(
                                 tool_approval_surface_key,
                                 _tool_interaction_notify,
@@ -7719,6 +7773,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                             tool_approval_notify_token,
                                         )
                             finally:
+                                if user_input_token is not None:
+                                    try:
+                                        unregister_user_input_session(
+                                            approval_session_key, user_input_token
+                                        )
+                                    except Exception:
+                                        pass
                                 try:
                                     unregister_gateway_notify(approval_session_key)
                                 finally:
@@ -8368,6 +8429,18 @@ class APIServerAdapter(BasePlatformAdapter):
             from tools.user_input import resolve_user_input
 
             resolved = resolve_user_input(session_key, response, tool_call_id)
+            if not resolved:
+                # Turn-path runs park their wait under the run id (the run's
+                # session context), while callers key answers by conversation
+                # session — translate across the two namespaces here, where
+                # both are known.
+                for run_id in list(self._active_run_agents):
+                    run_session = self._run_statuses.get(run_id, {}).get("session_id")
+                    if run_session != session_key:
+                        continue
+                    if resolve_user_input(run_id, response, tool_call_id):
+                        resolved = True
+                        break
         except Exception as exc:
             logger.exception("[api_server] user input resolution failed")
             return web.json_response(_openai_error(str(exc)), status=500)
