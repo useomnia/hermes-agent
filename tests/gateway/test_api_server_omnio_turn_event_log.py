@@ -2704,3 +2704,57 @@ async def test_stop_wind_down_is_logged_and_visible_to_attached_subscriber() -> 
     assert adapter._run_statuses[run_id]["status"] == "cancelled"
     assert built_agent is not None
     built_agent.interrupt.assert_called_once_with("Stop requested via API")
+
+
+@pytest.mark.asyncio
+async def test_runs_register_the_user_input_surface_so_questions_park_and_resolve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without a registered interactive surface the blocking wait returns
+    # "no_surface" instantly and every question degrades to no_response — the
+    # run worker must register the run's session key for the run's lifetime.
+    # The answer arrives keyed by conversation session and must translate to
+    # the run-scoped wait.
+    monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "5")
+    adapter = _make_adapter()
+    captured: Dict[str, Any] = {}
+
+    def run(**_kwargs: Any) -> Dict[str, Any]:
+        import tools.user_input as user_input
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key()
+        captured["surface"] = user_input._wait_registry.has_surface(session_key)
+        captured["answer"] = user_input.await_user_input(session_key, "call-q")
+        return {"final_response": "done", "messages": []}
+
+    app = _make_app(adapter)
+    app.router.add_post("/v1/omnio/user-input", adapter._handle_omnio_user_input)
+    async with TestClient(TestServer(app)) as client:
+        with patch.object(adapter, "_create_agent", return_value=_agent(run)):
+            started = await client.post(
+                "/v1/runs", json={"input": "ask me", "session_id": "conv-session-1"}
+            )
+            run_id = (await started.json())["run_id"]
+
+            import tools.user_input as user_input
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 3.0
+            while loop.time() < deadline:
+                if user_input._wait_registry.pending_count(run_id):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("the question never parked on the run surface")
+
+            answered = await client.post(
+                "/v1/omnio/user-input",
+                json={"response": "Option B", "toolCallId": "call-q"},
+                headers={"X-Hermes-Session-Id": "conv-session-1"},
+            )
+            assert (await answered.json())["resolved"] is True
+            await _wait_for_terminal(adapter, run_id)
+
+    assert captured["surface"] is True
+    assert captured["answer"] == "Option B"

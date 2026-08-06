@@ -7662,6 +7662,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         set_current_session_key,
                         unregister_gateway_notify,
                     )
+                    from tools.user_input import (
+                        register_user_input_session,
+                        unregister_user_input_session,
+                    )
                     from tools.tool_approval import (
                         register_tool_approval_notify,
                         reset_current_tool_approval_surface_key,
@@ -7676,6 +7680,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_approval_session_token = None
                     tool_approval_surface_token = None
                     tool_approval_notify_token = None
+                    user_input_token = None
                     session_tokens = []
                     with self._profile_scope(request_profile):
                         try:
@@ -7707,6 +7712,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_id=session_id or "",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
+                            # Mark this run's session as an interactive surface so
+                            # request_user_input can PARK for an answer; without it
+                            # the blocking wait returns "no_surface" instantly and
+                            # every question degrades to no_response.
+                            user_input_token = register_user_input_session(
+                                approval_session_key
+                            )
                             tool_approval_notify_token = register_tool_approval_notify(
                                 tool_approval_surface_key,
                                 _tool_interaction_notify,
@@ -7754,6 +7766,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                             tool_approval_notify_token,
                                         )
                             finally:
+                                if user_input_token is not None:
+                                    try:
+                                        unregister_user_input_session(
+                                            approval_session_key, user_input_token
+                                        )
+                                    except Exception:
+                                        pass
                                 try:
                                     unregister_gateway_notify(approval_session_key)
                                 finally:
