@@ -2182,6 +2182,17 @@ def _format_fetch_size(size: int) -> str:
     return f"{size}B"
 
 
+def _fetch_file_error_detail(exc) -> dict:
+    """The structured `detail` object from a fetch hook error body, or {} for
+    older proxies that answer with a plain string (or anything unparseable)."""
+    try:
+        body = json.loads(exc.read().decode("utf-8"))
+    except Exception:
+        return {}
+    detail = body.get("detail") if isinstance(body, dict) else None
+    return detail if isinstance(detail, dict) else {}
+
+
 def _handle_fetch_file(args, **kw):
     import urllib.error
     import urllib.request
@@ -2223,11 +2234,34 @@ def _handle_fetch_file(args, **kw):
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
+            detail = _fetch_file_error_detail(exc)
             if version is not None:
+                latest_version = detail.get("latest_version")
+                if isinstance(latest_version, int):
+                    return tool_error(
+                        f"No stored version {version} of {path}. This path's versions go up "
+                        f"to {latest_version}; retry with a version in that range (or omit "
+                        "version for the newest)."
+                    )
                 return tool_error(
                     f"No stored version {version} of {path} was found. Versions start at 1 "
                     "and grow by one for each re-delivery whose content changed."
                 )
+            suggestions = detail.get("suggestions")
+            if isinstance(suggestions, list) and suggestions:
+                lines = []
+                for item in suggestions[:5]:
+                    if isinstance(item, dict) and isinstance(item.get("path"), str):
+                        line = f"  {item['path']}"
+                        if isinstance(item.get("version"), int) and item["version"] > 1:
+                            line += f" (versions up to {item['version']})"
+                        lines.append(line)
+                if lines:
+                    return tool_error(
+                        f"No stored copy of {path} was found, but these stored paths look "
+                        "similar:\n" + "\n".join(lines) + "\nRetry fetch_file with one of "
+                        "these exact paths if it is the file you meant."
+                    )
             return tool_error(
                 f"No stored copy of {path} was found. Only files that were delivered to "
                 "the user or uploaded by them are recoverable; scratch files are not."
