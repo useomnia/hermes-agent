@@ -781,9 +781,11 @@ class TestSpawnEnvSanitization:
             def __init__(self):
                 self.commands = []
                 self._responses = iter([
+                    {"output": ""},
                     {"output": "hello\n"},
                     {"output": "1\n"},
                     {"output": "0\n"},
+                    {"output": "hello\n"},
                 ])
 
             def execute(self, command, **kwargs):
@@ -802,9 +804,63 @@ class TestSpawnEnvSanitization:
                 "/path with spaces/hermes_bg.exit",
             )
 
-        assert env.commands[0][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
-        assert env.commands[1][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
-        assert env.commands[2][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
+        assert env.commands[0][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
+        assert env.commands[1][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
+        assert env.commands[2][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
+        assert env.commands[3][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
+        assert env.commands[4][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
+
+    def test_env_poller_prefers_durable_exit_marker(self, registry):
+        session = _make_session(sid="proc_exit_marker")
+        session.exited = False
+
+        class FakeEnv:
+            def execute(self, command, **kwargs):
+                if "hermes_bg.exit" in command:
+                    return {"output": "7\n"}
+                if "job.log" in command:
+                    return {"output": "finished output\n"}
+                raise AssertionError(f"unexpected command: {command}")
+
+        with patch("tools.process_registry.time.sleep", return_value=None), \
+            patch.object(registry, "_move_to_finished") as move:
+            registry._env_poller_loop(
+                session, FakeEnv(), "/tmp/job.log", "/tmp/job.pid", "/tmp/hermes_bg.exit"
+            )
+
+        assert session.exited is True
+        assert session.exit_code == 7
+        assert session.completion_reason == "exited"
+        assert session.output_buffer == "finished output\n"
+        move.assert_called_once_with(session)
+
+    def test_env_poller_retries_transient_backend_failure(self, registry):
+        session = _make_session(sid="proc_transient")
+        session.exited = False
+        calls = {"count": 0}
+
+        class FakeEnv:
+            def execute(self, command, **kwargs):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise ConnectionError("temporary toolbox disconnect")
+                if "hermes_bg.exit" in command:
+                    return {"output": "0\n"}
+                if "job.log" in command:
+                    return {"output": "done after reconnect\n"}
+                raise AssertionError(f"unexpected command: {command}")
+
+        with patch("tools.process_registry.time.sleep", return_value=None), \
+            patch.object(registry, "_move_to_finished") as move:
+            registry._env_poller_loop(
+                session, FakeEnv(), "/tmp/job.log", "/tmp/job.pid", "/tmp/hermes_bg.exit"
+            )
+
+        assert calls["count"] == 3
+        assert session.exit_code == 0
+        assert session.completion_reason == "exited"
+        assert session.output_buffer == "done after reconnect\n"
+        move.assert_called_once_with(session)
 
 
 # =========================================================================
@@ -1151,6 +1207,16 @@ class TestCheckpoint:
             recovered = registry.recover_from_checkpoint()
             assert recovered == 1
             assert len(registry.pending_watchers) == 0
+
+    def test_pending_watcher_drain_transfers_exact_batch(self, registry):
+        first = {"session_id": "proc_first"}
+        second = {"session_id": "proc_second"}
+        registry.enqueue_pending_watcher(first)
+        registry.enqueue_pending_watcher(second)
+
+        assert registry.drain_pending_watchers() == [first, second]
+        assert registry.drain_pending_watchers() == []
+        assert registry.pending_watchers == []
 
     def test_recovery_keeps_live_checkpoint_entries(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"

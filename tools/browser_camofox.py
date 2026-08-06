@@ -98,7 +98,7 @@ def _config_cdp_url() -> str:
 
     Read here (instead of importing ``browser_tool._get_cdp_override`` to avoid
     a circular import) so Camofox can yield to a config-based CDP override the
-    same way it already yields to the ``BROWSER_CDP_URL`` env override.
+    same way it already yields to CDP environment overrides.
     """
     try:
         from hermes_cli.config import read_raw_config
@@ -117,12 +117,15 @@ def is_camofox_mode() -> bool:
     A CDP override takes priority over Camofox so the browser tools operate on
     the real CDP browser (and a CDP backend is treated as non-local for SSRF
     checks) instead of being silently routed to Camofox. The override may come
-    from the ``BROWSER_CDP_URL`` env var (set by ``/browser connect``) OR a
-    persistent ``browser.cdp_url`` in config.yaml — both are honored, matching
+    from ``BROWSER_CDP_URL_TEMPLATE`` (conversation-scoped gateways), the
+    ``BROWSER_CDP_URL`` env var (set by ``/browser connect``), OR a persistent
+    ``browser.cdp_url`` in config.yaml — all are honored, matching
     ``browser_tool._get_cdp_override()``'s precedence. (Previously only the env
     var suppressed Camofox, so ``CAMOFOX_URL`` + a config CDP override still
     routed navigation through Camofox.)
     """
+    if os.getenv("BROWSER_CDP_URL_TEMPLATE", "").strip():
+        return False
     if os.getenv("BROWSER_CDP_URL", "").strip():
         return False
     if _config_cdp_url():
@@ -947,4 +950,3 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
         "note": "Console log capture is not available with the Camofox backend. "
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
-

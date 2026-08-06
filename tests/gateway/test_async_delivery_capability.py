@@ -1,15 +1,13 @@
 """Tests for the async-delivery capability gate (issue #10760).
 
-Stateless request/response adapters (the API server / WebUI path) cannot route
-a background completion back to the agent after a turn ends — there is no
-persistent channel and ``APIServerAdapter.send()`` is a no-op stub. So tools
-that promise async delivery (``terminal`` notify_on_complete / watch_patterns,
-``delegate_task`` background=True) must refuse the promise on that path instead
-of silently registering a watcher that never fires.
+The API server has no persistent push channel, but it can route a background
+completion back to the raw session through its authenticated self-post wake
+path. Async capability and push capability are therefore separate contracts.
 
 This is wired through:
   - ``BasePlatformAdapter.supports_async_delivery`` (default True)
-  - ``APIServerAdapter.supports_async_delivery = False``
+  - ``APIServerAdapter.supports_async_delivery = True``
+  - ``APIServerAdapter.supports_push_delivery = False``
   - ``gateway.session_context._SESSION_ASYNC_DELIVERY`` contextvar +
     ``async_delivery_supported()`` helper, bound per-session.
 
@@ -208,15 +206,16 @@ class TestAdapterCapabilityFlag:
 
         assert BasePlatformAdapter.supports_async_delivery is True
 
-    def test_api_server_false(self):
+    def test_api_server_supports_async_self_post_but_not_push(self):
         from gateway.platforms.api_server import APIServerAdapter
 
-        assert APIServerAdapter.supports_async_delivery is False
+        assert APIServerAdapter.supports_async_delivery is True
+        assert APIServerAdapter.supports_push_delivery is False
 
-    def test_api_server_bind_chokepoint_hardwires_no_delivery(self):
+    def test_api_server_bind_chokepoint_enables_self_post_delivery(self):
         """Every API-server agent-entry path binds through
-        _bind_api_server_session, which hardwires async_delivery=False — a new
-        route physically cannot reintroduce the silent no-op (#10760)."""
+        _bind_api_server_session, which hardwires async_delivery=True so a new
+        route cannot accidentally disable the self-post wake contract."""
         from gateway.platforms.api_server import APIServerAdapter
         from gateway.session_context import clear_session_vars, get_session_env
 
@@ -224,21 +223,19 @@ class TestAdapterCapabilityFlag:
             chat_id="c1", session_key="sk1", session_id="sid1"
         )
         try:
-            assert async_delivery_supported() is False
+            assert async_delivery_supported() is True
             assert get_session_env("HERMES_SESSION_PLATFORM") == "api_server"
         finally:
             clear_session_vars(tokens)
 
     def test_api_server_binding_does_not_outlive_turn(self):
-        """The no-delivery decision is request-scoped, NOT stuck to the session.
-        After clear, a session resumed on a delivering interface re-binds fresh
-        and is NOT blocked."""
+        """The delivery decision remains request-scoped and clears cleanly."""
         from gateway.platforms.api_server import APIServerAdapter
         from gateway.session_context import clear_session_vars
 
-        # Turn 1: same session over the API server -> blocked.
+        # Turn 1: same session over the API server -> self-post capable.
         tokens = APIServerAdapter._bind_api_server_session(session_key="shared-key")
-        assert async_delivery_supported() is False
+        assert async_delivery_supported() is True
         clear_session_vars(tokens)
 
         # Turn 2: SAME session_key resumed on a delivering interface (CLI/gateway)
@@ -310,6 +307,26 @@ class TestTerminalNotifyGate:
         assert not d.get("notify_unsupported")
         assert len(process_registry.pending_watchers) == 1
         assert process_registry.pending_watchers[0]["platform"] == "telegram"
+
+    def test_api_server_registers_self_post_watcher(self):
+        from tools.process_registry import process_registry
+
+        tokens = set_session_vars(
+            platform="api_server",
+            chat_id="raw-session",
+            session_key="raw-session",
+            session_id="raw-session",
+            async_delivery=True,
+        )
+        try:
+            d = self._run_bg("sleep 30 && echo DONE")
+        finally:
+            clear_session_vars(tokens)
+
+        assert d.get("notify_on_complete") is True
+        assert not d.get("notify_unsupported")
+        assert len(process_registry.pending_watchers) == 1
+        assert process_registry.pending_watchers[0]["platform"] == "api_server"
 
     def test_cli_stays_supported(self):
         """CLI delivers via the in-process completion_queue: notify stays on,

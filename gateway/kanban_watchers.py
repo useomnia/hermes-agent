@@ -493,8 +493,8 @@ class GatewayKanbanWatchersMixin:
                         )
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
-                        # Adapters with no push channel (the API server —
-                        # ``supports_async_delivery = False``) can NEVER
+                        # Adapters with no push channel (the API server sets
+                        # ``supports_push_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
                         # SendResult(success=False) by design (see
                         # ApiServerAdapter.send()). Treating that as a

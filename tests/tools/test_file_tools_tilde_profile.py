@@ -109,9 +109,21 @@ class TestResolvePathUsesProfileHome:
         assert str(profile_home) in str(resolved)
         assert str(process_home) not in str(resolved)
 
+    def test_container_tilde_is_preserved_for_remote_home_expansion(self, monkeypatch):
+        monkeypatch.setattr(ft, "_uses_container_paths", lambda _task: True)
+
+        with patch(
+            "hermes_constants.get_subprocess_home",
+            return_value="/Users/host-user",
+        ):
+            resolved = ft._resolve_path_for_task("~/brand/brief.md", task_id="sprite")
+
+        assert resolved == ft.PurePosixPath("~/brand/brief.md")
+        assert "/Users/host-user" not in str(resolved)
+
 
 # ---------------------------------------------------------------------------
-# Container-pathed tasks: ~ is the CONTAINER's home, never the process home
+# Container-derived roots: config paths expand against the CONTAINER's home
 # ---------------------------------------------------------------------------
 
 class TestContainerTildeExpansion:
@@ -146,8 +158,3 @@ class TestContainerTildeExpansion:
             result = ft._expand_tilde_for_container("~/file.md", "default")
         assert result == "/root/file.md"
 
-    def test_resolve_path_routes_sprites_tilde_to_container_home(self):
-        with patch.object(ft, "_terminal_env_type_for_task", return_value="sprites"), \
-                patch("hermes_constants.get_subprocess_home", return_value="/home/sprite"):
-            resolved = ft._resolve_path_for_task("~/brand/knowledge/report.md", "default")
-        assert str(resolved) == "/home/brand/knowledge/report.md"

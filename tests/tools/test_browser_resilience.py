@@ -215,7 +215,34 @@ def test_snapshot_renderer_failure_recovers_without_retrying_blank_page(
         ["-c"],
         timeout=90,
     )
-    mock_recover.assert_called_once_with()
+    mock_recover.assert_called_once_with("brand-a")
+
+
+def test_vision_renderer_failure_uses_same_scoped_recovery_contract(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(browser_tool, "_last_session_key", lambda _task: "conversation-a")
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
+    monkeypatch.setattr(browser_tool, "_get_browser_engine", lambda: "auto")
+    monkeypatch.setattr(browser_tool, "_session_is_cdp_backed", lambda _task: True)
+    monkeypatch.setattr("hermes_constants.get_hermes_dir", lambda *_args: tmp_path)
+
+    with (
+        patch("tools.browser_tool._run_browser_command", return_value=_cdp_failure()),
+        patch(
+            "tools.browser_tool._recover_omnio_browser",
+            return_value=True,
+        ) as mock_recover,
+    ):
+        result = json.loads(
+            browser_tool.browser_vision("what is visible?", task_id="conversation-a")
+        )
+
+    assert result["code"] == "browser_session_reset"
+    assert result["next_action"] == "browser_navigate"
+    mock_recover.assert_called_once_with("conversation-a")
 
 
 def test_snapshot_bare_timeout_does_not_recover(monkeypatch) -> None:
@@ -358,7 +385,7 @@ def test_navigate_retryable_failure_recovers_and_retries_once(
         ),
         call("nav-recover", "snapshot", ["-c"], timeout=90),
     ]
-    mock_recover.assert_called_once_with()
+    mock_recover.assert_called_once_with("nav-recover")
     browser_tool._last_active_session_key.pop("nav-recover", None)
 
 
@@ -393,7 +420,7 @@ def test_snapshot_preserves_failure_when_recover_is_unsupported(
         ["-c"],
         timeout=90,
     )
-    mock_recover.assert_called_once_with()
+    mock_recover.assert_called_once_with("brand-a")
 
 
 def test_toolbox_v5_does_not_receive_recover_operation(monkeypatch) -> None:
@@ -413,7 +440,7 @@ def test_toolbox_v5_does_not_receive_recover_operation(monkeypatch) -> None:
         ) as mock_get,
         patch("tools.browser_tool.requests.post") as mock_post,
     ):
-        recovered = browser_tool._recover_omnio_browser()
+        recovered = browser_tool._recover_omnio_browser("conversation-a")
 
     assert recovered is False
     mock_get.assert_called_once_with(
@@ -422,6 +449,7 @@ def test_toolbox_v5_does_not_receive_recover_operation(monkeypatch) -> None:
             "Authorization": "Bearer pair-bearer",
             "Content-Type": "application/json",
             "X-Omnio-Brand": "brand-a",
+            "X-Hermes-Session-Id": "conversation-a",
         },
         timeout=3,
     )
@@ -453,7 +481,7 @@ def test_toolbox_recover_404_degrades_gracefully(monkeypatch) -> None:
             return_value=unsupported_response,
         ) as mock_post,
     ):
-        recovered = browser_tool._recover_omnio_browser()
+        recovered = browser_tool._recover_omnio_browser("conversation-a")
 
     assert recovered is False
     mock_post.assert_called_once_with(
@@ -462,6 +490,7 @@ def test_toolbox_recover_404_degrades_gracefully(monkeypatch) -> None:
             "Authorization": "Bearer pair-bearer",
             "Content-Type": "application/json",
             "X-Omnio-Brand": "brand-a",
+            "X-Hermes-Session-Id": "conversation-a",
         },
         json={"operation": "recover"},
         timeout=20,

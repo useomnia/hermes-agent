@@ -4,9 +4,9 @@ Raw Chrome DevTools Protocol (CDP) passthrough tool.
 
 Exposes a single tool, ``browser_cdp``, that sends arbitrary CDP commands to
 the browser's DevTools WebSocket endpoint.  Works when a CDP URL is
-configured — either via ``/browser connect`` (sets ``BROWSER_CDP_URL``) or
-``browser.cdp_url`` in ``config.yaml`` — or when a CDP-backed cloud provider
-session is active.
+configured — via a conversation-scoped ``BROWSER_CDP_URL_TEMPLATE``,
+``/browser connect`` (sets ``BROWSER_CDP_URL``), or ``browser.cdp_url`` in
+``config.yaml`` — or when a CDP-backed cloud provider session is active.
 
 This is the escape hatch for browser operations not covered by the main
 browser tool surface (``browser_navigate``, ``browser_click``,
@@ -96,19 +96,20 @@ def _run_async(coro):
 # ---------------------------------------------------------------------------
 
 
-def _resolve_cdp_endpoint() -> str:
+def _resolve_cdp_endpoint(task_id: Optional[str] = None) -> str:
     """Return the normalized CDP WebSocket URL, or empty string if unavailable.
 
     Delegates to ``tools.browser_tool._get_cdp_override`` so precedence stays
     consistent with the rest of the browser tool surface:
 
-    1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
-    2. ``browser.cdp_url`` in ``config.yaml``
+    1. ``BROWSER_CDP_URL_TEMPLATE`` (conversation-scoped gateway)
+    2. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
+    3. ``browser.cdp_url`` in ``config.yaml``
     """
     try:
         from tools.browser_tool import _get_cdp_override  # type: ignore[import-not-found]
 
-        return (_get_cdp_override() or "").strip()
+        return (_get_cdp_override(task_id) or "").strip()
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("browser_cdp: failed to resolve CDP endpoint: %s", exc)
         return ""
@@ -192,14 +193,15 @@ async def _cdp_call(
     target_id: Optional[str],
     timeout: float,
 ) -> Dict[str, Any]:
-    """Make a single CDP call, optionally attaching to a target first.
+    """Make a single CDP call, attaching page-scoped methods to a page target.
 
     When ``target_id`` is provided, we call ``Target.attachToTarget`` with
     ``flatten=True`` to multiplex a page-level session over the same
     browser-level WebSocket, then send ``method`` with that ``sessionId``.
-    When ``target_id`` is None, ``method`` is sent at browser level — which
-    works for ``Target.*``, ``Browser.*``, ``Storage.*`` and a few other
-    globally-scoped domains.
+    When ``target_id`` is omitted for a page-scoped domain, the sole page
+    target is selected automatically. Multiple pages require an explicit
+    target so commands cannot land in the wrong conversation tab.
+    Browser-scoped methods are sent at the browser level.
     """
     assert websockets is not None  # guarded by _WS_AVAILABLE at call-site
 
@@ -213,7 +215,53 @@ async def _cdp_call(
         next_id = 1
         session_id: Optional[str] = None
 
-        # --- Step 1: attach to target if requested ---
+        page_scoped_prefixes = (
+            "Page.",
+            "Runtime.",
+            "DOM.",
+            "Emulation.",
+            "Network.",
+            "CSS.",
+            "Input.",
+            "Overlay.",
+            "Performance.",
+        )
+        if target_id is None and method.startswith(page_scoped_prefixes):
+            discover_id = next_id
+            next_id += 1
+            await ws.send(json.dumps({
+                "id": discover_id,
+                "method": "Target.getTargets",
+                "params": {},
+            }))
+            deadline = asyncio.get_running_loop().time() + timeout
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError("Timed out discovering a page target")
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                msg = json.loads(raw)
+                if msg.get("id") != discover_id:
+                    continue
+                if "error" in msg:
+                    raise RuntimeError(f"Target.getTargets failed: {msg['error']}")
+                targets = msg.get("result", {}).get("targetInfos", [])
+                page_target_ids = [
+                    str(item.get("targetId"))
+                    for item in targets
+                    if item.get("type") == "page" and item.get("targetId")
+                ]
+                if not page_target_ids:
+                    raise RuntimeError("No page target is available for this CDP method")
+                if len(page_target_ids) > 1:
+                    raise RuntimeError(
+                        "Multiple page targets are open; call Target.getTargets "
+                        "and provide target_id explicitly"
+                    )
+                target_id = page_target_ids[0]
+                break
+
+        # --- Step 1: attach to target if requested or auto-selected ---
         if target_id:
             attach_id = next_id
             next_id += 1
@@ -404,10 +452,9 @@ def browser_cdp(
     Args:
         method: CDP method name, e.g. ``"Target.getTargets"``.
         params: Method-specific parameters; defaults to ``{}``.
-        target_id: Optional target/tab ID for page-level methods.  When set,
-            we first attach to the target (``flatten=True``) and send
-            ``method`` with the resulting ``sessionId``.  Uses a fresh
-            stateless CDP connection.
+        target_id: Optional target/tab ID for page-level methods. When omitted,
+            Hermes selects the page automatically only when exactly one exists.
+            Uses a fresh stateless CDP connection.
         frame_id: Optional cross-origin (OOPIF) iframe ``frame_id`` from
             ``browser_snapshot.frame_tree.children[]``.  When set (and the
             frame is an OOPIF with a live session tracked by the CDP
@@ -457,7 +504,7 @@ def browser_cdp(
             "Install it with: pip install websockets"
         )
 
-    endpoint = _resolve_cdp_endpoint()
+    endpoint = _resolve_cdp_endpoint(effective_task_id)
     if not endpoint:
         return tool_error(
             "No CDP endpoint is available. Run '/browser connect' to attach "
@@ -565,7 +612,8 @@ BROWSER_CDP_SCHEMA: Dict[str, Any] = {
         "'mobile': false}, target_id=<tabId>\n\n"
         "**Usage rules:**\n"
         "- Browser-level methods (Target.*, Browser.*, Storage.*): omit "
-        "target_id and frame_id.\n"
+        "target_id and frame_id. If omitted for a page-scoped method, Hermes "
+        "selects it automatically only when exactly one page exists.\n"
         "- Page-level methods (Page.*, Runtime.*, DOM.*, Emulation.*, "
         "Network.* scoped to a tab): pass target_id from Target.getTargets.\n"
         "- **Cross-origin iframe scope** (Runtime.evaluate inside an OOPIF, "
@@ -638,8 +686,9 @@ def _browser_cdp_check() -> bool:
     """Availability check for browser_cdp.
 
     The tool is only offered when a static CDP URL is configured — via
-    ``/browser connect`` (``BROWSER_CDP_URL``) or ``browser.cdp_url`` in
-    ``config.yaml``. Configuration, not liveness: the endpoint's health at
+    ``BROWSER_CDP_URL_TEMPLATE``, ``/browser connect`` (``BROWSER_CDP_URL``),
+    or ``browser.cdp_url`` in ``config.yaml``. Configuration, not liveness:
+    the endpoint's health at
     registration says nothing about its health when the model calls the tool,
     and probing it here stalls registration whenever the browser host has not
     come up yet.

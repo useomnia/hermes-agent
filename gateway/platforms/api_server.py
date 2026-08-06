@@ -1309,15 +1309,11 @@ class APIServerAdapter(BasePlatformAdapter):
     and routes them through hermes-agent's AIAgent.
     """
 
-    # Stateless request/response: every route (the OpenAI-spec
-    # /v1/chat/completions and /v1/responses, and the proprietary /v1/runs SSE
-    # stream) tears down its channel when the turn ends. There is no persistent
-    # outbound channel to push a background completion to a client that already
-    # received its response, and ``send()`` is a no-op stub. So async-delivery
-    # tools (terminal notify_on_complete / watch_patterns, delegate_task
-    # background=True) must NOT promise delivery on this path — see
-    # ``async_delivery_supported()``.
-    supports_async_delivery: bool = False
+    # The HTTP response channel is stateless, but the gateway can wake the raw
+    # session by self-POSTing through /v1/chat/completions. Async jobs are
+    # therefore supported even though direct push via handle_message is not.
+    supports_async_delivery: bool = True
+    supports_push_delivery: bool = False
 
     # Same statelessness applies to the startup auto-resume prompt: no client
     # is waiting to answer "session restored — what next?", so a resumed turn
@@ -6379,12 +6375,9 @@ class APIServerAdapter(BasePlatformAdapter):
         """Bind session contextvars for an API-server agent run.
 
         This is the SINGLE structural chokepoint every API-server agent-entry
-        path must use to seed session context — it hardwires
-        ``platform="api_server"`` and ``async_delivery=False`` so a new route
-        physically cannot reintroduce the silent-no-op bug (#10760) by
-        forgetting to mark the channel as non-delivering. There is no
-        ``async_delivery`` parameter to get wrong; the stateless HTTP path can
-        never wake the agent after the turn ends, on ANY route.
+        path must use to seed session context. API sessions support asynchronous
+        completion via the gateway's authenticated self-post wake path, while
+        remaining non-push adapters.
 
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive
@@ -6398,7 +6391,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
-            async_delivery=False,
+            async_delivery=True,
         )
 
     async def _run_agent(
