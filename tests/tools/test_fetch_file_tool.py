@@ -26,8 +26,9 @@ def _ok_response(body: dict) -> io.BytesIO:
     return raw
 
 
-def _http_error(code: int) -> urllib.error.HTTPError:
-    return urllib.error.HTTPError(_HOOK_URL, code, "err", hdrs=None, fp=io.BytesIO(b"{}"))
+def _http_error(code: int, detail: dict | None = None) -> urllib.error.HTTPError:
+    body = json.dumps({"detail": detail} if detail is not None else {}).encode("utf-8")
+    return urllib.error.HTTPError(_HOOK_URL, code, "err", hdrs=None, fp=io.BytesIO(body))
 
 
 @pytest.fixture
@@ -142,6 +143,41 @@ def test_invalid_version_is_a_tool_error(hook_env):
     for bad in (0, -1, "two", 1.5):
         result = file_tools._handle_fetch_file({"path": "/brand/report.pdf", "version": bad})
         assert "'version' must be a positive integer" in result
+
+
+def test_404_with_suggestions_lists_similar_stored_paths(
+    hook_env, monkeypatch: pytest.MonkeyPatch
+):
+    error = _http_error(
+        404,
+        {
+            "message": "No stored version of this path",
+            "suggestions": [
+                {"path": "/brand/reports/q2-performance.pdf", "version": 2},
+                {"path": "/brand/reports/q2-summary.pdf", "version": 1},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda request, timeout: (_ for _ in ()).throw(error)
+    )
+    result = file_tools._handle_fetch_file({"path": "/brand/reports/q2.pdf"})
+
+    assert "these stored paths look similar" in result
+    assert "/brand/reports/q2-performance.pdf (versions up to 2)" in result
+    assert "/brand/reports/q2-summary.pdf" in result
+
+
+def test_versioned_404_reports_the_latest_existing_version(
+    hook_env, monkeypatch: pytest.MonkeyPatch
+):
+    error = _http_error(404, {"message": "No stored copy of this version", "latest_version": 3})
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda request, timeout: (_ for _ in ()).throw(error)
+    )
+    result = file_tools._handle_fetch_file({"path": "/brand/report.pdf", "version": 9})
+
+    assert "versions go up to 3" in result
 
 
 def test_versioned_404_explains_versioning(hook_env, monkeypatch: pytest.MonkeyPatch):
