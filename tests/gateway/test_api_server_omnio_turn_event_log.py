@@ -977,7 +977,7 @@ async def test_finalize_hook_failure_still_emits_terminal_promptly(
 
     hook_app = web.Application()
     hook_app.router.add_post("/internal/turn-finalize", finalize)
-    monkeypatch.setattr(api_server_module, "_OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setenv(api_server_module._OMNIO_TURN_FINALIZE_TIMEOUT_ENV, "0.02")
     adapter = _make_adapter()
 
     async with TestServer(hook_app) as server:
@@ -2789,6 +2789,26 @@ async def test_stop_wind_down_is_logged_and_visible_to_attached_subscriber() -> 
     assert adapter._run_statuses[run_id]["status"] == "cancelled"
     assert built_agent is not None
     built_agent.interrupt.assert_called_once_with("Stop requested via API")
+
+
+def test_turn_finalize_timeout_defaults_and_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(api_server_module._OMNIO_TURN_FINALIZE_TIMEOUT_ENV, raising=False)
+    assert (
+        api_server_module._turn_finalize_timeout_seconds()
+        == api_server_module._OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS
+    )
+
+    monkeypatch.setenv(api_server_module._OMNIO_TURN_FINALIZE_TIMEOUT_ENV, "12.5")
+    assert api_server_module._turn_finalize_timeout_seconds() == 12.5
+
+    for invalid in ("", "not-a-number", "0", "-3"):
+        monkeypatch.setenv(api_server_module._OMNIO_TURN_FINALIZE_TIMEOUT_ENV, invalid)
+        assert (
+            api_server_module._turn_finalize_timeout_seconds()
+            == api_server_module._OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS
+        )
 
 
 @pytest.mark.asyncio
