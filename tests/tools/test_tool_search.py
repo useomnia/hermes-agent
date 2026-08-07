@@ -129,6 +129,66 @@ class TestClassification:
 
 
 # ---------------------------------------------------------------------------
+# Omnio product tools — always loaded, never behind the bridge
+# ---------------------------------------------------------------------------
+
+
+class TestOmnioAlwaysLoad:
+    """Omnio's own plugin tools are named in the agent's operating docs and
+    skills; a deferred one makes the model substitute a weaker built-in."""
+
+    OMNIO_TOOLS = [
+        "web_read", "web_map", "request_user_input",
+        "render_component", "store-credential", "emit_client_event",
+    ]
+
+    @staticmethod
+    def _register(name, toolset):
+        from tools.registry import registry
+
+        def _handler(args, task_id=None, **kw):
+            return json.dumps({"ok": True, "tool": name})
+
+        registry.register(
+            name=name,
+            handler=_handler,
+            schema=_td(name, f"desc for {name}")["function"],
+            toolset=toolset,
+        )
+
+    def test_omnio_tools_never_defer(self):
+        from tools.tool_search import is_deferrable_tool_name
+        for name in self.OMNIO_TOOLS:
+            # Registered as ordinary plugin tools — without the always-load
+            # set they would classify as deferrable.
+            self._register(name, "omnio")
+            assert not is_deferrable_tool_name(name), (
+                f"Omnio product tool '{name}' must NEVER be deferrable"
+            )
+
+    def test_omnio_tools_stay_visible_in_classify(self):
+        from tools.tool_search import classify_tools
+        for name in self.OMNIO_TOOLS:
+            self._register(name, "omnio")
+        defs = [_td(n, f"desc for {n}") for n in self.OMNIO_TOOLS]
+        visible, deferrable = classify_tools(defs)
+        assert {(td["function"]["name"]) for td in visible} == set(self.OMNIO_TOOLS)
+        assert deferrable == []
+
+    def test_other_plugin_and_mcp_tools_still_defer(self):
+        """The always-load set is a named allowlist, not a blanket opt-out."""
+        from tools.tool_search import classify_tools, is_deferrable_tool_name
+        self._register("omnio_unlisted_helper", "omnio")
+        self._register("mcp_omnio_ctl_list", "mcp-omnio-ctl")
+        for name in ("omnio_unlisted_helper", "mcp_omnio_ctl_list"):
+            assert is_deferrable_tool_name(name)
+        defs = [_td("omnio_unlisted_helper"), _td("mcp_omnio_ctl_list")]
+        visible, deferrable = classify_tools(defs)
+        assert visible == []
+        assert len(deferrable) == 2
+
+
+# ---------------------------------------------------------------------------
 # Token estimation + threshold gate
 # ---------------------------------------------------------------------------
 

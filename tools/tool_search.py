@@ -185,6 +185,27 @@ def load_config() -> ToolSearchConfig:
 # Tool classification
 # ---------------------------------------------------------------------------
 
+# Omnio's own plugin tools. These are the product's surface, not third-party
+# capability: the agent's operating docs and skills reference them BY NAME, so
+# a deferred one reads to the model as "not available" and it silently
+# substitutes a weaker built-in (observed live: web_read deferred, web_extract
+# used instead). The catalog is six tools, so deferral saves nothing measurable
+# while costing a blind tool_call round-trip on every use.
+#
+# Kept as a separate constant rather than appended to _HERMES_CORE_TOOLS
+# because that list is also the ``tools:`` payload for the hermes-cli,
+# hermes-cron and hermes-telegram toolsets — adding Omnio names there would
+# make those toolsets advertise tools that don't exist outside our sprites.
+# Leaving the upstream literal untouched also keeps upstream syncs conflict-free.
+_OMNIO_ALWAYS_LOAD_TOOLS = frozenset({
+    "web_read",
+    "web_map",
+    "request_user_input",
+    "render_component",
+    "store-credential",
+    "emit_client_event",
+})
+
 
 def _core_tool_names() -> frozenset[str]:
     """Return the set of tool names that must NEVER be deferred.
@@ -194,9 +215,9 @@ def _core_tool_names() -> frozenset[str]:
     """
     try:
         from toolsets import _HERMES_CORE_TOOLS
-        return frozenset(_HERMES_CORE_TOOLS)
+        return frozenset(_HERMES_CORE_TOOLS) | _OMNIO_ALWAYS_LOAD_TOOLS
     except Exception:
-        return frozenset()
+        return _OMNIO_ALWAYS_LOAD_TOOLS
 
 
 def is_deferrable_tool_name(name: str) -> bool:
