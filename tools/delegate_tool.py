@@ -2583,6 +2583,16 @@ def _run_single_child(
         if _heartbeat_thread.ident is not None:
             _heartbeat_thread.join(timeout=5)
 
+        # Mark the child terminal for the batch progress sampler, whatever the
+        # outcome (completed, error, interrupted). This is the only per-child
+        # completion signal a detached batch has: the parent's progress
+        # callback is dead by then, and the async registry's completion event
+        # fires once, for the batch as a whole.
+        try:
+            child._subagent_finished = True
+        except Exception:
+            pass
+
         # Drop the TUI-facing registry entry.  Safe to call even if the
         # child was never registered (e.g. ID missing on test doubles).
         if _subagent_id:
@@ -3360,6 +3370,10 @@ def delegate_task(
             # (_run_single_child sets it as child._subagent_id) — carried
             # here so the Omnio progress hook can attribute a running
             # update to the exact child the proxy already has a row for.
+            # The trailing `finished` flag (set by _run_single_child's finally)
+            # is what lets that hook announce ONE child finishing while its
+            # siblings keep running — the batch's own completion event only
+            # fires once every child is done.
             parts = []
             in_tool = False
             for _c in _child_agents:
@@ -3372,6 +3386,7 @@ def delegate_task(
                             _tool,
                             _summary.get("last_activity_ts"),
                             getattr(_c, "_subagent_id", None),
+                            getattr(_c, "_subagent_finished", False) is True,
                         )
                     )
                     in_tool = in_tool or bool(_tool)

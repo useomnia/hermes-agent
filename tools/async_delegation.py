@@ -795,6 +795,15 @@ def dispatch_async_delegation(
 
 def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
     """Mark a record complete and push the completion event onto the queue."""
+    # Before _begin_finalization drops progress_fn: last chance to announce
+    # children whose terminal tick the sweep never got to.
+    try:
+        _flush_child_completions(delegation_id)
+    except Exception as exc:
+        logger.debug(
+            "Child-completion flush failed for delegation %s: %s",
+            delegation_id, exc,
+        )
     claimed = _begin_finalization(delegation_id)
     if claimed is None:
         return
@@ -1049,6 +1058,15 @@ def _finalize_batch(
     delegation_id: str, combined: Dict[str, Any], status: str
 ) -> None:
     """Mark a batch record complete and push ONE combined completion event."""
+    # Before _begin_finalization drops progress_fn: last chance to announce
+    # children whose terminal tick the sweep never got to.
+    try:
+        _flush_child_completions(delegation_id)
+    except Exception as exc:
+        logger.debug(
+            "Child-completion flush failed for delegation %s: %s",
+            delegation_id, exc,
+        )
     claimed = _begin_finalization(delegation_id)
     if claimed is None:
         return
@@ -1322,12 +1340,12 @@ def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
     """Parse a progress token into per-child activity dicts (best-effort).
 
     delegate_tool's ``_batch_progress`` emits one ``(api_call_count,
-    current_tool, last_activity_ts, subagent_id)`` tuple per child (the
-    trailing ``subagent_id`` is the same stable id the child streams as
-    "subagentId" on its subagent.start/complete events — see
-    ``tools.delegate_tool._batch_progress``). Foreign token shapes (custom
-    dispatchers) degrade to ``None`` entries rather than raising — the token
-    contract is intentionally opaque to the registry.
+    current_tool, last_activity_ts, subagent_id, finished)`` tuple per child
+    (``subagent_id`` is the same stable id the child streams as "subagentId"
+    on its subagent.start/complete events, ``finished`` flips once that child
+    returns — see ``tools.delegate_tool._batch_progress``). Shorter tuples and
+    foreign token shapes (custom dispatchers) degrade rather than raising —
+    the token contract is intentionally opaque to the registry.
     """
     try:
         parts = list(token)
@@ -1346,6 +1364,8 @@ def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
                 )
             if len(part) >= 4 and isinstance(part[3], str) and part[3]:
                 entry["subagent_id"] = part[3]
+            if len(part) >= 5:
+                entry["finished"] = bool(part[4])
             out.append(entry)
         else:
             out.append(None)
@@ -1411,14 +1431,15 @@ def _progress_report_payload(
         label = (
             goals[idx] if isinstance(goals, list) and idx < len(goals) else goal
         )
+        finished = bool(a.get("finished"))
         payloads.append({
             "origin_turn_id": origin_turn_id,
             "delegation_id": delegation_id,
             "subagent_id": a.get("subagent_id") or "",
-            "status": "running",
+            "status": "completed" if finished else "running",
             "progress": {
                 "label": str(label)[:200],
-                "detail": a.get("current_tool"),
+                "detail": None if finished else a.get("current_tool"),
             },
         })
     if not payloads:
@@ -1436,6 +1457,61 @@ def _progress_report_payload(
             },
         })
     return payloads, token
+
+
+def _claim_child_completions(
+    delegation_id: str, payloads: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Filter out terminal ticks for children already announced as completed.
+
+    A finished child stays finished in every later sample, so without a claim
+    set the sweep would re-announce it on each pass. The set lives on the live
+    record (private key — excluded from ``list_async_delegations`` snapshots)
+    so the terminal tick fires exactly once per child, independent of whether
+    its siblings are still running.
+    """
+    kept: List[Dict[str, Any]] = []
+    with _records_lock:
+        record = _records.get(delegation_id)
+        claimed = record.get("_progress_completed") if record is not None else None
+        if not isinstance(claimed, set):
+            claimed = set()
+            if record is not None:
+                record["_progress_completed"] = claimed
+        for payload in payloads:
+            if payload.get("status") != "completed":
+                kept.append(payload)
+                continue
+            subagent_id = payload.get("subagent_id") or ""
+            if subagent_id in claimed:
+                continue
+            claimed.add(subagent_id)
+            kept.append(payload)
+    return kept
+
+
+def _flush_child_completions(delegation_id: str) -> None:
+    """Announce any child that finished without a terminal tick going out.
+
+    The sweep catches a child the moment it observes the flip, but the LAST
+    child's flip lands together with the batch's own completion — inside a
+    sweep interval. Sampling once more here, while the record is still running
+    and the child agents are still alive, closes that gap.
+    """
+    hook_url = os.environ.get(_OMNIO_SUBAGENT_PROGRESS_HOOK_ENV, "").strip()
+    if not hook_url:
+        return
+    with _records_lock:
+        record = _records.get(delegation_id)
+    if record is None:
+        return
+    built = _progress_report_payload(record, time.time())
+    if built is None:
+        return
+    payloads, _token = built
+    terminal = [p for p in payloads if p.get("status") == "completed"]
+    for payload in _claim_child_completions(delegation_id, terminal):
+        _post_progress_update(hook_url, payload)
 
 
 def _post_progress_update(hook_url: str, payload: Dict[str, Any]) -> None:
@@ -1515,7 +1591,7 @@ def _progress_monitor_loop() -> None:
                     continue
                 live["_progress_report_token"] = token
                 live["_progress_report_ts"] = now
-            to_report.extend(payloads)
+            to_report.extend(_claim_child_completions(delegation_id, payloads))
         for payload in to_report:
             _post_progress_update(hook_url, payload)
 

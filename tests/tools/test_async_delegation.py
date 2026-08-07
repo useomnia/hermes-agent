@@ -1201,11 +1201,12 @@ def test_delegate_task_background_passes_progress_fn_to_async_registry(monkeypat
     # includes last_activity_ts so streamed chunks count as liveness (each
     # chunk ticks _touch_activity), not just completed API calls, plus the
     # child's stable subagent_id (its streamed "subagentId") so an opt-in
-    # progress report can attribute an update to the exact child.
+    # progress report can attribute an update to the exact child, and a
+    # per-child finished flag so that report can announce ONE child ending.
     progress_fn = captured["progress_fn"]
     assert callable(progress_fn)
     token, in_tool = progress_fn()
-    assert token == ((4, "terminal", 1234.5, "s1"),)
+    assert token == ((4, "terminal", 1234.5, "s1", False),)
     assert in_tool is True
 
 
@@ -1635,3 +1636,165 @@ def test_progress_reporter_skips_delegations_without_origin_turn_id(monkeypatch)
     assert _drain_for(res["delegation_id"], timeout=5.0) is not None
     assert posted == []
 
+
+
+# ---------------------------------------------------------------------------
+# Per-child completion ticks — one terminal update per finished child
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_tick_emitted_for_finished_child_while_siblings_run(monkeypatch):
+    """A batch's only completion signal is the delegation-level event, which
+    fires once ALL children are done. A child that finishes on its own must
+    still get a terminal update carrying its own subagent_id, while its
+    still-running siblings keep reporting 'running'."""
+    monkeypatch.setenv("OMNIO_SUBAGENT_PROGRESS_HOOK", "http://example.invalid/progress")
+    monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-tok")
+    _fast_progress_monitor(monkeypatch)
+    gate = threading.Event()
+    posted = []
+    post_seen = threading.Event()
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posted.append(json)
+        post_seen.set()
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    def progress_fn():
+        # Child A has returned (finished=True); child B is still in a tool.
+        return (
+            (
+                (3, None, time.time(), "sa-a", True),
+                (1, "terminal", time.time(), "sa-b", False),
+            ),
+            True,
+        )
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["goal a", "goal b"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_turn_id="turn-child-done",
+        runner=lambda: (gate.wait(timeout=5), {"results": []})[1],
+        progress_fn=progress_fn,
+    )
+    assert res["status"] == "dispatched"
+    assert post_seen.wait(timeout=3.0)
+    time.sleep(0.2)  # let more sweeps run
+    gate.set()
+    assert _drain_for(res["delegation_id"], timeout=5.0) is not None
+
+    done = [p for p in posted if p["status"] == "completed"]
+    assert len(done) == 1, f"expected exactly one terminal tick, got {done}"
+    assert done[0]["subagent_id"] == "sa-a"
+    assert done[0]["origin_turn_id"] == "turn-child-done"
+    assert done[0]["delegation_id"] == res["delegation_id"]
+    assert done[0]["progress"]["label"] == "goal a"
+    assert done[0]["progress"]["detail"] is None
+
+    # The sibling is unaffected — still reported as running, every sweep.
+    sibling = [p for p in posted if p["subagent_id"] == "sa-b"]
+    assert sibling, "sibling stopped being reported"
+    assert all(p["status"] == "running" for p in sibling)
+
+
+def test_terminal_tick_flushed_for_the_last_child(monkeypatch):
+    """The last child's flip lands together with the batch's own completion,
+    inside a sweep interval — the finalize-time flush is what keeps it from
+    being dropped. Sweeps are pinned long enough that only the flush can
+    have posted."""
+    monkeypatch.setenv("OMNIO_SUBAGENT_PROGRESS_HOOK", "http://example.invalid/progress")
+    monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-tok")
+    _fast_progress_monitor(monkeypatch, interval=30.0)
+    posted = []
+
+    monkeypatch.setattr(
+        "requests.post",
+        lambda url, json=None, headers=None, timeout=None: (
+            posted.append(json), SimpleNamespace(status_code=200))[1],
+    )
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["goal a"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_turn_id="turn-last-child",
+        runner=lambda: {"results": []},
+        progress_fn=lambda: (((2, None, time.time(), "sa-last", True),), False),
+    )
+    assert res["status"] == "dispatched"
+    assert _drain_for(res["delegation_id"], timeout=5.0) is not None
+
+    done = [p for p in posted if p["status"] == "completed"]
+    assert len(done) == 1
+    assert done[0]["subagent_id"] == "sa-last"
+
+
+def test_terminal_tick_not_re_emitted_on_later_sweeps(monkeypatch):
+    """A finished child stays finished in every later sample. Without a claim
+    set the sweep would re-announce it on each pass, and the product would
+    show the same subagent completing over and over."""
+    monkeypatch.setenv("OMNIO_SUBAGENT_PROGRESS_HOOK", "http://example.invalid/progress")
+    monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-tok")
+    _fast_progress_monitor(monkeypatch, interval=0.02)
+    gate = threading.Event()
+    posted = []
+    post_seen = threading.Event()
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posted.append(json)
+        post_seen.set()
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    def progress_fn():
+        return (
+            (
+                (3, None, time.time(), "sa-done", True),
+                (1, "terminal", time.time(), "sa-busy", False),
+            ),
+            True,
+        )
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["goal a", "goal b"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_turn_id="turn-no-repeat",
+        runner=lambda: (gate.wait(timeout=5), {"results": []})[1],
+        progress_fn=progress_fn,
+    )
+    assert res["status"] == "dispatched"
+    assert post_seen.wait(timeout=3.0)
+    time.sleep(0.4)  # ~20 sweeps at the shrunk interval
+    gate.set()
+    assert _drain_for(res["delegation_id"], timeout=5.0) is not None
+
+    done = [p for p in posted if p["subagent_id"] == "sa-done"]
+    assert len(done) == 1, f"terminal tick re-emitted {len(done)} times"
+    assert done[0]["status"] == "completed"
+
+
+def test_terminal_tick_hook_failure_is_swallowed(monkeypatch):
+    """A raising hook on the terminal tick must never reach the delegation:
+    the batch still finalizes and delivers its completion event."""
+    monkeypatch.setenv("OMNIO_SUBAGENT_PROGRESS_HOOK", "http://example.invalid/progress")
+    monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-tok")
+    _fast_progress_monitor(monkeypatch, interval=30.0)
+    calls = []
+
+    def raising_post(url, json=None, headers=None, timeout=None):
+        calls.append(json)
+        raise RuntimeError("hook exploded")
+
+    monkeypatch.setattr("requests.post", raising_post)
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["goal a"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_turn_id="turn-hook-boom",
+        runner=lambda: {"results": [{"task_index": 0, "status": "completed", "summary": "ok"}]},
+        progress_fn=lambda: (((1, None, time.time(), "sa-boom", True),), False),
+    )
+    assert res["status"] == "dispatched"
+
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    assert evt is not None
+    assert evt["status"] == "completed"
+    assert calls and calls[0]["status"] == "completed"
