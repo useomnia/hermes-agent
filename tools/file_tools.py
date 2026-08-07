@@ -1969,6 +1969,15 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "The results have not changed. Use the information you already have."
             )
 
+        # A name search that came up empty on disk falls back to durable
+        # storage, where a delivered file or upload survives the sandbox that
+        # produced it. Only name search: the store holds opaque bytes with no
+        # text index, so there is nothing for a content search to match against.
+        if target == "files" and not result_dict.get("files"):
+            durable = _durable_store_block(pattern, limit)
+            if durable is not None:
+                result_dict["durable_store"] = durable
+
         result_json = json.dumps(result_dict, ensure_ascii=False)
         # Hint when results were truncated — explicit next offset is clearer
         # than relying on the model to infer it from total_count vs match count.
@@ -2076,9 +2085,17 @@ PATCH_SCHEMA = {
     },
 }
 
+SEARCH_FILES_BASE_DESCRIPTION = "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time."
+
+# Appended only where a durable file store is wired up (see
+# SEARCH_FILES_HOOK_ENV): the store is searched by name when a file search finds
+# nothing on disk, so the agent has to know the capability exists before it will
+# reach for it.
+SEARCH_FILES_DURABLE_SUFFIX = "\n\nFile search also covers durable storage: when no file on disk matches, previously delivered or uploaded files that match are listed separately under 'durable_store'. Those are not on disk — restore one with fetch_file before reading it."
+
 SEARCH_FILES_SCHEMA = {
     "name": "search_files",
-    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.",
+    "description": SEARCH_FILES_BASE_DESCRIPTION,
     "parameters": {
         "type": "object",
         "properties": {
@@ -2152,6 +2169,83 @@ def _handle_search_files(args, **kw):
 
 FETCH_FILE_HOOK_ENV = "OMNIO_FILE_FETCH_HOOK"
 _FETCH_FILE_TIMEOUT_SECONDS = 60.0
+
+def _build_dynamic_search_files_schema() -> dict:
+    """Advertise the durable store only where one is wired up, so a deployment
+    without it sees the plain disk-search description."""
+    if not (os.environ.get(SEARCH_FILES_HOOK_ENV) or "").strip():
+        return {}
+    return {"description": SEARCH_FILES_BASE_DESCRIPTION + SEARCH_FILES_DURABLE_SUFFIX}
+
+
+SEARCH_FILES_HOOK_ENV = "OMNIO_FILE_SEARCH_HOOK"
+# A file search that finds nothing on disk is a common, benign outcome, so the
+# store lookup riding on it stays cheap: one request, no retries, and a short
+# deadline. Exceeding it costs the store results, never the search.
+_SEARCH_FILES_TIMEOUT_SECONDS = 3.0
+
+
+def _durable_store_matches(pattern: str, limit: int) -> list:
+    """Stored files whose path matches `pattern`, or an empty list when the
+    store is not configured or cannot answer. Never raises: a search must not
+    fail because durable storage is unavailable."""
+    hook_url = (os.environ.get(SEARCH_FILES_HOOK_ENV) or "").strip()
+    if not hook_url:
+        return []
+
+    import urllib.error
+    import urllib.request
+
+    payload = json.dumps(
+        {
+            "pattern": pattern,
+            "brand": (os.environ.get("OMNIO_TOOLBOX_BRAND") or "").strip(),
+            "limit": limit,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        hook_url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "X-Omnio-Service-Token": os.environ.get("OMNIO_INTERNAL_TOKEN", ""),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_SEARCH_FILES_TIMEOUT_SECONDS) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        logger.warning("durable store search failed for pattern=%s", pattern, exc_info=True)
+        return []
+
+    files = body.get("files") if isinstance(body, dict) else None
+    if not isinstance(files, list):
+        return []
+    return [item for item in files if isinstance(item, dict) and isinstance(item.get("path"), str)]
+
+
+def _durable_store_block(pattern: str, limit: int) -> dict | None:
+    """The `durable_store` section for a file search with no disk hits, or None
+    when there is nothing to add. Kept out of the on-disk `files` list on
+    purpose: reading one of these paths requires a fetch_file first."""
+    matches = _durable_store_matches(pattern, limit)
+    if not matches:
+        return None
+    return {
+        "note": (
+            "Not on disk — these are stored durably. Restore one with "
+            "fetch_file(<path>) before reading it."
+        ),
+        "files": [
+            {
+                "path": match["path"],
+                "size_bytes": match.get("size_bytes"),
+                "stored_at": match.get("stored_at"),
+            }
+            for match in matches[:limit]
+        ],
+    }
 
 FETCH_FILE_SCHEMA = {
     "name": "fetch_file",
@@ -2247,24 +2341,16 @@ def _handle_fetch_file(args, **kw):
                     f"No stored version {version} of {path} was found. Versions start at 1 "
                     "and grow by one for each re-delivery whose content changed."
                 )
-            suggestions = detail.get("suggestions")
-            if isinstance(suggestions, list) and suggestions:
-                lines = []
-                for item in suggestions[:5]:
-                    if isinstance(item, dict) and isinstance(item.get("path"), str):
-                        line = f"  {item['path']}"
-                        if isinstance(item.get("version"), int) and item["version"] > 1:
-                            line += f" (versions up to {item['version']})"
-                        lines.append(line)
-                if lines:
-                    return tool_error(
-                        f"No stored copy of {path} was found, but these stored paths look "
-                        "similar:\n" + "\n".join(lines) + "\nRetry fetch_file with one of "
-                        "these exact paths if it is the file you meant."
-                    )
+            recovery = (
+                " If the path might be misremembered, search_files with target='files'"
+                " finds stored files by name."
+                if (os.environ.get(SEARCH_FILES_HOOK_ENV) or "").strip()
+                else ""
+            )
             return tool_error(
                 f"No stored copy of {path} was found. Only files that were delivered to "
                 "the user or uploaded by them are recoverable; scratch files are not."
+                + recovery
             )
         logger.warning("fetch_file hook returned status=%s for path=%s", exc.code, path)
         return tool_error(
@@ -2300,5 +2386,5 @@ def _handle_fetch_file(args, **kw):
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
-registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
+registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000, dynamic_schema_overrides=_build_dynamic_search_files_schema)
 registry.register(name="fetch_file", toolset="file", schema=FETCH_FILE_SCHEMA, handler=_handle_fetch_file, check_fn=_check_fetch_file_reqs, emoji="📥", max_result_size_chars=2_000)

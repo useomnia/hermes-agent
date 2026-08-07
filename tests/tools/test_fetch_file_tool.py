@@ -145,27 +145,32 @@ def test_invalid_version_is_a_tool_error(hook_env):
         assert "'version' must be a positive integer" in result
 
 
-def test_404_with_suggestions_lists_similar_stored_paths(
+def test_404_points_at_name_search_when_the_store_is_searchable(
     hook_env, monkeypatch: pytest.MonkeyPatch
 ):
-    error = _http_error(
-        404,
-        {
-            "message": "No stored version of this path",
-            "suggestions": [
-                {"path": "/brand/reports/q2-performance.pdf", "version": 2},
-                {"path": "/brand/reports/q2-summary.pdf", "version": 1},
-            ],
-        },
-    )
+    monkeypatch.setenv(file_tools.SEARCH_FILES_HOOK_ENV, "http://127.0.0.1:8642/internal/search-files")
+    error = _http_error(404, {"message": "No stored version of this path"})
     monkeypatch.setattr(
         urllib.request, "urlopen", lambda request, timeout: (_ for _ in ()).throw(error)
     )
     result = file_tools._handle_fetch_file({"path": "/brand/reports/q2.pdf"})
 
-    assert "these stored paths look similar" in result
-    assert "/brand/reports/q2-performance.pdf (versions up to 2)" in result
-    assert "/brand/reports/q2-summary.pdf" in result
+    assert "No stored copy of /brand/reports/q2.pdf was found" in result
+    assert "search_files with target='files'" in result
+
+
+def test_404_omits_the_search_pointer_without_a_search_hook(
+    hook_env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv(file_tools.SEARCH_FILES_HOOK_ENV, raising=False)
+    error = _http_error(404, {"message": "No stored version of this path"})
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda request, timeout: (_ for _ in ()).throw(error)
+    )
+    result = file_tools._handle_fetch_file({"path": "/brand/reports/q2.pdf"})
+
+    assert "No stored copy of /brand/reports/q2.pdf was found" in result
+    assert "search_files" not in result
 
 
 def test_versioned_404_reports_the_latest_existing_version(
