@@ -104,7 +104,59 @@ def _patch_delegate(monkeypatch):
     monkeypatch.setattr(dt, "_build_child_agent", clobbering_build_child)
     monkeypatch.setattr(dt, "_run_single_child", fast_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    # Test-only handle so callers can inspect the fixed child instance
+    # clobbering_build_child always returns (e.g. its tool_progress_callback
+    # mock) without a second, side-effecting call into _build_child_agent.
+    dt._test_fake_child = fake_child
     return dt
+
+
+def test_background_dispatch_emits_subagent_start_synchronously(monkeypatch):
+    """A background dispatch must emit subagent.start for each child
+    SYNCHRONOUSLY, before delegate_task returns "dispatched" — while the
+    parent's turn/run is still live, which is the only point at which the
+    persisted Turn Event Log row can actually land (once the parent's run
+    goes terminal, TurnEventLogStore.append_payload silently drops further
+    writes for that run_id)."""
+    dt = _patch_delegate(monkeypatch)
+    # delegate_task tees tool_progress_callback through
+    # tools.delegation_live_log.wrap_progress_callback for the live
+    # transcript feature, which replaces fake_child.tool_progress_callback
+    # with a real wrapping function — irrelevant to this test (it forwards
+    # every call to the inner callback unchanged) but it would hide the
+    # MagicMock this test needs to assert against. Make it a passthrough.
+    import tools.delegation_live_log as dll
+
+    monkeypatch.setattr(dll, "wrap_progress_callback", lambda inner, writer: inner)
+
+    set_session_vars(
+        platform="api_server",
+        chat_id="raw-sid-start",
+        session_key="raw-sid-start",
+        session_id="raw-sid-start",
+        async_delivery=False,
+    )
+
+    out = dt.delegate_task(
+        goal="bg on api_server", context="ctx",
+        background=True, parent_agent=_fake_parent(),
+    )
+    parsed = json.loads(out)
+    assert parsed["status"] == "dispatched"
+
+    # By the time delegate_task returned, the child's own progress callback
+    # must already have received subagent.start — exactly once.
+    fake_child = dt._test_fake_child
+    fake_child.tool_progress_callback.assert_called_once_with(
+        "subagent.start", preview="bg on api_server",
+    )
+    assert fake_child._subagent_start_emitted_at_dispatch is True
+
+    # Drain the async worker's completion event so it can't leak into a
+    # later test's queue (the fixture only drains what's already queued at
+    # teardown time, not what a still-running daemon-thread worker later
+    # pushes).
+    _drain_one()
 
 
 def test_apiserver_session_with_id_dispatches_background(monkeypatch):
@@ -166,6 +218,68 @@ def test_origin_helper_empty_on_push_platforms(monkeypatch):
 
     set_session_vars(platform="telegram", chat_id="123456789")
     assert _current_origin_session_id() == ""
+
+
+def test_apiserver_session_carries_origin_turn_id_through_child_clobber(monkeypatch):
+    """The Omnio turn_id bound alongside chat_id (see
+    ApiServerAdapter._bind_api_server_session) must reach the completion
+    event as origin_turn_id, surviving the same child-session clobber that
+    origin_session_id survives — captured before child construction, from
+    the request-scoped binding, not from anything the child touches."""
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-8")
+    set_session_vars(
+        platform="api_server",
+        chat_id="raw-sid-8",
+        session_key="raw-sid-8",
+        session_id="raw-sid-8",
+        async_delivery=False,
+        origin_turn_id="turn-abc-123",
+    )
+
+    out = dt.delegate_task(
+        goal="bg on api_server with turn id", context="ctx",
+        background=True, parent_agent=_fake_parent(),
+    )
+    parsed = json.loads(out)
+    assert parsed["status"] == "dispatched", parsed
+
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["origin_session_id"] == "raw-sid-8"
+    assert evt["origin_turn_id"] == "turn-abc-123"
+
+
+# ---------------------------------------------------------------------------
+# _current_origin_turn_id — the clobber-proof origin turn-id capture helper
+# ---------------------------------------------------------------------------
+
+
+def test_origin_turn_id_helper_survives_child_session_clobber(monkeypatch):
+    """Same guarantee as _current_origin_session_id, for the turn id."""
+    from gateway.session_context import set_current_session_id
+    from tools.async_delegation import _current_origin_turn_id
+
+    set_session_vars(platform="api_server", chat_id="raw-origin-2", origin_turn_id="turn-xyz")
+    assert _current_origin_turn_id() == "turn-xyz"
+
+    set_current_session_id("20260715_child3")  # the clobber
+    assert _current_origin_turn_id() == "turn-xyz"
+
+
+def test_origin_turn_id_helper_empty_on_push_platforms(monkeypatch):
+    from tools.async_delegation import _current_origin_turn_id
+
+    set_session_vars(platform="telegram", chat_id="123456789", origin_turn_id="turn-should-not-apply")
+    assert _current_origin_turn_id() == ""
+
+
+def test_origin_turn_id_helper_empty_when_not_bound(monkeypatch):
+    """Non-Omnio deployments never set the turn id — must degrade to ""."""
+    from tools.async_delegation import _current_origin_turn_id
+
+    set_session_vars(platform="api_server", chat_id="raw-origin-3")
+    assert _current_origin_turn_id() == ""
 
 
 def test_apiserver_session_without_id_stays_synchronous(monkeypatch):

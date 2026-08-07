@@ -15,7 +15,7 @@ import threading
 import time
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
@@ -2101,6 +2101,89 @@ class TestChildCredentialLeasing(unittest.TestCase):
 
         self.assertEqual(result["status"], "error")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
+
+
+class TestBackgroundSubagentStartDedupe(unittest.TestCase):
+    """A background dispatch emits subagent.start SYNCHRONOUSLY at dispatch
+    time (delegate_task's `if background:` block, while the parent's turn
+    is still live) and stamps the child with
+    ``_subagent_start_emitted_at_dispatch`` so _run_single_child's own
+    in-thread emission — which normally fires once the child's worker
+    thread starts, typically well after the parent's run has already gone
+    terminal — is skipped instead of producing a duplicate persisted row."""
+
+    def test_run_single_child_skips_start_when_already_emitted_at_dispatch(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child._subagent_start_emitted_at_dispatch = True
+        child.run_conversation.return_value = {
+            "final_response": "done", "completed": True,
+            "interrupted": False, "api_calls": 1, "messages": [],
+        }
+
+        _run_single_child(
+            task_index=0, goal="already started at dispatch",
+            child=child, parent_agent=_make_mock_parent(),
+        )
+
+        started_calls = [
+            c for c in child.tool_progress_callback.call_args_list
+            if c.args and c.args[0] == "subagent.start"
+        ]
+        self.assertEqual(started_calls, [])
+
+    def test_run_single_child_emits_start_when_not_flagged(self):
+        """Sync-path (or any caller that never set the dispatch-time flag)
+        keeps emitting subagent.start from the child thread exactly as
+        before — this must stay unchanged."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child._subagent_start_emitted_at_dispatch = False
+        child.run_conversation.return_value = {
+            "final_response": "done", "completed": True,
+            "interrupted": False, "api_calls": 1, "messages": [],
+        }
+
+        _run_single_child(
+            task_index=0, goal="normal sync child",
+            child=child, parent_agent=_make_mock_parent(),
+        )
+
+        started_calls = [
+            c for c in child.tool_progress_callback.call_args_list
+            if c.args and c.args[0] == "subagent.start"
+        ]
+        self.assertEqual(
+            started_calls,
+            [call("subagent.start", preview="normal sync child")],
+        )
+
+    def test_run_single_child_still_emits_complete_when_start_deduped(self):
+        """Suppressing the dispatch-time-duplicated subagent.start must not
+        touch subagent.complete — that stays exactly as-is (fires post-run,
+        dropped silently if the parent run already went terminal, which is
+        expected/fine per the coordinator's finding)."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child._subagent_start_emitted_at_dispatch = True
+        child.run_conversation.return_value = {
+            "final_response": "done", "completed": True,
+            "interrupted": False, "api_calls": 1, "messages": [],
+        }
+
+        _run_single_child(
+            task_index=0, goal="dispatch-time started",
+            child=child, parent_agent=_make_mock_parent(),
+        )
+
+        complete_calls = [
+            c for c in child.tool_progress_callback.call_args_list
+            if c.args and c.args[0] == "subagent.complete"
+        ]
+        self.assertEqual(len(complete_calls), 1)
 
 
 class TestDelegateHeartbeat(unittest.TestCase):

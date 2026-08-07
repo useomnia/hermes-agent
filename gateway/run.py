@@ -18158,7 +18158,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     raw_sid = _sk
             if raw_sid:
                 adapter = self.adapters.get(Platform.API_SERVER)
-                from gateway.wake import adapter_supports_push, deliver_wake
+                from gateway.wake import (
+                    WakeHookPermanentError,
+                    adapter_supports_push,
+                    deliver_wake,
+                )
                 if adapter is not None and not adapter_supports_push(adapter):
                     try:
                         logger.info(
@@ -18166,7 +18170,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "session %s via self-post",
                             raw_sid,
                         )
-                        await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                        await deliver_wake(
+                            adapter,
+                            text=synth_text,
+                            session_id=raw_sid,
+                            delegation_id=str(evt.get("delegation_id") or ""),
+                            origin_turn_id=str(evt.get("origin_turn_id") or ""),
+                            subagent_ids=list(evt.get("subagent_ids") or []),
+                        )
+                        return True
+                    except WakeHookPermanentError as e:
+                        # Unwinnable (e.g. 404 — the proxy no longer
+                        # recognises this turn, most likely the conversation
+                        # was deleted). Retrying can never succeed, so treat
+                        # this as CONSUMED rather than returning False —
+                        # returning False would requeue the completion event
+                        # and redeliver the same 404 forever.
+                        logger.warning(
+                            "wake_dropped origin_turn_id=%s delegation_id=%s "
+                            "status=%s session=%s: %s",
+                            e.origin_turn_id,
+                            evt.get("delegation_id") or "<none>",
+                            e.status_code, raw_sid, e,
+                        )
                         return True
                     except Exception as e:
                         logger.warning(
@@ -18201,7 +18227,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # which binds chat_id = session_id). handle_message would run the
             # wake under a build_session_key()-derived key that never matches
             # the raw X-Hermes-Session-Id session — self-post instead.
-            from gateway.wake import deliver_wake
+            from gateway.wake import WakeHookPermanentError, deliver_wake
             raw_sid = str(evt.get("origin_session_id") or "").strip() or str(source.chat_id or "")
             try:
                 logger.info(
@@ -18209,7 +18235,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "%s via self-post",
                     raw_sid,
                 )
-                await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                await deliver_wake(
+                    adapter,
+                    text=synth_text,
+                    session_id=raw_sid,
+                    delegation_id=str(evt.get("delegation_id") or ""),
+                    origin_turn_id=str(evt.get("origin_turn_id") or ""),
+                    subagent_ids=list(evt.get("subagent_ids") or []),
+                )
+                return True
+            except WakeHookPermanentError as e:
+                # See the twin branch above (no-routing-metadata case) for
+                # why this is CONSUMED rather than requeued: a 404 (deleted
+                # conversation) can never succeed on retry.
+                logger.warning(
+                    "wake_dropped origin_turn_id=%s delegation_id=%s "
+                    "status=%s session=%s: %s",
+                    e.origin_turn_id,
+                    evt.get("delegation_id") or "<none>",
+                    e.status_code, raw_sid, e,
+                )
                 return True
             except Exception as e:
                 logger.warning(

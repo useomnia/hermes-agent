@@ -338,3 +338,52 @@ class TestTerminalNotifyGate:
         assert not d.get("notify_unsupported")
         # No platform bound -> no gateway watcher, but completion_queue still fires.
         assert len(process_registry.pending_watchers) == 0
+
+
+# ---------------------------------------------------------------------------
+# HERMES_ORIGIN_TURN_ID — bound alongside chat_id, empty on non-Omnio paths
+# ---------------------------------------------------------------------------
+
+
+class TestOriginTurnIdBinding:
+    """The Omnio ``turn_id`` bound by ``_bind_api_server_session`` follows
+    the exact same lifecycle as ``chat_id``: set by ``set_session_vars``,
+    readable via ``get_session_env``, "" (not the os.environ fallback) once
+    ``clear_session_vars`` runs, and back to "never bound" after
+    ``reset_session_vars``."""
+
+    def test_set_and_read(self):
+        tokens = set_session_vars(
+            platform="api_server",
+            chat_id="sess1",
+            session_id="sess1",
+            origin_turn_id="turn-abc",
+        )
+        try:
+            assert get_session_env("HERMES_ORIGIN_TURN_ID") == "turn-abc"
+        finally:
+            clear_session_vars(tokens)
+
+    def test_defaults_empty_when_not_passed(self):
+        """Non-Omnio callers never pass origin_turn_id — must read "" rather
+        than raising or falling back to a stale value."""
+        tokens = set_session_vars(platform="telegram", chat_id="123")
+        try:
+            assert get_session_env("HERMES_ORIGIN_TURN_ID") == ""
+        finally:
+            clear_session_vars(tokens)
+
+    def test_cleared_to_empty_not_environ_fallback(self, monkeypatch):
+        monkeypatch.setenv("HERMES_ORIGIN_TURN_ID", "leaked-from-os-environ")
+        tokens = set_session_vars(
+            platform="api_server", chat_id="sess1", origin_turn_id="turn-xyz",
+        )
+        clear_session_vars(tokens)
+        # Explicitly cleared ("") — must NOT fall back to os.environ, exactly
+        # like every other _VAR_MAP-mapped session var.
+        assert get_session_env("HERMES_ORIGIN_TURN_ID") == ""
+
+    def test_reset_restores_environ_fallback(self, monkeypatch):
+        monkeypatch.setenv("HERMES_ORIGIN_TURN_ID", "cli-env-value")
+        reset_session_vars()
+        assert get_session_env("HERMES_ORIGIN_TURN_ID") == "cli-env-value"

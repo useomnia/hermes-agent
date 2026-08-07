@@ -6371,6 +6371,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        origin_turn_id: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -6378,6 +6379,12 @@ class APIServerAdapter(BasePlatformAdapter):
         path must use to seed session context. API sessions support asynchronous
         completion via the gateway's authenticated self-post wake path, while
         remaining non-push adapters.
+
+        ``origin_turn_id`` mirrors ``chat_id``: the Omnio ``turn_id`` from the
+        request body (``/v1/runs``), bound here so a background delegation
+        dispatched from this run can thread it through to its completion
+        event (see ``tools.async_delegation._current_origin_session_id`` and
+        its turn-id sibling). Empty on non-Omnio deployments.
 
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive
@@ -6392,6 +6399,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_key=session_key,
             session_id=session_id,
             async_delivery=True,
+            origin_turn_id=origin_turn_id,
         )
 
     async def _run_agent(
@@ -7703,6 +7711,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 chat_id=session_id or "",
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
+                                origin_turn_id=str(turn_id) if turn_id else "",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # Mark this run's session as an interactive surface so
