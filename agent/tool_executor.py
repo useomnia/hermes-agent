@@ -568,9 +568,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 args_preview = args_str[:agent.log_prefix_chars] + "..." if len(args_str) > agent.log_prefix_chars else args_str
                 print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
+    # Blocked calls are answered with an error result; surface them through
+    # the same live callbacks as executed calls.
     for tc, name, args, middleware_trace, block_result, blocked_by_guardrail in parsed_calls:
-        if block_result is not None:
-            continue
         if agent.tool_progress_callback:
             try:
                 display_args = _redact_tool_args_for_display(name, args) or args
@@ -580,8 +580,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
     for tc, name, args, middleware_trace, block_result, blocked_by_guardrail in parsed_calls:
-        if block_result is not None:
-            continue
         if agent.tool_start_callback:
             try:
                 display_args = _redact_tool_args_for_display(name, args) or args
@@ -943,7 +941,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
-            if not blocked and agent.tool_progress_callback:
+            # Blocked calls are answered with an error result; surface them
+            # through the same live callbacks as executed calls.
+            if agent.tool_progress_callback:
                 try:
                     agent.tool_progress_callback(
                         "tool.completed", function_name, None, None,
@@ -974,7 +974,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
-        if not blocked and agent.tool_complete_callback:
+        if agent.tool_complete_callback:
             try:
                 display_args = _redact_tool_args_for_display(name, args) or args
                 agent.tool_complete_callback(tc.id, name, display_args, function_result)
@@ -1219,7 +1219,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception:
                 pass
 
-        if not _execution_blocked and agent.tool_progress_callback:
+        # Blocked calls are answered with an error result; surface them
+        # through the same live callbacks as executed calls.
+        if agent.tool_progress_callback:
             try:
                 display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
                 preview = _build_tool_preview(function_name, display_args)
@@ -1227,7 +1229,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
-        if not _execution_blocked and agent.tool_start_callback:
+        if agent.tool_start_callback:
             try:
                 display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
                 agent.tool_start_callback(tool_call.id, function_name, display_args)
@@ -1670,7 +1672,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
-        if not _execution_blocked and agent.tool_progress_callback:
+        # Blocked calls are answered with an error result; surface them
+        # through the same live callbacks as executed calls.
+        if agent.tool_progress_callback:
             try:
                 agent.tool_progress_callback(
                     "tool.completed", function_name, None, None,
@@ -1689,7 +1693,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _log_result = _multimodal_text_summary(function_result)
             logging.debug(f"Tool result ({len(_log_result)} chars): {_log_result}")
 
-        if not _execution_blocked and agent.tool_complete_callback:
+        if agent.tool_complete_callback:
             try:
                 display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
                 agent.tool_complete_callback(tool_call.id, function_name, display_args, function_result)
