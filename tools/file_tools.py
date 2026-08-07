@@ -2150,7 +2150,155 @@ def _handle_search_files(args, **kw):
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
 
 
+FETCH_FILE_HOOK_ENV = "OMNIO_FILE_FETCH_HOOK"
+_FETCH_FILE_TIMEOUT_SECONDS = 60.0
+
+FETCH_FILE_SCHEMA = {
+    "name": "fetch_file",
+    "description": "Restore a previously delivered or uploaded file from durable storage onto disk at its original path. Use when a path referenced earlier in the conversation is missing from disk (for example after the sandbox was replaced). Files that were delivered to the user or uploaded by them are always recoverable by path; scratch files that were never delivered are not. If the file already exists on disk it is left untouched — that also holds when asking for an older version: move the on-disk copy aside first, then fetch.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "The missing file's path as previously referenced (e.g. ~/report.xlsx or /brand/assets/logo.png)"},
+            "version": {"type": "integer", "minimum": 1, "description": "A specific stored version to restore (1 is the oldest). Omit for the newest. Each re-delivery of a path with changed content stores the next version."},
+        },
+        "required": ["path"],
+    },
+}
+
+
+def _check_fetch_file_reqs():
+    """fetch_file needs the file backend plus the durable-file hook env."""
+    if not (os.environ.get(FETCH_FILE_HOOK_ENV) or "").strip():
+        return False
+    return _check_file_reqs()
+
+
+def _format_fetch_size(size: int) -> str:
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f}MB"
+    if size >= 1024:
+        return f"{size / 1024:.1f}KB"
+    return f"{size}B"
+
+
+def _fetch_file_error_detail(exc) -> dict:
+    """The structured `detail` object from a fetch hook error body, or {} for
+    older proxies that answer with a plain string (or anything unparseable)."""
+    try:
+        body = json.loads(exc.read().decode("utf-8"))
+    except Exception:
+        return {}
+    detail = body.get("detail") if isinstance(body, dict) else None
+    return detail if isinstance(detail, dict) else {}
+
+
+def _handle_fetch_file(args, **kw):
+    import urllib.error
+    import urllib.request
+
+    path = args.get("path")
+    if not path or not isinstance(path, str):
+        return tool_error(
+            "fetch_file: missing required field 'path'. Re-emit the tool call with "
+            "the missing file's path."
+        )
+    version = args.get("version")
+    if version is not None and (not isinstance(version, int) or version < 1):
+        return tool_error(
+            "fetch_file: 'version' must be a positive integer (1 is the oldest version). "
+            "Omit it to fetch the newest."
+        )
+    hook_url = (os.environ.get(FETCH_FILE_HOOK_ENV) or "").strip()
+    if not hook_url:
+        return tool_error("fetch_file is unavailable: durable-file storage is not configured.")
+
+    payload_dict = {
+        "path": path,
+        "brand": (os.environ.get("OMNIO_TOOLBOX_BRAND") or "").strip(),
+    }
+    if version is not None:
+        payload_dict["version"] = version
+    payload = json.dumps(payload_dict).encode("utf-8")
+    request = urllib.request.Request(
+        hook_url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "X-Omnio-Service-Token": os.environ.get("OMNIO_INTERNAL_TOKEN", ""),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_FETCH_FILE_TIMEOUT_SECONDS) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            detail = _fetch_file_error_detail(exc)
+            if version is not None:
+                latest_version = detail.get("latest_version")
+                if isinstance(latest_version, int):
+                    return tool_error(
+                        f"No stored version {version} of {path}. This path's versions go up "
+                        f"to {latest_version}; retry with a version in that range (or omit "
+                        "version for the newest)."
+                    )
+                return tool_error(
+                    f"No stored version {version} of {path} was found. Versions start at 1 "
+                    "and grow by one for each re-delivery whose content changed."
+                )
+            suggestions = detail.get("suggestions")
+            if isinstance(suggestions, list) and suggestions:
+                lines = []
+                for item in suggestions[:5]:
+                    if isinstance(item, dict) and isinstance(item.get("path"), str):
+                        line = f"  {item['path']}"
+                        if isinstance(item.get("version"), int) and item["version"] > 1:
+                            line += f" (versions up to {item['version']})"
+                        lines.append(line)
+                if lines:
+                    return tool_error(
+                        f"No stored copy of {path} was found, but these stored paths look "
+                        "similar:\n" + "\n".join(lines) + "\nRetry fetch_file with one of "
+                        "these exact paths if it is the file you meant."
+                    )
+            return tool_error(
+                f"No stored copy of {path} was found. Only files that were delivered to "
+                "the user or uploaded by them are recoverable; scratch files are not."
+            )
+        logger.warning("fetch_file hook returned status=%s for path=%s", exc.code, path)
+        return tool_error(
+            f"fetch_file failed (status {exc.code}). Durable storage may be temporarily "
+            "unavailable — try again."
+        )
+    except Exception:
+        logger.warning("fetch_file hook request failed for path=%s", path, exc_info=True)
+        return tool_error("fetch_file failed: could not reach durable storage. Try again.")
+
+    if not isinstance(body, dict) or not isinstance(body.get("path"), str):
+        return tool_error("fetch_file failed: durable storage returned an invalid response.")
+
+    restored_path = body["path"]
+    size = body.get("size")
+    size_label = _format_fetch_size(size) if isinstance(size, int) else "unknown size"
+    content_type = body.get("content_type") or "unknown type"
+    if body.get("outcome") == "already_present":
+        if version is not None:
+            return (
+                f"{restored_path} already exists on disk ({size_label}, {content_type}); nothing "
+                f"was fetched. To restore version {version}, move the on-disk copy aside first, "
+                "then fetch again."
+            )
+        return f"{restored_path} already exists on disk ({size_label}, {content_type}); nothing was fetched."
+    restored_version = body.get("version")
+    version_label = (
+        f" (version {restored_version})" if isinstance(restored_version, int) and restored_version > 0 else ""
+    )
+    return f"Restored {restored_path}{version_label} ({size_label}, {content_type}) from durable storage."
+
+
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
+registry.register(name="fetch_file", toolset="file", schema=FETCH_FILE_SCHEMA, handler=_handle_fetch_file, check_fn=_check_fetch_file_reqs, emoji="📥", max_result_size_chars=2_000)
