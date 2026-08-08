@@ -4964,26 +4964,14 @@ This compaction should PRIORITISE preserving all information related to the focu
         return idx
 
     def _find_tail_cut_by_tokens(
-        self, messages: List[Dict[str, Any]], head_end: int,
-        token_budget: int | None = None,
+        self, messages: List[Dict[str, Any]], head_end: int, token_budget: int | None = None,
+        *, allow_split_turn: bool = True,
     ) -> int:
-        """Walk backward from the end of messages, accumulating tokens until
-        the budget is reached. Returns the index where the tail starts.
-
-        ``token_budget`` defaults to ``self.tail_token_budget`` which is
-        derived from ``summary_target_ratio * context_length``, so it
-        scales automatically with the model's context window.
-
-        Token budget is the primary criterion.  A bounded message-count floor
-        keeps a short run of recent turns verbatim even when the budget is
-        exhausted, but the budget is allowed to exceed by up to 1.5x to avoid
-        cutting inside an oversized message (tool output, file read, etc.). If
-        even that floor exceeds 1.5x the budget, the cut is placed right after
-        the head so compression still runs.
-
-        Never cuts inside a tool_call/result group.  Always ensures the most
-        recent user message is in the tail (see ``_ensure_last_user_message_in_tail``).
-        """
+        """Walk backward accumulating tokens until the budget; return the tail start index.
+        Optional rows are bounded by a 1.5x soft ceiling. Required last-user/last-assistant (and
+        multi-user) anchors and their atomic tool groups may exceed it; tool groups are never split.
+        ``allow_split_turn`` is disabled by rolling micro-compaction, which consumes complete
+        exchanges only; batch/manual compaction enables it so an oversized active turn can progress."""
         if token_budget is None:
             token_budget = self.tail_token_budget
         n = len(messages)
@@ -5053,37 +5041,56 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Align to avoid splitting tool groups
         cut_idx = self._align_boundary_backward(messages, cut_idx)
+        # Latest user message must stay in the tail (active task). Latest assistant reply must stay too;
+        # anchors only walk backward, so chaining is monotonic.
+        # Ensure the most recent user message is always in the tail so the active task is never lost to
+        # compression (fixes #10896) — EXCEPT when one in-progress turn alone exceeds the soft ceiling:
+        # then the anchor would retain the entire oversized turn and blow the budget by design, so the
+        # clean tool-group boundary above wins and the turn-opening request rides the handoff (#80449).
+        last_user_idx = self._find_last_user_message_idx(messages, head_end)
+        user_anchored_cut = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
+        split_oversized_turn = False
+        if (
+            allow_split_turn
+            and last_user_idx >= head_end
+            and last_user_idx < cut_idx
+            and user_anchored_cut < cut_idx
+            # A single oversized user message is indivisible and must stay verbatim in the tail; this
+            # exception is only for aggregate turn growth after a normally sized opening request.
+            and _estimate_msg_budget_tokens(messages[last_user_idx]) <= soft_ceiling
+            and len(_content_text_for_contains(messages[last_user_idx].get("content")).strip())
+            <= _ACTIVE_TASK_MAX_CHARS
+            and sum(
+                _estimate_msg_budget_tokens(message) for message in messages[user_anchored_cut:]
+            ) > soft_ceiling
+        ):
+            split_oversized_turn = True
+            if not self.quiet_mode:
+                logger.info(
+                    "Active turn exceeds protected-tail soft ceiling; keeping tool-group-aligned "
+                    "mid-turn cut at index %d instead of anchoring user message %d (#80449)",
+                    cut_idx, last_user_idx,
+                )
+        else:
+            cut_idx = user_anchored_cut
+        # An older visible assistant reply can precede the active user turn; when the active turn was
+        # deliberately split above, pulling back to it would undo the bounded exception. A latest
+        # assistant already inside the chosen tail is unchanged.
+        assistant_anchored_cut = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
+        if not split_oversized_turn or assistant_anchored_cut == cut_idx:
+            cut_idx = assistant_anchored_cut
 
-        # Ensure the most recent user message is always in the tail so the
-        # active task is never lost to compression (fixes #10896).
-        cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
-
-        # Ensure the most recent assistant message is always in the tail
-        # so the previously-visible reply isn't silently rolled into the
-        # ``[CONTEXT COMPACTION — REFERENCE ONLY]`` block (fixes #29824).
-        # Each anchor only walks ``cut_idx`` backward, so chaining them is
-        # monotonic — the tail can only grow, never shrink.
-        cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
-
-        # Extend to the last N actionable user messages when configured
-        # (compression.min_tail_user_messages > 1).  This prevents the
-        # token-budget tail from consuming recent turns when large tool
-        # outputs fill the budget.  The anchor only walks ``cut_idx``
-        # backward (monotonic — the tail can only grow, never shrink), and
-        # a user message is a clean boundary, so the forward re-alignment
-        # below remains a no-op for the anchored index.  Gated at the call
-        # site so the default (1) path is byte-identical to the historical
-        # single-anchor pipeline — the single-user anchor already ran above,
-        # and re-invoking it here could re-trigger the causal-coupling
-        # forward push (#22523) after the assistant anchor adjusted the cut.
-        # getattr-guarded: bare ``ContextCompressor.__new__`` test doubles
-        # (and plugin engines) skip __init__, so the attribute may be absent
-        # (see the compression-path test-double pitfall).
+        # Optional multi-user anchor; n<=1 is gated here (not delegated): re-running the single-user anchor after
+        # the assistant anchor could re-trigger its forward turn-pair push. getattr: __new__ doubles skip __init__.
+        # Skipped entirely under the split exception, which would otherwise undo the bounded cut.
         _min_tail_users = getattr(self, "min_tail_user_messages", 1)
-        if isinstance(_min_tail_users, int) and not isinstance(_min_tail_users, bool) and _min_tail_users > 1:
-            cut_idx = self._ensure_last_n_user_messages_in_tail(
-                messages, cut_idx, head_end, _min_tail_users,
-            )
+        if (
+            not split_oversized_turn
+            and isinstance(_min_tail_users, int)
+            and not isinstance(_min_tail_users, bool)
+            and _min_tail_users > 1
+        ):
+            cut_idx = self._ensure_last_n_user_messages_in_tail(messages, cut_idx, head_end, _min_tail_users)
 
         # The floor guarantees forward progress — compression must always claim
         # at least one message or the caller's compress_start >= compress_end
