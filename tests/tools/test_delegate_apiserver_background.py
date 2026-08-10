@@ -192,6 +192,42 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     assert evt["origin_session_id"] == "raw-sid-7"
 
 
+def test_healthy_push_path_still_stamps_origin_session_id(monkeypatch):
+    """async_delivery=True (the normal api_server push path) must stamp the
+    origin session id on the dispatch record too: the session-delegations
+    listing matches records by origin_session_id, so a record dispatched on
+    the healthy path with an empty stamp is invisible to its own session."""
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-8")
+    set_session_vars(
+        platform="api_server",
+        chat_id="raw-sid-8",
+        session_key="raw-sid-8",
+        session_id="raw-sid-8",
+        async_delivery=True,
+    )
+
+    out = dt.delegate_task(
+        goal="bg on healthy api_server", context="ctx",
+        background=True, parent_agent=_fake_parent(),
+    )
+    parsed = json.loads(out)
+    assert parsed["status"] == "dispatched", parsed
+    assert parsed["mode"] == "background"
+
+    from tools.async_delegation import list_async_delegations
+
+    record = next(
+        r for r in list_async_delegations()
+        if r.get("delegation_id") == parsed["delegation_id"]
+    )
+    assert record["origin_session_id"] == "raw-sid-8"
+
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["origin_session_id"] == "raw-sid-8"
+
+
 # ---------------------------------------------------------------------------
 # _current_origin_session_id — the clobber-proof origin capture helper
 # ---------------------------------------------------------------------------
