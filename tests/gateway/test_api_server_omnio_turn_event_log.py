@@ -977,7 +977,7 @@ async def test_finalize_hook_failure_still_emits_terminal_promptly(
 
     hook_app = web.Application()
     hook_app.router.add_post("/internal/turn-finalize", finalize)
-    monkeypatch.setattr(api_server_module, "_OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setenv(api_server_module._OMNIO_TURN_FINALIZE_TIMEOUT_ENV, "0.02")
     adapter = _make_adapter()
 
     async with TestServer(hook_app) as server:
@@ -1227,6 +1227,91 @@ async def test_runs_rotate_output_items_at_each_contiguous_block_boundary() -> N
     assert [event["sequence_number"] for event in events] == list(
         range(1, len(events) + 1)
     )
+
+
+@pytest.mark.asyncio
+async def test_run_result_tool_calls_never_started_live_are_not_replayed_at_run_end() -> (
+    None
+):
+    """A tool_call the model saw only as an error result (rejected before
+    dispatch — scope/plugin/guardrail block, invalid tool name) must not be
+    fabricated into a run-end function_call item: the executor and
+    conversation loop emit those calls live, and the gateway's run-end sweep
+    only closes calls that actually started live.
+    """
+    adapter = _make_adapter()
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            # No tool_start_callback/tool_complete_callback fired — this
+            # simulates a call blocked before dispatch, whose only trace is
+            # in the final message history the mock agent returns.
+            return {
+                "final_response": "done",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call-rejected",
+                                "function": {
+                                    "name": "blocked_tool",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-rejected",
+                        "content": '{"error": "blocked"}',
+                    },
+                ],
+            }
+
+        return _agent(run)
+
+    with patch.object(adapter, "_create_agent", side_effect=build_agent):
+        _, events = await _run_without_http_server(adapter, {"input": "do work"})
+
+    assert not any(
+        event["type"] == "response.output_item.added"
+        and event["item"]["type"] == "function_call"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_result_tool_call_started_live_but_never_completed_is_closed_at_run_end() -> (
+    None
+):
+    """A call that started live (tool_start_callback fired) but never got a
+    tool_complete_callback — e.g. abandoned on interrupt — must still get
+    its response.output_item.done at run end so the stream doesn't hang
+    with an unclosed function_call item.
+    """
+    adapter = _make_adapter()
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            callbacks["tool_start_callback"]("call-abandoned", "terminal", {})
+            return {"final_response": "done", "messages": []}
+
+        return _agent(run)
+
+    with patch.object(adapter, "_create_agent", side_effect=build_agent):
+        _, events = await _run_without_http_server(adapter, {"input": "do work"})
+
+    boundaries = [
+        (event["type"], event["item"]["type"])
+        for event in events
+        if event["type"] in {
+            "response.output_item.added",
+            "response.output_item.done",
+        }
+    ]
+    assert ("response.output_item.added", "function_call") in boundaries
+    assert ("response.output_item.done", "function_call") in boundaries
 
 
 @pytest.mark.asyncio
@@ -2704,6 +2789,26 @@ async def test_stop_wind_down_is_logged_and_visible_to_attached_subscriber() -> 
     assert adapter._run_statuses[run_id]["status"] == "cancelled"
     assert built_agent is not None
     built_agent.interrupt.assert_called_once_with("Stop requested via API")
+
+
+def test_turn_finalize_timeout_defaults_and_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(api_server_module._OMNIO_TURN_FINALIZE_TIMEOUT_ENV, raising=False)
+    assert (
+        api_server_module._turn_finalize_timeout_seconds()
+        == api_server_module._OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS
+    )
+
+    monkeypatch.setenv(api_server_module._OMNIO_TURN_FINALIZE_TIMEOUT_ENV, "12.5")
+    assert api_server_module._turn_finalize_timeout_seconds() == 12.5
+
+    for invalid in ("", "not-a-number", "0", "-3"):
+        monkeypatch.setenv(api_server_module._OMNIO_TURN_FINALIZE_TIMEOUT_ENV, invalid)
+        assert (
+            api_server_module._turn_finalize_timeout_seconds()
+            == api_server_module._OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS
+        )
 
 
 @pytest.mark.asyncio

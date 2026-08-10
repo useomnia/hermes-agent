@@ -38,7 +38,11 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
-from agent.display import KawaiiSpinner
+from agent.display import (
+    KawaiiSpinner,
+    build_tool_preview,
+    redact_tool_args_for_display,
+)
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
@@ -716,6 +720,52 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
         )
     available = ", ".join(sorted(valid_tool_names))
     return f"Tool '{name}' does not exist. Available tools: {available}"
+
+
+def _emit_unexecuted_tool_call_callbacks(agent, tc, error_content: str) -> None:
+    """Fire the started/completed callback pair for a tool call that gets an
+    error/skip result here in the conversation loop without ever reaching
+    the executor — an invalid-named call, or a valid-named call skipped
+    because a sibling in the same batch was invalid.
+    """
+    tc_id = getattr(tc, "id", None)
+    name = getattr(tc.function, "name", None) if hasattr(tc, "function") else None
+    if not tc_id or not (name or "").strip():
+        # Nameless/idless calls have nothing for the gateway to key a live
+        # event on — it drops them anyway, so skip emission.
+        return
+    try:
+        args = json.loads(tc.function.arguments or "{}")
+        if not isinstance(args, dict):
+            args = {}
+    except Exception:
+        args = {}
+    display_args = redact_tool_args_for_display(name, args) or args
+    if agent.tool_progress_callback:
+        try:
+            preview = build_tool_preview(name, display_args)
+            agent.tool_progress_callback("tool.started", name, preview, display_args)
+        except Exception as cb_err:
+            logging.debug(f"Tool progress callback error: {cb_err}")
+    if agent.tool_start_callback:
+        try:
+            agent.tool_start_callback(tc_id, name, display_args)
+        except Exception as cb_err:
+            logging.debug(f"Tool start callback error: {cb_err}")
+    if agent.tool_progress_callback:
+        try:
+            agent.tool_progress_callback(
+                "tool.completed", name, None, None,
+                duration=0.0, is_error=True,
+                result=error_content,
+            )
+        except Exception as cb_err:
+            logging.debug(f"Tool progress callback error: {cb_err}")
+    if agent.tool_complete_callback:
+        try:
+            agent.tool_complete_callback(tc_id, name, display_args, error_content)
+        except Exception as cb_err:
+            logging.debug(f"Tool complete callback error: {cb_err}")
 
 
 def _content_policy_blocked_result(
@@ -5619,6 +5669,7 @@ def run_conversation(
                             )
                         else:
                             content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
+                        _emit_unexecuted_tool_call_callbacks(agent, tc, content)
                         messages.append({
                             "role": "tool",
                             "name": tc.function.name,
@@ -5857,13 +5908,15 @@ def run_conversation(
                 # provider-side tool_call/result pairing stays intact.
                 if _invalid_batch_calls:
                     for tc in _invalid_batch_calls:
+                        _invalid_content = _invalid_tool_name_error_content(
+                            tc.function.name, agent.valid_tool_names
+                        )
+                        _emit_unexecuted_tool_call_callbacks(agent, tc, _invalid_content)
                         messages.append({
                             "role": "tool",
                             "name": tc.function.name,
                             "tool_call_id": tc.id,
-                            "content": _invalid_tool_name_error_content(
-                                tc.function.name, agent.valid_tool_names
-                            ),
+                            "content": _invalid_content,
                         })
                     assistant_message.tool_calls = [
                         tc for tc in assistant_message.tool_calls

@@ -120,14 +120,28 @@ logger = logging.getLogger(__name__)
 _OMNIO_DURABLE_APPROVALS_DISABLED_ENV = "OMNIO_TOOL_APPROVAL_DURABLE_DISABLED"
 _OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS = 5.0
 _OMNIO_TURN_FINALIZE_HOOK_ENV = "OMNIO_TURN_FINALIZE_HOOK"
-_OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS = 5.0
+_OMNIO_TURN_FINALIZE_TIMEOUT_ENV = "OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS"
+# The hook may persist deliverables to durable storage before returning, so its
+# budget covers uploads, not just the path scan.
+_OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS = 30.0
+
+
+def _turn_finalize_timeout_seconds() -> float:
+    raw = os.environ.get(_OMNIO_TURN_FINALIZE_TIMEOUT_ENV, "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return _OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS
+    if value <= 0:
+        return _OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS
+    return value
 
 
 async def _request_turn_finalize_annotations(
     hook_url: str,
     payload: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    timeout = aiohttp.ClientTimeout(total=_OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS)
+    timeout = aiohttp.ClientTimeout(total=_turn_finalize_timeout_seconds())
     headers = {
         "X-Omnio-Service-Token": os.environ.get("OMNIO_INTERNAL_TOKEN", ""),
     }
@@ -7034,36 +7048,6 @@ class APIServerAdapter(BasePlatformAdapter):
         return _callback
 
     @staticmethod
-    def _run_result_tool_calls(
-        result: Any, history_length: int
-    ) -> List[tuple[str, str, Dict[str, Any]]]:
-        """Read this turn's tool-call structure without exposing tool results."""
-        if not isinstance(result, dict) or not isinstance(result.get("messages"), list):
-            return []
-        calls: List[tuple[str, str, Dict[str, Any]]] = []
-        for message in result["messages"][history_length:]:
-            if not isinstance(message, dict) or message.get("role") != "assistant":
-                continue
-            for raw_call in message.get("tool_calls") or []:
-                if not isinstance(raw_call, dict):
-                    continue
-                function = raw_call.get("function") or {}
-                if not isinstance(function, dict):
-                    continue
-                call_id = str(raw_call.get("id") or "")
-                name = str(function.get("name") or "")
-                raw_args = function.get("arguments")
-                try:
-                    parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                except Exception:
-                    parsed_args = {}
-                if call_id and name:
-                    calls.append(
-                        (call_id, name, parsed_args if isinstance(parsed_args, dict) else {})
-                    )
-        return calls
-
-    @staticmethod
     def _interrupted_history_marker(result: Any, history_length: int) -> str:
         if isinstance(result, dict) and isinstance(result.get("messages"), list):
             for message in reversed(result["messages"][history_length:]):
@@ -7858,11 +7842,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         from_stream=False,
                     )
 
-                for call_id, name, args in self._run_result_tool_calls(
-                    result, len(conversation_history)
-                ):
-                    if call_id not in started_tool_calls:
-                        _emit_tool_start(call_id, name, args)
+                # Close out calls that started live but never got a
+                # completion event (e.g. abandoned on interrupt/timeout).
+                for call_id, (name, _args) in list(started_tool_calls.items()):
                     _emit_tool_end(call_id, name)
 
                 _close_text_item()

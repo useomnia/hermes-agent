@@ -128,8 +128,15 @@ def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution
         agent._execute_tool_calls_sequential(msg, messages, "task-1")
 
     mock_hfc.assert_not_called()
-    assert starts == []
-    assert progress == []
+    # Blocked calls never dispatch, but still fire the live started/completed
+    # callback pair, same as executed calls.
+    assert len(starts) == 1
+    assert starts[0][0] == ("c-block", "web_search", args)
+    started_events = [event for event in progress if event[0][0] == "tool.started"]
+    completed_events = [event for event in progress if event[0][0] == "tool.completed"]
+    assert len(started_events) == 1
+    assert len(completed_events) == 1
+    assert completed_events[0][1].get("is_error") is True
     assert len(messages) == 1
     assert messages[0]["role"] == "tool"
     assert messages[0]["tool_call_id"] == "c-block"
@@ -212,12 +219,24 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     assert [m["tool_call_id"] for m in messages] == ["c-block", "c-allow"]
     assert "repeated_exact_failure_block" in messages[0]["content"]
     assert json.loads(messages[1]["content"]) == {"ok": "allowed"}
-    assert starts == [("c-allow", "web_search", allowed_args)]
+    # The blocked call never dispatches (not in `executed`), but still gets
+    # live started/completed callbacks in original batch order alongside
+    # the allowed call — see the sequential-path test above for rationale.
+    assert starts == [
+        ("c-block", "web_search", blocked_args),
+        ("c-allow", "web_search", allowed_args),
+    ]
     started_events = [event for event in progress_events if event[0] == "tool.started"]
     completed_events = [event for event in progress_events if event[0] == "tool.completed"]
-    assert started_events == [("tool.started", "web_search", allowed_args, {})]
-    assert len(completed_events) == 1
+    assert started_events == [
+        ("tool.started", "web_search", blocked_args, {}),
+        ("tool.started", "web_search", allowed_args, {}),
+    ]
+    assert len(completed_events) == 2
     assert completed_events[0][1] == "web_search"
+    assert completed_events[0][3].get("is_error") is True
+    assert completed_events[1][1] == "web_search"
+    assert not completed_events[1][3].get("is_error")
 
 
 def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
@@ -236,6 +255,84 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     mock_hfc.assert_not_called()
     assert "plugin policy" in messages[0]["content"]
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
+
+
+def test_scope_blocked_tool_call_fires_live_callbacks_sequential():
+    """A tool_search-bridged call to a tool outside the session's scope is
+    rejected before dispatch (#5149 scope gate). It must still surface via
+    the live started/completed callbacks, like any other pre-dispatch block.
+    """
+    agent = _make_agent("web_search")
+    starts = []
+    progress = []
+    agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
+    agent.tool_progress_callback = lambda *a, **k: progress.append((a, k))
+    tc = _mock_tool_call(
+        "tool_call",
+        json.dumps({"name": "out_of_scope_tool", "arguments": {}}),
+        "c-scope",
+    )
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with (
+        patch(
+            "tools.tool_search.resolve_underlying_call",
+            return_value=("out_of_scope_tool", {}, None),
+        ),
+        patch("agent.tool_executor._tool_search_scoped_names", return_value=frozenset()),
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+    ):
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    mock_hfc.assert_not_called()
+    assert len(starts) == 1
+    assert starts[0][0][0] == "c-scope"
+    started_events = [event for event in progress if event[0][0] == "tool.started"]
+    completed_events = [event for event in progress if event[0][0] == "tool.completed"]
+    assert len(started_events) == 1
+    assert len(completed_events) == 1
+    assert completed_events[0][1].get("is_error") is True
+    assert len(messages) == 1
+    assert messages[0]["tool_call_id"] == "c-scope"
+    assert "not available in this session" in messages[0]["content"]
+
+
+def test_scope_blocked_tool_call_fires_live_callbacks_concurrent():
+    agent = _make_agent("web_search")
+    starts = []
+    progress = []
+    agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
+    agent.tool_progress_callback = lambda *a, **k: progress.append((a, k))
+    tc = _mock_tool_call(
+        "tool_call",
+        json.dumps({"name": "out_of_scope_tool", "arguments": {}}),
+        "c-scope",
+    )
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with (
+        patch(
+            "tools.tool_search.resolve_underlying_call",
+            return_value=("out_of_scope_tool", {}, None),
+        ),
+        patch("agent.tool_executor._tool_search_scoped_names", return_value=frozenset()),
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+    ):
+        agent._execute_tool_calls_concurrent(msg, messages, "task-1")
+
+    mock_hfc.assert_not_called()
+    assert len(starts) == 1
+    assert starts[0][0][0] == "c-scope"
+    started_events = [event for event in progress if event[0][0] == "tool.started"]
+    completed_events = [event for event in progress if event[0][0] == "tool.completed"]
+    assert len(started_events) == 1
+    assert len(completed_events) == 1
+    assert completed_events[0][1].get("is_error") is True
+    assert len(messages) == 1
+    assert messages[0]["tool_call_id"] == "c-scope"
+    assert "not available in this session" in messages[0]["content"]
 
 
 def test_default_run_conversation_warns_without_guardrail_halt():

@@ -3226,8 +3226,10 @@ class TestConcurrentToolExecution:
 
         assert json.loads(result) == {"error": "Blocked"}
 
-    def test_sequential_blocked_tool_skips_checkpoints_and_callbacks(self, agent, monkeypatch):
-        """Sequential path: blocked tool should not trigger checkpoints or start callbacks."""
+    def test_sequential_blocked_tool_skips_checkpoints_but_fires_live_callbacks(self, agent, monkeypatch):
+        """Sequential path: a blocked tool should not trigger checkpoints, but
+        it still fires the live start callback through the normal live
+        pipeline, same as an executed call."""
         tool_call = _mock_tool_call(name="write_file",
                                     arguments='{"path":"test.txt","content":"hello"}',
                                     call_id="c1")
@@ -3250,7 +3252,7 @@ class TestConcurrentToolExecution:
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         agent._checkpoint_mgr.ensure_checkpoint.assert_not_called()
-        assert starts == []
+        assert starts == [("c1", "write_file", {"path": "test.txt", "content": "hello"})]
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert json.loads(messages[0]["content"]) == {"error": "Blocked by policy"}
@@ -4342,6 +4344,111 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
+
+    def test_mixed_invalid_batch_invalid_call_fires_live_callbacks(self, agent):
+        """An unknown-named tool call alongside a valid one in the same batch
+        is error-resulted without voiding the turn (mixed-invalid-batch
+        handling in conversation_loop). That error-result must fire the same
+        live started/completed callback pair the executor uses for
+        pre-dispatch-blocked calls.
+        """
+        self._setup_agent(agent)
+        valid_tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c-valid")
+        invalid_tc = _mock_tool_call(name="not_a_real_tool", arguments="{}", call_id="c-invalid")
+        resp1 = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[valid_tc, invalid_tc]
+        )
+        resp2 = _mock_response(content="Done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        starts = []
+        progress = []
+        completes = []
+        agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
+        agent.tool_progress_callback = lambda *a, **k: progress.append((a, k))
+        agent.tool_complete_callback = lambda *a, **k: completes.append((a, k))
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do something")
+
+        assert result["final_response"] == "Done"
+
+        invalid_starts = [s for s in starts if s[0][0] == "c-invalid"]
+        assert len(invalid_starts) == 1
+        assert invalid_starts[0][0][1] == "not_a_real_tool"
+
+        invalid_completed_progress = [
+            e for e in progress
+            if e[0][0] == "tool.completed" and e[0][1] == "not_a_real_tool"
+        ]
+        assert len(invalid_completed_progress) == 1
+        assert invalid_completed_progress[0][1].get("is_error") is True
+
+        invalid_completes = [c for c in completes if c[0][0] == "c-invalid"]
+        assert len(invalid_completes) == 1
+        assert invalid_completes[0][0][1] == "not_a_real_tool"
+        assert "not_a_real_tool" in invalid_completes[0][0][3]
+
+    def test_all_invalid_batch_every_call_fires_live_callbacks(self, agent):
+        """A batch with no valid-named call at all (the all-invalid retry
+        path, distinct from the mixed-batch path above) still error-results
+        and answers-with-a-callback every tool call in the batch.
+        """
+        self._setup_agent(agent)
+        tc1 = _mock_tool_call(name="not_a_real_tool", arguments="{}", call_id="c-1")
+        tc2 = _mock_tool_call(name="also_not_real", arguments="{}", call_id="c-2")
+        resp = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc1, tc2])
+        agent.client.chat.completions.create.return_value = resp
+
+        starts = []
+        completes = []
+        agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
+        agent.tool_complete_callback = lambda *a, **k: completes.append((a, k))
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation("do something")
+
+        assert {s[0][0] for s in starts} == {"c-1", "c-2"}
+        assert {c[0][0] for c in completes} == {"c-1", "c-2"}
+
+    def test_emit_unexecuted_tool_call_callbacks_covers_skipped_valid_sibling(self, agent):
+        """conversation_loop's all-invalid-retry loop calls this helper for
+        every tool call in the batch — including a valid-named call skipped
+        only because a sibling in the batch was invalid. Verify the helper
+        answers that skipped-but-valid call the same way as an invalid one:
+        a live started/completed(is_error=True) pair carrying the skip
+        message.
+        """
+        from agent.conversation_loop import _emit_unexecuted_tool_call_callbacks
+
+        self._setup_agent(agent)
+        skipped_tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c-skipped")
+        skip_content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
+
+        starts = []
+        progress = []
+        completes = []
+        agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
+        agent.tool_progress_callback = lambda *a, **k: progress.append((a, k))
+        agent.tool_complete_callback = lambda *a, **k: completes.append((a, k))
+
+        _emit_unexecuted_tool_call_callbacks(agent, skipped_tc, skip_content)
+
+        assert starts == [(("c-skipped", "web_search", {}), {})]
+        completed_events = [e for e in progress if e[0][0] == "tool.completed"]
+        assert len(completed_events) == 1
+        assert completed_events[0][1].get("is_error") is True
+        assert completed_events[0][1].get("result") == skip_content
+        assert completes == [(("c-skipped", "web_search", {}, skip_content), {})]
 
     def test_tool_call_none_args_verbose_logging_does_not_crash(self, agent):
         self._setup_agent(agent)
