@@ -1938,6 +1938,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("GET", "/api/sessions/{session_id}/delegations", self._handle_session_delegations),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -8102,6 +8103,33 @@ class APIServerAdapter(BasePlatformAdapter):
         response_status = dict(status)
         response_status.setdefault("run_id", run_id)
         return web.json_response(response_status)
+
+    async def _handle_session_delegations(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/delegations — this session's async delegations.
+
+        Filters the process-wide async-delegation registry down to records whose
+        ``origin_session_id`` matches the requested session, so an external UI can
+        rebuild "what is this conversation still waiting on" from the process that
+        owns the children instead of from its own bookkeeping. Records carry the
+        registry's live-status fields (``children_activity``, per-child
+        ``finished``) — see ``list_async_delegations``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+        try:
+            from tools.async_delegation import list_async_delegations
+
+            records = list_async_delegations()
+        except Exception as exc:
+            logger.exception("[api_server] delegation listing failed: %s", exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
+        data = [
+            r for r in records if r.get("origin_session_id") == session_id
+        ]
+        return web.json_response({"data": data})
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """Replay sequence_number > ``after``, then follow the live run."""
