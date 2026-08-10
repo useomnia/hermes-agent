@@ -3217,7 +3217,11 @@ def delegate_task(
         except Exception:
             _async_ok = True
 
-        _wake_sid = ""
+        # Stamped on the dispatch record unconditionally: the api_server's
+        # session-delegations listing matches records by origin_session_id,
+        # so a record dispatched on the healthy push path must carry it too,
+        # not only the self-post wake fallback below.
+        _wake_sid = _origin_wake_sid
         if _sync_only:
             # The Omnio proxy set delegation_sync_only for this run: this is
             # a headless surface (cron, trigger.dev run) with NO channel to
@@ -3240,10 +3244,9 @@ def delegate_task(
             # still reach the session by self-POSTing /v1/chat/completions
             # with that id in X-Hermes-Session-Id once the batch completes.
             # Only fall back to forced-sync execution when there is truly no
-            # session id to wake. Uses the origin captured before child
-            # construction (see _origin_wake_sid above) — reading
-            # HERMES_SESSION_ID here would return the subagent's internal id.
-            _wake_sid = _origin_wake_sid
+            # session id to wake. _wake_sid holds the origin captured before
+            # child construction — reading HERMES_SESSION_ID here would
+            # return the subagent's internal id.
             if _wake_sid:
                 logger.info(
                     "delegate_task: async delivery unsupported on this "
