@@ -2758,3 +2758,61 @@ async def test_runs_register_the_user_input_surface_so_questions_park_and_resolv
 
     assert captured["surface"] is True
     assert captured["answer"] == "Option B"
+
+
+@pytest.mark.asyncio
+async def test_runs_thread_delegation_sync_only_into_session_context() -> None:
+    """The Omnio proxy's ``delegation_sync_only`` on ``POST /v1/runs`` must
+    reach the running agent via ``HERMES_DELEGATION_SYNC_ONLY`` — bound by
+    ``_bind_api_server_session`` exactly like ``turn_id`` -> ``HERMES_ORIGIN_TURN_ID``
+    — so ``tools.async_delegation._current_delegation_sync_only()`` (read by
+    ``delegate_task``) sees it while the run is live."""
+    from gateway.session_context import get_session_env
+
+    adapter = _make_adapter()
+    captured: Dict[str, Any] = {}
+
+    def run(**_kwargs: Any) -> Dict[str, Any]:
+        captured["delegation_sync_only"] = get_session_env(
+            "HERMES_DELEGATION_SYNC_ONLY"
+        )
+        return {"final_response": "done", "messages": []}
+
+    with patch.object(adapter, "_create_agent", return_value=_agent(run)):
+        started, _events = await _run_without_http_server(
+            adapter,
+            {
+                "input": "run headless",
+                "session_id": "session-sync-only",
+                "delegation_sync_only": True,
+            },
+        )
+
+    assert started.status == 202
+    assert captured["delegation_sync_only"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_runs_default_delegation_sync_only_false_when_omitted() -> None:
+    """Callers that never pass ``delegation_sync_only`` (every non-Omnio and
+    most Omnio deployments) must not force delegate_task's synchronous
+    fallback."""
+    from gateway.session_context import get_session_env
+
+    adapter = _make_adapter()
+    captured: Dict[str, Any] = {}
+
+    def run(**_kwargs: Any) -> Dict[str, Any]:
+        captured["delegation_sync_only"] = get_session_env(
+            "HERMES_DELEGATION_SYNC_ONLY"
+        )
+        return {"final_response": "done", "messages": []}
+
+    with patch.object(adapter, "_create_agent", return_value=_agent(run)):
+        started, _events = await _run_without_http_server(
+            adapter,
+            {"input": "run normally", "session_id": "session-normal"},
+        )
+
+    assert started.status == 202
+    assert captured["delegation_sync_only"] == ""

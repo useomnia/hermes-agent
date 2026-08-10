@@ -6373,6 +6373,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_key: str = "",
         session_id: str = "",
         origin_turn_id: str = "",
+        delegation_sync_only: bool = False,
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -6386,6 +6387,15 @@ class APIServerAdapter(BasePlatformAdapter):
         dispatched from this run can thread it through to its completion
         event (see ``tools.async_delegation._current_origin_session_id`` and
         its turn-id sibling). Empty on non-Omnio deployments.
+
+        ``delegation_sync_only`` mirrors ``origin_turn_id``: the Omnio
+        ``delegation_sync_only`` flag from the request body (``/v1/runs``),
+        set by the proxy for headless surfaces (crons, trigger.dev runs) that
+        have no channel to ever receive a background delegation's wake. Bound
+        here so ``delegate_task(background=True)`` can force its synchronous
+        fallback for this run regardless of an otherwise-available wake
+        session id (see ``tools.async_delegation._current_delegation_sync_only``
+        and ``tools/delegate_tool.py``).
 
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive
@@ -6401,6 +6411,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             async_delivery=True,
             origin_turn_id=origin_turn_id,
+            delegation_sync_only=delegation_sync_only,
         )
 
     async def _run_agent(
@@ -7104,6 +7115,11 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         explicit_session_id = body.get("session_id")
         turn_id = body.get("turn_id")
+        # Omnio proxy flag: headless surfaces (crons, trigger.dev runs) have
+        # no channel to ever receive a background delegation's wake, so they
+        # force delegate_task(background=True) onto its synchronous fallback
+        # for this run — see _bind_api_server_session and tools/delegate_tool.py.
+        delegation_sync_only = bool(body.get("delegation_sync_only"))
 
         if explicit_session_id is not None:
             if not isinstance(explicit_session_id, str) or not explicit_session_id.strip():
@@ -7713,6 +7729,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
                                 origin_turn_id=str(turn_id) if turn_id else "",
+                                delegation_sync_only=delegation_sync_only,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # Mark this run's session as an interactive surface so

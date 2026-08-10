@@ -2959,6 +2959,7 @@ def delegate_task(
     # api_server) is untouched by child construction, so read it here and
     # thread it through the dispatch.
     from tools.async_delegation import (
+        _current_delegation_sync_only,
         _current_origin_session_id,
         _current_origin_turn_id,
     )
@@ -2969,6 +2970,11 @@ def delegate_task(
     # is request-scoped and would be unreadable once a child agent binds its
     # own session context. Empty on non-Omnio deployments.
     _origin_turn_id = _current_origin_turn_id()
+    # Same rationale, same capture point: the Omnio proxy's per-run
+    # delegation_sync_only flag (bound alongside HERMES_SESSION_CHAT_ID) must
+    # be read before it becomes unreadable once a child agent binds its own
+    # session context. False on non-Omnio deployments.
+    _sync_only = _current_delegation_sync_only()
 
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
@@ -3212,7 +3218,22 @@ def delegate_task(
             _async_ok = True
 
         _wake_sid = ""
-        if not _async_ok:
+        if _sync_only:
+            # The Omnio proxy set delegation_sync_only for this run: this is
+            # a headless surface (cron, trigger.dev run) with NO channel to
+            # ever consume a background wake, even though the API server
+            # always binds a raw session id and would otherwise qualify for
+            # the self-post wake re-enable below. Force the synchronous
+            # fallback unconditionally — this defeats that re-enable path
+            # entirely rather than merely skipping it, since a caller could
+            # set the flag even when async_delivery_supported() is True.
+            logger.info(
+                "delegate_task: delegation_sync_only is set for this run — "
+                "forcing synchronous execution regardless of wake-session "
+                "availability."
+            )
+            _async_ok = False
+        elif not _async_ok:
             # The adapter itself cannot push, but if a raw session id is
             # bound (the API server always binds one — see
             # ApiServerAdapter._bind_api_server_session), gateway.wake can
