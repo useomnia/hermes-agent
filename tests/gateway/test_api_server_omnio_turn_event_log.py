@@ -396,6 +396,82 @@ async def test_cursor_replays_exact_sequence_numbers_then_follows_live() -> None
 
 
 @pytest.mark.asyncio
+async def test_events_response_stamps_replay_boundary_recorded_at_connect() -> None:
+    adapter = _make_adapter()
+    store = adapter._turn_event_logs
+    store.create_run("run_replay_header", "session-replay-header")
+    emitter = TurnEventEmitter(store, "run_replay_header", "session-replay-header")
+    emitter.response_started()
+    emitter.output_text_start("message-1")
+    emitter.output_text_delta("message-1", "recorded")
+    recorded_high_water = store.get_log(  # type: ignore[union-attr]
+        "run_replay_header"
+    ).sequence_number_high_water
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        response = await client.get("/v1/runs/run_replay_header/events?after=0")
+        connect_boundary = response.headers["X-Omnio-Replay-Through"]
+
+        emitter.output_text_delta("message-1", "live")
+        emitter.output_text_done("message-1")
+        emitter.response_completed()
+        body = await response.text()
+
+    assert connect_boundary == str(recorded_high_water)
+    events = _sse_events(body)
+    assert events[-1]["sequence_number"] > recorded_high_water
+
+
+@pytest.mark.asyncio
+async def test_terminal_replay_stamps_boundary_covering_every_frame() -> None:
+    adapter = _make_adapter()
+    store = adapter._turn_event_logs
+    store.create_run("run_replay_terminal", "session-replay-terminal")
+    emitter = TurnEventEmitter(store, "run_replay_terminal", "session-replay-terminal")
+    emitter.response_started()
+    emitter.output_text_start("message-1")
+    emitter.output_text_delta("message-1", "already finished")
+    emitter.output_text_done("message-1")
+    emitter.response_completed()
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        response = await client.get("/v1/runs/run_replay_terminal/events?after=0")
+        boundary = int(response.headers["X-Omnio-Replay-Through"])
+        body = await response.text()
+
+    events = _sse_events(body)
+    assert events
+    assert all(event["sequence_number"] <= boundary for event in events)
+
+
+@pytest.mark.asyncio
+async def test_tombstone_caught_up_response_stamps_replay_boundary() -> None:
+    clock = _Clock()
+    adapter = _make_adapter()
+    store = _install_log_store(adapter, clock=clock)
+    store.create_run("run_replay_tombstone", "session-replay-tombstone")
+    emitter = TurnEventEmitter(
+        store, "run_replay_tombstone", "session-replay-tombstone"
+    )
+    emitter.response_started()
+    emitter.response_completed()
+    high_water = store.get_log(  # type: ignore[union-attr]
+        "run_replay_tombstone"
+    ).sequence_number_high_water
+    clock.now += 300.0
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        response = await client.get(
+            f"/v1/runs/run_replay_tombstone/events?after={high_water}"
+        )
+        body = await response.text()
+
+    assert response.status == 200
+    assert response.headers["X-Omnio-Replay-Through"] == str(high_water)
+    assert _sse_events(body) == []
+
+
+@pytest.mark.asyncio
 async def test_live_run_rejects_cursor_ahead_of_high_water() -> None:
     adapter = _make_adapter()
     store = adapter._turn_event_logs
