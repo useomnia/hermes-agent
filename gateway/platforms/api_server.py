@@ -8120,6 +8120,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 "Content-Type": "text/event-stream",
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
+                # The highest sequence number already recorded at the moment
+                # this attachment connected: frames at or below it are replayed
+                # history, not live output. Consumers use it to render the
+                # replay instantly instead of re-pacing recorded text as if
+                # the model were still producing it.
+                "X-Omnio-Replay-Through": str(retained.sequence_number_high_water),
             },
         )
         await response.prepare(request)
