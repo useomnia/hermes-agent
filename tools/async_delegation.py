@@ -1675,6 +1675,15 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             continue
         activity = _children_activity_from_token(token, now)
         if activity is not None:
+            # Stamp each child's own goal onto its activity entry. The token
+            # tuples arrive in dispatch order — the same order ``goals`` was
+            # recorded in — so consumers of this snapshot can name each child
+            # individually instead of falling back to the batch-level goal.
+            goals = item.get("goals")
+            if isinstance(goals, list):
+                for idx, entry in enumerate(activity):
+                    if entry is not None and idx < len(goals):
+                        entry["goal"] = goals[idx]
             item["children_activity"] = activity
         item["in_tool"] = bool(in_tool)
     return items
