@@ -5041,10 +5041,12 @@ class TestRunConversation:
             "assistant",
             "user",
         ]
-        checkpoint = replay[-2]["content"]
-        assert "interrupted by a user correction" in checkpoint
-        assert "I should implement this with SQLite." in checkpoint
-        assert replay[-1]["content"] == "No, use Postgres instead."
+        placeholder = replay[-2]
+        correction = replay[-1]
+        assert "interrupted by a user correction" not in (placeholder.get("content") or "")
+        assert "interrupted by a user correction" in (correction.get("content") or "")
+        assert "I should implement this with SQLite." in (correction.get("content") or "")
+        assert correction["content"].endswith("No, use Postgres instead.")
         assert agent._pending_redirect is None
         assert any(
             snapshot[-1].get("content") == "No, use Postgres instead."
@@ -5124,11 +5126,16 @@ class TestRunConversation:
         assert calls == 2
         assert results["result"]["completed"] is True
         assert results["result"]["final_response"] == "Corrected answer."
-        checkpoint = results["result"]["messages"][-3]
-        assert "Following the original approach." in checkpoint["content"]
-        assert results["result"]["messages"][-2]["content"] == (
-            "Use the corrected approach."
+        placeholder = results["result"]["messages"][-3]
+        correction = results["result"]["messages"][-2]
+        assert placeholder["role"] == "assistant"
+        assert "interrupted by a user correction" not in (
+            placeholder.get("content") or ""
         )
+        assert "Following the original approach." in (
+            correction.get("api_content") or ""
+        )
+        assert correction["content"] == "Use the corrected approach."
 
     def test_interrupt_before_any_stream_keeps_sentinel(self, agent):
         """An interrupt with no streamed text falls back to the metadata sentinel."""

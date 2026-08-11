@@ -240,9 +240,35 @@ class TestActiveTurnRedirectCheckpoint:
         assert messages[-1]["role"] == "user"
         assert messages[-1]["content"].endswith("Use Postgres instead.")
         assert sum(1 for m in messages if m["role"] == "assistant") == 1
-        assert "Shown reasoning." in messages[-1]["content"]
-        assert "Visible draft." in messages[-1]["content"]
-        assert "Context from the interrupted assistant response" in messages[-1]["content"]
+        assert "Shown reasoning." in messages[-1]["api_content"]
+        assert "Visible draft." in messages[-1]["api_content"]
+        assert "Context from the interrupted assistant response" in messages[-1]["api_content"]
+
+    def test_tool_tail_scaffold_never_on_assistant_placeholder(self):
+        """Mid-tool redirects keep scaffold bytes on the user sidecar only."""
+        from agent.conversation_loop import _apply_active_turn_redirect
+
+        agent = _bare_agent()
+        messages = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+            {"role": "tool", "content": "out", "tool_call_id": "a"},
+        ]
+
+        _apply_active_turn_redirect(agent, messages, "Stop and do X instead.")
+
+        placeholder = messages[-2]
+        correction = messages[-1]
+        assert placeholder["role"] == "assistant"
+        assert placeholder.get("display_kind") == "hidden"
+        assert placeholder.get("content") == ""
+        assert not placeholder.get("api_content")
+        assert correction["role"] == "user"
+        assert correction["content"] == "Stop and do X instead."
+        assert correction["api_content"].startswith(
+            "[Context from the interrupted assistant response]\n"
+            "[This response was interrupted by a user correction.]"
+        )
 
 
 class TestSteerInjection:
@@ -463,6 +489,24 @@ class TestSteerMarkerContract:
         emitted = format_steer_marker("hi")
         assert STEER_MARKER_OPEN in emitted and STEER_MARKER_CLOSE in emitted
         assert STEER_MARKER_OPEN in STEER_CHANNEL_NOTE and STEER_MARKER_CLOSE in STEER_CHANNEL_NOTE
+
+    def test_system_prompt_scopes_freshness_to_unanswered_marker(self):
+        """A delivered marker remains in immutable history on later API calls.
+
+        The prompt contract must distinguish the unanswered tail occurrence
+        from one followed by an assistant response, or a model can interpret a
+        historical steer as newly delivered and repeat non-idempotent work.
+        """
+        from agent.prompt_builder import STEER_CHANNEL_NOTE
+
+        assert "latest tool-result batch" in STEER_CHANNEL_NOTE
+        assert "no later assistant message follows it" in STEER_CHANNEL_NOTE
+        assert "do not treat it as a new message" in STEER_CHANNEL_NOTE
+        assert "repeat completed work" in STEER_CHANNEL_NOTE
+
+        emitted = format_steer_marker("deploy once")
+        assert "delivered once at this position" in emitted
+        assert "not a new delivery when replayed" in emitted
 
     def test_marker_no_longer_uses_the_distrusted_label(self):
         """Regression: the bare 'User guidance:' line read as tool content and
