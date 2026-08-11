@@ -1953,6 +1953,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("GET", "/api/sessions/{session_id}/delegations", self._handle_session_delegations),
+            ("POST", "/api/sessions/{session_id}/subagents/{subagent_id}/cancel", self._handle_cancel_session_subagent),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -8129,6 +8130,55 @@ class APIServerAdapter(BasePlatformAdapter):
             r for r in records if r.get("origin_session_id") == session_id
         ]
         return web.json_response({"data": data})
+
+    async def _handle_cancel_session_subagent(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Request interruption of one child owned by the requested session.
+
+        A retained finalizing/terminal record counts as an idempotent success:
+        the child is already travelling through the normal completion path and
+        must not be turned into a 404 merely because it won the cancel race.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+        subagent_id = request.match_info["subagent_id"]
+        try:
+            from tools.async_delegation import request_subagent_cancel
+            from tools.delegate_tool import interrupt_subagent
+
+            matched = request_subagent_cancel(session_id, subagent_id)
+        except Exception as exc:
+            logger.exception("[api_server] delegation cancel lookup failed: %s", exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        if matched is None:
+            return web.json_response(
+                _openai_error(
+                    f"Subagent not found: {subagent_id}",
+                    code="subagent_not_found",
+                ),
+                status=404,
+            )
+
+        if matched.get("should_interrupt"):
+            # False is still success: the worker can unregister between the
+            # registry snapshot and this call, in which case normal
+            # finalization is already underway.
+            interrupt_subagent(subagent_id)
+
+        return web.json_response(
+            {
+                "status": "cancelling",
+                "subagent_id": subagent_id,
+                "delegation_id": matched.get("delegation_id", ""),
+                "origin_turn_id": matched.get("origin_turn_id", ""),
+            },
+            status=202,
+        )
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """Replay sequence_number > ``after``, then follow the live run."""

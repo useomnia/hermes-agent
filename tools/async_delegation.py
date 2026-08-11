@@ -136,6 +136,21 @@ _PROGRESS_HOOK_TIMEOUT_SECONDS = 5.0
 _progress_monitor_lock = threading.Lock()
 _progress_monitor_thread: Optional[threading.Thread] = None
 _progress_monitor_stop = threading.Event()
+# Set to wake the monitor out of its sweep wait: either for an immediate
+# out-of-cycle report (a child just reached its terminal state) or, together
+# with _progress_monitor_stop, for a prompt shutdown.
+_progress_monitor_wake = threading.Event()
+
+
+def request_progress_flush() -> None:
+    """Wake the progress monitor for an immediate out-of-cycle sweep.
+
+    Called when a child reaches its terminal state so its final status ticks
+    out to the hook now instead of waiting out the sweep interval. No-op when
+    the monitor is not running — the batch completion event covers reporting
+    in that case.
+    """
+    _progress_monitor_wake.set()
 
 
 def _db_path():
@@ -826,7 +841,10 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
             "Child-completion flush failed for delegation %s: %s",
             delegation_id, exc,
         )
-    claimed = _begin_finalization(delegation_id)
+    claimed = _begin_finalization(
+        delegation_id,
+        [result["subagent_id"]] if result.get("subagent_id") else None,
+    )
     if claimed is None:
         return
     event_record, _interrupt_fn = claimed
@@ -837,6 +855,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
 
 def _begin_finalization(
     delegation_id: str,
+    subagent_ids: Optional[List[str]] = None,
 ) -> Optional[tuple[Dict[str, Any], Optional[Callable[[], None]]]]:
     """Atomically claim terminal delivery while keeping the record active."""
     with _records_lock:
@@ -848,12 +867,70 @@ def _begin_finalization(
         # gap after status flips but before SQLite is committed.
         record["status"] = "finalizing"
         record["completed_at"] = time.time()
+        if subagent_ids:
+            # Keep the stable child identities after ``progress_fn`` is
+            # released so session-scoped cancel remains idempotent while the
+            # normal completion delivery path is still finalizing (and for
+            # the short retained terminal-record window afterwards).
+            record["subagent_ids"] = list(
+                dict.fromkeys(
+                    [*(record.get("subagent_ids") or []), *subagent_ids]
+                )
+            )
         interrupt_fn = record.get("interrupt_fn")
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
         event_record = dict(record)
 
     return event_record, interrupt_fn
+
+
+def request_subagent_cancel(
+    origin_session_id: str, subagent_id: str
+) -> Optional[Dict[str, Any]]:
+    """Atomically validate ownership and latch a per-child cancel request.
+
+    Stable child ids exist on the async record at dispatch, before the worker
+    registers its live agent in ``delegate_tool._active_subagents``.  Keeping
+    the request on that record closes the dispatch-to-registration window;
+    ``delegate_tool._register_subagent`` observes the latch after publishing
+    the live child into its registry.
+    """
+    with _records_lock:
+        for record in _records.values():
+            if record.get("origin_session_id") != origin_session_id:
+                continue
+            child_ids = set(record.get("subagent_ids") or [])
+            child_ids.update(
+                child.get("subagent_id")
+                for child in (record.get("children_activity") or [])
+                if isinstance(child, dict) and child.get("subagent_id")
+            )
+            if subagent_id not in child_ids:
+                continue
+            should_interrupt = False
+            if record.get("status") in ("running", "stalling"):
+                requested = list(record.get("cancel_requested_subagent_ids") or [])
+                if subagent_id not in requested:
+                    requested.append(subagent_id)
+                    record["cancel_requested_subagent_ids"] = requested
+                    should_interrupt = True
+            return {
+                "delegation_id": record.get("delegation_id", ""),
+                "origin_turn_id": record.get("origin_turn_id", ""),
+                "status": record.get("status", ""),
+                "should_interrupt": should_interrupt,
+            }
+    return None
+
+
+def is_subagent_cancel_requested(subagent_id: str) -> bool:
+    """Whether a live async record latched cancellation for this child."""
+    with _records_lock:
+        return any(
+            subagent_id in (record.get("cancel_requested_subagent_ids") or [])
+            for record in _records.values()
+        )
 
 
 def _finish_finalization(delegation_id: str, status: str) -> None:
@@ -957,6 +1034,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    subagent_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1008,6 +1086,8 @@ def dispatch_async_delegation_batch(
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
     }
+    if subagent_ids:
+        record["subagent_ids"] = list(dict.fromkeys(subagent_ids))
     with _records_lock:
         running = sum(
             1 for r in _records.values()
@@ -1089,7 +1169,14 @@ def _finalize_batch(
             "Child-completion flush failed for delegation %s: %s",
             delegation_id, exc,
         )
-    claimed = _begin_finalization(delegation_id)
+    claimed = _begin_finalization(
+        delegation_id,
+        [
+            result["subagent_id"]
+            for result in (combined.get("results") or [])
+            if isinstance(result, dict) and result.get("subagent_id")
+        ],
+    )
     if claimed is None:
         return
     event_record, _interrupt_fn = claimed
@@ -1122,10 +1209,18 @@ def _push_batch_completion_event(
     # instead of delegation_id (which is a batch-level id, not a per-child
     # one; a single-task batch's subagent_id can equal delegation_id by
     # coincidence but must never be assumed to).
-    _subagent_ids = [
-        r.get("subagent_id") for r in _results
-        if isinstance(r, dict) and r.get("subagent_id")
-    ]
+    _subagent_ids = list(
+        dict.fromkeys(
+            [
+                *(event_record.get("subagent_ids") or []),
+                *(
+                    r.get("subagent_id")
+                    for r in _results
+                    if isinstance(r, dict) and r.get("subagent_id")
+                ),
+            ]
+        )
+    )
     evt = {
         "type": "async_delegation",
         "delegation_id": event_record.get("delegation_id"),
@@ -1388,6 +1483,8 @@ def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
                 entry["subagent_id"] = part[3]
             if len(part) >= 5:
                 entry["finished"] = bool(part[4])
+            if len(part) >= 6 and isinstance(part[5], str) and part[5]:
+                entry["terminal_status"] = part[5]
             out.append(entry)
         else:
             out.append(None)
@@ -1407,6 +1504,7 @@ def _ensure_progress_monitor() -> None:
         if _progress_monitor_thread is not None and _progress_monitor_thread.is_alive():
             return
         _progress_monitor_stop.clear()
+        _progress_monitor_wake.clear()
         _progress_monitor_thread = threading.Thread(
             target=_progress_monitor_loop,
             name="async-delegate-progress-monitor",
@@ -1454,11 +1552,16 @@ def _progress_report_payload(
             goals[idx] if isinstance(goals, list) and idx < len(goals) else goal
         )
         finished = bool(a.get("finished"))
+        # Prefer the child's real outcome ("completed" / "interrupted" /
+        # "failed" / "timeout" / "error") over the bare finished bool — the
+        # coercion to "completed" made a cancelled child flash a success tick
+        # until the batch-level wake corrected it.
+        terminal_status = a.get("terminal_status") if finished else None
         payloads.append({
             "origin_turn_id": origin_turn_id,
             "delegation_id": delegation_id,
             "subagent_id": a.get("subagent_id") or "",
-            "status": "completed" if finished else "running",
+            "status": (terminal_status or "completed") if finished else "running",
             "progress": {
                 "label": str(label)[:200],
                 "detail": None if finished else a.get("current_tool"),
@@ -1577,10 +1680,17 @@ def _progress_monitor_loop() -> None:
     ``origin_turn_id``: sample progress, and POST an update when the sampled
     token changed since the last report OR the last report is older than
     ``_PROGRESS_REPORT_INTERVAL`` — i.e. report on meaningful state change,
-    but never faster than the sweep interval either way. Stops itself once
+    but never faster than the sweep interval either way. A
+    ``request_progress_flush`` wake skips the wait AND the due check, so a
+    child's terminal status reaches the hook immediately. Stops itself once
     no running record is reportable, same as the stale monitor.
     """
-    while not _progress_monitor_stop.wait(_PROGRESS_REPORT_INTERVAL):
+    while True:
+        flushed = _progress_monitor_wake.wait(_PROGRESS_REPORT_INTERVAL)
+        if _progress_monitor_stop.is_set():
+            return
+        if flushed:
+            _progress_monitor_wake.clear()
         hook_url = os.environ.get(_OMNIO_SUBAGENT_PROGRESS_HOOK_ENV, "").strip()
         if not hook_url:
             return  # opted out mid-run (env cleared) — nothing left to do
@@ -1604,7 +1714,7 @@ def _progress_monitor_loop() -> None:
             delegation_id = record.get("delegation_id")
             last_token = record.get("_progress_report_token")
             last_ts = record.get("_progress_report_ts") or 0
-            due = token != last_token or (now - last_ts) >= _PROGRESS_REPORT_INTERVAL
+            due = flushed or token != last_token or (now - last_ts) >= _PROGRESS_REPORT_INTERVAL
             if not due:
                 continue
             with _records_lock:
@@ -1789,6 +1899,7 @@ def _reset_for_tests() -> None:
     if thread is not None and thread.is_alive():
         thread.join(timeout=2)
     _progress_monitor_stop.set()
+    _progress_monitor_wake.set()
     with _progress_monitor_lock:
         progress_thread = _progress_monitor_thread
         _progress_monitor_thread = None

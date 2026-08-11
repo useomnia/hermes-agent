@@ -173,6 +173,17 @@ def _register_subagent(record: Dict[str, Any]) -> None:
         return
     with _active_subagents_lock:
         _active_subagents[sid] = record
+    # A browser cancel can arrive after the dispatch-time start event but
+    # before this worker registers. The async record latches that request;
+    # checking after registration makes either race ordering converge on the
+    # same existing per-child interrupt primitive.
+    try:
+        from tools.async_delegation import is_subagent_cancel_requested
+
+        if is_subagent_cancel_requested(sid):
+            interrupt_subagent(sid)
+    except Exception as exc:
+        logger.debug("Latched interrupt lookup failed for %s: %s", sid, exc)
 
 
 def _unregister_subagent(subagent_id: str) -> None:
@@ -1956,6 +1967,21 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _flush_terminal_progress() -> None:
+    """Wake the async-delegation progress monitor for an immediate sweep.
+
+    Called right after a child's terminal status is stamped so the outcome
+    ticks out to the progress hook now, instead of waiting out the sweep
+    interval. Best-effort: reporting is the monitor's job either way.
+    """
+    try:
+        from tools.async_delegation import request_progress_flush
+
+        request_progress_flush()
+    except Exception:
+        pass
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2301,6 +2327,11 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
+            try:
+                child._subagent_terminal_status = "timeout" if is_timeout else "error"
+                _flush_terminal_progress()
+            except Exception:
+                pass
             return {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
@@ -2346,7 +2377,13 @@ def _run_single_child(
         # it instead of silently accepting zero-content "success".
         _empty_sentinel = summary.strip() == "(empty)"
 
-        if interrupted:
+        from tools.async_delegation import is_subagent_cancel_requested
+
+        user_cancelled = bool(_subagent_id and is_subagent_cancel_requested(_subagent_id))
+        if interrupted or user_cancelled:
+            # A user-cancelled child can slip past the interrupt flag (the
+            # cancel latched after its last flag poll) and still produce a
+            # summary; the latch keeps it from masquerading as completed.
             status = "interrupted"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
@@ -2355,6 +2392,16 @@ def _run_single_child(
             status = "completed"
         else:
             status = "failed"
+
+        # Stamp the outcome for the batch progress sampler: `_subagent_finished`
+        # alone can't distinguish an interrupted child from a completed one, so
+        # progress ticks would report a cancelled child as "completed" until
+        # the batch-level wake corrects it.
+        try:
+            child._subagent_terminal_status = status
+            _flush_terminal_progress()
+        except Exception:
+            pass
 
         # Build tool trace from conversation messages (already in memory).
         # Uses tool_call_id to correctly pair parallel tool calls with results.
@@ -2422,6 +2469,10 @@ def _run_single_child(
             # Omnio proxy already persisted rows for under, rather than
             # re-deriving/guessing them.
             "subagent_id": _subagent_id,
+            # Distinguishes a deliberate user cancel from every other
+            # interruption: the completion text renders it as intentionally
+            # dropped so the orchestrator does not re-dispatch it.
+            "user_cancelled": user_cancelled,
             "tokens": {
                 "input": (
                     _input_tokens if isinstance(_input_tokens, (int, float)) else 0
@@ -2551,6 +2602,11 @@ def _run_single_child(
     except Exception as exc:
         duration = round(time.monotonic() - child_start, 2)
         logging.exception(f"[subagent-{task_index}] failed")
+        try:
+            child._subagent_terminal_status = "error"
+            _flush_terminal_progress()
+        except Exception:
+            pass
         if child_progress_cb:
             try:
                 child_progress_cb(
@@ -3404,6 +3460,7 @@ def delegate_task(
                 try:
                     _summary = _c.get_activity_summary()
                     _tool = _summary.get("current_tool")
+                    _terminal_status = getattr(_c, "_subagent_terminal_status", None)
                     parts.append(
                         (
                             _summary.get("api_call_count", 0),
@@ -3411,6 +3468,7 @@ def delegate_task(
                             _summary.get("last_activity_ts"),
                             getattr(_c, "_subagent_id", None),
                             getattr(_c, "_subagent_finished", False) is True,
+                            _terminal_status if isinstance(_terminal_status, str) else None,
                         )
                     )
                     in_tool = in_tool or bool(_tool)
@@ -3439,6 +3497,14 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            # Persist the stable identities at dispatch, before the live
+            # sampler can be released by finalization. This lets the
+            # session-scoped cancel endpoint validate ownership throughout
+            # the retained record's lifecycle.
+            subagent_ids=[
+                str(getattr(child, "_subagent_id", "") or "")
+                for child in _child_agents
+            ],
         )
 
         if dispatch.get("status") == "dispatched":

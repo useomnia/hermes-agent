@@ -1,4 +1,4 @@
-"""Contract tests for ``GET /api/sessions/{session_id}/delegations``.
+"""Contracts for session-scoped async-delegation HTTP endpoints.
 
 The endpoint filters the process-wide async-delegation registry by
 ``origin_session_id`` so an external UI can rebuild a session's outstanding
@@ -29,12 +29,25 @@ def _make_app(adapter: APIServerAdapter) -> web.Application:
         "/api/sessions/{session_id}/delegations",
         adapter._handle_session_delegations,
     )
+    app.router.add_post(
+        "/api/sessions/{session_id}/subagents/{subagent_id}/cancel",
+        adapter._handle_cancel_session_subagent,
+    )
     return app
 
 
 async def _get(client: TestClient, session_id: str, headers=None):
     return await client.get(
         f"/api/sessions/{session_id}/delegations", headers=headers or {}
+    )
+
+
+async def _cancel(
+    client: TestClient, session_id: str, subagent_id: str, headers=None
+):
+    return await client.post(
+        f"/api/sessions/{session_id}/subagents/{subagent_id}/cancel",
+        headers=headers or {},
     )
 
 
@@ -146,3 +159,108 @@ async def test_auth_required_when_key_configured():
             )
     assert denied.status == 401
     assert allowed.status == 200
+
+
+@pytest.mark.asyncio
+async def test_cancel_interrupts_exact_child_and_returns_identity():
+    adapter = _make_adapter()
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with (
+            patch(
+                "tools.async_delegation.request_subagent_cancel",
+                return_value={
+                    "delegation_id": "d_1",
+                    "origin_turn_id": "turn-1",
+                    "status": "running",
+                    "should_interrupt": True,
+                },
+            ),
+            patch("tools.delegate_tool.interrupt_subagent") as interrupt,
+        ):
+            resp = await _cancel(client, "sess-a", "sub_1")
+            body = await resp.json()
+
+    assert resp.status == 202
+    assert body == {
+        "status": "cancelling",
+        "subagent_id": "sub_1",
+        "delegation_id": "d_1",
+        "origin_turn_id": "turn-1",
+    }
+    interrupt.assert_called_once_with("sub_1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session_id", "subagent_id"),
+    [("sess-b", "sub_1"), ("sess-a", "sub_missing")],
+)
+async def test_cancel_rejects_wrong_session_or_unknown_child(
+    session_id: str, subagent_id: str
+):
+    adapter = _make_adapter()
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with (
+            patch(
+                "tools.async_delegation.request_subagent_cancel",
+                return_value=None,
+            ),
+            patch("tools.delegate_tool.interrupt_subagent") as interrupt,
+        ):
+            resp = await _cancel(client, session_id, subagent_id)
+
+    assert resp.status == 404
+    interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_repeat_cancel_is_success_once_finalization_has_started():
+    adapter = _make_adapter()
+    finalizing = {
+        **_RECORDS[0],
+        "status": "finalizing",
+        "children_activity": [],
+        "subagent_ids": ["sub_1"],
+    }
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with (
+            patch(
+                "tools.async_delegation.request_subagent_cancel",
+                return_value={
+                    "delegation_id": finalizing["delegation_id"],
+                    "origin_turn_id": finalizing["origin_turn_id"],
+                    "status": "finalizing",
+                    "should_interrupt": False,
+                },
+            ),
+            patch("tools.delegate_tool.interrupt_subagent") as interrupt,
+        ):
+            resp = await _cancel(client, "sess-a", "sub_1")
+
+    assert resp.status == 202
+    interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancel_requires_auth_when_key_configured():
+    adapter = _make_adapter(api_key="omnio-test-key")
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch(
+            "tools.async_delegation.request_subagent_cancel",
+            return_value={
+                "delegation_id": "d_1",
+                "origin_turn_id": "turn-1",
+                "status": "running",
+                "should_interrupt": True,
+            },
+        ):
+            denied = await _cancel(client, "sess-a", "sub_1")
+            allowed = await _cancel(
+                client,
+                "sess-a",
+                "sub_1",
+                headers={"Authorization": "Bearer omnio-test-key"},
+            )
+
+    assert denied.status == 401
+    assert allowed.status == 202
