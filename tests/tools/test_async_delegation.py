@@ -442,6 +442,37 @@ def test_list_async_delegations_exposes_live_activity(monkeypatch):
         gate.set()
 
 
+def test_list_async_delegations_stamps_per_child_goal(monkeypatch):
+    """Each children_activity entry must carry its OWN goal from the batch's
+    goals list (dispatch order), not leave consumers to fall back to the
+    combined batch-level goal string."""
+    monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.03)
+    gate = threading.Event()
+    ts = time.time()
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["research competitor A", "research competitor B"],
+        context=None, toolsets=None, role="leaf", model="m", session_key="",
+        max_async_children=2,
+        runner=lambda: {} if gate.wait(timeout=10) else {},
+        progress_fn=lambda: (
+            ((1, "web_search", ts, "sub-a", False), (2, "web_read", ts, "sub-b", False)),
+            True,
+        ),
+    )
+    try:
+        assert res["status"] == "dispatched"
+        item = next(
+            d for d in ad.list_async_delegations()
+            if d["delegation_id"] == res["delegation_id"]
+        )
+        first, second = item["children_activity"]
+        assert first["goal"] == "research competitor A"
+        assert second["goal"] == "research competitor B"
+    finally:
+        gate.set()
+
+
 def test_stalled_batch_is_interrupted_then_finalized(monkeypatch):
     _fast_stale_monitor(monkeypatch)
     gate = threading.Event()
