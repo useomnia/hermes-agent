@@ -20,6 +20,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- POST /v1/runs/{run_id}/steer      — steer an active running agent
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -1395,6 +1396,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # Each run serializes steering with its own lifecycle lock so a slow
+        # native steer cannot delay unrelated runs.
+        self._run_lifecycles: Dict[str, Dict[str, Any]] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
@@ -1976,6 +1980,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
+            ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
             ("POST", "/v1/omnio/tool-approval", self._handle_omnio_tool_approval),
             ("POST", "/v1/omnio/user-input", self._handle_omnio_user_input),
             ("POST", "/v1/mcp/reload", self._handle_mcp_reload),
@@ -3073,6 +3078,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
+                "run_steer": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -3112,6 +3118,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -6766,6 +6773,168 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         return current
 
+    @staticmethod
+    def _combine_steer_texts(*values: Any) -> Optional[str]:
+        parts = [value for value in values if isinstance(value, str) and value.strip()]
+        return "\n".join(parts) if parts else None
+
+    async def _publish_run_agent(self, run_id: str, agent: Any) -> bool:
+        """Publish an agent and deliver steering latched before publication."""
+        lifecycle = self._run_lifecycles.get(run_id)
+        if lifecycle is None:
+            return False
+        async with lifecycle["lock"]:
+            if (
+                self._run_lifecycles.get(run_id) is not lifecycle
+                or not lifecycle["accepting"]
+            ):
+                return False
+            self._active_run_agents[run_id] = agent
+            lifecycle["agent"] = agent
+            pending = lifecycle["pending"]
+            lifecycle["pending"] = []
+            if pending and run_id not in self._stopping_run_ids:
+                pending_text = "\n".join(pending)
+                try:
+                    accepted = bool(await asyncio.to_thread(agent.steer, pending_text))
+                except Exception:
+                    logger.warning(
+                        "[api_server] pre-publication steer failed for run %s",
+                        run_id,
+                        exc_info=True,
+                    )
+                    accepted = False
+                if not accepted:
+                    lifecycle["pending"] = pending
+            return True
+
+    async def _close_run_steering(self, run_id: str, agent: Any = None) -> Optional[str]:
+        """Close steering acceptance and drain the final undelivered artifact."""
+        lifecycle = self._run_lifecycles.get(run_id)
+        if lifecycle is None:
+            return None
+        async with lifecycle["lock"]:
+            if self._run_lifecycles.get(run_id) is not lifecycle:
+                return None
+            published_agent = lifecycle.get("agent")
+            if (
+                agent is not None
+                and published_agent is not None
+                and published_agent is not agent
+            ):
+                return None
+            lifecycle["accepting"] = False
+            pending = lifecycle.pop("pending", [])
+            drain_agent = published_agent or agent
+            if drain_agent is not None:
+                drain = getattr(drain_agent, "_drain_pending_steer", None)
+                if callable(drain):
+                    try:
+                        drained = await asyncio.to_thread(drain)
+                    except Exception:
+                        logger.debug(
+                            "[api_server] final steer drain failed for run %s",
+                            run_id,
+                            exc_info=True,
+                        )
+                    else:
+                        if drained:
+                            pending.append(drained)
+            return self._combine_steer_texts(*pending)
+
+    async def _discard_run_lifecycle(self, run_id: str) -> None:
+        lifecycle = self._run_lifecycles.get(run_id)
+        if lifecycle is None:
+            return
+        async with lifecycle["lock"]:
+            if self._run_lifecycles.get(run_id) is lifecycle:
+                self._run_lifecycles.pop(run_id, None)
+
+    async def _steer_run_off_loop(
+        self,
+        run_id: str,
+        text: str,
+        mode: str = "redirect",
+    ) -> str:
+        """Accept and deliver one steer without blocking the aiohttp loop."""
+        lifecycle = self._run_lifecycles.get(run_id)
+        if lifecycle is None:
+            return "not_found"
+        async with lifecycle["lock"]:
+            if self._run_lifecycles.get(run_id) is not lifecycle:
+                return "not_found"
+            agent = self._active_run_agents.get(run_id)
+            task = self._active_run_tasks.get(run_id)
+
+            if not lifecycle["accepting"]:
+                return "not_found"
+            published_agent = lifecycle.get("agent")
+            if published_agent is not None and published_agent is not agent:
+                return "not_found"
+            if task is None or task.done():
+                return "not_found"
+
+            if agent is None:
+                lifecycle["pending"].append(text)
+                return "queued"
+
+            if published_agent is None:
+                lifecycle["agent"] = agent
+
+            is_codex_app_server = (
+                getattr(agent, "api_mode", None) == "codex_app_server"
+            )
+            native_soft_steer = mode == "steer" and is_codex_app_server
+            should_redirect = native_soft_steer or (
+                mode == "redirect"
+                and getattr(agent, "_supports_active_turn_redirect", False)
+            )
+            redirect_degraded_to_steer = (
+                mode == "redirect"
+                and not is_codex_app_server
+                and bool(getattr(agent, "_executing_tools", False))
+            )
+
+            redirected = False
+            if should_redirect:
+                try:
+                    redirected = bool(await asyncio.to_thread(agent.redirect, text))
+                except Exception:
+                    logger.warning(
+                        "[api_server] active-turn redirect failed for run %s",
+                        run_id,
+                        exc_info=True,
+                    )
+            if redirected:
+                outcome = (
+                    "queued"
+                    if native_soft_steer or redirect_degraded_to_steer
+                    else "redirected"
+                )
+            elif native_soft_steer:
+                outcome = "failed"
+            else:
+                try:
+                    accepted = bool(await asyncio.to_thread(agent.steer, text))
+                except Exception:
+                    logger.warning(
+                        "[api_server] steer failed for run %s",
+                        run_id,
+                        exc_info=True,
+                    )
+                    accepted = False
+                outcome = "queued" if accepted else "failed"
+
+            # Re-check the identity/state after the off-loop call.  A stale
+            # success must not turn into a 200 for a finished or replaced run.
+            still_live = (
+                lifecycle["accepting"]
+                and self._active_run_agents.get(run_id) is agent
+                and lifecycle.get("agent") is agent
+                and not task.done()
+            )
+            return outcome if still_live else "not_found"
+
     def _interrupt_run(
         self,
         run_id: str,
@@ -7540,15 +7709,28 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             model=body.get("model", self._model_name),
         )
+        self._run_lifecycles[run_id] = {
+            "accepting": True,
+            "agent": None,
+            "pending": [],
+            "lock": asyncio.Lock(),
+        }
 
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         async def _run_and_close():
             result: Any = None
+            agent: Any = None
             try:
                 self._set_run_status(run_id, "running")
                 emitter.response_started()
                 if run_id in self._stopping_run_ids:
+                    missed_steer = await self._close_run_steering(run_id)
+                    if missed_steer:
+                        emitter.omnio_event(
+                            "response.omnio.steer_missed",
+                            text=missed_steer,
+                        )
                     self._set_run_status(
                         run_id,
                         "cancelled",
@@ -7589,8 +7771,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
 
                 agent = await loop.run_in_executor(None, _build_agent)
-                self._active_run_agents[run_id] = agent
+                await self._publish_run_agent(run_id, agent)
                 if run_id in self._stopping_run_ids:
+                    missed_steer = await self._close_run_steering(run_id, agent)
+                    if missed_steer:
+                        emitter.omnio_event(
+                            "response.omnio.steer_missed",
+                            text=missed_steer,
+                        )
                     self._interrupt_run(run_id, "Stop requested via API")
                     queued_log = self._turn_event_logs.get_log(run_id)
                     queued_failure = (
@@ -7815,6 +8003,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 result, usage = await asyncio.get_running_loop().run_in_executor(
                     None, _run_sync
                 )
+                missed_steer = await self._close_run_steering(run_id, agent)
+                result_pending_steer = (
+                    result.get("pending_steer") if isinstance(result, dict) else None
+                )
+                missed_steer = self._combine_steer_texts(
+                    result_pending_steer,
+                    missed_steer,
+                )
+                if missed_steer:
+                    emitter.omnio_event(
+                        "response.omnio.steer_missed",
+                        text=missed_steer,
+                    )
                 # Drain callbacks marshalled from the executor before closing
                 # message/tool boundaries and minting the terminal event.
                 await asyncio.sleep(0)
@@ -7956,6 +8157,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             usage=usage,
                         )
             except asyncio.CancelledError:
+                missed_steer = await self._close_run_steering(run_id, agent)
+                if missed_steer:
+                    emitter.omnio_event(
+                        "response.omnio.steer_missed",
+                        text=missed_steer,
+                    )
                 self._set_run_status(
                     run_id,
                     "cancelled",
@@ -7973,6 +8180,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 # message the other endpoints give a provider auth/credential
                 # failure, instead of falling through to the generic
                 # except-Exception branch below.
+                missed_steer = await self._close_run_steering(run_id, agent)
+                if missed_steer:
+                    emitter.omnio_event(
+                        "response.omnio.steer_missed",
+                        text=missed_steer,
+                    )
                 logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
                 error_msg = f"⚠️ Provider authentication failed: {exc}"
                 self._set_run_status(
@@ -7989,6 +8202,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 _legacy_terminal("run.failed", error=error_msg)
             except Exception as exc:
+                missed_steer = await self._close_run_steering(run_id, agent)
+                if missed_steer:
+                    emitter.omnio_event(
+                        "response.omnio.steer_missed",
+                        text=missed_steer,
+                    )
                 logger.exception("[api_server] run %s failed", run_id)
                 error_msg = _redact_api_error_text(exc)
                 self._set_run_status(
@@ -8043,6 +8262,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                await self._discard_run_lifecycle(run_id)
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
@@ -8618,6 +8838,50 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
+
+    async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/steer — steer an active running agent."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        raw_text = body.get("text") if isinstance(body, dict) else None
+        text = raw_text.strip() if isinstance(raw_text, str) else ""
+        if not text:
+            return web.json_response(
+                _openai_error("Missing 'text'", code="steer_missing_text"),
+                status=400,
+            )
+
+        mode = body.get("mode", "redirect") if isinstance(body, dict) else "redirect"
+        if not isinstance(mode, str) or mode not in {"redirect", "steer"}:
+            return web.json_response(
+                _openai_error(
+                    "Invalid 'mode'; expected 'redirect' or 'steer'",
+                    code="steer_invalid_mode",
+                ),
+                status=400,
+            )
+
+        outcome = await self._steer_run_off_loop(run_id, text, mode)
+        if outcome in {"redirected", "queued"}:
+            return web.json_response({"status": outcome})
+        if outcome == "not_found":
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+
+        return web.json_response(
+            _openai_error(f"Unable to steer run: {run_id}", code="steer_failed"),
+            status=400,
+        )
 
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically expire transport buffers and terminal status records."""

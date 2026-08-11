@@ -9,6 +9,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -60,16 +61,25 @@ def _make_adapter(api_key: str = "") -> APIServerAdapter:
     return adapter
 
 
-def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
+def _create_runs_app(
+    adapter: APIServerAdapter,
+    *,
+    include_profile_routes: bool = False,
+) -> web.Application:
     """Create an aiohttp app with /v1/runs routes registered."""
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
+    app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
+    app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
+    if include_profile_routes:
+        for method, path, handler in adapter._http_route_table():
+            app.router.add_route(method, f"/p/{{profile}}{path}", handler)
     return app
 
 
@@ -448,6 +458,37 @@ class TestRunEvents:
                 # Should contain run.completed
                 assert "run.completed" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_pending_steer_event_precedes_terminal_event(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": "done",
+                    "pending_steer": "Use the other approach",
+                }
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        event_types = [event["type"] for event in events]
+        missed_index = event_types.index("response.omnio.steer_missed")
+        terminal_index = event_types.index("response.completed")
+        assert events[missed_index]["text"] == "Use the other approach"
+        assert missed_index < terminal_index
 
 
 
@@ -960,6 +1001,391 @@ class TestStopRun:
                 body = await events_resp.text()
                 # Stream should have received run.failed and closed
                 assert "run.failed" in body or "stream closed" in body
+
+
+class TestSteerRun:
+    @staticmethod
+    def _make_active_agent(adapter, run_id="run_steer"):
+        agent = MagicMock()
+        agent.api_mode = "chat_completions"
+        agent._executing_tools = False
+        task = MagicMock()
+        task.done.return_value = False
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "running",
+        }
+        adapter._active_run_agents[run_id] = agent
+        adapter._active_run_tasks[run_id] = task
+        adapter._run_lifecycles[run_id] = {
+            "accepting": True,
+            "agent": agent,
+            "pending": [],
+            "lock": asyncio.Lock(),
+        }
+        return agent
+
+    def test_route_table_registers_steer_next_to_stop(self, adapter):
+        routes = {
+            (method, path): handler.__name__
+            for method, path, handler in adapter._http_route_table()
+        }
+        assert routes[("POST", "/v1/runs/{run_id}/stop")] == "_handle_stop_run"
+        assert routes[("POST", "/v1/runs/{run_id}/steer")] == "_handle_steer_run"
+
+    @pytest.mark.asyncio
+    async def test_redirects_capable_active_agent(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = self._make_active_agent(adapter)
+        agent._supports_active_turn_redirect = True
+        agent.redirect.return_value = True
+        agent.steer.return_value = True
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_steer/steer",
+                json={"text": "  change direction  "},
+            )
+            response_data = await response.json()
+
+        assert response.status == 200
+        assert response_data == {"status": "redirected"}
+        agent.redirect.assert_called_once_with("change direction")
+        agent.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_soft_steer_skips_redirect_when_redirect_is_supported(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = self._make_active_agent(adapter)
+        agent._supports_active_turn_redirect = True
+        agent.redirect.return_value = True
+        agent.steer.return_value = True
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_steer/steer",
+                json={"text": "do not interrupt", "mode": "steer"},
+            )
+            response_data = await response.json()
+
+        assert response.status == 200
+        assert response_data == {"status": "queued"}
+        agent.redirect.assert_not_called()
+        agent.steer.assert_called_once_with("do not interrupt")
+
+    @pytest.mark.asyncio
+    async def test_tool_boundary_redirect_reports_queued(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = self._make_active_agent(adapter)
+        agent._supports_active_turn_redirect = True
+        agent._executing_tools = True
+        agent.redirect.return_value = True
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_steer/steer",
+                json={"text": "apply after the tool"},
+            )
+            response_data = await response.json()
+
+        assert response.status == 200
+        assert response_data == {"status": "queued"}
+        agent.redirect.assert_called_once_with("apply after the tool")
+        agent.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_codex_soft_steer_uses_native_turn_steer(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = self._make_active_agent(adapter)
+        agent.api_mode = "codex_app_server"
+        agent._supports_active_turn_redirect = False
+        agent.redirect.return_value = True
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_steer/steer",
+                json={"text": "native soft correction", "mode": "steer"},
+            )
+            response_data = await response.json()
+
+        assert response.status == 200
+        assert response_data == {"status": "queued"}
+        agent.redirect.assert_called_once_with("native soft correction")
+        agent.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_steer_when_redirect_is_unavailable(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = self._make_active_agent(adapter)
+        agent._supports_active_turn_redirect = False
+        agent.steer.return_value = True
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_steer/steer",
+                json={"text": "keep going"},
+            )
+            response_data = await response.json()
+
+        assert response.status == 200
+        assert response_data["status"] == "queued"
+        agent.redirect.assert_not_called()
+        agent.steer.assert_called_once_with("keep going")
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_steer_when_redirect_raises(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = self._make_active_agent(adapter)
+        agent._supports_active_turn_redirect = True
+        agent.redirect.side_effect = RuntimeError("redirect unavailable")
+        agent.steer.return_value = True
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_steer/steer",
+                json={"text": "use the fallback"},
+            )
+            response_data = await response.json()
+
+        assert response.status == 200
+        assert response_data["status"] == "queued"
+        agent.steer.assert_called_once_with("use the fallback")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", [{}, {"text": ""}, {"text": "   "}])
+    async def test_rejects_missing_or_blank_text(self, adapter, body):
+        app = _create_runs_app(adapter)
+        self._make_active_agent(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/runs/run_steer/steer", json=body)
+
+        assert response.status == 400
+
+    @pytest.mark.asyncio
+    async def test_returns_400_when_both_steer_paths_are_rejected(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = self._make_active_agent(adapter)
+        agent._supports_active_turn_redirect = True
+        agent.redirect.return_value = False
+        agent.steer.return_value = False
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_steer/steer",
+                json={"text": "not accepted"},
+            )
+            response_data = await response.json()
+
+        assert response.status == 400
+        assert response_data["error"]["code"] == "steer_failed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["soft", "", None, {"kind": "steer"}])
+    async def test_rejects_invalid_mode(self, adapter, mode):
+        app = _create_runs_app(adapter)
+        agent = self._make_active_agent(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_steer/steer",
+                json={"text": "keep going", "mode": mode},
+            )
+            response_data = await response.json()
+
+        assert response.status == 400
+        assert response_data["error"]["code"] == "steer_invalid_mode"
+        agent.redirect.assert_not_called()
+        agent.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_latches_steers_until_agent_is_published_in_order(self, adapter):
+        app = _create_runs_app(adapter)
+        create_started = threading.Event()
+        allow_create = threading.Event()
+        run_started = threading.Event()
+        allow_run_finish = threading.Event()
+
+        agent = MagicMock()
+        agent._supports_active_turn_redirect = True
+        agent.redirect.return_value = True
+        agent.steer.return_value = True
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        def _create_agent(**_kwargs):
+            create_started.set()
+            assert allow_create.wait(5)
+            return agent
+
+        def _run_conversation(*_args, **_kwargs):
+            run_started.set()
+            assert allow_run_finish.wait(5)
+            return {"final_response": "done"}
+
+        agent.run_conversation.side_effect = _run_conversation
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                start_response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_response.json())["run_id"]
+                assert await _wait_for_thread_event(create_started)
+
+                first = await cli.post(
+                    f"/v1/runs/{run_id}/steer",
+                    json={"text": "first correction", "mode": "steer"},
+                )
+                second = await cli.post(
+                    f"/v1/runs/{run_id}/steer",
+                    json={"text": "second correction"},
+                )
+
+                assert first.status == 200
+                assert await first.json() == {"status": "queued"}
+                assert second.status == 200
+                assert await second.json() == {"status": "queued"}
+                agent.steer.assert_not_called()
+
+                allow_create.set()
+                assert await _wait_for_thread_event(run_started)
+                agent.steer.assert_called_once_with(
+                    "first correction\nsecond correction"
+                )
+                agent.redirect.assert_not_called()
+
+                allow_run_finish.set()
+                for _ in range(40):
+                    if run_id not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.05)
+                assert run_id not in adapter._active_run_tasks
+
+    @pytest.mark.asyncio
+    async def test_finalize_race_surfaces_accepted_steer_before_terminal(self, adapter):
+        app = _create_runs_app(adapter)
+        run_started = threading.Event()
+        allow_run_finish = threading.Event()
+        run_returned = threading.Event()
+        steer_entered = threading.Event()
+        allow_steer_return = threading.Event()
+        pending: list[str] = []
+
+        agent = MagicMock()
+        agent._supports_active_turn_redirect = False
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        def _run_conversation(*_args, **_kwargs):
+            run_started.set()
+            assert allow_run_finish.wait(5)
+            run_returned.set()
+            return {"final_response": "done"}
+
+        def _steer(text):
+            steer_entered.set()
+            assert allow_steer_return.wait(5)
+            pending.append(text)
+            return True
+
+        def _drain_pending_steer():
+            if not pending:
+                return None
+            text = "\n".join(pending)
+            pending.clear()
+            return text
+
+        agent.run_conversation.side_effect = _run_conversation
+        agent.steer.side_effect = _steer
+        agent._drain_pending_steer.side_effect = _drain_pending_steer
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=agent):
+                start_response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_response.json())["run_id"]
+                assert await _wait_for_thread_event(run_started)
+
+                steer_request = asyncio.create_task(
+                    cli.post(
+                        f"/v1/runs/{run_id}/steer",
+                        json={"text": "retain this exact text"},
+                    )
+                )
+                assert await _wait_for_thread_event(steer_entered)
+
+                allow_run_finish.set()
+                assert await _wait_for_thread_event(run_returned)
+                await asyncio.sleep(0)
+                allow_steer_return.set()
+
+                steer_response = await steer_request
+                assert steer_response.status == 200
+                assert await steer_response.json() == {"status": "queued"}
+
+                events_response = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_response.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        event_types = [event["type"] for event in events]
+        missed_index = event_types.index("response.omnio.steer_missed")
+        terminal_index = event_types.index("response.completed")
+        assert events[missed_index]["text"] == "retain this exact text"
+        assert missed_index < terminal_index
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_uses_stop_not_found_error_shape(self, adapter):
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            stop_response = await cli.post("/v1/runs/run_unknown/stop")
+            steer_response = await cli.post(
+                "/v1/runs/run_unknown/steer",
+                json={"text": "hello"},
+            )
+            stop_data = await stop_response.json()
+            steer_data = await steer_response.json()
+
+        assert stop_response.status == 404
+        assert steer_response.status == 404
+        assert steer_data == stop_data
+
+    @pytest.mark.asyncio
+    async def test_prefixed_route_reaches_steer_handler(self, adapter):
+        app = _create_runs_app(adapter, include_profile_routes=True)
+        agent = self._make_active_agent(adapter, run_id="run_prefixed")
+        agent._supports_active_turn_redirect = False
+        agent.steer.return_value = True
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/p/coder/v1/runs/run_prefixed/steer",
+                json={"text": "profile guidance"},
+            )
+            response_data = await response.json()
+
+        assert response.status == 200
+        assert response_data["status"] == "queued"
+
+    @pytest.mark.asyncio
+    async def test_capabilities_advertise_steer(self, adapter):
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get("/v1/capabilities")
+            payload = await response.json()
+
+        assert response.status == 200
+        assert payload["features"]["run_steer"] is True
+        assert payload["endpoints"]["run_steer"] == {
+            "method": "POST",
+            "path": "/v1/runs/{run_id}/steer",
+        }
 
 
 class TestRunsProviderAuthFailure:

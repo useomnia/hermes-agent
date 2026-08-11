@@ -234,6 +234,7 @@ def test_omnio_extension_event_types_are_explicit_and_namespaced() -> None:
         "response.omnio.interrupted_history",
         "response.omnio.approval_request",
         "response.omnio.approval_responded",
+        "response.omnio.steer_missed",
     }
     assert OMNIO_EXTENSION_EVENT_TYPES == expected
 
