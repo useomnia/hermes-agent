@@ -136,6 +136,21 @@ _PROGRESS_HOOK_TIMEOUT_SECONDS = 5.0
 _progress_monitor_lock = threading.Lock()
 _progress_monitor_thread: Optional[threading.Thread] = None
 _progress_monitor_stop = threading.Event()
+# Set to wake the monitor out of its sweep wait: either for an immediate
+# out-of-cycle report (a child just reached its terminal state) or, together
+# with _progress_monitor_stop, for a prompt shutdown.
+_progress_monitor_wake = threading.Event()
+
+
+def request_progress_flush() -> None:
+    """Wake the progress monitor for an immediate out-of-cycle sweep.
+
+    Called when a child reaches its terminal state so its final status ticks
+    out to the hook now instead of waiting out the sweep interval. No-op when
+    the monitor is not running — the batch completion event covers reporting
+    in that case.
+    """
+    _progress_monitor_wake.set()
 
 
 def _db_path():
@@ -1489,6 +1504,7 @@ def _ensure_progress_monitor() -> None:
         if _progress_monitor_thread is not None and _progress_monitor_thread.is_alive():
             return
         _progress_monitor_stop.clear()
+        _progress_monitor_wake.clear()
         _progress_monitor_thread = threading.Thread(
             target=_progress_monitor_loop,
             name="async-delegate-progress-monitor",
@@ -1664,10 +1680,17 @@ def _progress_monitor_loop() -> None:
     ``origin_turn_id``: sample progress, and POST an update when the sampled
     token changed since the last report OR the last report is older than
     ``_PROGRESS_REPORT_INTERVAL`` — i.e. report on meaningful state change,
-    but never faster than the sweep interval either way. Stops itself once
+    but never faster than the sweep interval either way. A
+    ``request_progress_flush`` wake skips the wait AND the due check, so a
+    child's terminal status reaches the hook immediately. Stops itself once
     no running record is reportable, same as the stale monitor.
     """
-    while not _progress_monitor_stop.wait(_PROGRESS_REPORT_INTERVAL):
+    while True:
+        flushed = _progress_monitor_wake.wait(_PROGRESS_REPORT_INTERVAL)
+        if _progress_monitor_stop.is_set():
+            return
+        if flushed:
+            _progress_monitor_wake.clear()
         hook_url = os.environ.get(_OMNIO_SUBAGENT_PROGRESS_HOOK_ENV, "").strip()
         if not hook_url:
             return  # opted out mid-run (env cleared) — nothing left to do
@@ -1691,7 +1714,7 @@ def _progress_monitor_loop() -> None:
             delegation_id = record.get("delegation_id")
             last_token = record.get("_progress_report_token")
             last_ts = record.get("_progress_report_ts") or 0
-            due = token != last_token or (now - last_ts) >= _PROGRESS_REPORT_INTERVAL
+            due = flushed or token != last_token or (now - last_ts) >= _PROGRESS_REPORT_INTERVAL
             if not due:
                 continue
             with _records_lock:
@@ -1876,6 +1899,7 @@ def _reset_for_tests() -> None:
     if thread is not None and thread.is_alive():
         thread.join(timeout=2)
     _progress_monitor_stop.set()
+    _progress_monitor_wake.set()
     with _progress_monitor_lock:
         progress_thread = _progress_monitor_thread
         _progress_monitor_thread = None

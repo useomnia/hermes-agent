@@ -1967,6 +1967,21 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _flush_terminal_progress() -> None:
+    """Wake the async-delegation progress monitor for an immediate sweep.
+
+    Called right after a child's terminal status is stamped so the outcome
+    ticks out to the progress hook now, instead of waiting out the sweep
+    interval. Best-effort: reporting is the monitor's job either way.
+    """
+    try:
+        from tools.async_delegation import request_progress_flush
+
+        request_progress_flush()
+    except Exception:
+        pass
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2314,6 +2329,7 @@ def _run_single_child(
 
             try:
                 child._subagent_terminal_status = "timeout" if is_timeout else "error"
+                _flush_terminal_progress()
             except Exception:
                 pass
             return {
@@ -2382,6 +2398,7 @@ def _run_single_child(
         # the batch-level wake corrects it.
         try:
             child._subagent_terminal_status = status
+            _flush_terminal_progress()
         except Exception:
             pass
 
@@ -2582,6 +2599,7 @@ def _run_single_child(
         logging.exception(f"[subagent-{task_index}] failed")
         try:
             child._subagent_terminal_status = "error"
+            _flush_terminal_progress()
         except Exception:
             pass
         if child_progress_cb:

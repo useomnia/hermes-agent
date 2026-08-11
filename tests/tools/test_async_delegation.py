@@ -1696,6 +1696,47 @@ def test_progress_reporter_posts_per_child_payload(monkeypatch):
     assert body["progress"]["detail"] == "terminal"
 
 
+def test_request_progress_flush_reports_immediately(monkeypatch):
+    """A child's terminal stamp must not wait out the sweep interval: waking
+    the monitor via request_progress_flush posts an out-of-cycle report even
+    though the sampled token has not changed since the last sweep."""
+    monkeypatch.setenv("OMNIO_SUBAGENT_PROGRESS_HOOK", "http://example.invalid/progress")
+    monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-tok")
+    monkeypatch.setattr(ad, "_PROGRESS_REPORT_INTERVAL", 60.0)
+    gate = threading.Event()
+    post_seen = threading.Event()
+    posted = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posted.append({"url": url, "json": json})
+        post_seen.set()
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    res = ad.dispatch_async_delegation(
+        goal="flush child", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_turn_id="turn-flush-1",
+        runner=lambda: (gate.wait(timeout=10), {"status": "completed", "summary": "done"})[1],
+        progress_fn=lambda: (
+            ((1, "terminal", time.time(), "sa-0-flush", True, "interrupted"),),
+            True,
+        ),
+    )
+    assert res["status"] == "dispatched"
+    # With a 60s sweep interval nothing reports on its own.
+    assert not post_seen.wait(0.3)
+
+    ad.request_progress_flush()
+
+    assert post_seen.wait(2.0), "flush did not produce an immediate report"
+    assert posted[0]["json"]["subagent_id"] == "sa-0-flush"
+    assert posted[0]["json"]["status"] == "interrupted"
+
+    gate.set()
+    assert _drain_for(res["delegation_id"], timeout=5.0) is not None
+
+
 def test_progress_reporter_hook_failure_never_raises_into_delegation(monkeypatch):
     """A hook returning 500 (or raising) is strictly best-effort: it must
     never affect the delegation's own completion event or crash the worker
