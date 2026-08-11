@@ -2312,6 +2312,10 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
+            try:
+                child._subagent_terminal_status = "timeout" if is_timeout else "error"
+            except Exception:
+                pass
             return {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
@@ -2357,7 +2361,12 @@ def _run_single_child(
         # it instead of silently accepting zero-content "success".
         _empty_sentinel = summary.strip() == "(empty)"
 
-        if interrupted:
+        from tools.async_delegation import is_subagent_cancel_requested
+
+        if interrupted or (_subagent_id and is_subagent_cancel_requested(_subagent_id)):
+            # A user-cancelled child can slip past the interrupt flag (the
+            # cancel latched after its last flag poll) and still produce a
+            # summary; the latch keeps it from masquerading as completed.
             status = "interrupted"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
@@ -2366,6 +2375,15 @@ def _run_single_child(
             status = "completed"
         else:
             status = "failed"
+
+        # Stamp the outcome for the batch progress sampler: `_subagent_finished`
+        # alone can't distinguish an interrupted child from a completed one, so
+        # progress ticks would report a cancelled child as "completed" until
+        # the batch-level wake corrects it.
+        try:
+            child._subagent_terminal_status = status
+        except Exception:
+            pass
 
         # Build tool trace from conversation messages (already in memory).
         # Uses tool_call_id to correctly pair parallel tool calls with results.
@@ -2562,6 +2580,10 @@ def _run_single_child(
     except Exception as exc:
         duration = round(time.monotonic() - child_start, 2)
         logging.exception(f"[subagent-{task_index}] failed")
+        try:
+            child._subagent_terminal_status = "error"
+        except Exception:
+            pass
         if child_progress_cb:
             try:
                 child_progress_cb(
@@ -3415,6 +3437,7 @@ def delegate_task(
                 try:
                     _summary = _c.get_activity_summary()
                     _tool = _summary.get("current_tool")
+                    _terminal_status = getattr(_c, "_subagent_terminal_status", None)
                     parts.append(
                         (
                             _summary.get("api_call_count", 0),
@@ -3422,6 +3445,7 @@ def delegate_task(
                             _summary.get("last_activity_ts"),
                             getattr(_c, "_subagent_id", None),
                             getattr(_c, "_subagent_finished", False) is True,
+                            _terminal_status if isinstance(_terminal_status, str) else None,
                         )
                     )
                     in_tool = in_tool or bool(_tool)

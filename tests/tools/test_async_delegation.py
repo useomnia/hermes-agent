@@ -1237,7 +1237,7 @@ def test_delegate_task_background_passes_progress_fn_to_async_registry(monkeypat
     progress_fn = captured["progress_fn"]
     assert callable(progress_fn)
     token, in_tool = progress_fn()
-    assert token == ((4, "terminal", 1234.5, "s1", False),)
+    assert token == ((4, "terminal", 1234.5, "s1", False, None),)
     assert in_tool is True
 
 
@@ -1814,6 +1814,52 @@ def test_terminal_tick_emitted_for_finished_child_while_siblings_run(monkeypatch
     sibling = [p for p in posted if p["subagent_id"] == "sa-b"]
     assert sibling, "sibling stopped being reported"
     assert all(p["status"] == "running" for p in sibling)
+
+
+def test_terminal_tick_carries_the_childs_real_outcome(monkeypatch):
+    """A finished child's tick reports its actual terminal status — an
+    interrupted (user-cancelled) child must not masquerade as 'completed'
+    until the batch-level wake corrects it."""
+    monkeypatch.setenv("OMNIO_SUBAGENT_PROGRESS_HOOK", "http://example.invalid/progress")
+    monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-tok")
+    _fast_progress_monitor(monkeypatch)
+    gate = threading.Event()
+    posted = []
+    post_seen = threading.Event()
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posted.append(json)
+        post_seen.set()
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    def progress_fn():
+        # Child A was interrupted; child B finished on an old producer that
+        # carries no terminal-status slot (5-tuple) and keeps the coercion.
+        return (
+            (
+                (3, None, time.time(), "sa-a", True, "interrupted"),
+                (2, None, time.time(), "sa-b", True),
+            ),
+            False,
+        )
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["goal a", "goal b"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_turn_id="turn-outcome",
+        runner=lambda: (gate.wait(timeout=5), {"results": []})[1],
+        progress_fn=progress_fn,
+    )
+    assert res["status"] == "dispatched"
+    assert post_seen.wait(timeout=3.0)
+    gate.set()
+    assert _drain_for(res["delegation_id"], timeout=5.0) is not None
+
+    interrupted = [p for p in posted if p["subagent_id"] == "sa-a"]
+    assert interrupted and all(p["status"] == "interrupted" for p in interrupted)
+    legacy = [p for p in posted if p["subagent_id"] == "sa-b"]
+    assert legacy and all(p["status"] == "completed" for p in legacy)
 
 
 def test_terminal_tick_flushed_for_the_last_child(monkeypatch):

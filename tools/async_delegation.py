@@ -1468,6 +1468,8 @@ def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
                 entry["subagent_id"] = part[3]
             if len(part) >= 5:
                 entry["finished"] = bool(part[4])
+            if len(part) >= 6 and isinstance(part[5], str) and part[5]:
+                entry["terminal_status"] = part[5]
             out.append(entry)
         else:
             out.append(None)
@@ -1534,11 +1536,16 @@ def _progress_report_payload(
             goals[idx] if isinstance(goals, list) and idx < len(goals) else goal
         )
         finished = bool(a.get("finished"))
+        # Prefer the child's real outcome ("completed" / "interrupted" /
+        # "failed" / "timeout" / "error") over the bare finished bool — the
+        # coercion to "completed" made a cancelled child flash a success tick
+        # until the batch-level wake corrected it.
+        terminal_status = a.get("terminal_status") if finished else None
         payloads.append({
             "origin_turn_id": origin_turn_id,
             "delegation_id": delegation_id,
             "subagent_id": a.get("subagent_id") or "",
-            "status": "completed" if finished else "running",
+            "status": (terminal_status or "completed") if finished else "running",
             "progress": {
                 "label": str(label)[:200],
                 "detail": None if finished else a.get("current_tool"),
