@@ -2574,3 +2574,60 @@ class TestReaderLoopOrphanedPipe:
         for i in range(1, 6):
             assert f"line-{i}" in s.output_buffer
         assert "tail-after-sleep" in s.output_buffer
+
+
+class TestAsyncDelegationBatchFormatting:
+    """The consolidated batch block the wake re-injects into the parent."""
+
+    @staticmethod
+    def _batch_evt(results):
+        return {
+            "type": "async_delegation",
+            "delegation_id": "deleg_test01",
+            "is_batch": True,
+            "status": "completed",
+            "goals": ["research A", "research B"],
+            "results": results,
+            "role": "leaf",
+            "model": "m",
+        }
+
+    def test_user_cancelled_child_renders_as_intentionally_dropped(self):
+        """A user-cancelled child must not read like a crash: without an
+        explicit do-not-retry directive the orchestrator re-dispatches the
+        very task the user just stopped."""
+        from tools import process_registry
+
+        text = process_registry._format_async_delegation(
+            self._batch_evt(
+                [
+                    {"task_index": 0, "status": "completed", "summary": "done A"},
+                    {
+                        "task_index": 1,
+                        "status": "interrupted",
+                        "summary": "partial",
+                        "user_cancelled": True,
+                    },
+                ]
+            )
+        )
+        assert "status=cancelled by user" in text
+        assert "do NOT re-dispatch" in text
+        # The cancelled child's partial output is dropped with it.
+        assert "partial" not in text
+        assert "done A" in text
+
+    def test_plain_interrupted_child_keeps_its_partial_output(self):
+        from tools import process_registry
+
+        text = process_registry._format_async_delegation(
+            self._batch_evt(
+                [
+                    {"task_index": 0, "status": "completed", "summary": "done A"},
+                    {"task_index": 1, "status": "interrupted", "summary": "partial"},
+                ]
+            )
+        )
+        assert "status=interrupted" in text
+        assert "partial" in text
+        assert "cancelled by user" not in text

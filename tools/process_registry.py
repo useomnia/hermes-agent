@@ -2218,18 +2218,31 @@ def _format_async_delegation(evt: dict) -> str:
             r_summary = r.get("summary")
             r_error = r.get("error")
             r_goal = goals[idx] if idx < len(goals) else r.get("goal", "")
+            r_cancelled = bool(r.get("user_cancelled"))
             icon = "✓" if r_status in ("completed", "success") else "✗"
             lines.append("")
             header = f"--- {icon} TASK {idx + 1}/{n}"
             if r_goal:
                 header += f": {r_goal}"
-            header += f"  (status={r_status}"
+            header += (
+                "  (status=cancelled by user" if r_cancelled else f"  (status={r_status}"
+            )
             if r.get("api_calls"):
                 header += f", api_calls={r['api_calls']}"
             if r.get("duration_seconds") is not None:
                 header += f", {r['duration_seconds']}s"
             header += ") ---"
             lines.append(header)
+            if r_cancelled:
+                # A deliberate cancel is not a failure to repair — without this
+                # the orchestrator reads the ✗ as a crash and re-dispatches the
+                # very task the user just stopped.
+                lines.append(
+                    "The user cancelled this subagent while it was running. "
+                    "Treat the task as intentionally dropped: do NOT re-dispatch, "
+                    "retry, or redo it unless the user explicitly asks again."
+                )
+                continue
             if r_status in ("completed", "success") and r_summary:
                 lines.append(r_summary)
             elif r_summary:

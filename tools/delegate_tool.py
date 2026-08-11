@@ -2379,7 +2379,8 @@ def _run_single_child(
 
         from tools.async_delegation import is_subagent_cancel_requested
 
-        if interrupted or (_subagent_id and is_subagent_cancel_requested(_subagent_id)):
+        user_cancelled = bool(_subagent_id and is_subagent_cancel_requested(_subagent_id))
+        if interrupted or user_cancelled:
             # A user-cancelled child can slip past the interrupt flag (the
             # cancel latched after its last flag poll) and still produce a
             # summary; the latch keeps it from masquerading as completed.
@@ -2468,6 +2469,10 @@ def _run_single_child(
             # Omnio proxy already persisted rows for under, rather than
             # re-deriving/guessing them.
             "subagent_id": _subagent_id,
+            # Distinguishes a deliberate user cancel from every other
+            # interruption: the completion text renders it as intentionally
+            # dropped so the orchestrator does not re-dispatch it.
+            "user_cancelled": user_cancelled,
             "tokens": {
                 "input": (
                     _input_tokens if isinstance(_input_tokens, (int, float)) else 0
