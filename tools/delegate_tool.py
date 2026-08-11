@@ -2105,7 +2105,20 @@ def _run_single_child(
 
     try:
         _heartbeat_thread.start()
-        if child_progress_cb:
+        # Background dispatches already emitted this SYNCHRONOUSLY at dispatch
+        # time (see the `if background:` block in delegate_task), while the
+        # parent's turn/run was still live — that's the only way the event
+        # both streams to an attached client and persists into the Turn Event
+        # Log (a background child's own thread runs on a daemon executor
+        # after the parent's turn/run has typically already gone terminal;
+        # TurnEventLogStore.append_payload silently drops writes to a
+        # terminal run — see gateway/turn_event_log.py). Emitting again here
+        # would double the persisted subagent.start row and break proxy-side
+        # matching by subagentId, so skip it — never rely on downstream
+        # dedupe for this.
+        if child_progress_cb and not getattr(
+            child, "_subagent_start_emitted_at_dispatch", False
+        ):
             try:
                 child_progress_cb("subagent.start", preview=goal)
             except Exception as e:
@@ -2305,6 +2318,7 @@ def _run_single_child(
                 ),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                "subagent_id": _subagent_id,
             }
         finally:
             # Shut down executor without waiting — if the child thread
@@ -2401,6 +2415,13 @@ def _run_single_child(
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
+            # The stable id this child streamed as "subagentId" on every
+            # subagent.start/complete event (api_server.py's _callback,
+            # ~line 6820). Carried on the per-task result so a batch
+            # completion event can echo the exact set of child ids the
+            # Omnio proxy already persisted rows for under, rather than
+            # re-deriving/guessing them.
+            "subagent_id": _subagent_id,
             "tokens": {
                 "input": (
                     _input_tokens if isinstance(_input_tokens, (int, float)) else 0
@@ -2549,6 +2570,7 @@ def _run_single_child(
             "api_calls": 0,
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
+            "subagent_id": _subagent_id,
         }
 
     finally:
@@ -2560,6 +2582,16 @@ def _run_single_child(
         _heartbeat_stop.set()
         if _heartbeat_thread.ident is not None:
             _heartbeat_thread.join(timeout=5)
+
+        # Mark the child terminal for the batch progress sampler, whatever the
+        # outcome (completed, error, interrupted). This is the only per-child
+        # completion signal a detached batch has: the parent's progress
+        # callback is dead by then, and the async registry's completion event
+        # fires once, for the batch as a whole.
+        try:
+            child._subagent_finished = True
+        except Exception:
+            pass
 
         # Drop the TUI-facing registry entry.  Safe to call even if the
         # child was never registered (e.g. ID missing on test doubles).
@@ -2926,9 +2958,23 @@ def delegate_task(
     # request-scoped chat_id binding (the raw X-Hermes-Session-Id on
     # api_server) is untouched by child construction, so read it here and
     # thread it through the dispatch.
-    from tools.async_delegation import _current_origin_session_id
+    from tools.async_delegation import (
+        _current_delegation_sync_only,
+        _current_origin_session_id,
+        _current_origin_turn_id,
+    )
 
     _origin_wake_sid = _current_origin_session_id()
+    # Same rationale, same capture point: the Omnio product turn_id bound
+    # alongside HERMES_SESSION_CHAT_ID (ApiServerAdapter._bind_api_server_session)
+    # is request-scoped and would be unreadable once a child agent binds its
+    # own session context. Empty on non-Omnio deployments.
+    _origin_turn_id = _current_origin_turn_id()
+    # Same rationale, same capture point: the Omnio proxy's per-run
+    # delegation_sync_only flag (bound alongside HERMES_SESSION_CHAT_ID) must
+    # be read before it becomes unreadable once a child agent binds its own
+    # session context. False on non-Omnio deployments.
+    _sync_only = _current_delegation_sync_only()
 
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
@@ -3171,18 +3217,36 @@ def delegate_task(
         except Exception:
             _async_ok = True
 
-        _wake_sid = ""
-        if not _async_ok:
+        # Stamped on the dispatch record unconditionally: the api_server's
+        # session-delegations listing matches records by origin_session_id,
+        # so a record dispatched on the healthy push path must carry it too,
+        # not only the self-post wake fallback below.
+        _wake_sid = _origin_wake_sid
+        if _sync_only:
+            # The Omnio proxy set delegation_sync_only for this run: this is
+            # a headless surface (cron, trigger.dev run) with NO channel to
+            # ever consume a background wake, even though the API server
+            # always binds a raw session id and would otherwise qualify for
+            # the self-post wake re-enable below. Force the synchronous
+            # fallback unconditionally — this defeats that re-enable path
+            # entirely rather than merely skipping it, since a caller could
+            # set the flag even when async_delivery_supported() is True.
+            logger.info(
+                "delegate_task: delegation_sync_only is set for this run — "
+                "forcing synchronous execution regardless of wake-session "
+                "availability."
+            )
+            _async_ok = False
+        elif not _async_ok:
             # The adapter itself cannot push, but if a raw session id is
             # bound (the API server always binds one — see
             # ApiServerAdapter._bind_api_server_session), gateway.wake can
             # still reach the session by self-POSTing /v1/chat/completions
             # with that id in X-Hermes-Session-Id once the batch completes.
             # Only fall back to forced-sync execution when there is truly no
-            # session id to wake. Uses the origin captured before child
-            # construction (see _origin_wake_sid above) — reading
-            # HERMES_SESSION_ID here would return the subagent's internal id.
-            _wake_sid = _origin_wake_sid
+            # session id to wake. _wake_sid holds the origin captured before
+            # child construction — reading HERMES_SESSION_ID here would
+            # return the subagent's internal id.
             if _wake_sid:
                 logger.info(
                     "delegate_task: async delivery unsupported on this "
@@ -3247,6 +3311,42 @@ def delegate_task(
         _parent_session_id = getattr(parent_agent, "session_id", None)
         _child_agents = [c for (_, _, c) in children]
 
+        # Emit subagent.start SYNCHRONOUSLY, now, for every child — before
+        # this call returns "dispatched". The parent's run is necessarily
+        # still live at this point (we are inside its tool call), so this
+        # is the ONLY point at which the event both streams to an attached
+        # client and persists into the Turn Event Log. The child's own
+        # thread (tools.async_delegation's daemon executor) typically only
+        # starts running well after the parent's turn/run has already gone
+        # terminal, at which point the SAME emission would call
+        # TurnEventEmitter.omnio_event -> TurnEventLogStore.append_payload,
+        # which silently drops the write (log.terminal — see
+        # gateway/turn_event_log.py) — so without this, background
+        # children's start row never lands. Uses each child's own
+        # tool_progress_callback (the identity-aware closure
+        # _build_child_preserving_parent_tools already wired to it), the
+        # exact same call the child thread would otherwise make
+        # (`child_progress_cb("subagent.start", preview=goal)` in
+        # _run_single_child) — subagent_id/task_index/task_count/goal/
+        # parent_id/depth/model are all baked into that closure already.
+        # The flag suppresses the child thread's own later emission (see
+        # the guard in _run_single_child) so the persisted row is never
+        # duplicated.
+        for _i, _t, _c in children:
+            _start_cb = getattr(_c, "tool_progress_callback", None)
+            if _start_cb:
+                try:
+                    _start_cb("subagent.start", preview=_t.get("goal", ""))
+                except Exception as e:
+                    logger.debug(
+                        "Dispatch-time subagent.start emission failed for "
+                        "task %d: %s", _i, e,
+                    )
+            # Set regardless of whether the emission above succeeded — a
+            # best-effort emission failure must not turn into a doubled
+            # start row from the child thread retrying it later.
+            _c._subagent_start_emitted_at_dispatch = True
+
         # Detach every child from the parent's interrupt-propagation list — the
         # batch's lifecycle is owned by the async registry now, not the parent
         # turn. _build_child_agent attached them (correct for sync runs).
@@ -3277,18 +3377,27 @@ def delegate_task(
 
         def _batch_progress():
             # Progress token for the async registry's stale monitor: the
-            # combined (api_call_count, current_tool, last_activity_ts) of
-            # every child. last_activity_ts is ticked by _touch_activity on
-            # every streamed chunk ("receiving stream response"), every tool
-            # transition, and every API-call start/completion — so a child
-            # streaming a long response is alive even though api_call_count
-            # only advances when the call completes (same liveness signal as
-            # the compaction inactivity budget, PR #71508). A fully frozen
-            # token past the stale threshold means the detached batch is
-            # wedged (e.g. stuck inside the first model API call — #60203).
-            # in_tool=True while ANY child is inside a tool so legitimately
-            # slow tools get the higher staleness ceiling, mirroring the
-            # sync-path heartbeat monitor.
+            # combined (api_call_count, current_tool, last_activity_ts,
+            # subagent_id) of every child. last_activity_ts is ticked by
+            # _touch_activity on every streamed chunk ("receiving stream
+            # response"), every tool transition, and every API-call
+            # start/completion — so a child streaming a long response is
+            # alive even though api_call_count only advances when the call
+            # completes (same liveness signal as the compaction inactivity
+            # budget, PR #71508). A fully frozen token past the stale
+            # threshold means the detached batch is wedged (e.g. stuck
+            # inside the first model API call — #60203). in_tool=True while
+            # ANY child is inside a tool so legitimately slow tools get the
+            # higher staleness ceiling, mirroring the sync-path heartbeat
+            # monitor. subagent_id is the same stable id the child streams
+            # as "subagentId" on its subagent.start/complete events
+            # (_run_single_child sets it as child._subagent_id) — carried
+            # here so the Omnio progress hook can attribute a running
+            # update to the exact child the proxy already has a row for.
+            # The trailing `finished` flag (set by _run_single_child's finally)
+            # is what lets that hook announce ONE child finishing while its
+            # siblings keep running — the batch's own completion event only
+            # fires once every child is done.
             parts = []
             in_tool = False
             for _c in _child_agents:
@@ -3300,6 +3409,8 @@ def delegate_task(
                             _summary.get("api_call_count", 0),
                             _tool,
                             _summary.get("last_activity_ts"),
+                            getattr(_c, "_subagent_id", None),
+                            getattr(_c, "_subagent_finished", False) is True,
                         )
                     )
                     in_tool = in_tool or bool(_tool)
@@ -3319,6 +3430,7 @@ def delegate_task(
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
+            origin_turn_id=_origin_turn_id,
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,

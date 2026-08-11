@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -437,6 +438,37 @@ def test_list_async_delegations_exposes_live_activity(monkeypatch):
         assert "progress_fn" not in item
         assert "interrupt_fn" not in item
         assert not any(k.startswith("_") for k in item)
+    finally:
+        gate.set()
+
+
+def test_list_async_delegations_stamps_per_child_goal(monkeypatch):
+    """Each children_activity entry must carry its OWN goal from the batch's
+    goals list (dispatch order), not leave consumers to fall back to the
+    combined batch-level goal string."""
+    monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.03)
+    gate = threading.Event()
+    ts = time.time()
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["research competitor A", "research competitor B"],
+        context=None, toolsets=None, role="leaf", model="m", session_key="",
+        max_async_children=2,
+        runner=lambda: {} if gate.wait(timeout=10) else {},
+        progress_fn=lambda: (
+            ((1, "web_search", ts, "sub-a", False), (2, "web_read", ts, "sub-b", False)),
+            True,
+        ),
+    )
+    try:
+        assert res["status"] == "dispatched"
+        item = next(
+            d for d in ad.list_async_delegations()
+            if d["delegation_id"] == res["delegation_id"]
+        )
+        first, second = item["children_activity"]
+        assert first["goal"] == "research competitor A"
+        assert second["goal"] == "research competitor B"
     finally:
         gate.set()
 
@@ -1198,11 +1230,14 @@ def test_delegate_task_background_passes_progress_fn_to_async_registry(monkeypat
     # The dispatch wires a live progress sampler over the child agents so the
     # async registry's stale monitor can watch the detached batch. The token
     # includes last_activity_ts so streamed chunks count as liveness (each
-    # chunk ticks _touch_activity), not just completed API calls.
+    # chunk ticks _touch_activity), not just completed API calls, plus the
+    # child's stable subagent_id (its streamed "subagentId") so an opt-in
+    # progress report can attribute an update to the exact child, and a
+    # per-child finished flag so that report can announce ONE child ending.
     progress_fn = captured["progress_fn"]
     assert callable(progress_fn)
     token, in_tool = progress_fn()
-    assert token == ((4, "terminal", 1234.5),)
+    assert token == ((4, "terminal", 1234.5, "s1", False),)
     assert in_tool is True
 
 
@@ -1454,3 +1489,343 @@ def test_gateway_cli_origin_event_left_unrouted():
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
 
+
+# ---------------------------------------------------------------------------
+# origin_turn_id / subagent_id threading through the completion event
+# ---------------------------------------------------------------------------
+
+
+def test_completion_event_carries_origin_turn_id_and_subagent_ids():
+    """origin_turn_id and the batch's per-child subagent_ids must reach the
+    completion event, mirroring origin_session_id's existing contract."""
+    res = ad.dispatch_async_delegation_batch(
+        goals=["one task"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_session_id="raw-sid",
+        origin_turn_id="turn-batch-1",
+        runner=lambda: {
+            "results": [
+                {"task_index": 0, "status": "completed", "summary": "ok",
+                 "subagent_id": "sa-0-abc"},
+            ],
+            "total_duration_seconds": 0.1,
+        },
+    )
+    assert res["status"] == "dispatched"
+
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    assert evt is not None
+    assert evt["origin_turn_id"] == "turn-batch-1"
+    assert evt["subagent_ids"] == ["sa-0-abc"]
+
+
+def test_completion_event_origin_turn_id_defaults_empty():
+    """Non-Omnio callers that never pass origin_turn_id get "" — never a
+    missing key, so downstream .get() callers keep working unconditionally."""
+    res = ad.dispatch_async_delegation_batch(
+        goals=["one task"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="",
+        runner=lambda: {"results": [{"task_index": 0, "status": "completed", "summary": "ok"}]},
+    )
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    assert evt is not None
+    assert evt["origin_turn_id"] == ""
+    assert evt["subagent_ids"] == []
+
+
+# ---------------------------------------------------------------------------
+# Opt-in progress reporting (OMNIO_SUBAGENT_PROGRESS_HOOK) — default OFF
+# ---------------------------------------------------------------------------
+
+
+def _fast_progress_monitor(monkeypatch, interval=0.05):
+    monkeypatch.setattr(ad, "_PROGRESS_REPORT_INTERVAL", interval)
+
+
+def test_progress_reporter_off_by_default_no_thread_started(monkeypatch):
+    """Without OMNIO_SUBAGENT_PROGRESS_HOOK, dispatching with a progress_fn
+    must never spin up the progress-monitor thread — default-off is
+    sacred."""
+    monkeypatch.delenv("OMNIO_SUBAGENT_PROGRESS_HOOK", raising=False)
+    _fast_progress_monitor(monkeypatch)
+    gate = threading.Event()
+
+    res = ad.dispatch_async_delegation(
+        goal="off by default", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_turn_id="turn-x",
+        runner=lambda: (gate.wait(timeout=5), {"status": "completed", "summary": "done"})[1],
+        progress_fn=lambda: (((1, "terminal", time.time(), "sa-0"),), True),
+    )
+    assert res["status"] == "dispatched"
+    time.sleep(0.2)
+    assert ad._progress_monitor_thread is None
+
+    gate.set()
+    assert _drain_for(res["delegation_id"], timeout=5.0) is not None
+
+
+def test_progress_reporter_posts_per_child_payload(monkeypatch):
+    """When the hook env is set, a running delegation with an
+    origin_turn_id reports progress carrying the emitting child's
+    subagent_id — the same identity it streams as subagentId — plus a
+    human label/detail, to the configured hook URL with the service-token
+    header."""
+    monkeypatch.setenv("OMNIO_SUBAGENT_PROGRESS_HOOK", "http://example.invalid/progress")
+    monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-tok")
+    _fast_progress_monitor(monkeypatch)
+    gate = threading.Event()
+    posted = []
+    post_seen = threading.Event()
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posted.append({"url": url, "json": json, "headers": headers})
+        post_seen.set()
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    res = ad.dispatch_async_delegation(
+        goal="progress child", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_turn_id="turn-progress-1",
+        runner=lambda: (gate.wait(timeout=5), {"status": "completed", "summary": "done"})[1],
+        progress_fn=lambda: (((2, "terminal", time.time(), "sa-0-xyz"),), True),
+    )
+    assert res["status"] == "dispatched"
+
+    assert post_seen.wait(timeout=3.0)
+    gate.set()
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    assert evt is not None
+
+    assert posted, "progress hook was never POSTed to"
+    call = posted[0]
+    assert call["url"] == "http://example.invalid/progress"
+    assert call["headers"]["X-Omnio-Service-Token"] == "svc-tok"
+    body = call["json"]
+    assert body["origin_turn_id"] == "turn-progress-1"
+    assert body["delegation_id"] == res["delegation_id"]
+    assert body["subagent_id"] == "sa-0-xyz"
+    assert body["status"] == "running"
+    assert body["progress"]["label"] == "progress child"
+    assert body["progress"]["detail"] == "terminal"
+
+
+def test_progress_reporter_hook_failure_never_raises_into_delegation(monkeypatch):
+    """A hook returning 500 (or raising) is strictly best-effort: it must
+    never affect the delegation's own completion event or crash the worker
+    thread."""
+    monkeypatch.setenv("OMNIO_SUBAGENT_PROGRESS_HOOK", "http://example.invalid/progress")
+    monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-tok")
+    _fast_progress_monitor(monkeypatch)
+    gate = threading.Event()
+    post_seen = threading.Event()
+
+    def failing_post(url, json=None, headers=None, timeout=None):
+        post_seen.set()
+        return SimpleNamespace(status_code=500)
+
+    monkeypatch.setattr("requests.post", failing_post)
+
+    res = ad.dispatch_async_delegation(
+        goal="progress child failing hook", context=None, toolsets=None,
+        role="leaf", model="m", session_key="", origin_turn_id="turn-progress-2",
+        runner=lambda: (gate.wait(timeout=5), {"status": "completed", "summary": "done"})[1],
+        progress_fn=lambda: (((1, "terminal", time.time(), "sa-1"),), True),
+    )
+    assert res["status"] == "dispatched"
+    assert post_seen.wait(timeout=3.0)
+
+    gate.set()
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    assert evt is not None
+    assert evt["status"] == "completed"  # unaffected by the failing hook
+
+
+def test_progress_reporter_skips_delegations_without_origin_turn_id(monkeypatch):
+    """A delegation with no origin_turn_id (non-Omnio deployment) is never
+    reported — there is nothing on the product side to attribute it to."""
+    monkeypatch.setenv("OMNIO_SUBAGENT_PROGRESS_HOOK", "http://example.invalid/progress")
+    monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-tok")
+    _fast_progress_monitor(monkeypatch)
+    gate = threading.Event()
+    posted = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posted.append(json)
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    res = ad.dispatch_async_delegation(
+        goal="no turn id", context=None, toolsets=None, role="leaf",
+        model="m", session_key="",  # no origin_turn_id
+        runner=lambda: (gate.wait(timeout=5), {"status": "completed", "summary": "done"})[1],
+        progress_fn=lambda: (((1, "terminal", time.time(), "sa-2"),), True),
+    )
+    assert res["status"] == "dispatched"
+    time.sleep(0.25)  # several sweeps at the shrunk interval
+    gate.set()
+    assert _drain_for(res["delegation_id"], timeout=5.0) is not None
+    assert posted == []
+
+
+
+# ---------------------------------------------------------------------------
+# Per-child completion ticks — one terminal update per finished child
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_tick_emitted_for_finished_child_while_siblings_run(monkeypatch):
+    """A batch's only completion signal is the delegation-level event, which
+    fires once ALL children are done. A child that finishes on its own must
+    still get a terminal update carrying its own subagent_id, while its
+    still-running siblings keep reporting 'running'."""
+    monkeypatch.setenv("OMNIO_SUBAGENT_PROGRESS_HOOK", "http://example.invalid/progress")
+    monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-tok")
+    _fast_progress_monitor(monkeypatch)
+    gate = threading.Event()
+    posted = []
+    post_seen = threading.Event()
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posted.append(json)
+        post_seen.set()
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    def progress_fn():
+        # Child A has returned (finished=True); child B is still in a tool.
+        return (
+            (
+                (3, None, time.time(), "sa-a", True),
+                (1, "terminal", time.time(), "sa-b", False),
+            ),
+            True,
+        )
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["goal a", "goal b"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_turn_id="turn-child-done",
+        runner=lambda: (gate.wait(timeout=5), {"results": []})[1],
+        progress_fn=progress_fn,
+    )
+    assert res["status"] == "dispatched"
+    assert post_seen.wait(timeout=3.0)
+    time.sleep(0.2)  # let more sweeps run
+    gate.set()
+    assert _drain_for(res["delegation_id"], timeout=5.0) is not None
+
+    done = [p for p in posted if p["status"] == "completed"]
+    assert len(done) == 1, f"expected exactly one terminal tick, got {done}"
+    assert done[0]["subagent_id"] == "sa-a"
+    assert done[0]["origin_turn_id"] == "turn-child-done"
+    assert done[0]["delegation_id"] == res["delegation_id"]
+    assert done[0]["progress"]["label"] == "goal a"
+    assert done[0]["progress"]["detail"] is None
+
+    # The sibling is unaffected — still reported as running, every sweep.
+    sibling = [p for p in posted if p["subagent_id"] == "sa-b"]
+    assert sibling, "sibling stopped being reported"
+    assert all(p["status"] == "running" for p in sibling)
+
+
+def test_terminal_tick_flushed_for_the_last_child(monkeypatch):
+    """The last child's flip lands together with the batch's own completion,
+    inside a sweep interval — the finalize-time flush is what keeps it from
+    being dropped. Sweeps are pinned long enough that only the flush can
+    have posted."""
+    monkeypatch.setenv("OMNIO_SUBAGENT_PROGRESS_HOOK", "http://example.invalid/progress")
+    monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-tok")
+    _fast_progress_monitor(monkeypatch, interval=30.0)
+    posted = []
+
+    monkeypatch.setattr(
+        "requests.post",
+        lambda url, json=None, headers=None, timeout=None: (
+            posted.append(json), SimpleNamespace(status_code=200))[1],
+    )
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["goal a"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_turn_id="turn-last-child",
+        runner=lambda: {"results": []},
+        progress_fn=lambda: (((2, None, time.time(), "sa-last", True),), False),
+    )
+    assert res["status"] == "dispatched"
+    assert _drain_for(res["delegation_id"], timeout=5.0) is not None
+
+    done = [p for p in posted if p["status"] == "completed"]
+    assert len(done) == 1
+    assert done[0]["subagent_id"] == "sa-last"
+
+
+def test_terminal_tick_not_re_emitted_on_later_sweeps(monkeypatch):
+    """A finished child stays finished in every later sample. Without a claim
+    set the sweep would re-announce it on each pass, and the product would
+    show the same subagent completing over and over."""
+    monkeypatch.setenv("OMNIO_SUBAGENT_PROGRESS_HOOK", "http://example.invalid/progress")
+    monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-tok")
+    _fast_progress_monitor(monkeypatch, interval=0.02)
+    gate = threading.Event()
+    posted = []
+    post_seen = threading.Event()
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posted.append(json)
+        post_seen.set()
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    def progress_fn():
+        return (
+            (
+                (3, None, time.time(), "sa-done", True),
+                (1, "terminal", time.time(), "sa-busy", False),
+            ),
+            True,
+        )
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["goal a", "goal b"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_turn_id="turn-no-repeat",
+        runner=lambda: (gate.wait(timeout=5), {"results": []})[1],
+        progress_fn=progress_fn,
+    )
+    assert res["status"] == "dispatched"
+    assert post_seen.wait(timeout=3.0)
+    time.sleep(0.4)  # ~20 sweeps at the shrunk interval
+    gate.set()
+    assert _drain_for(res["delegation_id"], timeout=5.0) is not None
+
+    done = [p for p in posted if p["subagent_id"] == "sa-done"]
+    assert len(done) == 1, f"terminal tick re-emitted {len(done)} times"
+    assert done[0]["status"] == "completed"
+
+
+def test_terminal_tick_hook_failure_is_swallowed(monkeypatch):
+    """A raising hook on the terminal tick must never reach the delegation:
+    the batch still finalizes and delivers its completion event."""
+    monkeypatch.setenv("OMNIO_SUBAGENT_PROGRESS_HOOK", "http://example.invalid/progress")
+    monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-tok")
+    _fast_progress_monitor(monkeypatch, interval=30.0)
+    calls = []
+
+    def raising_post(url, json=None, headers=None, timeout=None):
+        calls.append(json)
+        raise RuntimeError("hook exploded")
+
+    monkeypatch.setattr("requests.post", raising_post)
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["goal a"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_turn_id="turn-hook-boom",
+        runner=lambda: {"results": [{"task_index": 0, "status": "completed", "summary": "ok"}]},
+        progress_fn=lambda: (((1, None, time.time(), "sa-boom", True),), False),
+    )
+    assert res["status"] == "dispatched"
+
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    assert evt is not None
+    assert evt["status"] == "completed"
+    assert calls and calls[0]["status"] == "completed"

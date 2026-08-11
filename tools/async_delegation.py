@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -114,6 +115,27 @@ _STALL_GRACE_SECONDS = 120.0  # after interrupt, time for the runner to return
 _monitor_lock = threading.Lock()
 _monitor_thread: Optional[threading.Thread] = None
 _monitor_stop = threading.Event()
+
+# ---------------------------------------------------------------------------
+# Opt-in progress reporting (Omnio) — off by default
+# ---------------------------------------------------------------------------
+# When env OMNIO_SUBAGENT_PROGRESS_HOOK is set, running delegations report
+# best-effort progress (goal + current child activity) to that URL so the
+# Omnio product UI can show "subagent working on X" instead of going silent
+# until completion. A dedicated monitor thread (same singleton-thread shape
+# as the stale monitor above) samples every dispatch's progress_fn on a
+# tighter cadence than the stale sweep, since the stale monitor's job is
+# "notice a wedge after minutes," not "report fresh status every few
+# seconds." Strictly best-effort: a hook failure is logged and dropped, never
+# raised into the delegation path, and the thread never keeps the process
+# alive (daemon=True, self-stops when nothing is running).
+_OMNIO_SUBAGENT_PROGRESS_HOOK_ENV = "OMNIO_SUBAGENT_PROGRESS_HOOK"
+_PROGRESS_REPORT_INTERVAL = 10.0  # seconds between monitor sweeps
+_PROGRESS_HOOK_TIMEOUT_SECONDS = 5.0
+
+_progress_monitor_lock = threading.Lock()
+_progress_monitor_thread: Optional[threading.Thread] = None
+_progress_monitor_stop = threading.Event()
 
 
 def _db_path():
@@ -591,6 +613,51 @@ def _current_origin_session_id() -> str:
         return ""
 
 
+def _current_origin_turn_id() -> str:
+    """Omnio product turn id of the ORIGINATING api_server request, or ``""``.
+
+    Mirrors ``_current_origin_session_id`` exactly, and for the same reason:
+    it must be read BEFORE any child agent is constructed, because
+    ``agent_init`` clobbers the session-id ContextVar (not this one, but
+    dispatch-time code that reads session context in one place should read
+    all of it together to avoid a future divergent read site). The binding
+    itself (``HERMES_ORIGIN_TURN_ID``) is set alongside ``HERMES_SESSION_CHAT_ID``
+    by ``ApiServerAdapter._bind_api_server_session`` and is request-scoped,
+    so it is empty on any non-Omnio deployment (no ``turn_id`` on the run) or
+    any non-api_server platform.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "api_server":
+            return ""
+        return get_session_env("HERMES_ORIGIN_TURN_ID", "") or ""
+    except Exception:
+        return ""
+
+
+def _current_delegation_sync_only() -> bool:
+    """Whether the ORIGINATING api_server request forced this run's background
+    delegations to run SYNCHRONOUSLY, or ``False``.
+
+    Mirrors ``_current_origin_turn_id`` exactly, and for the same reason: it
+    must be read BEFORE any child agent is constructed, at the same capture
+    point as the other origin reads. The binding itself
+    (``HERMES_DELEGATION_SYNC_ONLY``) is set alongside ``HERMES_SESSION_CHAT_ID``
+    by ``ApiServerAdapter._bind_api_server_session`` and is request-scoped, so
+    it is ``False`` on any non-Omnio deployment (no ``delegation_sync_only``
+    on the run) or any non-api_server platform.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "api_server":
+            return False
+        return get_session_env("HERMES_DELEGATION_SYNC_ONLY", "") == "1"
+    except Exception:
+        return False
+
+
 def dispatch_async_delegation(
     *,
     goal: str,
@@ -603,6 +670,7 @@ def dispatch_async_delegation(
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
+    origin_turn_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
@@ -624,6 +692,13 @@ def dispatch_async_delegation(
         the delegation. Carried on the completion event so the gateway can
         pin routing to the spawning session instead of recovering the latest
         ``ended_at IS NULL`` row for the peer tuple (#57498).
+    origin_turn_id
+        The Omnio product turn id (``turn_id`` on ``POST /v1/runs``) that
+        spawned this delegation, captured the same way as
+        ``origin_session_id`` (before child construction). Empty on any
+        non-Omnio deployment. Carried on the completion event so
+        ``gateway.wake`` can redirect the wake into a real product turn via
+        ``OMNIO_WAKE_HOOK`` instead of self-posting.
     runner
         Zero-arg callable that builds + runs the child and returns the same
         result dict ``_run_single_child`` produces. Runs on the worker thread.
@@ -661,6 +736,7 @@ def dispatch_async_delegation(
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
+        "origin_turn_id": origin_turn_id,
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -729,6 +805,8 @@ def dispatch_async_delegation(
         }
     if progress_fn is not None:
         _ensure_stale_monitor()
+        if os.environ.get(_OMNIO_SUBAGENT_PROGRESS_HOOK_ENV, "").strip():
+            _ensure_progress_monitor()
 
     logger.info(
         "Dispatched async delegation %s (session_key=%s): %s",
@@ -739,6 +817,15 @@ def dispatch_async_delegation(
 
 def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
     """Mark a record complete and push the completion event onto the queue."""
+    # Before _begin_finalization drops progress_fn: last chance to announce
+    # children whose terminal tick the sweep never got to.
+    try:
+        _flush_child_completions(delegation_id)
+    except Exception as exc:
+        logger.debug(
+            "Child-completion flush failed for delegation %s: %s",
+            delegation_id, exc,
+        )
     claimed = _begin_finalization(delegation_id)
     if claimed is None:
         return
@@ -808,6 +895,13 @@ def _push_completion_event(
         "session_key": record.get("session_key", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "origin_session_id": record.get("origin_session_id", ""),
+        "origin_turn_id": record.get("origin_turn_id", ""),
+        # Single-dispatch mirror of the batch path's subagent_ids (see
+        # _push_batch_completion_event) — a one-element list when the
+        # runner's result carries the child's streamed subagent_id.
+        "subagent_ids": (
+            [result["subagent_id"]] if result.get("subagent_id") else []
+        ),
         "parent_session_id": record.get("parent_session_id"),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
@@ -858,6 +952,7 @@ def dispatch_async_delegation_batch(
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
+    origin_turn_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
@@ -901,6 +996,7 @@ def dispatch_async_delegation_batch(
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
+        "origin_turn_id": origin_turn_id,
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -970,6 +1066,8 @@ def dispatch_async_delegation_batch(
         }
     if progress_fn is not None:
         _ensure_stale_monitor()
+        if os.environ.get(_OMNIO_SUBAGENT_PROGRESS_HOOK_ENV, "").strip():
+            _ensure_progress_monitor()
 
     logger.info(
         "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
@@ -982,6 +1080,15 @@ def _finalize_batch(
     delegation_id: str, combined: Dict[str, Any], status: str
 ) -> None:
     """Mark a batch record complete and push ONE combined completion event."""
+    # Before _begin_finalization drops progress_fn: last chance to announce
+    # children whose terminal tick the sweep never got to.
+    try:
+        _flush_child_completions(delegation_id)
+    except Exception as exc:
+        logger.debug(
+            "Child-completion flush failed for delegation %s: %s",
+            delegation_id, exc,
+        )
     claimed = _begin_finalization(delegation_id)
     if claimed is None:
         return
@@ -1007,12 +1114,26 @@ def _push_batch_completion_event(
 
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
+    _results = combined.get("results") or []
+    # The exact subagent_id values the children streamed as "subagentId" on
+    # their subagent.start/complete events (tools.delegate_tool._run_single_child
+    # -> entry["subagent_id"]) — echoed here so the wake payload can carry
+    # them and the Omnio proxy can match by the same streamed identity
+    # instead of delegation_id (which is a batch-level id, not a per-child
+    # one; a single-task batch's subagent_id can equal delegation_id by
+    # coincidence but must never be assumed to).
+    _subagent_ids = [
+        r.get("subagent_id") for r in _results
+        if isinstance(r, dict) and r.get("subagent_id")
+    ]
     evt = {
         "type": "async_delegation",
         "delegation_id": event_record.get("delegation_id"),
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "origin_session_id": event_record.get("origin_session_id", ""),
+        "origin_turn_id": event_record.get("origin_turn_id", ""),
+        "subagent_ids": _subagent_ids,
         "parent_session_id": event_record.get("parent_session_id"),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
@@ -1024,7 +1145,7 @@ def _push_batch_completion_event(
         "is_batch": True,
         # The full per-task results list — the formatter renders a
         # consolidated multi-task block from this.
-        "results": combined.get("results") or [],
+        "results": _results,
         # Per-task live transcript log paths (cache/delegation/live/...).
         # They persist after completion and double as the full-fidelity
         # operational record of each child's run.
@@ -1241,8 +1362,11 @@ def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
     """Parse a progress token into per-child activity dicts (best-effort).
 
     delegate_tool's ``_batch_progress`` emits one ``(api_call_count,
-    current_tool, last_activity_ts)`` tuple per child. Foreign token shapes
-    (custom dispatchers) degrade to ``None`` entries rather than raising —
+    current_tool, last_activity_ts, subagent_id, finished)`` tuple per child
+    (``subagent_id`` is the same stable id the child streams as "subagentId"
+    on its subagent.start/complete events, ``finished`` flips once that child
+    returns — see ``tools.delegate_tool._batch_progress``). Shorter tuples and
+    foreign token shapes (custom dispatchers) degrade rather than raising —
     the token contract is intentionally opaque to the registry.
     """
     try:
@@ -1260,10 +1384,238 @@ def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
                 entry["seconds_since_activity"] = round(
                     max(0.0, now - float(part[2])), 1
                 )
+            if len(part) >= 4 and isinstance(part[3], str) and part[3]:
+                entry["subagent_id"] = part[3]
+            if len(part) >= 5:
+                entry["finished"] = bool(part[4])
             out.append(entry)
         else:
             out.append(None)
     return out
+
+
+def _ensure_progress_monitor() -> None:
+    """Start (once) the module-level progress-reporting monitor thread.
+
+    Mirrors ``_ensure_stale_monitor``'s singleton-thread shape: one daemon
+    thread serves every progress-enabled dispatch, exits on its own when no
+    monitorable records remain, and is restarted by the next dispatch that
+    carries a ``progress_fn`` while ``OMNIO_SUBAGENT_PROGRESS_HOOK`` is set.
+    """
+    global _progress_monitor_thread
+    with _progress_monitor_lock:
+        if _progress_monitor_thread is not None and _progress_monitor_thread.is_alive():
+            return
+        _progress_monitor_stop.clear()
+        _progress_monitor_thread = threading.Thread(
+            target=_progress_monitor_loop,
+            name="async-delegate-progress-monitor",
+            daemon=True,
+        )
+        _progress_monitor_thread.start()
+
+
+def _progress_report_payload(
+    record: Dict[str, Any], now: float
+) -> Optional[tuple[List[Dict[str, Any]], Any]]:
+    """Build the progress-hook payload(s) for one running record, or ``None``.
+
+    Best-effort: samples ``progress_fn`` fresh (outside ``_records_lock`` —
+    see the same rationale in ``list_async_delegations``) and reduces it to
+    one payload PER CHILD (a batch of N tasks has N children, each streaming
+    its own ``subagentId`` — the proxy matches progress updates against the
+    per-child row that identity created, not against the batch-level
+    ``delegation_id``). Returns ``None`` when there is no origin turn to
+    attribute the update to, or the sampler is unavailable/errors — the
+    caller simply skips reporting that sweep.
+
+    Returns ``(payloads, token)`` where ``token`` is the RAW sampled token
+    (not the per-child breakdown), used by the caller to decide whether
+    anything meaningfully changed since the last report.
+    """
+    origin_turn_id = record.get("origin_turn_id") or ""
+    if not origin_turn_id:
+        return None
+    progress_fn = record.get("progress_fn")
+    if progress_fn is None:
+        return None
+    try:
+        token, in_tool = progress_fn()
+    except Exception:
+        return None
+    delegation_id = record.get("delegation_id", "")
+    goals = record.get("goals")
+    goal = record.get("goal", "")
+    activity = _children_activity_from_token(token, now) or []
+    payloads: List[Dict[str, Any]] = []
+    for idx, a in enumerate(activity):
+        a = a or {}
+        label = (
+            goals[idx] if isinstance(goals, list) and idx < len(goals) else goal
+        )
+        finished = bool(a.get("finished"))
+        payloads.append({
+            "origin_turn_id": origin_turn_id,
+            "delegation_id": delegation_id,
+            "subagent_id": a.get("subagent_id") or "",
+            "status": "completed" if finished else "running",
+            "progress": {
+                "label": str(label)[:200],
+                "detail": None if finished else a.get("current_tool"),
+            },
+        })
+    if not payloads:
+        # No per-child breakdown available (foreign/opaque token shape,
+        # e.g. a custom dispatcher) — fall back to one delegation-level
+        # update with an empty subagent_id rather than reporting nothing.
+        payloads.append({
+            "origin_turn_id": origin_turn_id,
+            "delegation_id": delegation_id,
+            "subagent_id": "",
+            "status": "running",
+            "progress": {
+                "label": str(goal)[:200],
+                "detail": "working" if in_tool else None,
+            },
+        })
+    return payloads, token
+
+
+def _claim_child_completions(
+    delegation_id: str, payloads: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Filter out terminal ticks for children already announced as completed.
+
+    A finished child stays finished in every later sample, so without a claim
+    set the sweep would re-announce it on each pass. The set lives on the live
+    record (private key — excluded from ``list_async_delegations`` snapshots)
+    so the terminal tick fires exactly once per child, independent of whether
+    its siblings are still running.
+    """
+    kept: List[Dict[str, Any]] = []
+    with _records_lock:
+        record = _records.get(delegation_id)
+        claimed = record.get("_progress_completed") if record is not None else None
+        if not isinstance(claimed, set):
+            claimed = set()
+            if record is not None:
+                record["_progress_completed"] = claimed
+        for payload in payloads:
+            if payload.get("status") != "completed":
+                kept.append(payload)
+                continue
+            subagent_id = payload.get("subagent_id") or ""
+            if subagent_id in claimed:
+                continue
+            claimed.add(subagent_id)
+            kept.append(payload)
+    return kept
+
+
+def _flush_child_completions(delegation_id: str) -> None:
+    """Announce any child that finished without a terminal tick going out.
+
+    The sweep catches a child the moment it observes the flip, but the LAST
+    child's flip lands together with the batch's own completion — inside a
+    sweep interval. Sampling once more here, while the record is still running
+    and the child agents are still alive, closes that gap.
+    """
+    hook_url = os.environ.get(_OMNIO_SUBAGENT_PROGRESS_HOOK_ENV, "").strip()
+    if not hook_url:
+        return
+    with _records_lock:
+        record = _records.get(delegation_id)
+    if record is None:
+        return
+    built = _progress_report_payload(record, time.time())
+    if built is None:
+        return
+    payloads, _token = built
+    terminal = [p for p in payloads if p.get("status") == "completed"]
+    for payload in _claim_child_completions(delegation_id, terminal):
+        _post_progress_update(hook_url, payload)
+
+
+def _post_progress_update(hook_url: str, payload: Dict[str, Any]) -> None:
+    """POST one progress update. Strictly best-effort — never raises.
+
+    Runs on the progress-monitor thread (a plain daemon thread, not an
+    asyncio task), so this uses ``requests`` synchronously rather than
+    aiohttp, matching the sync worker context. Any failure (network,
+    timeout, non-2xx) is logged and dropped — a lost progress update must
+    never affect the delegation or the agent loop.
+    """
+    try:
+        import requests
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-Omnio-Service-Token": os.environ.get("OMNIO_INTERNAL_TOKEN", ""),
+        }
+        resp = requests.post(
+            hook_url,
+            json=payload,
+            headers=headers,
+            timeout=_PROGRESS_HOOK_TIMEOUT_SECONDS,
+        )
+        if resp.status_code >= 400:
+            logger.debug(
+                "Subagent progress hook returned HTTP %d for delegation %s",
+                resp.status_code, payload.get("delegation_id"),
+            )
+    except Exception as exc:
+        logger.debug(
+            "Subagent progress hook POST failed for delegation %s: %s",
+            payload.get("delegation_id"), exc,
+        )
+
+
+def _progress_monitor_loop() -> None:
+    """Sweep running delegations and report best-effort progress.
+
+    Per sweep, for every running record with a ``progress_fn`` and a bound
+    ``origin_turn_id``: sample progress, and POST an update when the sampled
+    token changed since the last report OR the last report is older than
+    ``_PROGRESS_REPORT_INTERVAL`` — i.e. report on meaningful state change,
+    but never faster than the sweep interval either way. Stops itself once
+    no running record is reportable, same as the stale monitor.
+    """
+    while not _progress_monitor_stop.wait(_PROGRESS_REPORT_INTERVAL):
+        hook_url = os.environ.get(_OMNIO_SUBAGENT_PROGRESS_HOOK_ENV, "").strip()
+        if not hook_url:
+            return  # opted out mid-run (env cleared) — nothing left to do
+        now = time.time()
+        with _records_lock:
+            records_snapshot = [
+                r for r in _records.values()
+                if r.get("status") == "running" and r.get("progress_fn") is not None
+            ]
+        if not records_snapshot:
+            return
+        # Sample + decide OUTSIDE the lock (progress_fn reads child-agent
+        # attributes and must never run under _records_lock — mirrors
+        # list_async_delegations' rationale).
+        to_report: List[Dict[str, Any]] = []
+        for record in records_snapshot:
+            built = _progress_report_payload(record, now)
+            if built is None:
+                continue
+            payloads, token = built
+            delegation_id = record.get("delegation_id")
+            last_token = record.get("_progress_report_token")
+            last_ts = record.get("_progress_report_ts") or 0
+            due = token != last_token or (now - last_ts) >= _PROGRESS_REPORT_INTERVAL
+            if not due:
+                continue
+            with _records_lock:
+                live = _records.get(delegation_id)
+                if live is None or live.get("status") != "running":
+                    continue
+                live["_progress_report_token"] = token
+                live["_progress_report_ts"] = now
+            to_report.extend(_claim_child_completions(delegation_id, payloads))
+        for payload in to_report:
+            _post_progress_update(hook_url, payload)
 
 
 def list_async_delegations() -> List[Dict[str, Any]]:
@@ -1323,6 +1675,15 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             continue
         activity = _children_activity_from_token(token, now)
         if activity is not None:
+            # Stamp each child's own goal onto its activity entry. The token
+            # tuples arrive in dispatch order — the same order ``goals`` was
+            # recorded in — so consumers of this snapshot can name each child
+            # individually instead of falling back to the batch-level goal.
+            goals = item.get("goals")
+            if isinstance(goals, list):
+                for idx, entry in enumerate(activity):
+                    if entry is not None and idx < len(goals):
+                        entry["goal"] = goals[idx]
             item["children_activity"] = activity
         item["in_tool"] = bool(in_tool)
     return items
@@ -1415,7 +1776,7 @@ def interrupt_for_session(
 
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor + monitor."""
-    global _executor, _executor_max_workers, _monitor_thread
+    global _executor, _executor_max_workers, _monitor_thread, _progress_monitor_thread
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)
@@ -1427,5 +1788,11 @@ def _reset_for_tests() -> None:
         _monitor_thread = None
     if thread is not None and thread.is_alive():
         thread.join(timeout=2)
+    _progress_monitor_stop.set()
+    with _progress_monitor_lock:
+        progress_thread = _progress_monitor_thread
+        _progress_monitor_thread = None
+    if progress_thread is not None and progress_thread.is_alive():
+        progress_thread.join(timeout=2)
     with _records_lock:
         _records.clear()

@@ -338,3 +338,135 @@ class TestTerminalNotifyGate:
         assert not d.get("notify_unsupported")
         # No platform bound -> no gateway watcher, but completion_queue still fires.
         assert len(process_registry.pending_watchers) == 0
+
+
+# ---------------------------------------------------------------------------
+# HERMES_ORIGIN_TURN_ID — bound alongside chat_id, empty on non-Omnio paths
+# ---------------------------------------------------------------------------
+
+
+class TestOriginTurnIdBinding:
+    """The Omnio ``turn_id`` bound by ``_bind_api_server_session`` follows
+    the exact same lifecycle as ``chat_id``: set by ``set_session_vars``,
+    readable via ``get_session_env``, "" (not the os.environ fallback) once
+    ``clear_session_vars`` runs, and back to "never bound" after
+    ``reset_session_vars``."""
+
+    def test_set_and_read(self):
+        tokens = set_session_vars(
+            platform="api_server",
+            chat_id="sess1",
+            session_id="sess1",
+            origin_turn_id="turn-abc",
+        )
+        try:
+            assert get_session_env("HERMES_ORIGIN_TURN_ID") == "turn-abc"
+        finally:
+            clear_session_vars(tokens)
+
+    def test_defaults_empty_when_not_passed(self):
+        """Non-Omnio callers never pass origin_turn_id — must read "" rather
+        than raising or falling back to a stale value."""
+        tokens = set_session_vars(platform="telegram", chat_id="123")
+        try:
+            assert get_session_env("HERMES_ORIGIN_TURN_ID") == ""
+        finally:
+            clear_session_vars(tokens)
+
+    def test_cleared_to_empty_not_environ_fallback(self, monkeypatch):
+        monkeypatch.setenv("HERMES_ORIGIN_TURN_ID", "leaked-from-os-environ")
+        tokens = set_session_vars(
+            platform="api_server", chat_id="sess1", origin_turn_id="turn-xyz",
+        )
+        clear_session_vars(tokens)
+        # Explicitly cleared ("") — must NOT fall back to os.environ, exactly
+        # like every other _VAR_MAP-mapped session var.
+        assert get_session_env("HERMES_ORIGIN_TURN_ID") == ""
+
+    def test_reset_restores_environ_fallback(self, monkeypatch):
+        monkeypatch.setenv("HERMES_ORIGIN_TURN_ID", "cli-env-value")
+        reset_session_vars()
+        assert get_session_env("HERMES_ORIGIN_TURN_ID") == "cli-env-value"
+
+
+# ---------------------------------------------------------------------------
+# HERMES_DELEGATION_SYNC_ONLY — bound alongside chat_id, empty on non-Omnio
+# paths. Mirrors TestOriginTurnIdBinding exactly (same lifecycle, same
+# _bind_api_server_session chokepoint).
+# ---------------------------------------------------------------------------
+
+
+class TestDelegationSyncOnlyBinding:
+    """The Omnio ``delegation_sync_only`` flag bound by
+    ``_bind_api_server_session`` follows the exact same lifecycle as
+    ``chat_id``/``origin_turn_id``: set by ``set_session_vars``, readable via
+    ``get_session_env``, "" (not the os.environ fallback) once
+    ``clear_session_vars`` runs, and back to "never bound" after
+    ``reset_session_vars``."""
+
+    def test_set_and_read(self):
+        tokens = set_session_vars(
+            platform="api_server",
+            chat_id="sess1",
+            session_id="sess1",
+            delegation_sync_only=True,
+        )
+        try:
+            assert get_session_env("HERMES_DELEGATION_SYNC_ONLY") == "1"
+        finally:
+            clear_session_vars(tokens)
+
+    def test_defaults_empty_when_not_passed(self):
+        """Non-Omnio callers (and Omnio callers that omit the flag) never
+        pass delegation_sync_only — must read "" rather than raising or
+        falling back to a stale value."""
+        tokens = set_session_vars(platform="telegram", chat_id="123")
+        try:
+            assert get_session_env("HERMES_DELEGATION_SYNC_ONLY") == ""
+        finally:
+            clear_session_vars(tokens)
+
+    def test_cleared_to_empty_not_environ_fallback(self, monkeypatch):
+        monkeypatch.setenv(
+            "HERMES_DELEGATION_SYNC_ONLY", "leaked-from-os-environ"
+        )
+        tokens = set_session_vars(
+            platform="api_server", chat_id="sess1", delegation_sync_only=True,
+        )
+        clear_session_vars(tokens)
+        # Explicitly cleared ("") — must NOT fall back to os.environ, exactly
+        # like every other _VAR_MAP-mapped session var.
+        assert get_session_env("HERMES_DELEGATION_SYNC_ONLY") == ""
+
+    def test_reset_restores_environ_fallback(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DELEGATION_SYNC_ONLY", "1")
+        reset_session_vars()
+        assert get_session_env("HERMES_DELEGATION_SYNC_ONLY") == "1"
+
+    def test_bind_chokepoint_threads_the_flag(self):
+        """``APIServerAdapter._bind_api_server_session`` is the SINGLE
+        chokepoint every API-server agent-entry path uses — verify it
+        threads delegation_sync_only exactly like origin_turn_id."""
+        from gateway.platforms.api_server import APIServerAdapter
+
+        tokens = APIServerAdapter._bind_api_server_session(
+            chat_id="c1",
+            session_key="sk1",
+            session_id="sid1",
+            delegation_sync_only=True,
+        )
+        try:
+            assert get_session_env("HERMES_DELEGATION_SYNC_ONLY") == "1"
+        finally:
+            clear_session_vars(tokens)
+
+    def test_bind_chokepoint_defaults_false(self):
+        from gateway.platforms.api_server import APIServerAdapter
+
+        tokens = APIServerAdapter._bind_api_server_session(
+            chat_id="c1", session_key="sk1", session_id="sid1",
+        )
+        try:
+            assert get_session_env("HERMES_DELEGATION_SYNC_ONLY") == ""
+        finally:
+            clear_session_vars(tokens)

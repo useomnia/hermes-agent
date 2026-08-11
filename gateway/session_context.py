@@ -94,6 +94,28 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+# Omnio product-turn id (the ``turn_id`` on ``POST /v1/runs``), bound
+# alongside ``HERMES_SESSION_CHAT_ID`` for the same request. Empty on any
+# non-Omnio deployment. Lets a background delegation dispatched from this
+# request thread its ORIGINATING turn id through to its completion event, so
+# the async wake can be redirected (via ``OMNIO_WAKE_HOOK``) into a real
+# product turn instead of the raw self-post — see gateway/wake.py.
+_SESSION_ORIGIN_TURN_ID: ContextVar = ContextVar("HERMES_ORIGIN_TURN_ID", default=_UNSET)
+
+# Whether the ORIGINATING api_server request forced background delegations
+# to run SYNCHRONOUSLY for this run — the Omnio proxy's ``delegation_sync_only``
+# on ``POST /v1/runs``, bound alongside ``HERMES_ORIGIN_TURN_ID`` for the same
+# request. Headless Omnio surfaces (crons, trigger.dev runs) have no channel
+# to ever receive a background delegation's wake, so they set this to force
+# ``delegate_task(background=True)`` onto its synchronous fallback even when a
+# raw session id is bound and would otherwise qualify for the self-post wake
+# re-enable (see tools/delegate_tool.py). Stored as "1"/"" (not a real bool)
+# because get_session_env() only returns strings, matching every other bridged
+# var. Empty on any non-Omnio deployment or when the caller omits the flag.
+_SESSION_DELEGATION_SYNC_ONLY: ContextVar = ContextVar(
+    "HERMES_DELEGATION_SYNC_ONLY", default=_UNSET
+)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -136,6 +158,8 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_ORIGIN_TURN_ID": _SESSION_ORIGIN_TURN_ID,
+    "HERMES_DELEGATION_SYNC_ONLY": _SESSION_DELEGATION_SYNC_ONLY,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -173,6 +197,8 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    origin_turn_id: str = "",
+    delegation_sync_only: bool = False,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -188,6 +214,16 @@ def set_session_vars(
     background completion back to the agent after the turn ends (see
     ``_SESSION_ASYNC_DELIVERY`` / ``async_delivery_supported``). Stateless
     request/response adapters (the API server) pass ``False``.
+
+    ``origin_turn_id`` is the Omnio product turn id (``turn_id`` on
+    ``POST /v1/runs``), when the caller has one. Empty on any non-Omnio
+    entry point.
+
+    ``delegation_sync_only`` is the Omnio proxy's ``delegation_sync_only`` on
+    ``POST /v1/runs`` — set for headless surfaces (crons, trigger.dev runs)
+    that have no channel to ever receive a background delegation's wake, so
+    ``delegate_task(background=True)`` must be forced onto its synchronous
+    fallback for this run.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
@@ -209,6 +245,8 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _SESSION_ORIGIN_TURN_ID.set(origin_turn_id),
+        _SESSION_DELEGATION_SYNC_ONLY.set("1" if delegation_sync_only else ""),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -244,6 +282,8 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _SESSION_ORIGIN_TURN_ID,
+        _SESSION_DELEGATION_SYNC_ONLY,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

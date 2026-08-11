@@ -131,6 +131,48 @@ def test_unroutable_async_event_is_not_requeued_forever(
     assert isolated.empty()
 
 
+def test_wake_hook_404_drops_event_without_requeue_loop(
+    monkeypatch, isolated_registry, caplog,
+):
+    """A permanent 4xx (404 — the Omnio proxy no longer recognises
+    origin_turn_id, e.g. the conversation was deleted) from OMNIO_WAKE_HOOK
+    must be treated as CONSUMED, not requeued: retrying a 404 can never
+    succeed, and returning False here would redeliver the same unwinnable
+    wake forever (see the twin api_server self-post branches in
+    gateway.run._inject_watch_notification)."""
+    import gateway.wake as wake_module
+
+    async def _raise_404(*_a, **_k):
+        raise wake_module.WakeHookPermanentError(
+            "wake hook POST failed for turn turn-deleted: HTTP 404: gone",
+            status_code=404,
+            origin_turn_id="turn-deleted",
+        )
+
+    monkeypatch.setattr(wake_module, "deliver_wake", _raise_404)
+
+    # A non-push api_server-shaped adapter with an unparseable session_key,
+    # so _inject_watch_notification takes the no-routing-metadata self-post
+    # branch (mirrors the raw-session-id api_server shape).
+    adapter = SimpleNamespace(supports_async_delivery=False)
+    runner = _runner(adapter)
+    runner.adapters = {Platform.API_SERVER: adapter}
+
+    event = _async_event("deleg_gone_turn")
+    event["session_key"] = "raw-sid-gone"
+    event["origin_session_id"] = "raw-sid-gone"
+    event["origin_turn_id"] = "turn-deleted"
+
+    with caplog.at_level("WARNING"):
+        delivered = asyncio.run(
+            runner._deliver_completion_notification("wake text", dict(event))
+        )
+
+    assert delivered is True  # consumed, not requeued
+    assert any("wake_dropped" in r.message for r in caplog.records)
+    assert any("404" in r.message for r in caplog.records)
+
+
 def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     """Concurrent consumers in one runner cannot both enter the adapter."""
     entered = asyncio.Event()
