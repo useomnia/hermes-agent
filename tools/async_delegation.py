@@ -826,7 +826,10 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
             "Child-completion flush failed for delegation %s: %s",
             delegation_id, exc,
         )
-    claimed = _begin_finalization(delegation_id)
+    claimed = _begin_finalization(
+        delegation_id,
+        [result["subagent_id"]] if result.get("subagent_id") else None,
+    )
     if claimed is None:
         return
     event_record, _interrupt_fn = claimed
@@ -837,6 +840,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
 
 def _begin_finalization(
     delegation_id: str,
+    subagent_ids: Optional[List[str]] = None,
 ) -> Optional[tuple[Dict[str, Any], Optional[Callable[[], None]]]]:
     """Atomically claim terminal delivery while keeping the record active."""
     with _records_lock:
@@ -848,12 +852,70 @@ def _begin_finalization(
         # gap after status flips but before SQLite is committed.
         record["status"] = "finalizing"
         record["completed_at"] = time.time()
+        if subagent_ids:
+            # Keep the stable child identities after ``progress_fn`` is
+            # released so session-scoped cancel remains idempotent while the
+            # normal completion delivery path is still finalizing (and for
+            # the short retained terminal-record window afterwards).
+            record["subagent_ids"] = list(
+                dict.fromkeys(
+                    [*(record.get("subagent_ids") or []), *subagent_ids]
+                )
+            )
         interrupt_fn = record.get("interrupt_fn")
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
         event_record = dict(record)
 
     return event_record, interrupt_fn
+
+
+def request_subagent_cancel(
+    origin_session_id: str, subagent_id: str
+) -> Optional[Dict[str, Any]]:
+    """Atomically validate ownership and latch a per-child cancel request.
+
+    Stable child ids exist on the async record at dispatch, before the worker
+    registers its live agent in ``delegate_tool._active_subagents``.  Keeping
+    the request on that record closes the dispatch-to-registration window;
+    ``delegate_tool._register_subagent`` observes the latch after publishing
+    the live child into its registry.
+    """
+    with _records_lock:
+        for record in _records.values():
+            if record.get("origin_session_id") != origin_session_id:
+                continue
+            child_ids = set(record.get("subagent_ids") or [])
+            child_ids.update(
+                child.get("subagent_id")
+                for child in (record.get("children_activity") or [])
+                if isinstance(child, dict) and child.get("subagent_id")
+            )
+            if subagent_id not in child_ids:
+                continue
+            should_interrupt = False
+            if record.get("status") in ("running", "stalling"):
+                requested = list(record.get("cancel_requested_subagent_ids") or [])
+                if subagent_id not in requested:
+                    requested.append(subagent_id)
+                    record["cancel_requested_subagent_ids"] = requested
+                    should_interrupt = True
+            return {
+                "delegation_id": record.get("delegation_id", ""),
+                "origin_turn_id": record.get("origin_turn_id", ""),
+                "status": record.get("status", ""),
+                "should_interrupt": should_interrupt,
+            }
+    return None
+
+
+def is_subagent_cancel_requested(subagent_id: str) -> bool:
+    """Whether a live async record latched cancellation for this child."""
+    with _records_lock:
+        return any(
+            subagent_id in (record.get("cancel_requested_subagent_ids") or [])
+            for record in _records.values()
+        )
 
 
 def _finish_finalization(delegation_id: str, status: str) -> None:
@@ -957,6 +1019,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    subagent_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1008,6 +1071,8 @@ def dispatch_async_delegation_batch(
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
     }
+    if subagent_ids:
+        record["subagent_ids"] = list(dict.fromkeys(subagent_ids))
     with _records_lock:
         running = sum(
             1 for r in _records.values()
@@ -1089,7 +1154,14 @@ def _finalize_batch(
             "Child-completion flush failed for delegation %s: %s",
             delegation_id, exc,
         )
-    claimed = _begin_finalization(delegation_id)
+    claimed = _begin_finalization(
+        delegation_id,
+        [
+            result["subagent_id"]
+            for result in (combined.get("results") or [])
+            if isinstance(result, dict) and result.get("subagent_id")
+        ],
+    )
     if claimed is None:
         return
     event_record, _interrupt_fn = claimed
@@ -1122,10 +1194,18 @@ def _push_batch_completion_event(
     # instead of delegation_id (which is a batch-level id, not a per-child
     # one; a single-task batch's subagent_id can equal delegation_id by
     # coincidence but must never be assumed to).
-    _subagent_ids = [
-        r.get("subagent_id") for r in _results
-        if isinstance(r, dict) and r.get("subagent_id")
-    ]
+    _subagent_ids = list(
+        dict.fromkeys(
+            [
+                *(event_record.get("subagent_ids") or []),
+                *(
+                    r.get("subagent_id")
+                    for r in _results
+                    if isinstance(r, dict) and r.get("subagent_id")
+                ),
+            ]
+        )
+    )
     evt = {
         "type": "async_delegation",
         "delegation_id": event_record.get("delegation_id"),

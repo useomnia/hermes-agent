@@ -173,6 +173,17 @@ def _register_subagent(record: Dict[str, Any]) -> None:
         return
     with _active_subagents_lock:
         _active_subagents[sid] = record
+    # A browser cancel can arrive after the dispatch-time start event but
+    # before this worker registers. The async record latches that request;
+    # checking after registration makes either race ordering converge on the
+    # same existing per-child interrupt primitive.
+    try:
+        from tools.async_delegation import is_subagent_cancel_requested
+
+        if is_subagent_cancel_requested(sid):
+            interrupt_subagent(sid)
+    except Exception as exc:
+        logger.debug("Latched interrupt lookup failed for %s: %s", sid, exc)
 
 
 def _unregister_subagent(subagent_id: str) -> None:
@@ -3439,6 +3450,14 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            # Persist the stable identities at dispatch, before the live
+            # sampler can be released by finalization. This lets the
+            # session-scoped cancel endpoint validate ownership throughout
+            # the retained record's lifecycle.
+            subagent_ids=[
+                str(getattr(child, "_subagent_id", "") or "")
+                for child in _child_agents
+            ],
         )
 
         if dispatch.get("status") == "dispatched":

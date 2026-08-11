@@ -1495,6 +1495,59 @@ def test_gateway_cli_origin_event_left_unrouted():
 # ---------------------------------------------------------------------------
 
 
+def test_batch_registry_retains_explicit_subagent_ids_while_running():
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"results": [], "total_duration_seconds": 0.1}
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["one task"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", subagent_ids=["sa-0-abc"],
+        runner=runner,
+    )
+    try:
+        retained = next(
+            record
+            for record in ad.list_async_delegations()
+            if record["delegation_id"] == res["delegation_id"]
+        )
+        assert retained["status"] == "running"
+        assert retained["subagent_ids"] == ["sa-0-abc"]
+    finally:
+        gate.set()
+
+
+def test_cancel_requested_before_child_registration_is_honoured_on_registration():
+    from tools import delegate_tool
+
+    gate = threading.Event()
+    res = ad.dispatch_async_delegation_batch(
+        goals=["one task"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_session_id="raw-sid",
+        subagent_ids=["sa-0-abc"],
+        runner=lambda: (gate.wait(timeout=5), {"results": []})[1],
+    )
+    agent = SimpleNamespace(interrupt=lambda reason: setattr(agent, "reason", reason))
+    try:
+        matched = ad.request_subagent_cancel("raw-sid", "sa-0-abc")
+        assert matched is not None
+        assert matched["should_interrupt"] is True
+
+        delegate_tool._register_subagent(
+            {"subagent_id": "sa-0-abc", "agent": agent}
+        )
+
+        assert agent.reason == "Interrupted via TUI (sa-0-abc)"
+        repeated = ad.request_subagent_cancel("raw-sid", "sa-0-abc")
+        assert repeated is not None
+        assert repeated["should_interrupt"] is False
+    finally:
+        delegate_tool._unregister_subagent("sa-0-abc")
+        gate.set()
+
+
 def test_completion_event_carries_origin_turn_id_and_subagent_ids():
     """origin_turn_id and the batch's per-child subagent_ids must reach the
     completion event, mirroring origin_session_id's existing contract."""
@@ -1516,6 +1569,40 @@ def test_completion_event_carries_origin_turn_id_and_subagent_ids():
     assert evt is not None
     assert evt["origin_turn_id"] == "turn-batch-1"
     assert evt["subagent_ids"] == ["sa-0-abc"]
+    retained = next(
+        record
+        for record in ad.list_async_delegations()
+        if record["delegation_id"] == res["delegation_id"]
+    )
+    assert retained["subagent_ids"] == ["sa-0-abc"]
+
+
+def test_finalization_retains_dispatch_ids_missing_from_fabricated_results():
+    res = ad.dispatch_async_delegation_batch(
+        goals=["first", "second"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", origin_session_id="raw-sid",
+        subagent_ids=["sa-0-abc", "sa-1-def"],
+        runner=lambda: {
+            "results": [
+                {"task_index": 0, "status": "completed", "summary": "ok",
+                 "subagent_id": "sa-0-abc"},
+                {"task_index": 1, "status": "error", "error": "fabricated"},
+            ],
+            "total_duration_seconds": 0.1,
+        },
+    )
+
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    retained = next(
+        record
+        for record in ad.list_async_delegations()
+        if record["delegation_id"] == res["delegation_id"]
+    )
+
+    assert evt is not None
+    assert evt["subagent_ids"] == ["sa-0-abc", "sa-1-def"]
+    assert retained["subagent_ids"] == ["sa-0-abc", "sa-1-def"]
+    assert ad.request_subagent_cancel("raw-sid", "sa-1-def") is not None
 
 
 def test_completion_event_origin_turn_id_defaults_empty():
