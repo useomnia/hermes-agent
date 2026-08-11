@@ -2583,6 +2583,16 @@ def _run_single_child(
         if _heartbeat_thread.ident is not None:
             _heartbeat_thread.join(timeout=5)
 
+        # Mark the child terminal for the batch progress sampler, whatever the
+        # outcome (completed, error, interrupted). This is the only per-child
+        # completion signal a detached batch has: the parent's progress
+        # callback is dead by then, and the async registry's completion event
+        # fires once, for the batch as a whole.
+        try:
+            child._subagent_finished = True
+        except Exception:
+            pass
+
         # Drop the TUI-facing registry entry.  Safe to call even if the
         # child was never registered (e.g. ID missing on test doubles).
         if _subagent_id:
@@ -2949,6 +2959,7 @@ def delegate_task(
     # api_server) is untouched by child construction, so read it here and
     # thread it through the dispatch.
     from tools.async_delegation import (
+        _current_delegation_sync_only,
         _current_origin_session_id,
         _current_origin_turn_id,
     )
@@ -2959,6 +2970,11 @@ def delegate_task(
     # is request-scoped and would be unreadable once a child agent binds its
     # own session context. Empty on non-Omnio deployments.
     _origin_turn_id = _current_origin_turn_id()
+    # Same rationale, same capture point: the Omnio proxy's per-run
+    # delegation_sync_only flag (bound alongside HERMES_SESSION_CHAT_ID) must
+    # be read before it becomes unreadable once a child agent binds its own
+    # session context. False on non-Omnio deployments.
+    _sync_only = _current_delegation_sync_only()
 
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
@@ -3201,18 +3217,36 @@ def delegate_task(
         except Exception:
             _async_ok = True
 
-        _wake_sid = ""
-        if not _async_ok:
+        # Stamped on the dispatch record unconditionally: the api_server's
+        # session-delegations listing matches records by origin_session_id,
+        # so a record dispatched on the healthy push path must carry it too,
+        # not only the self-post wake fallback below.
+        _wake_sid = _origin_wake_sid
+        if _sync_only:
+            # The Omnio proxy set delegation_sync_only for this run: this is
+            # a headless surface (cron, trigger.dev run) with NO channel to
+            # ever consume a background wake, even though the API server
+            # always binds a raw session id and would otherwise qualify for
+            # the self-post wake re-enable below. Force the synchronous
+            # fallback unconditionally — this defeats that re-enable path
+            # entirely rather than merely skipping it, since a caller could
+            # set the flag even when async_delivery_supported() is True.
+            logger.info(
+                "delegate_task: delegation_sync_only is set for this run — "
+                "forcing synchronous execution regardless of wake-session "
+                "availability."
+            )
+            _async_ok = False
+        elif not _async_ok:
             # The adapter itself cannot push, but if a raw session id is
             # bound (the API server always binds one — see
             # ApiServerAdapter._bind_api_server_session), gateway.wake can
             # still reach the session by self-POSTing /v1/chat/completions
             # with that id in X-Hermes-Session-Id once the batch completes.
             # Only fall back to forced-sync execution when there is truly no
-            # session id to wake. Uses the origin captured before child
-            # construction (see _origin_wake_sid above) — reading
-            # HERMES_SESSION_ID here would return the subagent's internal id.
-            _wake_sid = _origin_wake_sid
+            # session id to wake. _wake_sid holds the origin captured before
+            # child construction — reading HERMES_SESSION_ID here would
+            # return the subagent's internal id.
             if _wake_sid:
                 logger.info(
                     "delegate_task: async delivery unsupported on this "
@@ -3360,6 +3394,10 @@ def delegate_task(
             # (_run_single_child sets it as child._subagent_id) — carried
             # here so the Omnio progress hook can attribute a running
             # update to the exact child the proxy already has a row for.
+            # The trailing `finished` flag (set by _run_single_child's finally)
+            # is what lets that hook announce ONE child finishing while its
+            # siblings keep running — the batch's own completion event only
+            # fires once every child is done.
             parts = []
             in_tool = False
             for _c in _child_agents:
@@ -3372,6 +3410,7 @@ def delegate_task(
                             _tool,
                             _summary.get("last_activity_ts"),
                             getattr(_c, "_subagent_id", None),
+                            getattr(_c, "_subagent_finished", False) is True,
                         )
                     )
                     in_tool = in_tool or bool(_tool)

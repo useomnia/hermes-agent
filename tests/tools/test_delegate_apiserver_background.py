@@ -192,6 +192,42 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     assert evt["origin_session_id"] == "raw-sid-7"
 
 
+def test_healthy_push_path_still_stamps_origin_session_id(monkeypatch):
+    """async_delivery=True (the normal api_server push path) must stamp the
+    origin session id on the dispatch record too: the session-delegations
+    listing matches records by origin_session_id, so a record dispatched on
+    the healthy path with an empty stamp is invisible to its own session."""
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-8")
+    set_session_vars(
+        platform="api_server",
+        chat_id="raw-sid-8",
+        session_key="raw-sid-8",
+        session_id="raw-sid-8",
+        async_delivery=True,
+    )
+
+    out = dt.delegate_task(
+        goal="bg on healthy api_server", context="ctx",
+        background=True, parent_agent=_fake_parent(),
+    )
+    parsed = json.loads(out)
+    assert parsed["status"] == "dispatched", parsed
+    assert parsed["mode"] == "background"
+
+    from tools.async_delegation import list_async_delegations
+
+    record = next(
+        r for r in list_async_delegations()
+        if r.get("delegation_id") == parsed["delegation_id"]
+    )
+    assert record["origin_session_id"] == "raw-sid-8"
+
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["origin_session_id"] == "raw-sid-8"
+
+
 # ---------------------------------------------------------------------------
 # _current_origin_session_id — the clobber-proof origin capture helper
 # ---------------------------------------------------------------------------
@@ -280,6 +316,99 @@ def test_origin_turn_id_helper_empty_when_not_bound(monkeypatch):
 
     set_session_vars(platform="api_server", chat_id="raw-origin-3")
     assert _current_origin_turn_id() == ""
+
+
+# ---------------------------------------------------------------------------
+# delegation_sync_only — defeats the wake-sid re-enable above, unconditionally
+# ---------------------------------------------------------------------------
+
+
+def test_current_delegation_sync_only_survives_child_session_clobber(monkeypatch):
+    """Same clobber-proof guarantee as _current_origin_session_id/_turn_id,
+    for the delegation_sync_only flag."""
+    from gateway.session_context import set_current_session_id
+    from tools.async_delegation import _current_delegation_sync_only
+
+    set_session_vars(
+        platform="api_server", chat_id="raw-origin-4", delegation_sync_only=True,
+    )
+    assert _current_delegation_sync_only() is True
+
+    set_current_session_id("20260715_child4")  # the clobber
+    assert _current_delegation_sync_only() is True
+
+
+def test_current_delegation_sync_only_false_on_push_platforms(monkeypatch):
+    from tools.async_delegation import _current_delegation_sync_only
+
+    set_session_vars(
+        platform="telegram", chat_id="123456789", delegation_sync_only=True,
+    )
+    assert _current_delegation_sync_only() is False
+
+
+def test_current_delegation_sync_only_false_when_not_bound(monkeypatch):
+    from tools.async_delegation import _current_delegation_sync_only
+
+    set_session_vars(platform="api_server", chat_id="raw-origin-5")
+    assert _current_delegation_sync_only() is False
+
+
+def test_delegation_sync_only_forces_sync_even_with_wake_sid_available(monkeypatch):
+    """The exact inverse of test_apiserver_session_with_id_dispatches_background:
+    async_delivery=False + a raw session id bound (which alone would trigger
+    the wake-sid re-enable and dispatch in the background) must instead stay
+    SYNCHRONOUS once delegation_sync_only is set — the flag defeats that
+    re-enable path unconditionally, because a headless surface (cron,
+    trigger.dev run) has no channel to ever consume the wake."""
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-9")
+    set_session_vars(
+        platform="api_server",
+        chat_id="raw-sid-9",
+        session_key="raw-sid-9",
+        session_id="raw-sid-9",
+        async_delivery=False,
+        delegation_sync_only=True,
+    )
+
+    out = dt.delegate_task(
+        goal="bg on headless api_server", context="ctx",
+        background=True, parent_agent=_fake_parent(),
+    )
+    parsed = json.loads(out)
+
+    assert parsed.get("status") != "dispatched", parsed
+    assert "SYNCHRONOUSLY" in parsed.get("note", "")
+    assert "results" in parsed
+    assert process_registry.completion_queue.empty()
+
+
+def test_delegation_sync_only_absent_preserves_existing_behavior(monkeypatch):
+    """Sanity check: without the flag, the exact same session state as above
+    dispatches in the background (unchanged from
+    test_apiserver_session_with_id_dispatches_background) — the new
+    parameter must not alter behavior when omitted/false."""
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-10")
+    set_session_vars(
+        platform="api_server",
+        chat_id="raw-sid-10",
+        session_key="raw-sid-10",
+        session_id="raw-sid-10",
+        async_delivery=False,
+        delegation_sync_only=False,
+    )
+
+    out = dt.delegate_task(
+        goal="bg on api_server", context="ctx",
+        background=True, parent_agent=_fake_parent(),
+    )
+    parsed = json.loads(out)
+    assert parsed["status"] == "dispatched", parsed
+    assert parsed["mode"] == "background"
+
+    _drain_one()
 
 
 def test_apiserver_session_without_id_stays_synchronous(monkeypatch):

@@ -1938,6 +1938,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("GET", "/api/sessions/{session_id}/delegations", self._handle_session_delegations),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -6372,6 +6373,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_key: str = "",
         session_id: str = "",
         origin_turn_id: str = "",
+        delegation_sync_only: bool = False,
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -6385,6 +6387,15 @@ class APIServerAdapter(BasePlatformAdapter):
         dispatched from this run can thread it through to its completion
         event (see ``tools.async_delegation._current_origin_session_id`` and
         its turn-id sibling). Empty on non-Omnio deployments.
+
+        ``delegation_sync_only`` mirrors ``origin_turn_id``: the Omnio
+        ``delegation_sync_only`` flag from the request body (``/v1/runs``),
+        set by the proxy for headless surfaces (crons, trigger.dev runs) that
+        have no channel to ever receive a background delegation's wake. Bound
+        here so ``delegate_task(background=True)`` can force its synchronous
+        fallback for this run regardless of an otherwise-available wake
+        session id (see ``tools.async_delegation._current_delegation_sync_only``
+        and ``tools/delegate_tool.py``).
 
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive
@@ -6400,6 +6411,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             async_delivery=True,
             origin_turn_id=origin_turn_id,
+            delegation_sync_only=delegation_sync_only,
         )
 
     async def _run_agent(
@@ -7103,6 +7115,11 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         explicit_session_id = body.get("session_id")
         turn_id = body.get("turn_id")
+        # Omnio proxy flag: headless surfaces (crons, trigger.dev runs) have
+        # no channel to ever receive a background delegation's wake, so they
+        # force delegate_task(background=True) onto its synchronous fallback
+        # for this run — see _bind_api_server_session and tools/delegate_tool.py.
+        delegation_sync_only = bool(body.get("delegation_sync_only"))
 
         if explicit_session_id is not None:
             if not isinstance(explicit_session_id, str) or not explicit_session_id.strip():
@@ -7712,6 +7729,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
                                 origin_turn_id=str(turn_id) if turn_id else "",
+                                delegation_sync_only=delegation_sync_only,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # Mark this run's session as an interactive surface so
@@ -8102,6 +8120,33 @@ class APIServerAdapter(BasePlatformAdapter):
         response_status = dict(status)
         response_status.setdefault("run_id", run_id)
         return web.json_response(response_status)
+
+    async def _handle_session_delegations(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/delegations — this session's async delegations.
+
+        Filters the process-wide async-delegation registry down to records whose
+        ``origin_session_id`` matches the requested session, so an external UI can
+        rebuild "what is this conversation still waiting on" from the process that
+        owns the children instead of from its own bookkeeping. Records carry the
+        registry's live-status fields (``children_activity``, per-child
+        ``finished``) — see ``list_async_delegations``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+        try:
+            from tools.async_delegation import list_async_delegations
+
+            records = list_async_delegations()
+        except Exception as exc:
+            logger.exception("[api_server] delegation listing failed: %s", exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
+        data = [
+            r for r in records if r.get("origin_session_id") == session_id
+        ]
+        return web.json_response({"data": data})
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """Replay sequence_number > ``after``, then follow the live run."""
