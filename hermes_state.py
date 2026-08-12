@@ -6681,6 +6681,235 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def resolve_pending_interaction(
+        self,
+        session_id: str,
+        tool_call_id: str,
+        *,
+        tool_result_content: Optional[str] = None,
+        expected_tool_name: Optional[str] = None,
+        excluded_tool_name: Optional[str] = None,
+        claim_approval: bool = False,
+        approval_scope: Optional[str] = None,
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        """Atomically validate and optionally resolve a dangling tool call.
+
+        The latest assistant tool-call block must contain ``tool_call_id`` and
+        anything after it must be a contiguous suffix of tool results belonging
+        to sibling calls from that same block. The target itself must remain
+        unresolved. When ``tool_result_content`` is provided, the matching tool
+        row is appended in the same ``BEGIN IMMEDIATE`` transaction as those
+        checks. Accepted approvals instead merge a durable claim keyed by
+        tool-call id into the assistant row's existing display metadata.
+        Concurrent deliveries therefore cannot both observe and resolve the
+        same dangling interaction.
+
+        Returns ``("resolved", call)``, ``("not_found", None)``, or
+        ``("not_resumable", call)``.  Approval grants use the validation-only
+        form because their grant stores deliberately share the gateway's
+        existing process-local lifecycle.
+        """
+        stored_content = self._encode_content(tool_result_content)
+
+        def _calls(raw: Any) -> List[Dict[str, Any]]:
+            if not raw:
+                return []
+            try:
+                value = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError):
+                return []
+            return [call for call in value if isinstance(call, dict)] if isinstance(value, list) else []
+
+        def _do(conn):
+            rows = conn.execute(
+                "SELECT id, role, tool_call_id, tool_calls, display_metadata "
+                "FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            matching_call = None
+            for row in rows:
+                if row["role"] != "assistant":
+                    continue
+                matching_call = next(
+                    (
+                        call
+                        for call in _calls(row["tool_calls"])
+                        if call.get("id") == tool_call_id
+                    ),
+                    matching_call,
+                )
+            if matching_call is None:
+                return "not_found", None
+
+            assistant_idx = next(
+                (
+                    idx
+                    for idx in range(len(rows) - 1, -1, -1)
+                    if rows[idx]["role"] == "assistant"
+                ),
+                None,
+            )
+            assistant_row = rows[assistant_idx] if assistant_idx is not None else None
+            assistant_calls = _calls(
+                assistant_row["tool_calls"] if assistant_row is not None else None
+            )
+            tail_call = next(
+                (
+                    call
+                    for call in assistant_calls
+                    if call.get("id") == tool_call_id
+                ),
+                None,
+            )
+            if tail_call is None:
+                return "not_resumable", matching_call
+            assistant_call_ids = {
+                call.get("id")
+                for call in assistant_calls
+                if isinstance(call.get("id"), str)
+            }
+            trailing_rows = rows[assistant_idx + 1:]
+            if any(
+                row["role"] != "tool"
+                or row["tool_call_id"] not in assistant_call_ids
+                for row in trailing_rows
+            ):
+                return "not_resumable", tail_call
+            if any(
+                row["tool_call_id"] == tool_call_id for row in trailing_rows
+            ):
+                return "not_resumable", tail_call
+
+            function = tail_call.get("function")
+            tool_name = function.get("name") if isinstance(function, dict) else None
+            if not isinstance(tool_name, str) or not tool_name:
+                return "not_found", None
+            if expected_tool_name is not None and tool_name != expected_tool_name:
+                return "not_found", None
+            if excluded_tool_name is not None and tool_name == excluded_tool_name:
+                return "not_found", None
+
+            metadata = self._decode_display_metadata(
+                assistant_row["display_metadata"]
+            ) or {}
+            claim_key = "_omnio_resolved_approvals"
+            claims = metadata.get(claim_key, {})
+            if not isinstance(claims, dict) or tool_call_id in claims:
+                return "not_resumable", tail_call
+            if claim_approval:
+                raw_arguments = function.get("arguments")
+                metadata[claim_key] = {
+                    **claims,
+                    tool_call_id: {
+                        "scope": approval_scope or "once",
+                        "tool_name": tool_name,
+                        "arguments": (
+                            raw_arguments
+                            if isinstance(raw_arguments, str)
+                            else "{}"
+                        ),
+                    },
+                }
+                conn.execute(
+                    "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                    (
+                        self._encode_display_metadata(metadata),
+                        assistant_row["id"],
+                    ),
+                )
+
+            if tool_result_content is not None:
+                conn.execute(
+                    "INSERT INTO messages "
+                    "(session_id, role, content, tool_call_id, tool_name, "
+                    "timestamp, observed, active) VALUES (?, 'tool', ?, ?, ?, ?, 0, 1)",
+                    (
+                        session_id,
+                        stored_content,
+                        tool_call_id,
+                        _scrub_surrogates(tool_name),
+                        time.time(),
+                    ),
+                )
+                conn.execute(
+                    "UPDATE sessions SET message_count = message_count + 1 "
+                    "WHERE id = ?",
+                    (session_id,),
+                )
+            return "resolved", tail_call
+
+        return self._execute_write(_do)
+
+    def claim_pending_continuation(
+        self,
+        session_id: str,
+        continuation_id: str,
+        run_id: str,
+        *,
+        reclaim_existing: bool = False,
+    ) -> tuple[str, Optional[str]]:
+        """Atomically claim the current resumable tail for one API run.
+
+        The claim is merged into the existing tail row's display metadata so
+        it shares SessionDB's durable, serialized lifecycle rather than adding
+        a process-local continuation lock. A retry with the same client
+        identity can reuse the recorded run while a distinct second delivery
+        is rejected. The claim itself never becomes provider-visible.
+        """
+        claim_key = "_omnio_continuation_claim"
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id, role, tool_calls, display_metadata FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return "not_resumable", None
+            resumable = row["role"] == "tool"
+            if row["role"] == "assistant":
+                try:
+                    calls = json.loads(row["tool_calls"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    calls = []
+                resumable = isinstance(calls, list) and bool(calls)
+            if not resumable:
+                return "not_resumable", None
+
+            metadata = self._decode_display_metadata(row["display_metadata"]) or {}
+            existing = metadata.get(claim_key)
+            if isinstance(existing, dict):
+                existing_id = existing.get("continuation_id")
+                existing_run_id = existing.get("run_id")
+                if existing_id == continuation_id and isinstance(existing_run_id, str):
+                    if reclaim_existing:
+                        metadata[claim_key] = {
+                            "continuation_id": continuation_id,
+                            "run_id": run_id,
+                        }
+                        conn.execute(
+                            "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                            (self._encode_display_metadata(metadata), row["id"]),
+                        )
+                        return "reclaimed", run_id
+                    return "existing", existing_run_id
+                return "not_resumable", (
+                    existing_run_id if isinstance(existing_run_id, str) else None
+                )
+
+            metadata[claim_key] = {
+                "continuation_id": continuation_id,
+                "run_id": run_id,
+            }
+            conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                (self._encode_display_metadata(metadata), row["id"]),
+            )
+            return "claimed", run_id
+
+        return self._execute_write(_do)
+
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
         display_metadata: Optional[Dict[str, Any]] = None,

@@ -29,7 +29,9 @@ import tempfile
 from unittest.mock import MagicMock, patch
 
 from agent.tool_dispatch_helpers import make_tool_result_message
+from hermes_state import SessionDB
 from run_agent import AIAgent
+import tools.tool_approval as tool_approval
 from tools.tool_approval import ToolApprovalDenial
 
 
@@ -328,3 +330,198 @@ def test_execute_tool_calls_concurrent_does_not_trust_provider_approval_like_con
         agent._execute_tool_calls_concurrent(assistant_message, messages, "task-1")
 
     assert "effect_disposition" not in messages[0]
+
+
+def test_continuation_reuses_answered_tool_tail_without_creating_a_user_turn():
+    """A late HITL answer resumes from the durable tool result, not a new user row."""
+    agent = _make_agent()
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="Thanks — I'll use Brand A."
+    )
+    db = SessionDB(Path(tempfile.mkdtemp(prefix="hermes-resume-db-")) / "state.db")
+    prior_assistant = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "input-1",
+                "type": "function",
+                "function": {
+                    "name": "request_user_input",
+                    "arguments": '{"question":"Which brand?"}',
+                },
+            }
+        ],
+    }
+    answered_tool = {
+        "role": "tool",
+        "tool_call_id": "input-1",
+        "name": "request_user_input",
+        "content": '{"status":"answered","response":"Brand A"}',
+    }
+    db.create_session("resume-session", "api_server")
+    db.append_message("resume-session", "assistant", "", tool_calls=prior_assistant["tool_calls"])
+    db.append_message(
+        "resume-session", "tool", answered_tool["content"],
+        tool_name="request_user_input", tool_call_id="input-1",
+    )
+    agent.session_id = "resume-session"
+    agent._session_db = db
+    agent._session_db_created = True
+    agent._last_flushed_db_idx = 2
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = "resume-session"
+
+    with (
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            None,
+            conversation_history=db.get_messages_as_conversation("resume-session"),
+            continuation=True,
+        )
+
+    provider_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+    assert [message["role"] for message in provider_messages[-2:]] == ["assistant", "tool"]
+    assert provider_messages[-1]["content"] == answered_tool["content"]
+    assert all(message.get("role") != "user" for message in result["messages"])
+    assert result["final_response"] == "Thanks — I'll use Brand A."
+    assert [message["role"] for message in db.get_messages("resume-session")] == [
+        "assistant", "tool", "assistant",
+    ]
+    db.close()
+
+
+def test_dangling_approval_continuation_consumes_once_grant_and_persists_real_result(
+    monkeypatch,
+):
+    """A granted dangling call runs once without re-emitting an approval card."""
+    agent = _make_agent()
+    tool_name = "mcp_connectors_TEST_WRITE"
+    function_args = {"target": "Brand A"}
+    call = {
+        "id": "approval-1",
+        "type": "function",
+        "function": {"name": tool_name, "arguments": '{"target":"Brand A"}'},
+    }
+    sibling_call = {
+        "id": "read-1",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+    }
+    db = SessionDB(Path(tempfile.mkdtemp(prefix="hermes-approval-db-")) / "state.db")
+    db.create_session("approval-session", "api_server")
+    db.append_message(
+        "approval-session",
+        "assistant",
+        "",
+        tool_calls=[call, sibling_call],
+        display_metadata={
+            "_omnio_resolved_approvals": {
+                "approval-1": {
+                    "scope": "once",
+                    "tool_name": tool_name,
+                    "arguments": '{"target":"Brand A"}',
+                }
+            }
+        },
+    )
+    db.append_message(
+        "approval-session",
+        "tool",
+        '{"content":"existing sibling"}',
+        tool_name="read_file",
+        tool_call_id="read-1",
+    )
+    agent.session_id = "approval-session"
+    agent._session_db = db
+    agent._session_db_created = True
+    agent._last_flushed_db_idx = 2
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = "approval-session"
+    agent.client.chat.completions.create.return_value = _mock_response("completed")
+    monkeypatch.setattr(tool_approval, "is_gated_tool", lambda name: name == tool_name)
+    approval_wait = MagicMock()
+    monkeypatch.setattr(tool_approval, "await_tool_approval", approval_wait)
+    # Simulate a fresh gateway process: only SessionDB survives.
+    tool_approval.clear_session("approval-session")
+
+    def _execute(assistant_message, messages, effective_task_id):
+        assert len(assistant_message.tool_calls) == 1
+        pending = assistant_message.tool_calls[0]
+        assert pending.id == "approval-1"
+        assert tool_approval.maybe_require_tool_approval(
+            pending.function.name,
+            pending.id,
+            function_args,
+        ) is None
+        messages.append(make_tool_result_message(tool_name, '{"ok":true}', pending.id))
+        agent._flush_messages_to_session_db(messages, [])
+
+    token = tool_approval.set_current_tool_approval_session_key("approval-session")
+    try:
+        with (
+            patch.object(agent, "_execute_tool_calls", side_effect=_execute),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation(
+                None,
+                conversation_history=db.get_messages_as_conversation("approval-session"),
+                continuation=True,
+            )
+    finally:
+        tool_approval.reset_current_tool_approval_session_key(token)
+        tool_approval.clear_session("approval-session")
+
+    assert approval_wait.call_count == 0
+    rows = db.get_messages("approval-session")
+    assert [row["role"] for row in rows] == [
+        "assistant", "tool", "tool", "assistant",
+    ]
+    assert rows[1]["tool_call_id"] == "read-1"
+    assert rows[2]["content"] == '{"ok":true}'
+    db.close()
+
+
+def test_normal_turn_normalizes_dangling_tail_only_in_provider_copy():
+    """A later user turn sees a provider-valid pending result without DB repair."""
+    agent = _make_agent()
+    db = SessionDB(Path(tempfile.mkdtemp(prefix="hermes-pending-db-")) / "state.db")
+    dangling_call = {
+        "id": "pending-1",
+        "type": "function",
+        "function": {
+            "name": "request_user_input",
+            "arguments": '{"question":"Which brand?"}',
+        },
+    }
+    db.create_session("pending-session", "api_server")
+    db.append_message("pending-session", "assistant", "", tool_calls=[dangling_call])
+    before = db.get_messages("pending-session")
+    agent.client.chat.completions.create.return_value = _mock_response("new answer")
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        agent.run_conversation(
+            "Please continue with something else",
+            conversation_history=db.get_messages_as_conversation("pending-session"),
+        )
+
+    provider_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+    pending = next(
+        message
+        for message in provider_messages
+        if message.get("tool_call_id") == "pending-1"
+    )
+    assert pending["name"] == "request_user_input"
+    assert pending["content"] == (
+        '{"status": "pending", "note": "The user has not answered this request yet; '
+        'it is still open. Do not assume an answer."}'
+    )
+    assert db.get_messages("pending-session") == before
+    db.close()

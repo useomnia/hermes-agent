@@ -1566,6 +1566,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # In-process half of durable continuation idempotency. Install before
+        # awaiting SessionDB so concurrent retries cannot both interpret a
+        # claim from this live adapter as restart residue.
+        self._continuation_reservations: Dict[
+            tuple[Optional[str], str, str], str
+        ] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -2322,6 +2328,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PUT", "/api/sessions/{session_id}/messages", self._handle_replace_session_messages),
             ("DELETE", "/api/sessions/{session_id}/messages", self._handle_delete_session_messages),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
+            ("POST", "/api/sessions/{session_id}/interactions/{tool_call_id}/resolve", self._handle_resolve_interaction),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
@@ -2860,6 +2867,49 @@ class APIServerAdapter(BasePlatformAdapter):
                 "Do not combine it with an explicit 'provider'."
             )
         return None
+
+    def _selected_run_api_mode(
+        self,
+        *,
+        session_id: Optional[str],
+        gateway_session_key: Optional[str],
+        requested_model: Optional[str],
+        requested_provider: Optional[str],
+        route: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Resolve enough of the selected runtime to gate continuation mode."""
+        session_override = self._session_model_override_for(
+            gateway_session_key or session_id
+        )
+        if isinstance(session_override, dict):
+            mode = _clean_request_string(session_override.get("api_mode"))
+            if mode:
+                return mode
+        provider = (
+            _clean_request_string(route.get("provider"))
+            if isinstance(route, dict)
+            else None
+        ) or _clean_request_string(requested_provider)
+        target_model = (
+            _clean_request_string(route.get("model"))
+            if isinstance(route, dict)
+            else None
+        ) or _clean_request_string(requested_model)
+        try:
+            if provider:
+                runtime = _resolve_request_runtime_agent_kwargs(
+                    provider, target_model=target_model
+                )
+            else:
+                from gateway.run import _resolve_runtime_agent_kwargs
+
+                runtime = _resolve_runtime_agent_kwargs() or {}
+            return _clean_request_string(runtime.get("api_mode"))
+        except Exception:
+            # Agent construction remains the authoritative error surface for
+            # provider/auth failures. This preflight only rejects a known
+            # incompatible transport before mutating continuation state.
+            return None
 
     def _create_agent(
         self,
@@ -4329,7 +4379,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if db is None:
             return []
         try:
-            return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+            resolved_session_id = await asyncio.to_thread(
+                db.resolve_resume_session_id, session_id
+            )
+            return await asyncio.to_thread(
+                db.get_messages_as_conversation, resolved_session_id
+            )
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
@@ -4700,6 +4755,111 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+
+    async def _handle_resolve_interaction(self, request: "web.Request") -> "web.Response":
+        """Resolve one durable Omnio HITL interaction for a later continuation."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        tool_call_id = request.match_info["tool_call_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        kind = body.get("kind")
+        if kind not in {"input", "approval"}:
+            return web.json_response(_openai_error("Invalid interaction kind", code="invalid_interaction"), status=400)
+
+        db = await self._ensure_session_db_async()
+        resolved_session_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
+
+        if kind == "input":
+            response = body.get("response")
+            if not isinstance(response, str):
+                return web.json_response(_openai_error("input response must be a string", code="invalid_interaction"), status=400)
+            ag_ui_state = body.get("agUiState")
+            if "agUiState" in body and not isinstance(ag_ui_state, dict):
+                return web.json_response(
+                    _openai_error(
+                        "agUiState must be an object",
+                        code="invalid_interaction",
+                    ),
+                    status=400,
+                )
+            result = {"status": "answered", "response": response}
+            if ag_ui_state is not None:
+                result["ag_ui_state"] = ag_ui_state
+            content = json.dumps(result, ensure_ascii=False)
+            resolution, _ = await asyncio.to_thread(
+                db.resolve_pending_interaction,
+                resolved_session_id,
+                tool_call_id,
+                tool_result_content=content,
+                expected_tool_name="request_user_input",
+            )
+            if resolution == "not_found":
+                return web.json_response({"error": "interaction_not_found"}, status=404)
+            if resolution == "not_resumable":
+                return web.json_response(
+                    {"error": "interaction_not_resumable"}, status=409
+                )
+        else:
+            decision = body.get("decision")
+            scope = decision.get("scope") if isinstance(decision, dict) else None
+            if scope not in {"once", "session", "always", "deny"}:
+                return web.json_response(_openai_error("Invalid approval decision", code="invalid_interaction"), status=400)
+            from tools.tool_approval import (
+                _denial_result,
+                is_credit_gated_tool,
+                record_always_approval,
+                record_once_approval,
+                record_session_approval,
+            )
+            denial_result = _denial_result("deny") if scope == "deny" else None
+            resolution, call = await asyncio.to_thread(
+                db.resolve_pending_interaction,
+                resolved_session_id,
+                tool_call_id,
+                tool_result_content=denial_result,
+                excluded_tool_name="request_user_input",
+                claim_approval=scope != "deny",
+                approval_scope=scope if scope != "deny" else None,
+            )
+            if resolution == "not_found":
+                return web.json_response({"error": "interaction_not_found"}, status=404)
+            if resolution == "not_resumable":
+                return web.json_response(
+                    {"error": "interaction_not_resumable"}, status=409
+                )
+            function = call.get("function") if isinstance(call, dict) else None
+            function_name = function.get("name") if isinstance(function, dict) else None
+            if not isinstance(function_name, str) or not function_name:
+                return web.json_response({"error": "interaction_not_found"}, status=404)
+            try:
+                function_args = json.loads(function.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                function_args = {}
+            if not isinstance(function_args, dict):
+                function_args = {}
+            approval_session_key = self._scoped_tool_approval_session_key(
+                resolved_session_id, self._effective_request_profile()
+            )
+            credit_gated = is_credit_gated_tool(function_name)
+            if scope == "once" or credit_gated:
+                record_once_approval(
+                    approval_session_key,
+                    tool_call_id,
+                    function_name,
+                    function_args,
+                )
+            elif scope == "session":
+                record_session_approval(approval_session_key, function_name)
+            elif scope == "always":
+                record_always_approval(function_name)
+        return web.json_response({"resolved": True})
 
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
@@ -8346,24 +8506,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        raw_input = body.get("input")
-        if not raw_input:
-            return web.json_response(_openai_error("Missing 'input' field"), status=400)
-
-        user_message = (
-            raw_input
-            if isinstance(raw_input, str)
-            else (
-                raw_input[-1].get("content", "")
-                if isinstance(raw_input, list)
-                and raw_input
-                and isinstance(raw_input[-1], dict)
-                else ""
-            )
-        )
-        if not user_message:
-            return web.json_response(_openai_error("No user message found in input"), status=400)
-
         instructions = body.get("instructions")
         from agent.unattended import (
             INTERACTION_POLICIES,
@@ -8396,6 +8538,28 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         explicit_session_id = body.get("session_id")
         turn_id = body.get("turn_id")
+        raw_input = body.get("input")
+        continuation = bool(explicit_session_id is not None and raw_input in (None, "", []))
+        if continuation:
+            user_message = None
+        else:
+            if not raw_input:
+                return web.json_response(_openai_error("Missing 'input' field"), status=400)
+            user_message = (
+                raw_input
+                if isinstance(raw_input, str)
+                else (
+                    raw_input[-1].get("content", "")
+                    if isinstance(raw_input, list)
+                    and raw_input
+                    and isinstance(raw_input[-1], dict)
+                    else ""
+                )
+            )
+            if not user_message:
+                return web.json_response(
+                    _openai_error("No user message found in input"), status=400
+                )
         if turn_id is not None:
             if not isinstance(turn_id, str) or not turn_id.strip():
                 return web.json_response(
@@ -8436,7 +8600,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # gateways retain the legacy body/response/input history precedence.
         conversation_history: List[Dict[str, str]] = []
         stored_session_id = None
+        resolved_session_id = None
+        db = None
         if explicit_session_id and self._api_key:
+            db = await self._ensure_session_db_async()
+            if db is not None:
+                resolved_session_id = await asyncio.to_thread(
+                    db.resolve_resume_session_id, explicit_session_id
+                )
             conversation_history = await self._conversation_history_for_session(
                 explicit_session_id
             )
@@ -8508,7 +8679,28 @@ class APIServerAdapter(BasePlatformAdapter):
         if interaction_forbidden:
             instructions = with_unattended_guidance(instructions)
 
-        session_id = explicit_session_id or stored_session_id
+        session_id = resolved_session_id or explicit_session_id or stored_session_id
+        if continuation:
+            tail = conversation_history[-1] if conversation_history else None
+            valid_continuation = (
+                isinstance(tail, dict)
+                and (
+                    tail.get("role") == "tool"
+                    or (
+                        tail.get("role") == "assistant"
+                        and isinstance(tail.get("tool_calls"), list)
+                        and bool(tail["tool_calls"])
+                    )
+                )
+            )
+            if not valid_continuation:
+                return web.json_response(
+                    _openai_error(
+                        "Session tail cannot be continued",
+                        code="invalid_continuation",
+                    ),
+                    status=400,
+                )
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
@@ -8520,6 +8712,21 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+
+        if continuation and self._selected_run_api_mode(
+            session_id=session_id,
+            gateway_session_key=gateway_session_key,
+            requested_model=agent_overrides.get("requested_model"),
+            requested_provider=agent_overrides.get("requested_provider"),
+            route=route,
+        ) == "codex_app_server":
+            return web.json_response(
+                _openai_error(
+                    "codex_app_server cannot consume continuation history",
+                    code="invalid_continuation",
+                ),
+                status=400,
+            )
 
         request_profile = self._effective_request_profile()
         run_id = f"run_{uuid.uuid4().hex}"
@@ -8595,6 +8802,56 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = record.session_id
         else:
             session_id = session_id or run_id
+        if continuation:
+            continuation_id = turn_id or run_id
+            if db is None:
+                return web.json_response(
+                    _openai_error(
+                        "Session database unavailable for continuation",
+                        code="invalid_continuation",
+                    ),
+                    status=503,
+                )
+            reservation_key = (
+                self._effective_request_profile(),
+                session_id,
+                continuation_id,
+            )
+            reserved_run_id = self._continuation_reservations.get(
+                reservation_key
+            )
+            if reserved_run_id is not None:
+                return web.json_response(
+                    {
+                        "run_id": reserved_run_id,
+                        "status": "started",
+                        "reused": True,
+                    },
+                    status=202,
+                )
+            self._continuation_reservations[reservation_key] = run_id
+            try:
+                claim_status, _claimed_run_id = await asyncio.to_thread(
+                    db.claim_pending_continuation,
+                    session_id,
+                    continuation_id,
+                    run_id,
+                    reclaim_existing=True,
+                )
+            except Exception:
+                if self._continuation_reservations.get(reservation_key) == run_id:
+                    self._continuation_reservations.pop(reservation_key, None)
+                raise
+            if claim_status not in {"claimed", "reclaimed"}:
+                if self._continuation_reservations.get(reservation_key) == run_id:
+                    self._continuation_reservations.pop(reservation_key, None)
+                return web.json_response(
+                    _openai_error(
+                        "Session tail cannot be continued again",
+                        code="invalid_continuation",
+                    ),
+                    status=409,
+                )
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -8961,6 +9218,8 @@ class APIServerAdapter(BasePlatformAdapter):
         ) -> None:
             projected_todos: Optional[List[Dict[str, Any]]] = None
             approval_timed_out = False
+            approval_unresolved = False
+            user_input_unresolved = False
             user_input_turn_ending = False
             normalized_tool_call_id = str(tool_call_id or "")
             normalized_tool_name = str(tool_name or "")
@@ -8991,13 +9250,16 @@ class APIServerAdapter(BasePlatformAdapter):
                             consume_user_input_completion_reason,
                         )
 
-                        reason = consume_user_input_completion_reason(session_id)
+                        reason = consume_user_input_completion_reason(
+                            approval_session_key
+                        )
                     except Exception:
                         reason = None
                     # Only an expired wait closes the card; a stop or disconnect
                     # leaves it open and answerable.
                     if reason == "expired":
                         completion_fields = {"timed_out": True}
+                    user_input_unresolved = reason in {"expired", "cancelled"}
                 # The question is now waiting on the chat, not on this run: the
                 # card stays answerable and a late answer arrives as the next
                 # Turn's user message, so the run must end instead of letting
@@ -9049,6 +9311,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             if reason == "expired":
                                 completion["timedOut"] = True
                                 approval_timed_out = True
+                            approval_unresolved = reason in {
+                                "expired", "cancelled",
+                            }
                             completion["completed"] = True
                         if completion:
                             event_cb(
@@ -9059,15 +9324,27 @@ class APIServerAdapter(BasePlatformAdapter):
                             )
                 except Exception:
                     pass
-            if approval_timed_out or user_input_turn_ending:
+            if approval_unresolved or user_input_turn_ending:
                 interrupt_message = (
-                    "awaiting user approval (tool approval timed out)"
-                    if approval_timed_out
+                    (
+                        "awaiting user approval (tool approval timed out)"
+                        if approval_timed_out
+                        else "awaiting user approval (tool approval cancelled)"
+                    )
+                    if approval_unresolved
                     else "awaiting user interaction (request_user_input)"
                 )
                 agent = self._active_run_agents.get(run_id)
                 if agent is not None:
                     try:
+                        if approval_unresolved or user_input_unresolved:
+                            pending = getattr(
+                                agent, "_omnio_skip_persist_tool_call_ids", None
+                            )
+                            if pending is None:
+                                pending = set()
+                                agent._omnio_skip_persist_tool_call_ids = pending
+                            pending.add(normalized_tool_call_id)
                         agent.interrupt(interrupt_message)
                     except Exception:
                         logger.warning(
@@ -9357,11 +9634,14 @@ class APIServerAdapter(BasePlatformAdapter):
                                     "messages": [],
                                 }
                             else:
-                                r = agent.run_conversation(
+                                conversation_args = dict(
                                     user_message=user_message,
                                     conversation_history=conversation_history,
                                     task_id=effective_task_id,
                                 )
+                                if continuation:
+                                    conversation_args["continuation"] = True
+                                r = agent.run_conversation(**conversation_args)
                         finally:
                             try:
                                 if tool_approval_notify_token is not None:

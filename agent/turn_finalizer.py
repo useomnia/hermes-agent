@@ -66,6 +66,38 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def _extract_last_reasoning(
+    messages,
+    *,
+    continuation: bool,
+    continuation_boundary_tool_call_ids=None,
+):
+    """Return reasoning from this logical turn without crossing its boundary.
+
+    Normal user turns may reason on an assistant tool-call step, so their
+    intervening tool rows are not boundaries. A no-user Omnio continuation has
+    no fresh user row to stop at, so the original assistant tool-call IDs mark
+    the boundary while allowing reasoning from new same-continuation tools.
+    """
+    boundary_call_ids = set(continuation_boundary_tool_call_ids or ())
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            break
+        if continuation and msg.get("role") == "assistant":
+            message_call_ids = {
+                call.get("id")
+                for call in msg.get("tool_calls") or []
+                if isinstance(call, dict) and isinstance(call.get("id"), str)
+            }
+            if boundary_call_ids and message_call_ids & boundary_call_ids:
+                break
+        if continuation and not boundary_call_ids and msg.get("role") == "tool":
+            break
+        if msg.get("role") == "assistant" and msg.get("reasoning"):
+            return msg["reasoning"]
+    return None
+
+
 def finalize_turn(
     agent,
     *,
@@ -81,6 +113,8 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    continuation=False,
+    continuation_boundary_tool_call_ids=None,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
 ):
@@ -562,13 +596,11 @@ def finalize_turn(
     # reasoning on the tool-call step and leave the final-answer step
     # with reasoning=None, so picking only the last assistant would
     # silently drop legitimate same-turn reasoning.
-    last_reasoning = None
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            break  # turn boundary — don't cross into prior turns
-        if msg.get("role") == "assistant" and msg.get("reasoning"):
-            last_reasoning = msg["reasoning"]
-            break
+    last_reasoning = _extract_last_reasoning(
+        messages,
+        continuation=continuation,
+        continuation_boundary_tool_call_ids=continuation_boundary_tool_call_ids,
+    )
 
     # Build result with interrupt info if applicable
     result = {

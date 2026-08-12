@@ -245,6 +245,10 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # drive the bounded retry. Persisting them would replay the internal
     # retry instruction as user-authored context on resume.
     "_dropped_toolcall_nudge",
+    # Omnio HITL expiry is deliberately durable as a dangling assistant
+    # tool-call.  The live sentinel still unwinds the blocked turn, but its
+    # tool row (and the matching interrupt closer) must never enter state.db.
+    "_omnio_skip_persist",
 )
 
 
@@ -6854,6 +6858,7 @@ class AIAgent:
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        continuation: bool = False,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -6898,6 +6903,7 @@ class AIAgent:
                     persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
                     moa_config=moa_config,
+                    continuation=continuation,
                 )
             finally:
                 reset_accounting_context(acct_token)
