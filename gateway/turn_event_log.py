@@ -54,6 +54,7 @@ OMNIO_EXTENSION_EVENT_TYPES = frozenset({
     "response.omnio.interrupted_history",
     "response.omnio.approval_request",
     "response.omnio.approval_responded",
+    "response.omnio.steer_missed",
 })
 
 _TOOL_EXTENSION_EVENTS = {

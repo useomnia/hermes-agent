@@ -162,20 +162,35 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         )
     checkpoint = "\n\n".join(checkpoint_parts)
 
-    # The normal live tail is user or tool, so an assistant checkpoint followed
-    # by the correction preserves strict alternation. If a transport already
-    # committed an assistant item, attribute the checkpoint inside the user
-    # correction instead of creating assistant→assistant.
+    correction = (
+        "[Context from the interrupted assistant response]\n"
+        f"{checkpoint}\n\n"
+        f"{text}"
+    )
+
+    # The normal live tail is user or tool, so an assistant placeholder
+    # followed by the correction preserves strict alternation. If a transport
+    # already committed an assistant item, attribute the checkpoint inside the
+    # user correction instead of creating assistant→assistant.
     if messages and messages[-1].get("role") == "assistant":
-        correction = (
-            "[Context from the interrupted assistant response]\n"
-            f"{checkpoint}\n\n"
-            f"{text}"
+        messages.append(
+            {"role": "user", "content": text, "api_content": correction}
         )
-        messages.append({"role": "user", "content": correction})
     else:
-        messages.append({"role": "assistant", "content": checkpoint})
-        messages.append({"role": "user", "content": text})
+        # Placeholder preserves role alternation only. Scaffold bytes must
+        # never land here — the API replay path substitutes api_content back
+        # into content, and a scaffold-as-assistant-reply is what the model
+        # then echoes.
+        placeholder: Dict[str, Any] = {
+            "role": "assistant",
+            "content": visible or "",
+        }
+        if not visible:
+            placeholder["display_kind"] = "hidden"
+        messages.append(placeholder)
+        messages.append(
+            {"role": "user", "content": text, "api_content": correction}
+        )
 
     agent._current_streamed_assistant_text = ""
     agent._current_streamed_reasoning_text = ""
