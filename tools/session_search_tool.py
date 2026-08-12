@@ -1121,11 +1121,10 @@ SESSION_SEARCH_SCHEMA = {
 # --- Registry ---
 from tools.registry import registry, tool_error
 
-registry.register(
-    name="session_search",
-    toolset="session_search",
-    schema=SESSION_SEARCH_SCHEMA,
-    handler=lambda args, **kw: session_search(
+
+def _session_search_handler(args, **kw):
+    """Registry handler for the built-in SQLite-backed session search."""
+    return session_search(
         query=args.get("query") or "",
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
@@ -1136,7 +1135,18 @@ registry.register(
         profile=args.get("profile"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
-    ),
+    )
+
+
+def is_builtin_session_search_handler(handler) -> bool:
+    """Return whether *handler* is Hermes' SQLite-backed implementation."""
+    return handler is _session_search_handler
+
+registry.register(
+    name="session_search",
+    toolset="session_search",
+    schema=SESSION_SEARCH_SCHEMA,
+    handler=_session_search_handler,
     check_fn=check_session_search_requirements,
     emoji="🔍",
 )
