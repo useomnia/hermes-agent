@@ -8325,6 +8325,22 @@ class APIServerAdapter(BasePlatformAdapter):
                         "timedOut", interaction.get("timed_out", missing)
                     )
 
+            # request_user_input's canonical argument event already emits the
+            # interaction with its call id. Tool-progress is only its completion
+            # channel; emitting the prompt here too creates duplicate cards.
+            if projected_tool_name == "request_user_input":
+                if completed or answered is not missing or timed_out is not missing:
+                    try:
+                        loop.call_soon_threadsafe(
+                            _emit_interaction_completed,
+                            raw_call_id,
+                            answered,
+                            timed_out,
+                        )
+                    except RuntimeError:
+                        pass
+                return
+
             if raw_call_id in interaction_tool_call_ids and (
                 completed or answered is not missing or timed_out is not missing
             ):
