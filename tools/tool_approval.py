@@ -3,7 +3,11 @@
 Reads run ungated. WRITE actions on a customer's connected third-party SaaS
 (e.g. drafting an email, creating a doc) require an explicit per-call user
 approval rendered as a control in the Omnia chat. MCP tools advertising an
-``_meta["omnia/credits"]`` descriptor require approval for every call.
+``_meta["omnia/credits"]`` descriptor require approval for every call, with the
+cost displayed; tools advertising ``_meta["omnia/approval"]`` require the same
+per-call approval with no cost block (confirmation only) — used for actions
+whose every invocation stores distinct work (e.g. scheduling), so standing
+session/always grants are deliberately reduced to one-shot approvals for both.
 
 A tool is gated when the connectors MCP route advertised it as NOT read-only
 (MCP ``readOnlyHint=False``). The route derives that from its own write allowlist
@@ -45,6 +49,7 @@ from tools.mcp_tool import (
     mcp_tool_credits_meta,
     mcp_tool_has_read_only_hint,
     mcp_tool_is_read_only,
+    mcp_tool_requires_approval,
 )
 from utils import env_var_enabled
 
@@ -186,6 +191,8 @@ def is_gated_tool(function_name: str) -> bool:
         return False
     if mcp_tool_credits_meta(function_name) is not None:
         return True
+    if mcp_tool_requires_approval(function_name):
+        return True
     if not function_name or not function_name.startswith(CONNECTORS_TOOL_PREFIXES):
         return False
     return not mcp_tool_is_read_only(function_name)
@@ -196,6 +203,22 @@ def is_credit_gated_tool(function_name: str) -> bool:
     if _DISABLED_FROZEN:
         return False
     return mcp_tool_credits_meta(function_name) is not None
+
+
+def is_per_call_gated_tool(function_name: str) -> bool:
+    """Whether *function_name* must be approved on EVERY call.
+
+    True for credit spends and for ``omnia/approval``-stamped tools. For both,
+    ``session``/``always`` decisions are reduced to ``once`` and never recorded:
+    each call stores or spends something distinct, so a standing grant would
+    let later calls run sight-unseen.
+    """
+    if _DISABLED_FROZEN:
+        return False
+    return (
+        mcp_tool_credits_meta(function_name) is not None
+        or mcp_tool_requires_approval(function_name)
+    )
 
 
 def is_tool_approved(session_key: str, function_name: str) -> bool:
@@ -418,8 +441,9 @@ def resolve_tool_approval(
     ran. `session`/`always` grants are still recorded in that case — they
     legitimately help the NEXT call of the same tool skip the prompt — but the
     call itself reports False so the caller can tell the user their decision
-    arrived too late to affect this write. Credit-gated calls are the exception:
-    their `session`/`always` decisions are reduced to `once` and never recorded.
+    arrived too late to affect this write. Per-call-gated tools (credit
+    spends and ``omnia/approval``-stamped tools) are the exception: their
+    `session`/`always` decisions are reduced to `once` and never recorded.
     """
     if not session_key or scope not in APPROVAL_SCOPES:
         return False
@@ -450,10 +474,10 @@ def resolve_tool_approval(
             or function_name
         )
         try:
-            credit_gated = is_credit_gated_tool(approval_tool)
+            per_call_gated = is_per_call_gated_tool(approval_tool)
         except Exception:
-            credit_gated = True
-        if credit_gated:
+            per_call_gated = True
+        if per_call_gated:
             scope = "once"
     approved_tools = _approved_tool_names(function_name, tools)
     if scope == "session":
@@ -686,9 +710,24 @@ def maybe_require_tool_approval(
     if not is_gated_tool(function_name):
         return None
     credits_descriptor = mcp_tool_credits_meta(function_name)
+    approval_stamped = mcp_tool_requires_approval(function_name)
     grant_session_key = get_current_tool_approval_session_key()
     surface_key = get_current_tool_approval_surface_key()
-    if credits_descriptor is None:
+    if credits_descriptor is not None:
+        options = CREDIT_APPROVAL_OPTIONS
+        option_scopes = CREDIT_APPROVAL_OPTION_SCOPES
+        cost = _credit_cost_data(credits_descriptor, function_args)
+        question = (
+            f'Allow Omnio to use "{_readable_tool(function_name)}"? '
+            f"{_credit_cost_sentence(credits_descriptor, cost)}"
+        )
+    elif approval_stamped:
+        # Confirmation only — same per-call Approve/Deny as a credit spend,
+        # without a cost block (the card renders the call's own arguments).
+        options = CREDIT_APPROVAL_OPTIONS
+        option_scopes = CREDIT_APPROVAL_OPTION_SCOPES
+        question = f'Allow Omnio to use "{_readable_tool(function_name)}"?'
+    else:
         if is_always_approved(function_name):
             return None  # granted for every conversation on this gateway
         if is_tool_approved(grant_session_key, function_name):
@@ -698,14 +737,6 @@ def maybe_require_tool_approval(
         question = (
             f'Allow Omnio to use "{_readable_tool(function_name)}"? '
             "It will act on your connected account."
-        )
-    else:
-        options = CREDIT_APPROVAL_OPTIONS
-        option_scopes = CREDIT_APPROVAL_OPTION_SCOPES
-        cost = _credit_cost_data(credits_descriptor, function_args)
-        question = (
-            f'Allow Omnio to use "{_readable_tool(function_name)}"? '
-            f"{_credit_cost_sentence(credits_descriptor, cost)}"
         )
 
     approval: dict[str, object] = {
@@ -717,6 +748,11 @@ def maybe_require_tool_approval(
     }
     if credits_descriptor is not None:
         approval["cost"] = cost
+    if approval_stamped and credits_descriptor is None and isinstance(function_args, dict):
+        # What the user approves is what runs: surface the call's arguments so
+        # the chat card can render them (e.g. a schedule's title, expression,
+        # and instructions).
+        approval["arguments"] = dict(function_args)
 
     interaction_event = {
         "tool": function_name,

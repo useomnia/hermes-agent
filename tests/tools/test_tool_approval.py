@@ -27,6 +27,7 @@ from tools.tool_approval import (
     is_always_approved,
     is_credit_gated_tool,
     is_gated_tool,
+    is_per_call_gated_tool,
     is_tool_approved,
     maybe_require_tool_approval,
     record_always_approval,
@@ -43,6 +44,7 @@ SIBLING = "mcp__connectors__GMAIL_SEND_EMAIL"
 READ = "mcp__connectors__GOOGLE_ANALYTICS_RUN_REPORT"
 LEGACY_GATED = "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT"
 CREDIT_GATED = "mcp_omnia_create_prompts_insights"
+APPROVAL_STAMPED = "mcp__omnia__create-omnio-cron"
 CREDIT_DESCRIPTOR = {
     "workflow": "insights",
     "strategy": "fixed",
@@ -65,12 +67,14 @@ def _clean_state(monkeypatch):
     register_always_approval_authority(lambda _function_name: True)
     mcp_tool._mcp_tool_read_only_hints.clear()
     mcp_tool._mcp_tool_credits_meta.clear()
+    mcp_tool._mcp_tool_approval_meta.clear()
     # Model the connectors route having advertised its tools: the write is NOT
     # read-only (gated), the read IS (ungated). Gating reads the live annotation.
     mcp_tool._track_mcp_tool_read_only(GATED, False)
     mcp_tool._track_mcp_tool_read_only(SIBLING, False)
     mcp_tool._track_mcp_tool_read_only(READ, True)
     mcp_tool._track_mcp_tool_credits(CREDIT_GATED, CREDIT_DESCRIPTOR)
+    mcp_tool._track_mcp_tool_approval(APPROVAL_STAMPED, True)
     yield
     _session_approved.clear()
     _always_approved.clear()
@@ -79,6 +83,7 @@ def _clean_state(monkeypatch):
     register_always_approval_authority(None)
     mcp_tool._mcp_tool_read_only_hints.clear()
     mcp_tool._mcp_tool_credits_meta.clear()
+    mcp_tool._mcp_tool_approval_meta.clear()
     reset_current_session_key(token)
 
 
@@ -123,6 +128,11 @@ class TestIsGatedTool:
     def test_should_gate_any_mcp_tool_with_a_credit_descriptor(self):
         assert is_credit_gated_tool(CREDIT_GATED) is True
         assert is_gated_tool(CREDIT_GATED) is True
+
+    def test_should_gate_any_mcp_tool_with_an_approval_stamp(self):
+        assert is_gated_tool(APPROVAL_STAMPED) is True
+        assert is_credit_gated_tool(APPROVAL_STAMPED) is False
+        assert is_per_call_gated_tool(APPROVAL_STAMPED) is True
 
     def test_should_not_gate_a_connector_read_tool(self):
         assert is_gated_tool(READ) is False
@@ -466,6 +476,103 @@ class TestCreditApproval:
         assert consume_tool_approval_decision(SESSION, "call-credit") == "skip"
         assert is_tool_approved(SESSION, CREDIT_GATED) is False
         assert is_always_approved(CREDIT_GATED) is False
+
+
+class TestApprovalStampedTools:
+    """``omnia/approval``-stamped tools: per-call Approve/Deny, no cost block,
+    arguments surfaced on the card, standing grants reduced to once."""
+
+    def test_should_surface_only_per_call_approve_and_deny_options(self):
+        captured = {}
+
+        def notify(event):
+            captured.update(event)
+            resolve_tool_approval(SESSION, APPROVAL_STAMPED, "once")
+
+        register_tool_approval_notify(SESSION, notify)
+        assert maybe_require_tool_approval(APPROVAL_STAMPED, "call-approval") is None
+
+        interaction = captured["interaction"]
+        assert interaction["kind"] == "approval"
+        assert interaction["options"] == CREDIT_APPROVAL_OPTIONS
+        assert interaction["approval"]["option_scopes"] == CREDIT_APPROVAL_OPTION_SCOPES
+        assert "cost" not in interaction["approval"]
+
+    def test_should_surface_the_call_arguments_on_the_card(self):
+        captured = {}
+        arguments = {
+            "title": "Weekly digest",
+            "expression": "0 9 * * 1",
+            "instructions": "Summarise the week.",
+        }
+
+        def notify(event):
+            captured.update(event)
+            resolve_tool_approval(SESSION, APPROVAL_STAMPED, "once")
+
+        register_tool_approval_notify(SESSION, notify)
+        assert (
+            maybe_require_tool_approval(
+                APPROVAL_STAMPED, "call-approval", function_args=arguments
+            )
+            is None
+        )
+
+        assert captured["interaction"]["approval"]["arguments"] == arguments
+
+    def test_should_not_mention_credits_in_the_question(self):
+        captured = {}
+
+        def notify(event):
+            captured.update(event)
+            resolve_tool_approval(SESSION, APPROVAL_STAMPED, "once")
+
+        register_tool_approval_notify(SESSION, notify)
+        maybe_require_tool_approval(APPROVAL_STAMPED, "call-approval")
+
+        assert "credits" not in captured["interaction"]["question"].lower()
+
+    def test_should_reduce_session_and_always_scopes_to_once(self):
+        def notify(_event):
+            assert (
+                resolve_tool_approval(
+                    SESSION,
+                    APPROVAL_STAMPED,
+                    "always",
+                    tool_call_id="call-approval",
+                )
+                is True
+            )
+
+        register_tool_approval_notify(SESSION, notify)
+        choice = await_tool_approval(SESSION, APPROVAL_STAMPED, {}, "call-approval")
+
+        assert choice == "once"
+        assert is_tool_approved(SESSION, APPROVAL_STAMPED) is False
+        assert is_always_approved(APPROVAL_STAMPED) is False
+
+    def test_should_prompt_again_on_the_next_call(self):
+        prompts = []
+
+        def notify(event):
+            prompts.append(event["interaction"]["approval"]["tool_call_id"])
+            resolve_tool_approval(SESSION, APPROVAL_STAMPED, "once")
+
+        register_tool_approval_notify(SESSION, notify)
+        assert maybe_require_tool_approval(APPROVAL_STAMPED, "call-1") is None
+        assert maybe_require_tool_approval(APPROVAL_STAMPED, "call-2") is None
+
+        assert prompts == ["call-1", "call-2"]
+
+    def test_should_fail_closed_without_ending_the_turn_when_headless(self):
+        # No interactive surface registered at all: the guard must deny the
+        # write with the non-turn-ending approval_error status.
+        denial = maybe_require_tool_approval(APPROVAL_STAMPED, "call-headless")
+
+        assert denial is not None
+        payload = json.loads(denial)
+        assert payload["status"] == "approval_error"
+        assert "NOT performed" in payload["error"]
 
 
 class TestCreditApprovalDispatch:
