@@ -244,6 +244,10 @@ async def test_resolve_input_after_sibling_result_builds_continuation_without_us
                 headers=AUTH,
                 json={"session_id": "mixed-siblings", "input": None},
             )
+            for _ in range(100):
+                if captured:
+                    break
+                await asyncio.sleep(0.01)
 
     assert resolved.status == 200
     assert continued.status == 202
@@ -894,12 +898,11 @@ async def test_runs_timeout_callback_marks_only_expired_hitl_sentinels_for_skip_
                 json={"session_id": "timeout-session", "input": None},
             )
             run_id = (await started.json())["run_id"]
-
-    assert started.status == 202
-    for _ in range(50):
-        if agent.interrupt.called:
-            break
-        await asyncio.sleep(0.01)
+            assert started.status == 202
+            for _ in range(50):
+                if agent.interrupt.called:
+                    break
+                await asyncio.sleep(0.01)
     assert agent.interrupt.called
     assert agent._omnio_skip_persist_tool_call_ids == {"expired-call"}
     assert observed == {"wait_key": run_id, "wait_result": None}
@@ -996,12 +999,11 @@ async def test_disconnected_hitl_waits_are_also_marked_skip_persist(
                 headers=AUTH,
                 json={"session_id": "cancelled-session", "input": None},
             )
-
-    assert started.status == 202
-    for _ in range(100):
-        if agent._omnio_skip_persist_tool_call_ids:
-            break
-        await asyncio.sleep(0.01)
+            assert started.status == 202
+            for _ in range(100):
+                if agent._omnio_skip_persist_tool_call_ids:
+                    break
+                await asyncio.sleep(0.01)
     assert agent._omnio_skip_persist_tool_call_ids == {"cancelled-call"}
 
 
