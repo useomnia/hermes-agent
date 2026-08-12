@@ -135,7 +135,7 @@ async def test_reload_refreshes_injected_connector_toolkit_approvals(
     monkeypatch.setattr(
         adapter,
         "_fetch_omnio_connector_toolkit_approvals",
-        AsyncMock(return_value=["mcp_connectors_NOTION_CREATE_NOTION_PAGE"]),
+        AsyncMock(return_value=(["mcp_connectors_NOTION_CREATE_NOTION_PAGE"], None)),
     )
     monkeypatch.setattr(
         adapter,
@@ -228,6 +228,84 @@ def test_authority_checks_the_exact_tool_without_a_positive_cache(adapter, monke
     assert tool_approval.is_always_approved(tool) is True
     assert tool_approval.is_always_approved(tool) is False
     assert urlopen.call_count == 2
+
+
+def test_authority_grants_a_native_tool_from_a_legacy_names_only_payload(
+    adapter, monkeypatch
+):
+    # Older Omnia deployments serve only legacy-prefixed names with no
+    # toolSlugs; slug derivation keeps the grant valid for native names.
+    native = "mcp__connectors__GMAIL_SEND_EMAIL"
+    _configure_authority(monkeypatch)
+    _standing_candidate("mcp_connectors_GMAIL_SEND_EMAIL")
+    monkeypatch.setattr(
+        "gateway.platforms.api_server.urlopen",
+        MagicMock(
+            return_value=_AuthorityResponse(
+                {"tools": ["mcp_connectors_GMAIL_SEND_EMAIL"]}
+            )
+        ),
+    )
+    tool_approval.register_always_approval_authority(
+        adapter._is_omnio_connector_toolkit_approval_granted
+    )
+
+    assert tool_approval.is_always_approved(native) is True
+
+
+def test_authority_prefers_the_slug_contract_when_served(adapter, monkeypatch):
+    native = "mcp__connectors__GMAIL_SEND_EMAIL"
+    _configure_authority(monkeypatch)
+    tool_approval.replace_injected_always_approvals([], tool_slugs=["GMAIL_SEND_EMAIL"])
+    monkeypatch.setattr(
+        "gateway.platforms.api_server.urlopen",
+        MagicMock(
+            return_value=_AuthorityResponse(
+                {"tools": [], "toolSlugs": ["GMAIL_SEND_EMAIL"]}
+            )
+        ),
+    )
+    tool_approval.register_always_approval_authority(
+        adapter._is_omnio_connector_toolkit_approval_granted
+    )
+
+    assert tool_approval.is_always_approved(native) is True
+
+
+def test_authority_served_slugs_do_not_grant_other_tools(adapter, monkeypatch):
+    native = "mcp__connectors__GMAIL_SEND_EMAIL"
+    _configure_authority(monkeypatch)
+    tool_approval.replace_injected_always_approvals([], tool_slugs=["GMAIL_SEND_EMAIL"])
+    monkeypatch.setattr(
+        "gateway.platforms.api_server.urlopen",
+        MagicMock(
+            return_value=_AuthorityResponse(
+                {"tools": [], "toolSlugs": ["NOTION_UPDATE_PAGE"]}
+            )
+        ),
+    )
+    tool_approval.register_always_approval_authority(
+        adapter._is_omnio_connector_toolkit_approval_granted
+    )
+
+    assert tool_approval.is_always_approved(native) is False
+
+
+def test_malformed_tool_slugs_fail_closed(adapter, monkeypatch):
+    tool = "mcp__connectors__GMAIL_SEND_EMAIL"
+    _configure_authority(monkeypatch)
+    _standing_candidate(tool)
+    monkeypatch.setattr(
+        "gateway.platforms.api_server.urlopen",
+        MagicMock(
+            return_value=_AuthorityResponse({"tools": [tool], "toolSlugs": "nope"})
+        ),
+    )
+    tool_approval.register_always_approval_authority(
+        adapter._is_omnio_connector_toolkit_approval_granted
+    )
+
+    assert tool_approval.is_always_approved(tool) is False
 
 
 def test_old_omnia_404_fails_closed_for_a_warm_candidate(adapter, monkeypatch):
