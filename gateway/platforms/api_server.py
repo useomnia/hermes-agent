@@ -2351,6 +2351,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
+            ("POST", "/v1/continuations/prepare", self._handle_prepare_continuation),
             ("GET", "/v1/runs", self._handle_recoverable_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -4070,6 +4071,10 @@ class APIServerAdapter(BasePlatformAdapter):
             "platform": "hermes-agent",
             "model": self._model_name,
             "turn_event_log_api_version": TURN_EVENT_LOG_API_VERSION,
+            # Additive two-phase late-interaction resume contract.  Omnia
+            # probes the prepare endpoint directly so older gateways can keep
+            # serving their legacy resolve path during rollout.
+            "omnio_hitl_resume_api_version": 1,
             "auth": {
                 "type": "bearer",
                 "required": bool(self._api_key),
@@ -4772,6 +4777,15 @@ class APIServerAdapter(BasePlatformAdapter):
         kind = body.get("kind")
         if kind not in {"input", "approval"}:
             return web.json_response(_openai_error("Invalid interaction kind", code="invalid_interaction"), status=400)
+        resolution_id = body.get("resolutionId")
+        if resolution_id is not None and (
+            not isinstance(resolution_id, str) or not resolution_id.strip()
+        ):
+            return web.json_response(
+                _openai_error("resolutionId must be a non-empty string", code="invalid_interaction"),
+                status=400,
+            )
+        resolution_id = resolution_id.strip() if isinstance(resolution_id, str) else None
 
         db = await self._ensure_session_db_async()
         resolved_session_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
@@ -4799,6 +4813,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_call_id,
                 tool_result_content=content,
                 expected_tool_name="request_user_input",
+                resolution_id=resolution_id,
             )
             if resolution == "not_found":
                 return web.json_response({"error": "interaction_not_found"}, status=404)
@@ -4827,12 +4842,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 excluded_tool_name="request_user_input",
                 claim_approval=scope != "deny",
                 approval_scope=scope if scope != "deny" else None,
+                resolution_id=resolution_id,
             )
             if resolution == "not_found":
                 return web.json_response({"error": "interaction_not_found"}, status=404)
             if resolution == "not_resumable":
                 return web.json_response(
                     {"error": "interaction_not_resumable"}, status=409
+                )
+            durable_approval = None
+            if resolution_id is not None:
+                durable_approval = await asyncio.to_thread(
+                    db.get_resolved_approval,
+                    resolved_session_id,
+                    tool_call_id,
                 )
             function = call.get("function") if isinstance(call, dict) else None
             function_name = function.get("name") if isinstance(function, dict) else None
@@ -4848,16 +4871,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 resolved_session_id, self._effective_request_profile()
             )
             credit_gated = is_credit_gated_tool(function_name)
-            if scope == "once" or credit_gated:
+            effective_scope = scope
+            if resolution_id is not None and durable_approval is not None:
+                stored_scope = durable_approval.get("scope")
+                if stored_scope not in {"once", "session", "always"}:
+                    effective_scope = "deny"
+                else:
+                    # Replays may rebuild the transient grant after a process
+                    # restart, but never escalate the durable first decision
+                    # from once/session to always (or alter a denial).
+                    effective_scope = stored_scope
+            if effective_scope != "deny" and (
+                effective_scope == "once" or credit_gated
+            ):
                 record_once_approval(
                     approval_session_key,
                     tool_call_id,
                     function_name,
                     function_args,
                 )
-            elif scope == "session":
+            elif effective_scope == "session":
                 record_session_approval(approval_session_key, function_name)
-            elif scope == "always":
+            elif effective_scope == "always":
                 record_always_approval(function_name)
         return web.json_response({"resolved": True})
 
@@ -8499,6 +8534,98 @@ class APIServerAdapter(BasePlatformAdapter):
         return "Operation interrupted."
 
     @_admit_api_agent_request
+    async def _handle_prepare_continuation(self, request: "web.Request") -> "web.Response":
+        """Reserve a continuation run without consuming a pending interaction."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        session_id = body.get("session_id") if isinstance(body, dict) else None
+        continuation_id = body.get("turn_id") if isinstance(body, dict) else None
+        tool_call_id = body.get("tool_call_id") if isinstance(body, dict) else None
+        if not isinstance(session_id, str) or not session_id.strip():
+            return web.json_response(
+                _openai_error("Invalid session ID", code="invalid_continuation"),
+                status=400,
+            )
+        if not isinstance(continuation_id, str) or not continuation_id.strip():
+            return web.json_response(
+                _openai_error("Invalid continuation turn ID", code="invalid_continuation"),
+                status=400,
+            )
+        if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+            return web.json_response(
+                _openai_error(
+                    "Invalid interaction tool call ID",
+                    code="invalid_continuation",
+                ),
+                status=400,
+            )
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable", code="session_db_unavailable"
+                ),
+                status=503,
+            )
+        resolved_session_id = await asyncio.to_thread(
+            db.resolve_resume_session_id, session_id.strip()
+        )
+        run_id = f"run_{uuid.uuid4().hex}"
+        claim_status, claimed_run_id = await asyncio.to_thread(
+            db.claim_pending_continuation,
+            resolved_session_id,
+            continuation_id.strip(),
+            run_id,
+            phase="prepared",
+            tool_call_id=tool_call_id.strip(),
+        )
+        if claim_status not in {"claimed", "existing"} or not isinstance(
+            claimed_run_id, str
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Session tail cannot be prepared",
+                    code="invalid_continuation",
+                ),
+                status=409,
+            )
+        # SessionDB owns the claim phase.  Return it alongside the stable run
+        # id so Omnia recovery can distinguish an unresolved fence from a
+        # resolved/started continuation after a proxy restart.  Older claims
+        # predate the phase field and represent already-started legacy runs;
+        # report those as started rather than allowing a fresh start.
+        durable_run_id, durable_phase = await asyncio.to_thread(
+            db.get_pending_continuation_claim,
+            resolved_session_id,
+            continuation_id.strip(),
+        )
+        if durable_run_id != claimed_run_id:
+            return web.json_response(
+                _openai_error(
+                    "Continuation claim changed while preparing",
+                    code="invalid_continuation",
+                ),
+                status=409,
+            )
+        if durable_phase not in {"prepared", "resolved", "started"}:
+            durable_phase = "started" if claim_status == "existing" else "prepared"
+        return web.json_response(
+            {
+                "run_id": claimed_run_id,
+                "status": durable_phase,
+                "phase": durable_phase,
+                "tool_call_id": tool_call_id.strip(),
+                "reused": claim_status == "existing",
+            },
+            status=202,
+        )
+
+    @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
         # Long-term memory scope header (see chat_completions for details).
@@ -8554,8 +8681,17 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         explicit_session_id = body.get("session_id")
         turn_id = body.get("turn_id")
+        start_prepared_run_id = body.get("start_prepared")
         raw_input = body.get("input")
         continuation = bool(explicit_session_id is not None and raw_input in (None, "", []))
+        if start_prepared_run_id is not None and not continuation:
+            return web.json_response(
+                _openai_error(
+                    "start_prepared requires a continuation",
+                    code="invalid_continuation",
+                ),
+                status=400,
+            )
         if continuation:
             user_message = None
         else:
@@ -8595,6 +8731,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             explicit_session_id = explicit_session_id.strip()
+        if start_prepared_run_id is not None and (
+            not isinstance(start_prepared_run_id, str)
+            or not start_prepared_run_id.strip()
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Invalid prepared run ID", code="invalid_continuation"
+                ),
+                status=400,
+            )
+        if isinstance(start_prepared_run_id, str):
+            start_prepared_run_id = start_prepared_run_id.strip()
+        if explicit_session_id is not None:
             from gateway.session import _is_path_unsafe
 
             if (
@@ -8745,7 +8894,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         request_profile = self._effective_request_profile()
-        run_id = f"run_{uuid.uuid4().hex}"
+        run_id = start_prepared_run_id or f"run_{uuid.uuid4().hex}"
         # Do not include turn_id itself in the fingerprint. The caller's
         # immutable request semantics are hashed in memory; the durable row
         # stores only that scalar digest and the resulting run identity.
@@ -8799,21 +8948,35 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=409,
                 )
             if not is_new:
-                status = self._restore_idempotent_run(record)
-                response_headers = (
-                    {"X-Hermes-Session-Key": gateway_session_key}
-                    if gateway_session_key
-                    else {}
+                # A prepared continuation can survive a gateway restart after
+                # durable run-id admission but before its SessionDB claim is
+                # advanced to `started`. Replay that exact request instead of
+                # converting the queued idempotency row into an interrupted
+                # terminal run; the prepared run id and claim make the replay
+                # single-owner. Ordinary Turns retain the established scalar
+                # restoration path.
+                replay_prepared = (
+                    start_prepared_run_id is not None
+                    and record.run_id == start_prepared_run_id
+                    and record.run_id not in self._run_statuses
+                    and record.status in {"queued", "running", "waiting_for_approval", "stopping"}
                 )
-                return web.json_response(
-                    {
-                        "run_id": record.run_id,
-                        "status": status.get("status", record.status),
-                        "idempotent": True,
-                    },
-                    status=202,
-                    headers=response_headers,
-                )
+                if not replay_prepared:
+                    status = self._restore_idempotent_run(record)
+                    response_headers = (
+                        {"X-Hermes-Session-Key": gateway_session_key}
+                        if gateway_session_key
+                        else {}
+                    )
+                    return web.json_response(
+                        {
+                            "run_id": record.run_id,
+                            "status": status.get("status", record.status),
+                            "idempotent": True,
+                        },
+                        status=202,
+                        headers=response_headers,
+                    )
             run_id = record.run_id
             session_id = record.session_id
         else:
@@ -8847,18 +9010,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             self._continuation_reservations[reservation_key] = run_id
             try:
-                claim_status, _claimed_run_id = await asyncio.to_thread(
-                    db.claim_pending_continuation,
-                    session_id,
-                    continuation_id,
-                    run_id,
-                    reclaim_existing=True,
-                )
+                if start_prepared_run_id is not None:
+                    claim_status, _claimed_run_id = await asyncio.to_thread(
+                        db.start_pending_continuation,
+                        session_id,
+                        continuation_id,
+                        start_prepared_run_id,
+                    )
+                else:
+                    claim_status, _claimed_run_id = await asyncio.to_thread(
+                        db.claim_pending_continuation,
+                        session_id,
+                        continuation_id,
+                        run_id,
+                        reclaim_existing=True,
+                    )
             except Exception:
                 if self._continuation_reservations.get(reservation_key) == run_id:
                     self._continuation_reservations.pop(reservation_key, None)
                 raise
-            if claim_status not in {"claimed", "reclaimed"}:
+            if (
+                claim_status not in {"claimed", "reclaimed", "started"}
+                or (start_prepared_run_id is not None and _claimed_run_id != run_id)
+            ):
                 if self._continuation_reservations.get(reservation_key) == run_id:
                     self._continuation_reservations.pop(reservation_key, None)
                 return web.json_response(

@@ -60,12 +60,205 @@ async def _seed_dangling(db: SessionDB, session_id: str, call: dict) -> None:
 
 def _app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application()
+    app.router.add_post(
+        "/v1/continuations/prepare", adapter._handle_prepare_continuation
+    )
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_post(
         "/api/sessions/{session_id}/interactions/{tool_call_id}/resolve",
         adapter._handle_resolve_interaction,
     )
     return app
+
+
+@pytest.mark.asyncio
+async def test_prepared_resume_keeps_interaction_unresolved_until_admission_and_replays(
+    adapter: APIServerAdapter, db: SessionDB,
+) -> None:
+    await _seed_dangling(db, "prepared-resume", _tool_call("call-prepared"))
+    continuation_id = "interaction-resume:call-prepared"
+    agent = MagicMock()
+    agent.run_conversation.return_value = {
+        "final_response": "continued",
+        "messages": [],
+        "interrupted": False,
+    }
+    agent.session_prompt_tokens = agent.session_completion_tokens = 0
+    agent.session_total_tokens = 0
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        prepared = await client.post(
+            "/v1/continuations/prepare",
+            headers=AUTH,
+            json={
+                "session_id": "prepared-resume",
+                "turn_id": continuation_id,
+                "tool_call_id": "call-prepared",
+            },
+        )
+        prepared_payload = await prepared.json()
+        replayed = await client.post(
+            "/v1/continuations/prepare",
+            headers=AUTH,
+            json={
+                "session_id": "prepared-resume",
+                "turn_id": continuation_id,
+                "tool_call_id": "call-prepared",
+            },
+        )
+        assert prepared_payload["run_id"] == (await replayed.json())["run_id"]
+        assert [row["role"] for row in db.get_messages("prepared-resume")] == [
+            "assistant"
+        ]
+        premature = await client.post(
+            "/v1/runs",
+            headers=AUTH,
+            json={
+                "session_id": "prepared-resume",
+                "input": None,
+                "turn_id": continuation_id,
+                "start_prepared": prepared_payload["run_id"],
+            },
+        )
+        resolved = await client.post(
+            "/api/sessions/prepared-resume/interactions/call-prepared/resolve",
+            headers=AUTH,
+            json={
+                "kind": "input",
+                "response": "accepted",
+                "resolutionId": continuation_id,
+            },
+        )
+        repeated = await client.post(
+            "/api/sessions/prepared-resume/interactions/call-prepared/resolve",
+            headers=AUTH,
+            json={
+                "kind": "input",
+                "response": "accepted",
+                "resolutionId": continuation_id,
+            },
+        )
+        prepared_after_resolve = await client.post(
+            "/v1/continuations/prepare",
+            headers=AUTH,
+            json={
+                "session_id": "prepared-resume",
+                "turn_id": continuation_id,
+                "tool_call_id": "call-prepared",
+            },
+        )
+        assert prepared_after_resolve.status == 202, await prepared_after_resolve.text()
+        assert (await prepared_after_resolve.json())["run_id"] == prepared_payload["run_id"]
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            started = await client.post(
+                "/v1/runs",
+                headers=AUTH,
+                json={
+                    "session_id": "prepared-resume",
+                    "input": None,
+                    "turn_id": continuation_id,
+                    "start_prepared": prepared_payload["run_id"],
+                },
+            )
+            started_payload = await started.json()
+
+    assert prepared.status == replayed.status == 202
+    assert premature.status == 409
+    assert resolved.status == repeated.status == 200
+    assert started.status == 202
+    assert started_payload["run_id"] == prepared_payload["run_id"]
+    rows = db.get_messages("prepared-resume")
+    assert [row["role"] for row in rows] == ["assistant", "tool"]
+    assert (
+        rows[0]["display_metadata"]["_omnio_continuation_claim"]["phase"]
+        == "started"
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_resume_takes_over_prepared_claim_after_legacy_resolve(
+    adapter: APIServerAdapter, db: SessionDB,
+) -> None:
+    """An old Omnia retry can finish a claim left by a newer Hermes prepare."""
+    await _seed_dangling(db, "legacy-takeover", _tool_call("call-legacy"))
+    continuation_id = "interaction-resume:call-legacy"
+    legacy_turn_id = "legacy-omnia-turn-id"
+    agent = MagicMock()
+    agent.run_conversation.return_value = {
+        "final_response": "continued",
+        "messages": [],
+        "interrupted": False,
+    }
+    agent.session_prompt_tokens = agent.session_completion_tokens = 0
+    agent.session_total_tokens = 0
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        prepared = await client.post(
+            "/v1/continuations/prepare",
+            headers=AUTH,
+            json={
+                "session_id": "legacy-takeover",
+                "turn_id": continuation_id,
+                "tool_call_id": "call-legacy",
+            },
+        )
+        prepared_payload = await prepared.json()
+        resolved = await client.post(
+            "/api/sessions/legacy-takeover/interactions/call-legacy/resolve",
+            headers=AUTH,
+            json={"kind": "input", "response": "accepted"},
+        )
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            started = await client.post(
+                "/v1/runs",
+                headers=AUTH,
+                json={
+                    "session_id": "legacy-takeover",
+                    "input": None,
+                    "turn_id": legacy_turn_id,
+                },
+            )
+            started_payload = await started.json()
+
+    assert prepared.status == 202
+    assert resolved.status == 200
+    assert started.status == 202
+    assert started_payload["run_id"] != prepared_payload["run_id"]
+    rows = db.get_messages("legacy-takeover")
+    assert [row["role"] for row in rows] == ["assistant", "tool"]
+    assert rows[0]["display_metadata"]["_omnio_continuation_claim"] == {
+        "continuation_id": legacy_turn_id,
+        "run_id": started_payload["run_id"],
+    }
+
+
+def test_resolution_id_cannot_resolve_a_different_tool_call(db: SessionDB) -> None:
+    db.create_session("bound-resolution", "api_server")
+    db.append_message(
+        "bound-resolution",
+        "assistant",
+        "",
+        tool_calls=[_tool_call("call-a"), _tool_call("call-b")],
+    )
+    status, _ = db.claim_pending_continuation(
+        "bound-resolution",
+        "interaction-resume:call-a",
+        "run-bound",
+        phase="prepared",
+        tool_call_id="call-a",
+    )
+    assert status == "claimed"
+    resolved, _ = db.resolve_pending_interaction(
+        "bound-resolution",
+        "call-b",
+        expected_tool_name="request_user_input",
+        tool_result_content='{"status":"answered","response":"wrong"}',
+        resolution_id="interaction-resume:call-a",
+    )
+    assert resolved == "not_resumable"
+    assert [row["role"] for row in db.get_messages("bound-resolution")] == [
+        "assistant"
+    ]
 
 
 @pytest.mark.asyncio
@@ -771,6 +964,99 @@ async def test_durable_once_approval_survives_fresh_adapter_and_executes(
     assert rows[-1]["content"] == '{"ok":true}'
     assert approval_wait.call_count == 0
     tool_approval.clear_session("approval-restart")
+
+
+@pytest.mark.asyncio
+async def test_approval_replay_cannot_escalate_stored_scope(
+    adapter: APIServerAdapter,
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_id = "scope-replay"
+    tool_name = "mcp_connectors_TEST_WRITE"
+    await _seed_dangling(db, "scope-replay", _tool_call(call_id, tool_name))
+    monkeypatch.setattr(tool_approval, "is_credit_gated_tool", lambda _name: False)
+    once = MagicMock()
+    session = MagicMock()
+    always = MagicMock()
+    monkeypatch.setattr(tool_approval, "record_once_approval", once)
+    monkeypatch.setattr(tool_approval, "record_session_approval", session)
+    monkeypatch.setattr(tool_approval, "record_always_approval", always)
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        prepared = await client.post(
+            "/v1/continuations/prepare",
+            headers=AUTH,
+            json={
+                "session_id": "scope-replay",
+                "turn_id": f"interaction-resume:{call_id}",
+                "tool_call_id": call_id,
+            },
+        )
+        assert prepared.status == 202
+        first = await client.post(
+            f"/api/sessions/scope-replay/interactions/{call_id}/resolve",
+            headers=AUTH,
+            json={
+                "kind": "approval",
+                "resolutionId": f"interaction-resume:{call_id}",
+                "decision": {"scope": "once"},
+            },
+        )
+        replay = await client.post(
+            f"/api/sessions/scope-replay/interactions/{call_id}/resolve",
+            headers=AUTH,
+            json={
+                "kind": "approval",
+                "resolutionId": f"interaction-resume:{call_id}",
+                "decision": {"scope": "always"},
+            },
+        )
+
+    assert first.status == replay.status == 200
+    assert always.call_count == 0
+    assert once.call_count == 2
+    assert session.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_resolution_id_cannot_replay_input_as_approval(
+    adapter: APIServerAdapter,
+    db: SessionDB,
+) -> None:
+    call_id = "kind-bound"
+    await _seed_dangling(db, "kind-bound", _tool_call(call_id, "request_user_input"))
+    async with TestClient(TestServer(_app(adapter))) as client:
+        prepared = await client.post(
+            "/v1/continuations/prepare",
+            headers=AUTH,
+            json={
+                "session_id": "kind-bound",
+                "turn_id": f"interaction-resume:{call_id}",
+                "tool_call_id": call_id,
+            },
+        )
+        assert prepared.status == 202
+        first = await client.post(
+            f"/api/sessions/kind-bound/interactions/{call_id}/resolve",
+            headers=AUTH,
+            json={
+                "kind": "input",
+                "resolutionId": f"interaction-resume:{call_id}",
+                "response": "ok",
+            },
+        )
+        replay = await client.post(
+            f"/api/sessions/kind-bound/interactions/{call_id}/resolve",
+            headers=AUTH,
+            json={
+                "kind": "approval",
+                "resolutionId": f"interaction-resume:{call_id}",
+                "decision": {"scope": "always"},
+            },
+        )
+    assert first.status == 200
+    assert replay.status == 404
 
 
 @pytest.mark.asyncio
