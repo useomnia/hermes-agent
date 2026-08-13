@@ -723,6 +723,173 @@ def test_consume_codex_stream_routes_commentary_phase_deltas_to_reasoning(monkey
     assert response.output_text == ""
 
 
+def test_consume_codex_stream_emits_only_safe_function_call_boundaries():
+    """Native added items expose name+call ID before their arguments finish."""
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    boundaries = []
+    _consume_codex_event_stream(
+        _FakeCreateStream([
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(
+                    type="function_call",
+                    name="terminal",
+                    call_id="call-native-early",
+                    arguments='{"command":',
+                ),
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                delta=' "hidden"}',
+            ),
+            # Neither partial identifier is safe to correlate to execution.
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(
+                    type="function_call", name="read_file", call_id=""
+                ),
+            ),
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(
+                    type="function_call", name="", call_id="call-no-name"
+                ),
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed"),
+            ),
+        ]),
+        model="gpt-5-codex",
+        on_function_call_added=lambda name, call_id: boundaries.append(
+            (name, call_id)
+        ),
+    )
+
+    assert boundaries == [("terminal", "call-native-early")]
+
+
+def test_run_codex_stream_forwards_native_function_call_boundary_without_args(
+    monkeypatch,
+):
+    """The live Codex Responses path calls only the rich generation hook."""
+    agent = _build_agent(monkeypatch)
+    legacy_generation_names = []
+    rich_generation_events = []
+    agent.tool_gen_callback = lambda name: legacy_generation_names.append(name)
+    agent.tool_gen_event_callback = (
+        lambda name, call_id: rich_generation_events.append((name, call_id))
+    )
+    function_item = SimpleNamespace(
+        type="function_call",
+        id="fc_native_early",
+        call_id="call-native-early",
+        name="terminal",
+        arguments='{"command":"hidden"}',
+    )
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **_kwargs: _FakeCreateStream([
+                SimpleNamespace(
+                    type="response.output_item.added",
+                    item=SimpleNamespace(
+                        type="function_call",
+                        id="fc_native_early",
+                        call_id="call-native-early",
+                        name="terminal",
+                    ),
+                ),
+                SimpleNamespace(
+                    type="response.function_call_arguments.delta",
+                    delta='{"command":"hidden"}',
+                ),
+                SimpleNamespace(
+                    type="response.output_item.done", item=function_item
+                ),
+                SimpleNamespace(
+                    type="response.completed",
+                    response=SimpleNamespace(status="completed"),
+                ),
+            ])
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert rich_generation_events == [("terminal", "call-native-early")]
+    assert legacy_generation_names == []
+    assert response.output == [function_item]
+
+
+def test_run_codex_stream_abandons_early_call_before_retrying_with_new_call(
+    monkeypatch,
+):
+    """A retry cannot leave its first native function call looking executed."""
+    import httpx
+
+    agent = _build_agent(monkeypatch)
+    lifecycle = []
+    agent.tool_gen_event_callback = (
+        lambda name, call_id: lifecycle.append(("added", name, call_id))
+    )
+    agent.tool_gen_event_aborted_callback = (
+        lambda call_id: lifecycle.append(("abandoned", call_id))
+    )
+    calls = {"create": 0}
+    completed_item = SimpleNamespace(
+        type="function_call",
+        id="fc_second",
+        call_id="call-second",
+        name="read_file",
+        arguments='{"path":"safe.py"}',
+    )
+
+    def _create(**_kwargs):
+        calls["create"] += 1
+        if calls["create"] == 1:
+            def _failed_stream():
+                yield SimpleNamespace(
+                    type="response.output_item.added",
+                    item=SimpleNamespace(
+                        type="function_call",
+                        id="fc_first",
+                        call_id="call-first",
+                        name="terminal",
+                    ),
+                )
+                raise httpx.RemoteProtocolError("transient stream drop")
+
+            return _failed_stream()
+        return _FakeCreateStream([
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(
+                    type="function_call",
+                    id="fc_second",
+                    call_id="call-second",
+                    name="read_file",
+                ),
+            ),
+            SimpleNamespace(type="response.output_item.done", item=completed_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed"),
+            ),
+        ])
+
+    agent.client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls["create"] == 2
+    assert lifecycle == [
+        ("added", "terminal", "call-first"),
+        ("abandoned", "call-first"),
+        ("added", "read_file", "call-second"),
+    ]
+    assert response.output == [completed_item]
+
+
 def test_consume_codex_stream_separates_commentary_from_analysis(monkeypatch):
     from agent.codex_runtime import _consume_codex_event_stream
 

@@ -2519,6 +2519,8 @@ class APIServerAdapter(BasePlatformAdapter):
         response_format: Optional[Dict[str, Any]] = None,
         prefill_messages: Optional[List[Dict[str, str]]] = None,
         prefill_before_current_user: bool = False,
+        tool_gen_event_callback=None,
+        tool_gen_event_aborted_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2847,6 +2849,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
             "tool_gen_callback": tool_gen_callback,
+            "tool_gen_event_callback": tool_gen_event_callback,
+            "tool_gen_event_aborted_callback": tool_gen_event_aborted_callback,
             "session_db": self._ensure_session_db(),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
@@ -6479,6 +6483,8 @@ class APIServerAdapter(BasePlatformAdapter):
         approval_notify: Optional[Any] = None,
         prefill_messages: Optional[List[Dict[str, str]]] = None,
         prefill_before_current_user: bool = False,
+        tool_gen_event_callback=None,
+        tool_gen_event_aborted_callback=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6578,6 +6584,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_start_callback=tool_start_callback,
                         tool_complete_callback=tool_complete_callback,
                         tool_gen_callback=tool_gen_callback,
+                        tool_gen_event_callback=tool_gen_event_callback,
+                        tool_gen_event_aborted_callback=tool_gen_event_aborted_callback,
                         gateway_session_key=gateway_session_key,
                         requested_model=requested_model,
                         requested_provider=requested_provider,
@@ -7446,6 +7454,8 @@ class APIServerAdapter(BasePlatformAdapter):
         strip_tool_separator_on_next_message = False
         started_tool_calls: Dict[str, tuple[str, Dict[str, Any]]] = {}
         ended_tool_calls: set[str] = set()
+        early_generating_tool_call_ids: set[str] = set()
+        abandoned_pending_tool_call_ids: set[str] = set()
         tool_approval_registration_lock = threading.Lock()
         tool_approval_registration_cancelled = [False]
         tool_approval_notify_token_ref: List[Any] = [None]
@@ -7543,6 +7553,27 @@ class APIServerAdapter(BasePlatformAdapter):
             nonlocal strip_tool_separator_on_next_message
             if not tool_call_id or not tool_name or tool_name.startswith("_"):
                 return
+            existing = started_tool_calls.get(tool_call_id)
+            if existing is not None:
+                # A Responses function-call item may already have been opened
+                # while the provider streamed this call's name.  Execution is
+                # still responsible for the (allowlisted) argument projection,
+                # but it must not mint a second item or another boundary.
+                if existing[0] == tool_name:
+                    # A retry can reuse a deterministic provider call ID.
+                    # Its earlier attempt was only *tentatively* abandoned;
+                    # this execution proves the in-progress item is real.
+                    abandoned_pending_tool_call_ids.discard(tool_call_id)
+                    early_generating_tool_call_ids.discard(tool_call_id)
+                    emitter.function_call_arguments(
+                        tool_call_id, tool_name,
+                        copy.deepcopy(function_args)
+                        if isinstance(function_args, dict)
+                        else {},
+                    )
+                return
+            _close_pending_abandoned_tool_calls()
+            ended_tool_calls.discard(tool_call_id)
             _close_text_item()
             _close_reasoning_item()
             strip_tool_separator_on_next_message = True
@@ -7550,6 +7581,70 @@ class APIServerAdapter(BasePlatformAdapter):
             started_tool_calls[tool_call_id] = (tool_name, args_copy)
             emitter.function_call_start(tool_call_id, tool_name)
             emitter.function_call_arguments(tool_call_id, tool_name, args_copy)
+
+        def _emit_tool_generation_start(
+            tool_call_id: str, tool_name: str
+        ) -> None:
+            nonlocal strip_tool_separator_on_next_message
+            # The execution path repairs duplicate IDs deterministically.  The
+            # first streamed occurrence retains its provider ID; later
+            # occurrences fall back to their repaired execution-time ID.  Do
+            # not create a second item for an ambiguous streamed ID.
+            if (
+                not tool_call_id
+                or not tool_name
+                or tool_name.startswith("_")
+            ):
+                return
+            existing = started_tool_calls.get(tool_call_id)
+            if existing is not None:
+                # Same ID/name on the retry means this is the same logical
+                # call. Keep the original native item open for execution.
+                if (
+                    tool_call_id in abandoned_pending_tool_call_ids
+                    and existing[0] == tool_name
+                ):
+                    abandoned_pending_tool_call_ids.discard(tool_call_id)
+                return
+            # A different call proves pending calls belonged to a dropped
+            # attempt, so close them before opening its replacement.
+            _close_pending_abandoned_tool_calls()
+            ended_tool_calls.discard(tool_call_id)
+            early_generating_tool_call_ids.add(tool_call_id)
+            _close_text_item()
+            _close_reasoning_item()
+            strip_tool_separator_on_next_message = True
+            started_tool_calls[tool_call_id] = (tool_name, {})
+            emitter.function_call_start(tool_call_id, tool_name, early=True)
+
+        def _tool_gen_cb(tool_name, tool_call_id=None) -> None:
+            normalized_tool_name = str(tool_name or "")
+            normalized_tool_call_id = str(tool_call_id or "")
+            try:
+                loop.call_soon_threadsafe(
+                    _emit_tool_generation_start,
+                    normalized_tool_call_id,
+                    normalized_tool_name,
+                )
+            except RuntimeError:
+                pass
+
+        def _emit_tool_generation_abandoned(tool_call_id: str) -> None:
+            if tool_call_id not in early_generating_tool_call_ids:
+                return
+            # Defer the terminal item until we know whether a retry will
+            # reuse this deterministic provider call ID. Closing immediately
+            # would make a later real execution look like an orphan.
+            abandoned_pending_tool_call_ids.add(tool_call_id)
+
+        def _tool_gen_aborted_cb(tool_call_id) -> None:
+            normalized_tool_call_id = str(tool_call_id or "")
+            try:
+                loop.call_soon_threadsafe(
+                    _emit_tool_generation_abandoned, normalized_tool_call_id
+                )
+            except RuntimeError:
+                pass
 
         def _tool_start_cb(tool_call_id, tool_name, function_args) -> None:
             try:
@@ -7717,6 +7812,28 @@ class APIServerAdapter(BasePlatformAdapter):
             except RuntimeError:
                 pass
 
+        def _close_open_tool_calls() -> None:
+            """Finish every opened item before a terminal Responses event."""
+            for call_id, (name, _args) in list(started_tool_calls.items()):
+                if (
+                    call_id in early_generating_tool_call_ids
+                    or call_id in abandoned_pending_tool_call_ids
+                ):
+                    emitter.function_call_incomplete(call_id)
+                    ended_tool_calls.add(call_id)
+                else:
+                    _emit_tool_end(call_id, name)
+
+        def _close_pending_abandoned_tool_calls() -> None:
+            """Retire dropped-attempt calls once a distinct retry proves them stale."""
+            for call_id in tuple(abandoned_pending_tool_call_ids):
+                if call_id in started_tool_calls and call_id not in ended_tool_calls:
+                    emitter.function_call_incomplete(call_id)
+                    ended_tool_calls.add(call_id)
+                abandoned_pending_tool_call_ids.discard(call_id)
+                early_generating_tool_call_ids.discard(call_id)
+                started_tool_calls.pop(call_id, None)
+
         self._set_run_status(
             run_id,
             "queued",
@@ -7778,6 +7895,8 @@ class APIServerAdapter(BasePlatformAdapter):
                             tool_progress_callback=event_cb,
                             tool_start_callback=_tool_start_cb,
                             tool_complete_callback=_tool_complete_cb,
+                            tool_gen_event_callback=_tool_gen_cb,
+                            tool_gen_event_aborted_callback=_tool_gen_aborted_cb,
                             gateway_session_key=gateway_session_key,
                             requested_model=agent_overrides.get("requested_model"),
                             requested_provider=agent_overrides.get("requested_provider"),
@@ -8061,8 +8180,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 # Close out calls that started live but never got a
                 # completion event (e.g. abandoned on interrupt/timeout).
-                for call_id, (name, _args) in list(started_tool_calls.items()):
-                    _emit_tool_end(call_id, name)
+                _close_open_tool_calls()
 
                 _close_text_item()
                 _close_reasoning_item()
@@ -8172,6 +8290,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             usage=usage,
                         )
             except asyncio.CancelledError:
+                _close_open_tool_calls()
                 missed_steer = await self._close_run_steering(run_id, agent)
                 if missed_steer:
                     emitter.omnio_event(
@@ -8188,6 +8307,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _legacy_terminal("run.cancelled")
                 raise
             except _ProviderAuthResolutionError as exc:
+                _close_open_tool_calls()
                 # /v1/runs builds its own agent via _create_agent() and does
                 # not route through _run_agent() (see that method's own
                 # _ProviderAuthResolutionError branch), so it needs its own
@@ -8217,6 +8337,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 _legacy_terminal("run.failed", error=error_msg)
             except Exception as exc:
+                _close_open_tool_calls()
                 missed_steer = await self._close_run_steering(run_id, agent)
                 if missed_steer:
                     emitter.omnio_event(

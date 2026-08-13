@@ -965,6 +965,7 @@ def _consume_codex_event_stream(
     on_first_delta=None,
     on_event=None,
     interrupt_check=None,
+    on_function_call_added=None,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE event stream and return a final response.
 
@@ -1002,6 +1003,10 @@ def _consume_codex_event_stream(
     * ``on_event(event)`` — fires for every event before any other processing.
       Used for watchdog activity, debug logging, anything wire-shape-agnostic.
     * ``interrupt_check()`` — returns True to break the loop early.
+    * ``on_function_call_added(name, call_id)`` — fires when a native
+      ``function_call`` output item is added with both identifiers.  It never
+      carries arguments; missing identifiers deliberately fall back to the
+      later execution-time callback.
     """
     collected_output_items: List[Any] = []
     collected_text_deltas: List[str] = []
@@ -1059,6 +1064,22 @@ def _consume_codex_event_stream(
                 active_message_phase = None
             if "function_call" in str(item_type):
                 has_tool_calls = True
+                name = _item_field(item, "name", "")
+                call_id = _item_field(item, "call_id", "")
+                if (
+                    isinstance(name, str)
+                    and name
+                    and isinstance(call_id, str)
+                    and call_id
+                    and on_function_call_added is not None
+                ):
+                    try:
+                        on_function_call_added(name, call_id)
+                    except Exception:
+                        logger.debug(
+                            "Codex stream on_function_call_added raised",
+                            exc_info=True,
+                        )
             continue
 
         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
@@ -1241,12 +1262,24 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
+    attempt_early_function_call_ids: set[str] = set()
+
+    def _on_function_call_added(name: str, call_id: str) -> None:
+        attempt_early_function_call_ids.add(call_id)
+        agent._fire_tool_gen_event_started(name, call_id)
+
+    def _abandon_attempt_function_calls() -> None:
+        for call_id in attempt_early_function_call_ids:
+            agent._fire_tool_gen_event_aborted(call_id)
+        attempt_early_function_call_ids.clear()
+
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
         stream_kwargs = dict(api_kwargs)
         stream_kwargs["stream"] = True
+        attempt_early_function_call_ids.clear()
 
         try:
             event_stream = active_client.responses.create(**stream_kwargs)
@@ -1304,9 +1337,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_first_delta=on_first_delta,
                     on_event=_on_event,
                     interrupt_check=_interrupt_or_superseded,
+                    on_function_call_added=_on_function_call_added,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
+                    _abandon_attempt_function_calls()
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
                         "(attempt %s/%s); retrying. %s error=%s",

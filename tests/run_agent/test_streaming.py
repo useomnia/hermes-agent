@@ -222,6 +222,12 @@ class TestStreamingAccumulator:
         )
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
+        legacy_generation_names = []
+        rich_generation_events = []
+        agent.tool_gen_callback = lambda name: legacy_generation_names.append(name)
+        agent.tool_gen_event_callback = (
+            lambda name, call_id: rich_generation_events.append((name, call_id))
+        )
 
         response = agent._interruptible_streaming_api_call({})
 
@@ -231,6 +237,8 @@ class TestStreamingAccumulator:
         assert tc[0].id == "call_123"
         assert tc[0].function.name == "terminal"
         assert tc[0].function.arguments == '{"command": "ls"}'
+        assert legacy_generation_names == ["terminal"]
+        assert rich_generation_events == [("terminal", "call_123")]
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
@@ -1242,7 +1250,9 @@ class TestAnthropicStreamCallbacks:
             ),
             SimpleNamespace(
                 type="content_block_start",
-                content_block=SimpleNamespace(type="tool_use", name="terminal"),
+                content_block=SimpleNamespace(
+                    type="tool_use", name="terminal", id="anthropic-call-1"
+                ),
             ),
         ]
 
@@ -1262,10 +1272,18 @@ class TestAnthropicStreamCallbacks:
         # #67142: streaming now runs on a request-local anthropic client; route
         # it to the test mock so .messages.stream is exercised.
         agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
+        legacy_generation_names = []
+        rich_generation_events = []
+        agent.tool_gen_callback = lambda name: legacy_generation_names.append(name)
+        agent.tool_gen_event_callback = (
+            lambda name, call_id: rich_generation_events.append((name, call_id))
+        )
 
         agent._interruptible_streaming_api_call({})
 
         assert touch_calls.count("receiving stream response") == len(events)
+        assert legacy_generation_names == ["terminal"]
+        assert rich_generation_events == [("terminal", "anthropic-call-1")]
 
     @patch("run_agent.AIAgent._rebuild_anthropic_client")
     @patch("run_agent.AIAgent._replace_primary_openai_client")
@@ -1688,6 +1706,81 @@ class TestSilentRetryMidToolCall:
         assert "Stream stalled" not in joined, (
             f"Stub-path warning leaked into silent-retry path: {joined!r}"
         )
+
+    @patch("run_agent.AIAgent._replace_primary_openai_client")
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_retry_abandons_first_early_tool_boundary_before_second_attempt(
+        self, mock_close, mock_create, mock_replace,
+    ):
+        """A dropped attempt's early call cannot be completed by a retry."""
+        from run_agent import AIAgent
+        import httpx as _httpx
+
+        attempts = {"n": 0}
+
+        def _first_stream():
+            yield _make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(index=0, tc_id="call-first", name="terminal"),
+            ])
+            raise _httpx.RemoteProtocolError("peer closed connection")
+
+        def _second_stream():
+            yield _make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(index=0, tc_id="call-second", name="read_file"),
+            ])
+            yield _make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(index=0, arguments='{"path":"/tmp/x"}'),
+            ])
+            yield _make_stream_chunk(finish_reason="tool_calls")
+
+        def _pick_stream(*_args, **_kwargs):
+            attempts["n"] += 1
+            return _first_stream() if attempts["n"] == 1 else _second_stream()
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = _pick_stream
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        lifecycle: list[tuple] = []
+        agent.tool_gen_callback = lambda name: lifecycle.append(("legacy", name))
+        agent.tool_gen_event_callback = (
+            lambda name, call_id: lifecycle.append(("started", name, call_id))
+        )
+        agent.tool_gen_event_aborted_callback = (
+            lambda call_id: lifecycle.append(("aborted", call_id))
+        )
+
+        import os as _os
+        _prev = _os.environ.get("HERMES_STREAM_RETRIES")
+        _os.environ["HERMES_STREAM_RETRIES"] = "1"
+        try:
+            response = agent._interruptible_streaming_api_call({})
+        finally:
+            if _prev is None:
+                _os.environ.pop("HERMES_STREAM_RETRIES", None)
+            else:
+                _os.environ["HERMES_STREAM_RETRIES"] = _prev
+
+        assert attempts["n"] == 2
+        assert lifecycle == [
+            ("legacy", "terminal"),
+            ("started", "terminal", "call-first"),
+            ("aborted", "call-first"),
+            ("legacy", "read_file"),
+            ("started", "read_file", "call-second"),
+        ]
+        assert response.choices[0].message.tool_calls[0].id == "call-second"
 
     @patch("run_agent.AIAgent._replace_primary_openai_client")
     @patch("run_agent.AIAgent._create_request_openai_client")

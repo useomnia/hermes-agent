@@ -500,6 +500,8 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        tool_gen_event_callback: callable = None,
+        tool_gen_event_aborted_callback: callable = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -545,6 +547,8 @@ class AIAgent:
             stream_delta_callback=stream_delta_callback,
             interim_assistant_callback=interim_assistant_callback,
             tool_gen_callback=tool_gen_callback,
+            tool_gen_event_callback=tool_gen_event_callback,
+            tool_gen_event_aborted_callback=tool_gen_event_aborted_callback,
             status_callback=status_callback,
             notice_callback=notice_callback,
             notice_clear_callback=notice_clear_callback,
@@ -5640,18 +5644,54 @@ class AIAgent:
                         + text
                     )
 
-    def _fire_tool_gen_started(self, tool_name: str) -> None:
+    def _fire_tool_gen_started(
+        self, tool_name: str, tool_call_id: str | None = None
+    ) -> None:
         """Notify display layer that the model is generating tool call arguments.
 
         Fires once per tool name when the streaming response begins producing
         tool_call / tool_use tokens.  Gives the TUI a chance to show a spinner
         or status line so the user isn't staring at a frozen screen while a
         large tool payload (e.g. a 45 KB write_file) is being generated.
+
+        ``tool_gen_callback`` is the established one-argument display hook.
+        ``tool_gen_event_callback`` is the additive, richer event hook for
+        consumers that need to correlate the optional provider call ID.
         """
+        if self._stream_writer_superseded():
+            self._note_dropped_stream_writer("_fire_tool_gen_started")
+            return
         cb = self.tool_gen_callback
         if cb is not None:
             try:
                 cb(tool_name)
+            except Exception:
+                pass
+        self._fire_tool_gen_event_started(tool_name, tool_call_id)
+
+    def _fire_tool_gen_event_started(
+        self, tool_name: str, tool_call_id: str | None = None
+    ) -> None:
+        """Notify rich tool-generation consumers without replaying display UI."""
+        if self._stream_writer_superseded():
+            self._note_dropped_stream_writer("_fire_tool_gen_event_started")
+            return
+        event_cb = getattr(self, "tool_gen_event_callback", None)
+        if event_cb is not None:
+            try:
+                event_cb(tool_name, tool_call_id)
+            except Exception:
+                pass
+
+    def _fire_tool_gen_event_aborted(self, tool_call_id: str) -> None:
+        """Tell rich consumers that a streamed call never reached execution."""
+        if self._stream_writer_superseded():
+            self._note_dropped_stream_writer("_fire_tool_gen_event_aborted")
+            return
+        event_cb = getattr(self, "tool_gen_event_aborted_callback", None)
+        if event_cb is not None:
+            try:
+                event_cb(tool_call_id)
             except Exception:
                 pass
 
