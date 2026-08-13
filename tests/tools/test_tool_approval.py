@@ -18,9 +18,11 @@ from tools.tool_approval import (
     _always_approved,
     _decisions,
     _injected_always_approved,
+    _injected_always_approved_slugs,
     _session_approved,
     await_tool_approval,
     clear_session,
+    connector_tool_slug,
     consume_tool_approval_completion_reason,
     consume_tool_approval_decision,
     fail_closed_denial,
@@ -61,6 +63,7 @@ def _clean_state(monkeypatch):
     _session_approved.clear()
     _always_approved.clear()
     _injected_always_approved.clear()
+    _injected_always_approved_slugs.clear()
     clear_session(SESSION)
     register_always_approval_authority(lambda _function_name: True)
     mcp_tool._mcp_tool_read_only_hints.clear()
@@ -75,6 +78,7 @@ def _clean_state(monkeypatch):
     _session_approved.clear()
     _always_approved.clear()
     _injected_always_approved.clear()
+    _injected_always_approved_slugs.clear()
     clear_session(SESSION)
     register_always_approval_authority(None)
     mcp_tool._mcp_tool_read_only_hints.clear()
@@ -678,6 +682,79 @@ class TestAlwaysScope:
         replace_injected_always_approvals([])
 
         assert maybe_require_tool_approval(GATED, "call-3") is not None
+
+
+class TestSlugKeyedGrants:
+    """Durable grants are keyed on the harness-agnostic tool slug, so a grant
+    stays valid when the wire-name prefix convention changes."""
+
+    def test_connector_tool_slug_should_strip_the_native_prefix(self):
+        assert connector_tool_slug(GATED) == "GMAIL_CREATE_EMAIL_DRAFT"
+
+    def test_connector_tool_slug_should_strip_the_legacy_prefix(self):
+        assert connector_tool_slug(LEGACY_GATED) == "GMAIL_CREATE_EMAIL_DRAFT"
+
+    def test_connector_tool_slug_should_reject_a_non_connector_tool(self):
+        assert connector_tool_slug("terminal") is None
+        assert connector_tool_slug(CREDIT_GATED) is None
+
+    def test_injected_slugs_should_grant_a_native_named_tool(self):
+        replace_injected_always_approvals([], tool_slugs=["GMAIL_CREATE_EMAIL_DRAFT"])
+
+        assert is_always_approved(GATED) is True
+
+    def test_injected_slugs_should_not_grant_another_slug(self):
+        replace_injected_always_approvals([], tool_slugs=["GMAIL_SEND_EMAIL"])
+
+        assert is_always_approved(GATED) is False
+
+    def test_legacy_only_names_should_grant_the_native_spelling_via_derived_slugs(
+        self,
+    ):
+        # An older Omnia payload carries only legacy-prefixed names; the slug
+        # derived from them must still match this harness's native names.
+        replace_injected_always_approvals([LEGACY_GATED])
+
+        assert is_always_approved(GATED) is True
+
+    def test_refresh_should_replace_injected_slugs(self):
+        replace_injected_always_approvals([], tool_slugs=["GMAIL_CREATE_EMAIL_DRAFT"])
+        replace_injected_always_approvals([], tool_slugs=["GMAIL_SEND_EMAIL"])
+
+        assert is_always_approved(GATED) is False
+        assert is_always_approved(SIBLING) is True
+
+    def test_empty_refresh_should_clear_injected_slugs(self):
+        replace_injected_always_approvals([], tool_slugs=["GMAIL_CREATE_EMAIL_DRAFT"])
+        replace_injected_always_approvals([])
+
+        assert is_always_approved(GATED) is False
+
+    def test_malformed_slug_entries_are_dropped(self):
+        replace_injected_always_approvals(
+            [], tool_slugs=["  ", 42, "GMAIL_CREATE_EMAIL_DRAFT "]  # type: ignore[list-item]
+        )
+
+        assert is_always_approved(GATED) is True
+        assert is_always_approved(SIBLING) is False
+
+    def test_slug_candidate_still_requires_the_authority(self):
+        replace_injected_always_approvals([], tool_slugs=["GMAIL_CREATE_EMAIL_DRAFT"])
+        register_always_approval_authority(lambda _function_name: False)
+
+        assert is_always_approved(GATED) is False
+
+    def test_session_grant_should_record_a_legacy_spelled_sibling_as_native(self):
+        # The client blankets the toolkit with names in the spelling IT knows;
+        # an older client sends legacy names, which must map onto this
+        # registry's native names rather than being dropped.
+        legacy_sibling = "mcp_connectors_GMAIL_SEND_EMAIL"
+        assert (
+            resolve_tool_approval(SESSION, GATED, "session", tools=[legacy_sibling])
+            is False
+        )
+
+        assert is_tool_approved(SESSION, SIBLING) is True
 
 
 class TestResolveToolApproval:

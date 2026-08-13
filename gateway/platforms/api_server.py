@@ -177,8 +177,16 @@ async def _request_turn_finalize_annotations(
     return [annotation for annotation in annotations if isinstance(annotation, dict)]
 
 
-def _parse_omnio_connector_toolkit_approval_tools(payload: Any) -> list[str]:
-    """Validate and normalize Omnia's authoritative standing-grant response."""
+def _parse_omnio_connector_toolkit_approvals(
+    payload: Any,
+) -> tuple[list[str], list[str] | None]:
+    """Validate and normalize Omnia's authoritative standing-grant response.
+
+    Returns ``(tools, tool_slugs)``. ``tools`` are exact wire names; ``toolSlugs``
+    is the harness-agnostic slug contract newer Omnia deployments also serve —
+    ``None`` when the payload predates it, so callers can derive slugs from the
+    names instead.
+    """
     if not isinstance(payload, dict):
         raise ValueError("approval payload must be an object")
     tools = payload.get("tools")
@@ -186,7 +194,14 @@ def _parse_omnio_connector_toolkit_approval_tools(payload: Any) -> list[str]:
         raise ValueError("approval payload tools must be an array")
     if not all(isinstance(item, str) for item in tools):
         raise ValueError("approval payload tools must contain strings")
-    return [item.strip() for item in tools if item.strip()]
+    tool_slugs = payload.get("toolSlugs")
+    if tool_slugs is not None:
+        if not isinstance(tool_slugs, list) or not all(
+            isinstance(item, str) for item in tool_slugs
+        ):
+            raise ValueError("approval payload toolSlugs must be an array of strings")
+        tool_slugs = [item.strip() for item in tool_slugs if item.strip()]
+    return [item.strip() for item in tools if item.strip()], tool_slugs
 
 
 def _hermes_version() -> str:
@@ -9162,7 +9177,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return
 
         try:
-            tools = await self._fetch_omnio_connector_toolkit_approvals(
+            tools, tool_slugs = await self._fetch_omnio_connector_toolkit_approvals(
                 base_url=base_url,
                 api_token=api_token,
                 brand_id=brand_id,
@@ -9172,7 +9187,7 @@ class APIServerAdapter(BasePlatformAdapter):
             replace_injected_always_approvals([])
             return
 
-        replace_injected_always_approvals(tools)
+        replace_injected_always_approvals(tools, tool_slugs=tool_slugs)
 
     def _is_omnio_connector_toolkit_approval_granted(
         self, function_name: str
@@ -9209,12 +9224,27 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise RuntimeError(f"omnia_status={status}")
             payload = json.loads(response.read())
 
-        tools = _parse_omnio_connector_toolkit_approval_tools(payload)
-        return function_name in tools
+        from tools.tool_approval import connector_tool_slug
+
+        tools, tool_slugs = _parse_omnio_connector_toolkit_approvals(payload)
+        if function_name in tools:
+            return True
+        # Slug matching keeps a grant valid across wire-name prefix renames.
+        # Older Omnia payloads carry no toolSlugs; derive them from the names.
+        slug = connector_tool_slug(function_name)
+        if slug is None:
+            return False
+        if tool_slugs is None:
+            tool_slugs = [
+                derived
+                for derived in (connector_tool_slug(name) for name in tools)
+                if derived
+            ]
+        return slug in tool_slugs
 
     async def _fetch_omnio_connector_toolkit_approvals(
         self, *, base_url: str, api_token: str, brand_id: str
-    ) -> list[str]:
+    ) -> tuple[list[str], list[str] | None]:
         import aiohttp
 
         headers = {"Authorization": f"Bearer {api_token}"}
@@ -9231,7 +9261,7 @@ class APIServerAdapter(BasePlatformAdapter):
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, headers=headers) as response:
                 if response.status == 404:
-                    return []
+                    return [], None
                 if response.status >= 400:
                     text = await response.text()
                     raise RuntimeError(
@@ -9239,7 +9269,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 payload = await response.json(content_type=None)
 
-        return _parse_omnio_connector_toolkit_approval_tools(payload)
+        return _parse_omnio_connector_toolkit_approvals(payload)
 
     async def disconnect(self) -> None:
         """Stop the aiohttp web server and release all owned resources.

@@ -61,6 +61,21 @@ _DEFAULT_TIMEOUT_S = 300
 # forms remain in the connector-write trust boundary.
 CONNECTORS_TOOL_PREFIXES = ("mcp__connectors__", "mcp_connectors_")
 
+
+def connector_tool_slug(function_name: str) -> Optional[str]:
+    """The harness-agnostic tool slug behind a connector wire name, or None.
+
+    The slug (e.g. ``GMAIL_SEND_EMAIL``) is the stable identifier durable
+    grants are keyed on; the ``mcp*connectors*`` prefix is transport dressing
+    this harness mints and can rename. Matching grants by slug is what keeps a
+    standing approval valid across such renames.
+    """
+    for prefix in CONNECTORS_TOOL_PREFIXES:
+        if function_name.startswith(prefix):
+            return function_name[len(prefix) :]
+    return None
+
+
 # User-facing option labels and the scope each one grants. Index-aligned so the
 # Omnia frontend can map a chosen label back to its scope.
 APPROVAL_OPTIONS = ["Allow once", "Allow for this chat", "Allow always", "Deny"]
@@ -87,6 +102,11 @@ _session_approved: dict[str, set[str]] = {}
 _always_approved: set[str] = set()
 # Tool names injected from Omnia's durable per-toolkit grants.
 _injected_always_approved: set[str] = set()
+# Harness-agnostic tool slugs injected from the same grants. Slug matching is
+# what keeps a durable grant valid when the wire-name prefix convention
+# changes; the exact-name set above covers payloads and tools alike only while
+# their spellings happen to agree.
+_injected_always_approved_slugs: set[str] = set()
 # Fresh server-authoritative check for one exact standing grant. The in-memory
 # sets above are only candidate indexes: they must never authorize a later write
 # by themselves because Omnia can revoke a shared grant while this process stays
@@ -218,10 +238,12 @@ def is_always_approved(function_name: str) -> bool:
     skip its prompt. There is deliberately no positive cache: a shared revoke
     must take effect on every warm gateway without reload or reprovision.
     """
+    slug = connector_tool_slug(function_name)
     with _lock:
         candidate = (
             function_name in _always_approved
             or function_name in _injected_always_approved
+            or (slug is not None and slug in _injected_always_approved_slugs)
         )
         authority = _always_approval_authority
     if not candidate:
@@ -258,12 +280,20 @@ def record_always_approval(function_name: str) -> None:
         _always_approved.add(function_name)
 
 
-def replace_injected_always_approvals(function_names: list[str]) -> None:
+def replace_injected_always_approvals(
+    function_names: list[str],
+    tool_slugs: list[str] | None = None,
+) -> None:
     """Replace the durable Omnia grant snapshot and clear local bridge grants.
 
     Local ``always`` approvals are only a bridge between the user's click and the
     next authoritative DB refresh. A reload means the DB snapshot has spoken; on
     failure the caller passes an empty list so stale grants fail closed.
+
+    ``tool_slugs`` is the harness-agnostic form of the same grants. Older Omnia
+    payloads carry only prefixed names, so when it is absent the slugs are
+    derived from those names — a grant published under either spelling means
+    the toolkit's tool slug is granted, whatever prefix this harness mints.
     """
     exact_names = {
         name.strip()
@@ -271,10 +301,22 @@ def replace_injected_always_approvals(function_names: list[str]) -> None:
         if isinstance(name, str)
         and _is_recordable_tool_name(name.strip(), require_hint=False)
     }
+    if tool_slugs is None:
+        slugs = {
+            slug for slug in (connector_tool_slug(name) for name in exact_names) if slug
+        }
+    else:
+        slugs = {
+            slug.strip()
+            for slug in tool_slugs
+            if isinstance(slug, str) and slug.strip()
+        }
     with _lock:
         _always_approved.clear()
         _injected_always_approved.clear()
         _injected_always_approved.update(exact_names)
+        _injected_always_approved_slugs.clear()
+        _injected_always_approved_slugs.update(slugs)
 
 
 def register_tool_approval_notify(
@@ -535,9 +577,22 @@ def _approved_tool_names(function_name: str, tools: list[str] | None) -> set[str
         candidate = name.strip()
         if not candidate or candidate == current_name:
             continue
-        if _is_recordable_tool_name(candidate, require_hint=True):
-            approved.add(candidate)
+        # A client may spell a sibling tool with a prefix this registry does
+        # not use (older clients predate the native-name convention), so try
+        # every spelling of the same slug and keep whichever is registered.
+        for spelling in _spelling_candidates(candidate):
+            if spelling != current_name and _is_recordable_tool_name(
+                spelling, require_hint=True
+            ):
+                approved.add(spelling)
     return approved
+
+
+def _spelling_candidates(name: str) -> list[str]:
+    slug = connector_tool_slug(name)
+    if slug is None:
+        return [name]
+    return [f"{prefix}{slug}" for prefix in CONNECTORS_TOOL_PREFIXES]
 
 
 def _is_recordable_tool_name(function_name: str, *, require_hint: bool) -> bool:
