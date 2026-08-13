@@ -823,19 +823,45 @@ async def test_successful_run_emits_file_annotations_before_terminal_with_contig
     )
 
 
+def _file_annotation(path: str) -> Dict[str, Any]:
+    return {
+        "type": "file_path",
+        "path": path,
+        "filename": path.rsplit("/", 1)[-1],
+        "content_type": "application/pdf",
+        "size_label": "2 KB",
+        "size_bytes": 1536,
+    }
+
+
 @pytest.mark.asyncio
-async def test_finalize_hook_uses_only_the_final_emitted_message_block(
+async def test_finalize_hook_annotates_every_emitted_message_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scratch_text = "I staged a scratch file at `/brand/scratch.pdf`."
+    """A file handed over mid-turn belongs to the block that named it.
+
+    The reply names the draft, then runs another tool and closes on a
+    different file. Scanning only the last block would leave the draft
+    unannotated, so its chat link would render as plain text forever.
+    """
+    handover_text = "Here's the draft: `/brand/draft.pdf`."
     final_text = "Download `/brand/final.pdf`."
-    finalize = AsyncMock(return_value=[])
+
+    async def finalize(_hook_url: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        path = (
+            "/brand/draft.pdf"
+            if "draft" in payload["final_text"]
+            else "/brand/final.pdf"
+        )
+        return [_file_annotation(path)]
+
+    finalize_mock = AsyncMock(side_effect=finalize)
     monkeypatch.setenv(
         api_server_module._OMNIO_TURN_FINALIZE_HOOK_ENV,
         "http://127.0.0.1:8642/internal/turn-finalize",
     )
     monkeypatch.setattr(
-        api_server_module, "_request_turn_finalize_annotations", finalize
+        api_server_module, "_request_turn_finalize_annotations", finalize_mock
     )
     adapter = _make_adapter()
 
@@ -845,7 +871,7 @@ async def test_finalize_hook_uses_only_the_final_emitted_message_block(
         tool_complete = kwargs["tool_complete_callback"]
 
         def run(**_kwargs: Any) -> Dict[str, Any]:
-            stream(scratch_text)
+            stream(handover_text)
             tool_start("call-finalize", "terminal", {"command": "make report"})
             tool_complete(
                 "call-finalize",
@@ -874,20 +900,111 @@ async def test_finalize_hook_uses_only_the_final_emitted_message_block(
         and event["item"]["type"] == "message"
     ]
     assert [event["item"]["content"][0]["text"] for event in message_events] == [
-        scratch_text,
+        handover_text,
         final_text,
     ]
     assert message_events[0]["item"]["id"] != message_events[1]["item"]["id"]
-    assert finalize.await_args.args[1]["final_text"] == final_text
-    assert (
-        finalize.await_args.args[1]["message_item_id"]
-        == message_events[1]["item"]["id"]
+
+    run_id = json.loads(started.text)["run_id"]
+    payloads = {
+        call.args[1]["message_item_id"]: call.args[1]
+        for call in finalize_mock.await_args_list
+    }
+    assert len(payloads) == 2
+    for text, message_event in zip(
+        [handover_text, final_text], message_events, strict=True
+    ):
+        payload = payloads[message_event["item"]["id"]]
+        assert payload["final_text"] == text
+        assert payload["output_index"] == message_event["output_index"]
+        assert payload["run_id"] == run_id
+        assert payload["turn_id"] == "turn-1"
+
+    annotations = [
+        event
+        for event in events
+        if event["type"] == "response.output_text.annotation.added"
+    ]
+    assert [
+        (event["item_id"], event["annotation"]["path"]) for event in annotations
+    ] == [
+        (message_events[0]["item"]["id"], "/brand/draft.pdf"),
+        (message_events[1]["item"]["id"], "/brand/final.pdf"),
+    ]
+    assert events[-1]["type"] == "response.completed"
+    assert [event["sequence_number"] for event in events] == list(
+        range(1, len(events) + 1)
     )
-    assert (
-        finalize.await_args.args[1]["output_index"]
-        == message_events[1]["output_index"]
+
+
+@pytest.mark.asyncio
+async def test_message_block_is_annotated_while_the_turn_is_still_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A block is annotated when it closes, not when the turn ends.
+
+    `request_user_input` blocks its turn for as long as the user takes to
+    answer, so a hand-over that waited for the turn to finish would leave the
+    file unopenable for exactly as long as the question stands. The fake agent
+    here refuses to move on until the block's hook has run, so an end-of-turn
+    annotation deadlocks this test instead of passing it.
+    """
+    handover_text = "Here's the draft: `/brand/draft.pdf`."
+    hook_called = threading.Event()
+
+    async def finalize(_hook_url: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if "draft" not in payload["final_text"]:
+            return []
+        hook_called.set()
+        return [_file_annotation("/brand/draft.pdf")]
+
+    monkeypatch.setenv(
+        api_server_module._OMNIO_TURN_FINALIZE_HOOK_ENV,
+        "http://127.0.0.1:8642/internal/turn-finalize",
     )
-    assert json.loads(started.text)["run_id"] == finalize.await_args.args[1]["run_id"]
+    monkeypatch.setattr(
+        api_server_module, "_request_turn_finalize_annotations", finalize
+    )
+    adapter = _make_adapter()
+
+    def create_agent(**kwargs: Any) -> MagicMock:
+        stream = kwargs["stream_delta_callback"]
+        tool_start = kwargs["tool_start_callback"]
+        tool_complete = kwargs["tool_complete_callback"]
+
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            stream(handover_text)
+            tool_start("call-ask", "terminal", {"command": "ask"})
+            assert hook_called.wait(10), "the block was not annotated mid-turn"
+            tool_complete("call-ask", "terminal", {"command": "ask"}, "answered")
+            stream("\n\nAll set.")
+            return {"final_response": "All set.", "messages": []}
+
+        return _agent(run)
+
+    with patch.object(adapter, "_create_agent", side_effect=create_agent):
+        _started, events = await _run_without_http_server(
+            adapter,
+            {"input": "draft it", "turn_id": "turn-1"},
+        )
+
+    handover_item = next(
+        event
+        for event in events
+        if event["type"] == "response.output_item.done"
+        and event["item"]["type"] == "message"
+        and event["item"]["content"][0]["text"] == handover_text
+    )
+    annotations = [
+        event
+        for event in events
+        if event["type"] == "response.output_text.annotation.added"
+    ]
+    assert [event["item_id"] for event in annotations] == [
+        handover_item["item"]["id"]
+    ]
+    assert annotations[0]["annotation"]["path"] == "/brand/draft.pdf"
+    assert events[-1]["type"] == "response.completed"
 
 
 @pytest.mark.asyncio
