@@ -773,6 +773,101 @@ class TestSpawnEnvSanitization:
         args, kwargs = env.commands[0]
         assert kwargs.get("rewrite_compound_background") is False
 
+    def test_spawn_via_env_detaches_wrapper_stdio(self, registry):
+        """The backgrounded subshell must not hold the caller's stdout pipe.
+
+        A backend that reads command output until EOF (the Omnio Toolbox)
+        blocks for the whole spawn timeout while the subshell holds the write
+        end, then kills the process group it just started.
+        """
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def get_temp_dir(self):
+                return "/tmp"
+
+            def execute(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return {"output": "4321\n", "returncode": 0}
+
+        env = FakeEnv()
+        fake_thread = MagicMock()
+
+        with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            registry.spawn_via_env(env, "echo hello")
+
+        bg_command = env.commands[0][0]
+        assert ") > /dev/null 2>&1 < /dev/null &" in bg_command
+        # `&` binds looser than `&&`, so chaining mkdir into the backgrounded
+        # compound races the PID-file write against the directory creation.
+        assert "mkdir -p /tmp;" in bg_command
+        assert "mkdir -p /tmp &&" not in bg_command
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+    def test_spawn_via_env_survives_pipe_reading_backend(self, registry, tmp_path):
+        """End-to-end guard against the spawn killing its own process.
+
+        Mimics the Omnio Toolbox exec loop: read stdout until EOF, and on
+        timeout kill the whole process group. With a wrapper that leaks the
+        pipe, the background process never outlives the spawn call.
+        """
+        marker = tmp_path / "survived"
+        backend_timeout = 1.0
+
+        class PipeReadingEnv:
+            """Runs the wrapper the way the Toolbox runs /exec."""
+
+            def __init__(self):
+                self.elapsed = None
+
+            def get_temp_dir(self):
+                return str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                proc = subprocess.Popen(
+                    ["bash", "-lc", command],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                start = time.monotonic()
+                output = b""
+                timed_out = False
+                try:
+                    output = proc.communicate(timeout=backend_timeout)[0]
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait(timeout=5)
+                self.elapsed = time.monotonic() - start
+                return {
+                    "output": output.decode(errors="replace"),
+                    "returncode": 124 if timed_out else proc.returncode,
+                }
+
+        env = PipeReadingEnv()
+        fake_thread = MagicMock()
+
+        # Writes the marker only after the backend would have timed out and
+        # killed the group, so the marker proves real survival.
+        with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(
+                env, f"sleep 2; touch {marker}", timeout=int(backend_timeout)
+            )
+
+        assert env.elapsed is not None, "backend was never invoked"
+        assert env.elapsed < backend_timeout, "spawn blocked until the backend timeout"
+        assert session.pid is not None, "spawn did not report a PID"
+
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.1)
+        assert marker.exists(), "background process did not survive the spawn call"
+
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
         session.exited = False

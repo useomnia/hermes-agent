@@ -246,12 +246,14 @@ def _global_allow_private_urls() -> bool:
     try:
         from hermes_cli.config import read_raw_config
         cfg = read_raw_config()
-        # security.allow_private_urls (preferred)
+        # security.allow_private_urls (preferred and authoritative when set).
+        # A browser may separately opt into private navigation for a trusted
+        # local/CDP backend without weakening server-side URL fetchers.
         sec = cfg.get("security", {})
-        if isinstance(sec, dict) and is_truthy_value(
-            sec.get("allow_private_urls"), default=False
-        ):
-            _cached_allow_private = True
+        if isinstance(sec, dict) and "allow_private_urls" in sec:
+            _cached_allow_private = is_truthy_value(
+                sec.get("allow_private_urls"), default=False
+            )
             return _cached_allow_private
         # browser.allow_private_urls (legacy fallback)
         browser = cfg.get("browser", {})

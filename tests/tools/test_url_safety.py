@@ -568,8 +568,21 @@ class TestGlobalAllowPrivateUrls:
         with patch("hermes_cli.config.read_raw_config", return_value=cfg):
             assert _global_allow_private_urls() is False
 
-    def test_config_security_takes_precedence_over_browser(self, monkeypatch):
-        """security section is checked before browser section."""
+    @pytest.mark.parametrize("security_value", [False, "false", 0, "no"])
+    def test_config_security_false_takes_precedence_over_browser(
+        self, monkeypatch, security_value
+    ):
+        """An explicit server-side deny is not reopened by the browser setting."""
+        monkeypatch.delenv("HERMES_ALLOW_PRIVATE_URLS", raising=False)
+        cfg = {
+            "security": {"allow_private_urls": security_value},
+            "browser": {"allow_private_urls": True},
+        }
+        with patch("hermes_cli.config.read_raw_config", return_value=cfg):
+            assert _global_allow_private_urls() is False
+
+    def test_config_security_true_takes_precedence_over_browser(self, monkeypatch):
+        """An explicit server-side opt-out remains authoritative."""
         monkeypatch.delenv("HERMES_ALLOW_PRIVATE_URLS", raising=False)
         cfg = {"security": {"allow_private_urls": True}, "browser": {"allow_private_urls": False}}
         with patch("hermes_cli.config.read_raw_config", return_value=cfg):
