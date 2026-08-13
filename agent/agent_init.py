@@ -518,6 +518,8 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    tool_gen_event_callback: callable = None,
+    tool_gen_event_aborted_callback: callable = None,
 ):
     """
     Initialize the AI Agent.
@@ -750,6 +752,8 @@ def init_agent(
     agent.event_callback = event_callback
     agent.reaction_callback = reaction_callback
     agent.tool_gen_callback = tool_gen_callback
+    agent.tool_gen_event_callback = tool_gen_event_callback
+    agent.tool_gen_event_aborted_callback = tool_gen_event_aborted_callback
 
     
     # Tool execution state — allows _vprint during tool execution

@@ -2418,9 +2418,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     agent._fire_stream_delta(text)
                     deltas_were_sent["yes"] = True
 
-                def _on_tool(name):
+                def _on_tool_event(name, tool_call_id=None):
                     _fire_first()
-                    agent._fire_tool_gen_started(name)
+                    agent._fire_tool_gen_started(name, tool_call_id)
 
                 def _on_reasoning(text):
                     _fire_first()
@@ -2429,7 +2429,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 result["response"] = stream_converse_with_callbacks(
                     raw_response,
                     on_text_delta=_on_text if agent._has_stream_consumers() else None,
-                    on_tool_start=_on_tool,
+                    on_tool_event=_on_tool_event,
                     on_reasoning_delta=_on_reasoning if agent.reasoning_callback or agent.stream_delta_callback else None,
                     on_interrupt_check=lambda: agent._interrupt_requested,
                     on_event=lambda: _bedrock_last_event.__setitem__("t", time.time()),
@@ -2513,6 +2513,32 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         return result["response"]
 
     result = {"response": None, "error": None, "partial_tool_names": []}
+
+    # A Responses consumer can receive a function-call item while the model is
+    # still streaming its arguments.  That item belongs to exactly one stream
+    # attempt: if the transport drops and we retry, it must be closed as
+    # incomplete before the replacement attempt can advertise a new call.
+    # Keep only safely-correlated IDs here; blank IDs intentionally retain the
+    # legacy execution-time boundary behaviour.
+    attempt_rich_tool_call_ids: set[str] = set()
+
+    def _fire_rich_tool_gen_started(tool_name, tool_call_id=None) -> None:
+        agent._fire_tool_gen_started(tool_name, tool_call_id)
+        if isinstance(tool_call_id, str) and tool_call_id.strip():
+            attempt_rich_tool_call_ids.add(tool_call_id)
+
+    def _fire_rich_tool_gen_event_started(tool_name, tool_call_id) -> None:
+        agent._fire_tool_gen_event_started(tool_name, tool_call_id)
+        if isinstance(tool_call_id, str) and tool_call_id.strip():
+            attempt_rich_tool_call_ids.add(tool_call_id)
+
+    def _abandon_attempt_rich_tool_calls() -> None:
+        # Clear before invoking consumers so a callback cannot cause an old
+        # attempt to be abandoned twice through re-entrant cleanup.
+        call_ids = tuple(attempt_rich_tool_call_ids)
+        attempt_rich_tool_call_ids.clear()
+        for tool_call_id in call_ids:
+            agent._fire_tool_gen_event_aborted(tool_call_id)
 
     # Cross-turn stale-stream circuit breaker (#58962) — see the canonical
     # comment block above ``_stale_streak()``.  Raises past the give-up
@@ -2859,6 +2885,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         content_parts: list = []
         tool_calls_acc: dict = {}
         tool_gen_notified: set = set()
+        tool_gen_event_notified: set = set()
         # Ollama-compatible endpoints reuse index 0 for every tool call
         # in a parallel batch, distinguishing them only by id.  Track
         # the last seen id per raw index so we can detect a new tool
@@ -3018,8 +3045,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     name = entry["function"]["name"]
                     if name and idx not in tool_gen_notified:
                         tool_gen_notified.add(idx)
+                        if entry["id"]:
+                            tool_gen_event_notified.add(idx)
                         _fire_first_delta()
-                        agent._fire_tool_gen_started(name)
+                        _fire_rich_tool_gen_started(name, entry["id"])
                         # Record the partial tool-call name so the outer
                         # stub-builder can surface a user-visible warning
                         # if streaming dies before this tool's arguments
@@ -3028,6 +3057,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # at line ~6107 return `tool_calls=None`, silently
                         # discarding the attempted action.
                         result["partial_tool_names"].append(name)
+                    elif (
+                        name
+                        and entry["id"]
+                        and idx not in tool_gen_event_notified
+                    ):
+                        # Some providers stream the name before the call ID.
+                        # The legacy display signal has already fired; emit
+                        # the richer correlation event as soon as its safe ID
+                        # arrives, still before the argument stream finishes.
+                        tool_gen_event_notified.add(idx)
+                        _fire_rich_tool_gen_event_started(name, entry["id"])
 
             if chunk.choices[0].finish_reason:
                 finish_reason = chunk.choices[0].finish_reason
@@ -3275,7 +3315,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         tool_name = getattr(block, "name", None)
                         if tool_name:
                             _fire_first_delta()
-                            agent._fire_tool_gen_started(tool_name)
+                            _fire_rich_tool_gen_started(
+                                tool_name, getattr(block, "id", None)
+                            )
 
                 elif event_type == "content_block_delta":
                     delta = getattr(event, "delta", None)
@@ -3343,6 +3385,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
                 stream_attempt_id = _start_stream_attempt()
+                # Each retry owns a fresh set of early Responses call items.
+                # Successful attempts clear this bookkeeping before returning;
+                # failed attempts are explicitly abandoned below.
+                attempt_rich_tool_call_ids.clear()
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),
                 # but the retry loop opens a FRESH connection — negating the
@@ -3366,6 +3412,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         result["response"] = _call_anthropic(request_client)
                     else:
                         result["response"] = _call_chat_completions(stream_attempt_id)
+                    # The tool executor now owns any advertised call IDs. Do
+                    # not let later cleanup for this API call classify them as
+                    # abandoned.
+                    attempt_rich_tool_call_ids.clear()
                     return  # success
                 except Exception as e:
                     # If the main poll loop force-closed this request because
@@ -3377,6 +3427,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # interrupt hang where doomed retries burned full
                     # stream-stale-timeout cycles. (#6600)
                     if _request_cancelled["value"]:
+                        _abandon_attempt_rich_tool_calls()
                         logger.debug(
                             "Streaming worker caught %s after request "
                             "cancellation — exiting without retry.",
@@ -3450,6 +3501,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             logger.warning(
                                 "Streaming failed after partial delivery, not retrying: %s", e
                             )
+                            _abandon_attempt_rich_tool_calls()
                             result["error"] = e
                             return
                         # Tool call was in-flight AND error is transient:
@@ -3489,6 +3541,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         )
                         _cancel_current_stream_attempt("stream_mid_tool_retry_cleanup")
                         _close_request_client_once("stream_mid_tool_retry_cleanup")
+                        _abandon_attempt_rich_tool_calls()
                         # #67142: anthropic streams on a request-local client,
                         # already worker-owned-closed by _close_request_client_once
                         # above; the next attempt builds a fresh one. The shared
@@ -3548,6 +3601,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # Close the stale request client before retry
                             _cancel_current_stream_attempt("stream_retry_cleanup")
                             _close_request_client_once("stream_retry_cleanup")
+                            _abandon_attempt_rich_tool_calls()
                             # Also rebuild the primary client to purge any dead
                             # connections from the pool. #67142: anthropic uses a
                             # request-local client (already worker-owned-closed
@@ -3647,12 +3701,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # richer recovery: credential rotation, provider fallback,
                     # backoff, and — for "stream not supported" — will switch
                     # to non-streaming on the next attempt via _disable_streaming.
+                    _abandon_attempt_rich_tool_calls()
                     result["error"] = e
                     return
         except InterruptedError as e:
             # The interrupt may be noticed inside the worker thread before
             # the polling loop sees it. Surface it through the normal result
             # channel so callers never miss a fast pre-retry interrupt.
+            _abandon_attempt_rich_tool_calls()
             result["error"] = e
             return
         finally:

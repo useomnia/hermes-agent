@@ -1115,6 +1115,28 @@ class TestStreamConverseWithCallbacks:
         )
         assert tools_started == ["read_file"]
 
+    def test_tool_event_callback_includes_bedrock_tool_use_id(self):
+        from agent.bedrock_adapter import stream_converse_with_callbacks
+
+        events = {"stream": [
+            {"contentBlockStart": {"contentBlockIndex": 0, "start": {
+                "toolUse": {"toolUseId": "bedrock-call-1", "name": "read_file"},
+            }}},
+            {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {
+                "toolUse": {"input": '{"path":"/tmp/f"}'},
+            }}},
+            {"contentBlockStop": {"contentBlockIndex": 0}},
+            {"messageStop": {"stopReason": "tool_use"}},
+        ]}
+        tool_events = []
+
+        stream_converse_with_callbacks(
+            events,
+            on_tool_event=lambda name, call_id: tool_events.append((name, call_id)),
+        )
+
+        assert tool_events == [("read_file", "bedrock-call-1")]
+
     def test_interrupt_stops_processing(self):
         from agent.bedrock_adapter import stream_converse_with_callbacks
         deltas = []

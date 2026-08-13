@@ -426,6 +426,7 @@ class TurnEventEmitter:
         self._message_output_indexes: Dict[str, int] = {}
         self._reasoning_items: Dict[str, Dict[str, Any]] = {}
         self._function_calls: Dict[str, Dict[str, Any]] = {}
+        self._function_call_occurrences: Dict[str, int] = {}
 
     def _emit(
         self,
@@ -626,8 +627,19 @@ class TurnEventEmitter:
             },
         )
 
-    def function_call_start(self, call_id: str, name: str) -> None:
-        item_id = f"fc_{call_id}"
+    def function_call_start(
+        self, call_id: str, name: str, *, early: bool = False
+    ) -> None:
+        occurrence = self._function_call_occurrences.get(call_id, 0) + 1
+        self._function_call_occurrences[call_id] = occurrence
+        # A provider may reuse a deterministic call ID on a later retry. The
+        # first item keeps the established identity; reopened lifecycles get a
+        # distinct Responses item ID while retaining the provider call_id.
+        item_id = (
+            f"fc_{call_id}"
+            if occurrence == 1
+            else f"fc_{call_id}_{occurrence}"
+        )
         output_index = self._allocate_output_index()
         started_at = self.clock()
         self._function_calls[call_id] = {
@@ -635,6 +647,7 @@ class TurnEventEmitter:
             "name": name,
             "output_index": output_index,
             "arguments": None,
+            "early": early,
             "started_at": started_at,
         }
         self._emit(
@@ -646,6 +659,7 @@ class TurnEventEmitter:
                 "status": "in_progress",
                 "name": name,
                 "call_id": call_id,
+                **({"arguments": ""} if early else {}),
                 "started_at": started_at,
             },
         )
@@ -697,10 +711,35 @@ class TurnEventEmitter:
                 arguments=arguments,
             )
             item["arguments"] = arguments
+        elif state["early"]:
+            # The early Responses boundary advertised an empty argument
+            # string. Keep that native item shape at completion without
+            # inventing argument delta/done frames for ordinary tools.
+            item["arguments"] = ""
         self._emit(
             "response.output_item.done",
             output_index=state["output_index"],
             item=item,
+        )
+
+    def function_call_incomplete(self, call_id: str) -> None:
+        """Close a call announced by an abandoned provider stream attempt."""
+        state = self._function_calls.pop(call_id, None)
+        if state is None:
+            return
+        self._emit(
+            "response.output_item.done",
+            output_index=state["output_index"],
+            item={
+                "id": state["item_id"],
+                "type": "function_call",
+                "status": "incomplete",
+                "name": state["name"],
+                "call_id": call_id,
+                "arguments": "",
+                "started_at": state["started_at"],
+                "completed_at": self.clock(),
+            },
         )
 
     def task_list(self, todos: list) -> None:

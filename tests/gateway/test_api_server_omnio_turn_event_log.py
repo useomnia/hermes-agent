@@ -2661,6 +2661,307 @@ async def test_runs_projection_allows_only_allowlisted_tool_args_and_no_results(
 
 
 @pytest.mark.asyncio
+async def test_runs_emit_function_call_boundary_while_arguments_are_generating() -> None:
+    """A streamed tool name opens the native item before execution starts."""
+    adapter = _make_adapter()
+    generating = threading.Event()
+    continue_execution = threading.Event()
+    executed = threading.Event()
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            callbacks["tool_gen_event_callback"]("terminal", "call-early")
+            generating.set()
+            assert continue_execution.wait(2.0)
+            executed.set()
+            callbacks["tool_start_callback"](
+                "call-early", "terminal", {"command": "hidden"}
+            )
+            callbacks["tool_complete_callback"](
+                "call-early", "terminal", {"command": "hidden"}, "hidden result"
+            )
+            return {"final_response": "done", "messages": []}
+
+        return _agent(run)
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", side_effect=build_agent):
+            started = await client.post("/v1/runs", json={"input": "use a tool"})
+            run_id = (await started.json())["run_id"]
+            await _wait_for_thread_event(generating)
+            response = await client.get(f"/v1/runs/{run_id}/events")
+
+            seen: List[Dict[str, Any]] = []
+            while True:
+                event = await _read_one_sse_event(response)
+                seen.append(event)
+                if (
+                    event["type"] == "response.output_item.added"
+                    and event["item"]["type"] == "function_call"
+                ):
+                    break
+
+            boundary = seen[-1]
+            assert boundary["item"] == {
+                "id": "fc_call-early",
+                "type": "function_call",
+                "status": "in_progress",
+                "name": "terminal",
+                "call_id": "call-early",
+                "arguments": "",
+                "started_at": boundary["item"]["started_at"],
+            }
+            assert not executed.is_set()
+            assert not any(
+                event["type"].startswith("response.function_call_arguments")
+                for event in seen
+            )
+
+            continue_execution.set()
+            remaining = _sse_events(await response.text())
+
+    events = seen + remaining
+    call_events = [
+        event
+        for event in events
+        if event.get("item_id") == "fc_call-early"
+        or (
+            event.get("item", {}).get("id") == "fc_call-early"
+            if isinstance(event.get("item"), dict)
+            else False
+        )
+    ]
+    assert [event["type"] for event in call_events] == [
+        "response.output_item.added",
+        "response.output_item.done",
+    ]
+    assert call_events[-1]["item"]["arguments"] == ""
+    assert "hidden" not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+async def test_runs_streamed_duplicate_or_blank_call_ids_fall_back_to_execution_ids() -> None:
+    """Ambiguous generation hints never duplicate or orphan Responses items."""
+    adapter = _make_adapter()
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            callbacks["tool_gen_event_callback"]("first_tool", "call-shared")
+            callbacks["tool_gen_event_callback"]("second_tool", "call-shared")
+            callbacks["tool_gen_event_callback"]("blank_id_tool", "")
+            for call_id, name in (
+                ("call-shared", "first_tool"),
+                ("call-shared_d2", "second_tool"),
+                ("call-from-execution", "blank_id_tool"),
+            ):
+                callbacks["tool_start_callback"](call_id, name, {})
+                callbacks["tool_complete_callback"](call_id, name, {}, "ok")
+            return {"final_response": "done", "messages": []}
+
+        return _agent(run)
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", side_effect=build_agent):
+            started = await client.post("/v1/runs", json={"input": "use tools"})
+            run_id = (await started.json())["run_id"]
+            response = await client.get(f"/v1/runs/{run_id}/events")
+            events = _sse_events(await response.text())
+
+    added = [
+        event["item"]
+        for event in events
+        if event["type"] == "response.output_item.added"
+        and event["item"]["type"] == "function_call"
+    ]
+    completed = [
+        event["item"]
+        for event in events
+        if event["type"] == "response.output_item.done"
+        and event["item"]["type"] == "function_call"
+    ]
+    assert [item["call_id"] for item in added] == [
+        "call-shared",
+        "call-shared_d2",
+        "call-from-execution",
+    ]
+    assert [item["call_id"] for item in completed] == [
+        "call-shared",
+        "call-shared_d2",
+        "call-from-execution",
+    ]
+    assert [event["type"] for event in events][-1] == "response.completed"
+
+
+@pytest.mark.asyncio
+async def test_runs_failure_closes_an_early_function_call_before_the_terminal_event() -> None:
+    """An interrupted generation never leaves an in-progress call item open."""
+    adapter = _make_adapter()
+    generating = threading.Event()
+    fail_now = threading.Event()
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            callbacks["tool_gen_event_callback"]("terminal", "call-abandoned")
+            generating.set()
+            assert fail_now.wait(2.0)
+            raise RuntimeError("stream ended during tool arguments")
+
+        return _agent(run)
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", side_effect=build_agent):
+            started = await client.post("/v1/runs", json={"input": "use a tool"})
+            run_id = (await started.json())["run_id"]
+            await _wait_for_thread_event(generating)
+            response = await client.get(f"/v1/runs/{run_id}/events")
+            while True:
+                event = await _read_one_sse_event(response)
+                if (
+                    event["type"] == "response.output_item.added"
+                    and event["item"].get("id") == "fc_call-abandoned"
+                ):
+                    break
+            fail_now.set()
+            events = _sse_events(await response.text())
+
+    assert [event["type"] for event in events] == [
+        "response.output_item.done",
+        "response.failed",
+    ]
+    assert events[0]["item"] == {
+        "id": "fc_call-abandoned",
+        "type": "function_call",
+        "status": "incomplete",
+        "name": "terminal",
+        "call_id": "call-abandoned",
+        "arguments": "",
+        "started_at": events[0]["item"]["started_at"],
+        "completed_at": events[0]["item"]["completed_at"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_runs_retry_marks_first_early_call_incomplete_before_second_executes() -> None:
+    """A dropped stream attempt cannot complete a fictional function call."""
+    adapter = _make_adapter()
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            # First stream attempt identifies a tool, then drops before its
+            # arguments reached execution. The provider retry advertises and
+            # executes a distinct call ID.
+            callbacks["tool_gen_event_callback"]("terminal", "call-first")
+            callbacks["tool_gen_event_aborted_callback"]("call-first")
+            callbacks["tool_gen_event_callback"]("read_file", "call-second")
+            callbacks["tool_start_callback"]("call-second", "read_file", {})
+            callbacks["tool_complete_callback"]("call-second", "read_file", {}, "ok")
+            return {"final_response": "done", "messages": []}
+
+        return _agent(run)
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", side_effect=build_agent):
+            started = await client.post("/v1/runs", json={"input": "use a tool"})
+            run_id = (await started.json())["run_id"]
+            response = await client.get(f"/v1/runs/{run_id}/events")
+            events = _sse_events(await response.text())
+
+    function_items = [
+        event["item"]
+        for event in events
+        if event["type"] in {"response.output_item.added", "response.output_item.done"}
+        and event.get("item", {}).get("type") == "function_call"
+    ]
+    assert [
+        (item["call_id"], item["status"])
+        for item in function_items
+    ] == [
+        ("call-first", "in_progress"),
+        ("call-first", "incomplete"),
+        ("call-second", "in_progress"),
+        ("call-second", "completed"),
+    ]
+    assert events[-1]["type"] == "response.completed"
+
+
+@pytest.mark.asyncio
+async def test_runs_retry_reuses_early_call_id_for_its_real_execution() -> None:
+    """A deterministic retry ID keeps one function-call lifecycle."""
+    adapter = _make_adapter()
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            callbacks["tool_gen_event_callback"]("read_file", "call-reused")
+            callbacks["tool_gen_event_aborted_callback"]("call-reused")
+            callbacks["tool_gen_event_callback"]("read_file", "call-reused")
+            callbacks["tool_start_callback"]("call-reused", "read_file", {})
+            callbacks["tool_complete_callback"]("call-reused", "read_file", {}, "ok")
+            return {"final_response": "done", "messages": []}
+
+        return _agent(run)
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", side_effect=build_agent):
+            started = await client.post("/v1/runs", json={"input": "use a tool"})
+            run_id = (await started.json())["run_id"]
+            response = await client.get(f"/v1/runs/{run_id}/events")
+            events = _sse_events(await response.text())
+
+    function_items = [
+        event["item"]
+        for event in events
+        if event["type"] in {"response.output_item.added", "response.output_item.done"}
+        and event.get("item", {}).get("type") == "function_call"
+    ]
+    assert [
+        (item["call_id"], item["status"])
+        for item in function_items
+    ] == [
+        ("call-reused", "in_progress"),
+        ("call-reused", "completed"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runs_retry_reopens_call_id_with_a_unique_item_lifecycle() -> None:
+    """A→B→A retries terminate each item even when A's ID is reused."""
+    adapter = _make_adapter()
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            callbacks["tool_gen_event_callback"]("first", "call-a")
+            callbacks["tool_gen_event_aborted_callback"]("call-a")
+            callbacks["tool_gen_event_callback"]("second", "call-b")
+            callbacks["tool_gen_event_aborted_callback"]("call-b")
+            callbacks["tool_gen_event_callback"]("third", "call-a")
+            callbacks["tool_start_callback"]("call-a", "third", {})
+            callbacks["tool_complete_callback"]("call-a", "third", {}, "ok")
+            return {"final_response": "done", "messages": []}
+
+        return _agent(run)
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", side_effect=build_agent):
+            started = await client.post("/v1/runs", json={"input": "use tools"})
+            run_id = (await started.json())["run_id"]
+            response = await client.get(f"/v1/runs/{run_id}/events")
+            events = _sse_events(await response.text())
+
+    items = [
+        event["item"]
+        for event in events
+        if event["type"] in {"response.output_item.added", "response.output_item.done"}
+        and event.get("item", {}).get("type") == "function_call"
+    ]
+    added = items[::2]
+    done = items[1::2]
+    assert [item["id"] for item in added] == ["fc_call-a", "fc_call-b", "fc_call-a_2"]
+    assert [item["status"] for item in done] == ["incomplete", "incomplete", "completed"]
+    assert [item["id"] for item in done] == [item["id"] for item in added]
+    assert events[-1]["type"] == "response.completed"
+
+
+@pytest.mark.asyncio
 async def test_runs_session_continuity_uses_authoritative_history_on_second_turn(
     tmp_path,
 ) -> None:

@@ -42,7 +42,11 @@ class TestSingleWriterSink:
         newest writer reaches the callbacks and the accumulated turn text."""
         agent = _make_agent()
         delivered = []
+        generated = []
         agent.stream_delta_callback = lambda t: delivered.append(t)
+        agent.tool_gen_event_callback = lambda name, call_id: generated.append(
+            (name, call_id)
+        )
         agent._stream_callback = None
 
         a_claimed = threading.Event()
@@ -55,6 +59,7 @@ class TestSingleWriterSink:
             # We are now stale — every sink call must be a no-op.
             agent._fire_stream_delta("A-should-drop")
             agent._fire_reasoning_delta("A-reason-drop")
+            agent._fire_tool_gen_event_started("terminal", "call-stale")
             agent._record_streamed_assistant_text("A-record-drop")
 
         def writer_b():
@@ -70,6 +75,7 @@ class TestSingleWriterSink:
         tb.join(timeout=3)
 
         assert delivered == [], "a superseded stream must not deliver any deltas"
+        assert generated == [], "a superseded stream must not open a tool item"
         assert "A-record-drop" not in (agent._current_streamed_assistant_text or "")
         assert agent._stream_writer_dropped >= 1
 
