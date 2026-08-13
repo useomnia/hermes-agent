@@ -7449,8 +7449,7 @@ class APIServerAdapter(BasePlatformAdapter):
         current_message_text_parts: List[str] = []
         text_started = False
         reasoning_started = False
-        last_message_id: Optional[str] = None
-        last_message_text = ""
+        annotation_tasks: List["asyncio.Task[None]"] = []
         strip_tool_separator_on_next_message = False
         started_tool_calls: Dict[str, tuple[str, Dict[str, Any]]] = {}
         ended_tool_calls: set[str] = set()
@@ -7473,16 +7472,71 @@ class APIServerAdapter(BasePlatformAdapter):
                 **fields,
             })
 
+        async def _annotate_message_item(item_id: str, text: str) -> None:
+            """Annotate one closed message block with the files it handed over.
+
+            The hook validates the paths named in ``text`` and stores each one
+            durably, so it runs per block rather than once per turn: the reply
+            hands a file over where it names it, and a turn that goes on to
+            call another tool — or blocks on a question — must still carry that
+            file's annotation on the block that named it. ``final_text`` keeps
+            its wire name so an already-provisioned proxy reads the payload
+            unchanged.
+            """
+            hook_url = os.environ.get(_OMNIO_TURN_FINALIZE_HOOK_ENV)
+            if not hook_url or not text:
+                return
+            output_index = emitter.output_index_for_message(item_id)
+            if output_index is None:
+                return
+            annotations = await _request_turn_finalize_annotations(
+                hook_url,
+                {
+                    "run_id": run_id,
+                    "turn_id": turn_id,
+                    "session_id": session_id,
+                    "final_text": text,
+                    "message_item_id": item_id,
+                    "output_index": output_index,
+                },
+            )
+            # A run stopped while the hook was in flight is closing on
+            # `response.incomplete`; an annotation after that would land past
+            # the turn's terminal event.
+            if not annotations or run_id in self._stopping_run_ids:
+                return
+            emitter.output_text_annotations_added(item_id, annotations)
+
+        async def _drain_annotation_tasks() -> None:
+            """Await the in-flight block annotations so their events land
+            before the terminal one."""
+            if not annotation_tasks:
+                return
+            pending = list(annotation_tasks)
+            annotation_tasks.clear()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        def _cancel_annotation_tasks() -> None:
+            for task in annotation_tasks:
+                task.cancel()
+            annotation_tasks.clear()
+
         def _close_text_item() -> None:
-            nonlocal message_id, text_started, last_message_id, last_message_text
+            nonlocal message_id, text_started
             if not text_started:
                 return
             emitter.output_text_done(message_id)
-            last_message_id = message_id
-            last_message_text = "".join(current_message_text_parts)
+            closed_id = message_id
+            closed_text = "".join(current_message_text_parts)
             current_message_text_parts.clear()
             text_started = False
             message_id = f"msg_{uuid.uuid4().hex}"
+            if closed_text and os.environ.get(_OMNIO_TURN_FINALIZE_HOOK_ENV):
+                annotation_tasks.append(
+                    asyncio.create_task(
+                        _annotate_message_item(closed_id, closed_text)
+                    )
+                )
 
         def _close_reasoning_item() -> None:
             nonlocal reasoning_message_id, reasoning_started
@@ -8247,33 +8301,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     _legacy_terminal("run.failed", error=error_msg)
                 else:
-                    hook_url = os.environ.get(_OMNIO_TURN_FINALIZE_HOOK_ENV)
-                    if last_message_id and last_message_text and hook_url:
-                        output_index = emitter.output_index_for_message(last_message_id)
-                        if output_index is not None:
-                            annotations = await _request_turn_finalize_annotations(
-                                hook_url,
-                                {
-                                    "run_id": run_id,
-                                    "turn_id": turn_id,
-                                    "session_id": session_id,
-                                    "final_text": last_message_text,
-                                    "message_item_id": last_message_id,
-                                    "output_index": output_index,
-                                },
-                            )
-                            if run_id in self._stopping_run_ids:
-                                _close_cancelled()
-                                return
-                            emitter.output_text_annotations_added(
-                                last_message_id, annotations
-                            )
+                    await _drain_annotation_tasks()
                     log = self._turn_event_logs.get_log(run_id)
                     annotation_failure_reason = (
                         log.failure_reason if log is not None else None
                     )
+                    # A log-cap breach also marks the run stopping (it stops the
+                    # run through the same cooperative path a user stop uses),
+                    # so it is read first — the run failed on its own cap, it
+                    # was not cancelled.
                     if annotation_failure_reason == "log_cap_exceeded":
                         _close_log_cap_exceeded()
+                    elif run_id in self._stopping_run_ids:
+                        _close_cancelled()
                     else:
                         self._set_run_status(
                             run_id,
@@ -8360,6 +8400,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 _legacy_terminal("run.failed", error=error_msg)
             finally:
+                # A run that ended on any path other than the successful one
+                # never drained its block annotations — drop them rather than
+                # leave hook calls running past the turn they belong to.
+                _cancel_annotation_tasks()
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
