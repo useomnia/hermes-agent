@@ -890,10 +890,23 @@ class ProcessRegistry:
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
+        # The backgrounded subshell must redirect its OWN stdio, not just the
+        # inner command's. A backend that streams command output over a pipe
+        # (the Omnio Toolbox reads /exec stdout until EOF) keeps waiting while
+        # the subshell holds the write end, so the spawn burns its whole
+        # timeout and the backend then kills the process group it started —
+        # taking the "background" process with it. Detaching stdio lets the
+        # spawn return as soon as the command is running.
+        #
+        # `mkdir` is a separate statement because `&` binds looser than `&&`:
+        # `mkdir -p X && ( ... ) &` backgrounds the whole compound, so
+        # `echo $!` races the mkdir and can write the PID file into a
+        # directory that does not exist yet.
         bg_command = (
-            f"mkdir -p {quoted_temp_dir} && "
+            f"mkdir -p {quoted_temp_dir}; "
             f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
-            f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
+            f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) "
+            f"> /dev/null 2>&1 < /dev/null & "
             f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
         )
 
