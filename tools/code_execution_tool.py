@@ -479,7 +479,18 @@ def generate_hermes_tools_module(enabled_tools: List[str],
     else:
         header = _UDS_TRANSPORT_HEADER
 
-    return header + "\n".join(stub_functions)
+    # Make the module introspectable. A script author who does not know a tool's
+    # exact name — likely once MCP tools are in here, since their registered name
+    # carries a server prefix — can list what this module actually exports instead
+    # of guessing at prefixes and failing an import.
+    footer = (
+        "\n\n__all__ = " + repr(sorted(export_names)) + "\n\n"
+        "def list_tools():\n"
+        '    """Exact names of every tool this script can call."""\n'
+        "    return list(__all__)\n"
+    )
+
+    return header + "\n".join(stub_functions) + footer
 
 
 # ---- Shared helpers section (embedded in both transport headers) ----------
@@ -2176,8 +2187,10 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         )
         tool_lines += (
             f"\n\nAlso importable: {count} available to you this "
-            "session, under their exact tool names — e.g. "
-            f"`from hermes_tools import {mcp_tools[0]}`. Each takes keyword arguments "
+            "session, under their exact registered names — e.g. "
+            f"`from hermes_tools import {mcp_tools[0]}`. If you are unsure of a name, "
+            "`hermes_tools.list_tools()` returns every name this script can call; use it "
+            "rather than guessing at a prefix. Each takes keyword arguments "
             "matching its schema and returns its result as a dict. This is the cheap way "
             "to run one tool over many inputs: the per-call results stay in the script "
             "instead of filling your context, so you can fetch across a whole list and "

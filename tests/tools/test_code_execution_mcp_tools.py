@@ -358,3 +358,35 @@ class TestBackendAwareCwdNote(unittest.TestCase):
 
     def test_strict_mode_warns_the_temp_dir_is_deleted(self):
         self.assertIn("deleted afterwards", self._describe("sprites", mode="strict"))
+
+
+class TestModuleIntrospection(_WithMcpTool):
+    """A script must be able to discover the exact names it can call.
+
+    Guessing at an MCP prefix and failing the import is the expensive failure
+    mode — it burns the turn before any work happens.
+    """
+
+    def test_list_tools_reports_every_generated_name(self):
+        source = generate_hermes_tools_module([MCP_TOOL, "terminal"])
+        namespace: dict = {}
+        exec(compile(source, "hermes_tools.py", "exec"), namespace)
+        self.assertEqual(sorted(namespace["list_tools"]()), sorted([MCP_TOOL, "terminal"]))
+
+    def test_list_tools_excludes_tools_that_were_not_generated(self):
+        source = generate_hermes_tools_module(["terminal"])
+        namespace: dict = {}
+        exec(compile(source, "hermes_tools.py", "exec"), namespace)
+        self.assertEqual(namespace["list_tools"](), ["terminal"])
+
+    def test_list_tools_is_a_copy(self):
+        """A script mutating the returned list must not corrupt the module."""
+        source = generate_hermes_tools_module(["terminal"])
+        namespace: dict = {}
+        exec(compile(source, "hermes_tools.py", "exec"), namespace)
+        namespace["list_tools"]().append("web_search")
+        self.assertEqual(namespace["list_tools"](), ["terminal"])
+
+    def test_description_points_at_list_tools_when_mcp_is_available(self):
+        schema = build_execute_code_schema({"terminal", MCP_TOOL}, mode="project")
+        self.assertIn("list_tools()", schema["description"])
