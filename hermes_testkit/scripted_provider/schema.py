@@ -27,7 +27,9 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -42,6 +44,20 @@ _RESPONSE_KINDS = frozenset({
     "hold",
 })
 _HOLD_RESPONSE_KINDS = frozenset({"text", "tool_calls", "http_error"})
+_MODEL_METADATA_FIELDS = frozenset({"pricing"})
+_PRICING_FIELDS = frozenset({
+    "prompt",
+    "completion",
+    "request",
+    "cache_read",
+    "cache_write",
+})
+# Pricing is deliberately represented as a JSON string rather than a JSON
+# number.  That keeps tiny per-token values exact across Python, JavaScript,
+# and the OpenAI-compatible wire.  Scientific notation is accepted because
+# it is still an exact Decimal representation; whitespace and signed values
+# are rejected to prevent implicit coercion and non-canonical JSON numbers.
+_DECIMAL_STRING = re.compile(r"[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z")
 
 
 class ScriptValidationError(ValueError):
@@ -89,6 +105,85 @@ def _as_mapping(value: Any, *, where: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ScriptValidationError(f"{where} must be an object")
     return value
+
+
+def _validate_decimal_string(value: Any, *, where: str) -> str:
+    """Validate one exact, finite, non-negative per-token decimal string."""
+
+    if not isinstance(value, str) or not _DECIMAL_STRING.fullmatch(value):
+        raise ScriptValidationError(
+            f"{where} must be a finite non-negative decimal string"
+        )
+    try:
+        decimal = Decimal(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise ScriptValidationError(
+            f"{where} must be a finite non-negative decimal string"
+        ) from exc
+    if not decimal.is_finite() or decimal < 0:
+        raise ScriptValidationError(
+            f"{where} must be a finite non-negative decimal string"
+        )
+    return value
+
+
+def _validate_model_metadata(
+    value: Any,
+    *,
+    model_ids: tuple[str, ...],
+    where: str = "model_metadata",
+) -> dict[str, dict[str, Any]]:
+    """Validate the optional per-model metadata/pricing contract.
+
+    The contract intentionally starts with one field (``pricing``), whose
+    values are exact per-token decimal strings consumed by Hermes' generic
+    OpenAI-compatible models parser.  Keeping the outer map keyed by model id
+    allows a script to advertise more than one model without coupling the
+    testkit to any particular Omnio model name.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ScriptValidationError(f"{where} must be an object")
+    known_models = set(model_ids)
+    result: dict[str, dict[str, Any]] = {}
+    for model_id, metadata in value.items():
+        if not isinstance(model_id, str) or not model_id:
+            raise ScriptValidationError(f"{where} keys must be non-empty strings")
+        if model_id not in known_models:
+            raise ScriptValidationError(
+                f"{where}.{model_id} must name a model listed in script.models"
+            )
+        if not isinstance(metadata, Mapping):
+            raise ScriptValidationError(f"{where}.{model_id} must be an object")
+        unknown = set(metadata) - _MODEL_METADATA_FIELDS
+        if unknown:
+            fields = ", ".join(sorted(str(field) for field in unknown))
+            raise ScriptValidationError(
+                f"{where}.{model_id} has unsupported field(s): {fields}"
+            )
+        pricing = metadata.get("pricing")
+        if not isinstance(pricing, Mapping) or not pricing:
+            raise ScriptValidationError(
+                f"{where}.{model_id}.pricing must be a non-empty object"
+            )
+        unknown_pricing = set(pricing) - _PRICING_FIELDS
+        if unknown_pricing:
+            fields = ", ".join(sorted(str(field) for field in unknown_pricing))
+            raise ScriptValidationError(
+                f"{where}.{model_id}.pricing has unsupported field(s): {fields}"
+            )
+        validated_pricing: dict[str, str] = {}
+        for field_name, amount in pricing.items():
+            if not isinstance(field_name, str):
+                raise ScriptValidationError(
+                    f"{where}.{model_id}.pricing keys must be strings"
+                )
+            validated_pricing[field_name] = _validate_decimal_string(
+                amount,
+                where=f"{where}.{model_id}.pricing.{field_name}",
+            )
+        result[model_id] = {"pricing": validated_pricing}
+    return result
 
 
 def _validate_status(value: Any, *, where: str) -> int:
@@ -368,6 +463,7 @@ class Script:
     models: tuple[str, ...] = ()
     created: int = FIXED_CREATED
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    model_metadata: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     @property
     def model_ids(self) -> tuple[str, ...]:
@@ -412,6 +508,15 @@ class Script:
         object.__setattr__(
             self, "metadata", _freeze_json(self.metadata, where="metadata")
         )
+        validated_model_metadata = _validate_model_metadata(
+            self.model_metadata,
+            model_ids=self.model_ids,
+        )
+        object.__setattr__(
+            self,
+            "model_metadata",
+            _freeze_json(validated_model_metadata, where="model_metadata"),
+        )
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-safe representation for state/debug endpoints."""
@@ -425,6 +530,8 @@ class Script:
         }
         if self.metadata:
             result["metadata"] = _thaw_json(self.metadata)
+        if self.model_metadata:
+            result["model_metadata"] = _thaw_json(self.model_metadata)
         for step in self.steps:
             response: dict[str, Any] = {"type": step.kind}
             if step.kind == "text":
@@ -732,6 +839,8 @@ def parse_script(value: Any, *, allow_default_version: bool = True) -> Script:
     metadata = root.get("metadata", {})
     if not isinstance(metadata, Mapping):
         raise ScriptValidationError("script.metadata must be an object")
+    model_metadata = root.get("model_metadata", {})
+    _validate_model_metadata(model_metadata, model_ids=tuple(raw_models))
     return Script(
         steps=steps,
         schema_version=SCRIPT_SCHEMA_VERSION,
@@ -739,6 +848,7 @@ def parse_script(value: Any, *, allow_default_version: bool = True) -> Script:
         models=tuple(raw_models),
         created=created,
         metadata=dict(metadata),
+        model_metadata=dict(model_metadata),
     )
 
 

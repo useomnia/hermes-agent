@@ -20,6 +20,38 @@ prescribe exact SSE delta boundaries. Empty and Unicode strings are valid;
 non-streaming content, usage, and held text use the concatenated value. Chunks
 are rejected on tool-call, error, and connection-close responses.
 
+Scripts may also provide optional per-model pricing metadata. The map keys must
+be model IDs listed by `models` (or the primary `model` when `models` is
+omitted), and pricing values are exact, finite, non-negative per-token decimal
+strings:
+
+```json
+{
+  "schema_version": 1,
+  "model": "omnio-conformance-scripted",
+  "model_metadata": {
+    "omnio-conformance-scripted": {
+      "pricing": {
+        "prompt": "0.000001",
+        "completion": "0.000002",
+        "cache_read": "0",
+        "cache_write": "0"
+      }
+    }
+  },
+  "steps": []
+}
+```
+
+The supported pricing fields are `prompt`, `completion`, `request`,
+`cache_read`, and `cache_write`; all are optional per model but a `pricing`
+object must contain at least one field. Unknown fields, JSON numbers, negative
+values, non-finite values, and metadata for an unlisted model are rejected.
+When present, each model's metadata is merged directly into its item in
+`GET /v1/models`, so generic OpenAI-compatible clients (including Hermes) can
+discover and price the model. Omitting `model_metadata` preserves the original
+model-list response exactly.
+
 Other response kinds are `tool_calls`, `http_error`, `connection_close`, and
 `hold`; `hold` wraps one text, tool-call, or HTTP-error response and is released
 through the authenticated control endpoint.

@@ -16,6 +16,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -150,6 +151,93 @@ def test_health_models_and_stable_metadata() -> None:
         assert model["owned_by"] == "hermes-testkit"
 
 
+def test_models_emit_optional_per_model_pricing_without_consuming_script() -> None:
+    script = _script(_text("ok"))
+    script["models"] = ["matrix-model", "second-model"]
+    script["model_metadata"] = {
+        "matrix-model": {
+            "pricing": {
+                "prompt": "0.000001",
+                "completion": "0.000002",
+                "request": "0",
+            }
+        }
+    }
+    with ScriptedProviderServer(script, control_token="matrix-token") as server:
+        status, models, _ = _request(server, "GET", "/v1/models")
+        assert status == 200
+        assert models["data"] == [
+            {
+                "id": "matrix-model",
+                "object": "model",
+                "created": 1_700_000_000,
+                "owned_by": "hermes-testkit",
+                "pricing": {
+                    "prompt": "0.000001",
+                    "completion": "0.000002",
+                    "request": "0",
+                },
+            },
+            {
+                "id": "second-model",
+                "object": "model",
+                "created": 1_700_000_000,
+                "owned_by": "hermes-testkit",
+            },
+        ]
+        assert server.state["step_index"] == 0
+        assert server.state["request_count"] == 0
+        # Discovery is safe to retry: repeated listing is identical and does
+        # not consume the first scripted chat response.
+        status, repeated, _ = _request(server, "GET", "/v1/models")
+        assert status == 200
+        assert repeated == models
+        assert server.state["step_index"] == 0
+        assert server.state["request_count"] == 0
+
+
+def test_hermes_discovers_scripted_pricing_and_estimates_exact_cost() -> None:
+    from agent.model_metadata import fetch_endpoint_model_metadata
+    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+    script = _script(_text("priced"))
+    script["model_metadata"] = {
+        "matrix-model": {
+            "pricing": {
+                "prompt": "0.000001",
+                "completion": "0.000002",
+            }
+        }
+    }
+    with ScriptedProviderServer(
+        script,
+        control_token="matrix-token",
+        api_key="inference-secret",
+    ) as server:
+        discovered = fetch_endpoint_model_metadata(
+            server.base_url,
+            api_key="inference-secret",
+            force_refresh=True,
+        )
+        assert discovered["matrix-model"]["pricing"] == {
+            "prompt": "0.000001",
+            "completion": "0.000002",
+        }
+        cost = estimate_usage_cost(
+            "matrix-model",
+            CanonicalUsage(input_tokens=1_000, output_tokens=500),
+            provider="custom",
+            base_url=server.base_url,
+            api_key="inference-secret",
+        )
+        assert cost.amount_usd == Decimal("0.002000")
+        assert cost.amount_usd is not None
+        assert cost.amount_usd > 0
+        assert cost.source == "provider_models_api"
+        assert server.state["step_index"] == 0
+        assert server.state["request_count"] == 0
+
+
 def test_known_model_capability_probes_are_probe_down_and_not_unexpected() -> None:
     with ScriptedProviderServer(
         _script(_text("chat")), control_token="matrix-token"
@@ -189,13 +277,20 @@ def test_known_model_capability_probes_are_probe_down_and_not_unexpected() -> No
 
 
 def test_capability_probes_honor_inference_auth_without_consuming_steps() -> None:
+    script = _script(_text("auth"))
+    script["model_metadata"] = {"matrix-model": {"pricing": {"prompt": "0.000001"}}}
     with ScriptedProviderServer(
-        _script(_text("auth")), control_token="matrix-token", api_key="probe-key"
+        script,
+        control_token="matrix-token",
+        api_key="probe-key",
     ) as server:
         status, _, _ = _request(server, "GET", "/api/tags")
         assert status == 401
         status, _, _ = _request(server, "POST", "/api/show", {"name": "matrix-model"})
         assert status == 401
+        status, body, _ = _request(server, "GET", "/v1/models")
+        assert status == 401
+        assert "pricing" not in json.dumps(body)
         assert server.state["step_index"] == 0
         assert server.state["request_count"] == 0
         assert server.state["unexpected_requests"] == []
@@ -758,6 +853,60 @@ def test_exported_dataclasses_enforce_schema_invariants_and_revalidate() -> None
     object.__setattr__(valid, "model", "")
     with pytest.raises(ScriptValidationError, match="model"):
         parse_script(valid)
+
+
+def test_model_metadata_pricing_is_strict_and_round_trips_exact_strings() -> None:
+    original = _script(_text("priced"))
+    original["models"] = ["matrix-model", "second-model"]
+    original["model_metadata"] = {
+        "matrix-model": {
+            "pricing": {
+                "prompt": "0.000000125",
+                "completion": "1e-7",
+                "cache_read": "0",
+            }
+        }
+    }
+    parsed = parse_script(original)
+    assert parsed.model_metadata == {
+        "matrix-model": {
+            "pricing": {
+                "prompt": "0.000000125",
+                "completion": "1e-7",
+                "cache_read": "0",
+            }
+        }
+    }
+    assert parse_script(parsed.as_dict()).as_dict() == parsed.as_dict()
+
+    invalid_values = [
+        0.000001,
+        1,
+        True,
+        "",
+        " -1",
+        "-0.1",
+        "NaN",
+        "Infinity",
+        "1.2.3",
+    ]
+    for value in invalid_values:
+        invalid = _script(_text("invalid"))
+        invalid["model_metadata"] = {"matrix-model": {"pricing": {"prompt": value}}}
+        with pytest.raises(ScriptValidationError, match="decimal string"):
+            parse_script(invalid)
+
+    unknown_pricing = _script(_text("invalid"))
+    unknown_pricing["model_metadata"] = {
+        "matrix-model": {"pricing": {"prompt": "0.1", "input": "0.2"}}
+    }
+    with pytest.raises(ScriptValidationError, match="unsupported field"):
+        parse_script(unknown_pricing)
+
+    unknown_model = _script(_text("invalid"))
+    unknown_model["model_metadata"] = {"not-listed": {"pricing": {"prompt": "0.1"}}}
+    with pytest.raises(ScriptValidationError, match="listed in script.models"):
+        parse_script(unknown_model)
 
 
 def test_script_as_dict_round_trips_every_response_variant() -> None:

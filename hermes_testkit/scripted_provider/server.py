@@ -597,21 +597,30 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 return
             snapshot = self.provider.state
             model = snapshot.get("model", DEFAULT_MODEL)
-            ids = snapshot.get("script", {}).get("models", [model])
+            script_snapshot = snapshot.get("script", {})
+            ids = script_snapshot.get("models", [model])
+            model_metadata = script_snapshot.get("model_metadata", {})
             created = snapshot.get("created", FIXED_CREATED)
+            data = []
+            for model_id in ids:
+                item: dict[str, Any] = {
+                    "id": model_id,
+                    "object": "model",
+                    "created": created,
+                    "owned_by": "hermes-testkit",
+                }
+                metadata = model_metadata.get(model_id)
+                if isinstance(metadata, Mapping):
+                    # Script validation limits these to OpenAI-compatible
+                    # model fields.  Copy before merging so a caller cannot
+                    # mutate the provider's state through the response.
+                    item.update(copy.deepcopy(dict(metadata)))
+                data.append(item)
             self._send_json(
                 HTTPStatus.OK,
                 {
                     "object": "list",
-                    "data": [
-                        {
-                            "id": model_id,
-                            "object": "model",
-                            "created": created,
-                            "owned_by": "hermes-testkit",
-                        }
-                        for model_id in ids
-                    ],
+                    "data": data,
                 },
             )
             return
