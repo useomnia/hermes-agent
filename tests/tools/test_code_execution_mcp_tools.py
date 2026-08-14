@@ -36,6 +36,7 @@ from tools.code_execution_tool import (
     _is_mcp_tool,
     _mcp_stub_source,
     _resolve_remote_script_cwd,
+    _ship_file_to_remote,
     _resolve_sandbox_tools,
     build_execute_code_schema,
     execute_code,
@@ -478,3 +479,70 @@ class TestBridgeCollapsedSessionList(unittest.TestCase):
                 _uncollapse_bridge_tool_names(["terminal", "tool_call"], None, None),
                 ["terminal", "tool_call"],
             )
+
+
+class TestShipFileToRemote(unittest.TestCase):
+    """Shipping a file must not depend on the file fitting in a command.
+
+    The generated tools module is as large as the session's tool surface — one stub
+    per MCP tool — and the shell fallback puts its bytes inside a command string,
+    which backends length-limit. A file write has no such limit.
+    """
+
+    class _EnvWithWriter:
+        def __init__(self, ok=True, raises=False):
+            self.ok, self.raises = ok, raises
+            self.written, self.commands = [], []
+
+        def write_file_content(self, path, content):
+            if self.raises:
+                raise RuntimeError("api rejected it")
+            self.written.append((path, content))
+            return self.ok
+
+        def execute(self, command, cwd=None, timeout=None):
+            self.commands.append(command)
+            return {"output": "", "returncode": 0}
+
+    class _EnvShellOnly:
+        def __init__(self):
+            self.commands = []
+
+        def execute(self, command, cwd=None, timeout=None):
+            self.commands.append(command)
+            return {"output": "", "returncode": 0}
+
+    def test_prefers_the_backends_own_file_write(self):
+        env = self._EnvWithWriter()
+        _ship_file_to_remote(env, "/tmp/x/omnio_tools.py", "print('hi')")
+        self.assertEqual(env.written, [("/tmp/x/omnio_tools.py", "print('hi')")])
+        self.assertEqual(env.commands, [])
+
+    def test_falls_back_to_the_shell_when_the_writer_declines(self):
+        env = self._EnvWithWriter(ok=False)
+        _ship_file_to_remote(env, "/tmp/x/mod.py", "print('hi')")
+        self.assertTrue(env.commands)
+
+    def test_falls_back_to_the_shell_when_the_writer_raises(self):
+        env = self._EnvWithWriter(raises=True)
+        _ship_file_to_remote(env, "/tmp/x/mod.py", "print('hi')")
+        self.assertTrue(env.commands)
+
+    def test_shell_fallback_chunks_a_large_file(self):
+        """A module the size of a real MCP catalog must not become one command."""
+        env = self._EnvShellOnly()
+        _ship_file_to_remote(env, "/tmp/x/mod.py", "x = 1\n" * 20_000)
+        self.assertGreater(len(env.commands), 2)
+        for command in env.commands:
+            self.assertLess(len(command), 32_000)
+        self.assertTrue(env.commands[0].startswith("printf %s "))
+        self.assertIn(">>", env.commands[1])
+        self.assertIn("base64 -d", env.commands[-1])
+        self.assertIn("rm -f", env.commands[-1])
+
+    def test_shell_fallback_writes_a_small_file_in_one_chunk(self):
+        env = self._EnvShellOnly()
+        _ship_file_to_remote(env, "/tmp/x/mod.py", "print('hi')")
+        self.assertEqual(len(env.commands), 2)  # one write + the decode
+        self.assertIn(">", env.commands[0])
+        self.assertNotIn(">>", env.commands[0])

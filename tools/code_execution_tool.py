@@ -954,18 +954,49 @@ def _get_or_create_env(task_id: str):
         return env, env_type
 
 
+# Base64 characters per shipping command when falling back to the shell. Backends
+# cap how long a single command may be, and the generated tools module is as big as
+# the session's tool surface — one stub per MCP tool — so a whole file will not
+# reliably fit in one command.
+_SHIP_CHUNK_CHARS = 24_000
+
+
 def _ship_file_to_remote(env, remote_path: str, content: str) -> None:
     """Write *content* to *remote_path* on the remote environment.
 
-    Uses ``echo … | base64 -d`` rather than stdin piping because some
-    backends (Modal) don't reliably deliver stdin_data to chained
-    commands.  Base64 output is shell-safe ([A-Za-z0-9+/=]) so single
-    quotes are fine.
+    Prefers the backend's own file write when it has one: the shell fallback puts
+    the file's bytes INSIDE a command string, and a command has a length limit that
+    a file does not.
+
+    The fallback uses ``base64 -d`` rather than stdin piping because some backends
+    (Modal) don't reliably deliver stdin_data to chained commands. Base64 output is
+    shell-safe ([A-Za-z0-9+/=]) so single quotes are fine, and it is appended in
+    chunks so file size never becomes command length.
     """
+    writer = getattr(env, "write_file_content", None)
+    if callable(writer):
+        try:
+            if writer(remote_path, content):
+                return
+        except Exception as exc:
+            logger.debug(
+                "First-class write of %s failed (%s); falling back to the shell",
+                remote_path, exc,
+            )
+
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     quoted_remote_path = shlex.quote(remote_path)
+    quoted_b64_path = shlex.quote(f"{remote_path}.b64")
+    for index in range(0, len(encoded), _SHIP_CHUNK_CHARS):
+        chunk = encoded[index:index + _SHIP_CHUNK_CHARS]
+        redirect = ">" if index == 0 else ">>"
+        env.execute(
+            f"printf %s '{chunk}' {redirect} {quoted_b64_path}",
+            cwd="/",
+            timeout=30,
+        )
     env.execute(
-        f"echo '{encoded}' | base64 -d > {quoted_remote_path}",
+        f"base64 -d < {quoted_b64_path} > {quoted_remote_path} && rm -f {quoted_b64_path}",
         cwd="/",
         timeout=30,
     )
