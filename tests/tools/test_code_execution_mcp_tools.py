@@ -98,11 +98,24 @@ class TestResolveSandboxTools(_WithMcpTool):
         self.assertEqual(resolved, frozenset({"terminal"}))
 
     def test_empty_session_list_falls_back_to_core_tools(self):
+        """No list means the caller could not tell us, not "grant nothing" — the
+        execution path still has to produce a working sandbox."""
         self.assertEqual(_resolve_sandbox_tools([]), SANDBOX_ALLOWED_TOOLS)
         self.assertEqual(_resolve_sandbox_tools(None), SANDBOX_ALLOWED_TOOLS)
 
     def test_session_with_only_unusable_tools_falls_back_to_core(self):
         self.assertEqual(_resolve_sandbox_tools(["todo"]), SANDBOX_ALLOWED_TOOLS)
+
+    def test_authoritative_caller_gets_no_fallback(self):
+        """A caller whose list IS the session's surface must not be handed the
+        core seven when the session has none of them."""
+        self.assertEqual(
+            _resolve_sandbox_tools(["todo"], fallback_to_core=False), frozenset()
+        )
+        self.assertEqual(
+            _resolve_sandbox_tools([MCP_TOOL], fallback_to_core=False),
+            frozenset({MCP_TOOL}),
+        )
 
     def test_is_mcp_tool_ignores_core_and_unknown_names(self):
         self.assertTrue(_is_mcp_tool(MCP_TOOL))

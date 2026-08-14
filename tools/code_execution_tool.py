@@ -365,24 +365,32 @@ def _is_mcp_tool(tool_name: str) -> bool:
     return entry is not None and entry.toolset.startswith(_MCP_TOOLSET_PREFIX)
 
 
-def _resolve_sandbox_tools(enabled_tools: Optional[List[str]]) -> frozenset:
+def _resolve_sandbox_tools(
+    enabled_tools: Optional[List[str]],
+    *,
+    fallback_to_core: bool = True,
+) -> frozenset:
     """The tools a script may call this session: core stubs + MCP-server tools.
 
     MCP tools are admitted by PREDICATE over the session's own tool list rather
-    than by a static allow-list, which is what keeps the sandbox's reach equal to
-    (never wider than) the session's: the list passed in is already the resolved
-    surface for this session, so a tool the session was not granted cannot appear
-    here. The RPC loops enforce the same set server-side.
+    than by a static allow-list. That is what keeps the MCP surface equal to (never
+    wider than) the session's: the list passed in is already the resolved surface,
+    so a server or tool the session was not granted cannot appear here. The RPC
+    loops enforce the same set server-side.
 
-    Falls back to the core tools when the session list is empty or resolves to
-    nothing — callers that can't supply one (older dispatch paths) still get a
-    working sandbox.
+    ``fallback_to_core`` keeps the execution path's long-standing behaviour of
+    treating a session list that yields nothing as "caller could not tell us",
+    handing back the core tools so the sandbox still works. Callers whose list IS
+    authoritative pass False, so a session with no sandbox-callable tools resolves
+    to nothing rather than being handed the core seven.
     """
     session_tools = set(enabled_tools or ())
     resolved = (SANDBOX_ALLOWED_TOOLS & session_tools) | {
         name for name in session_tools if _is_mcp_tool(name)
     }
-    return frozenset(resolved) or SANDBOX_ALLOWED_TOOLS
+    if not resolved and fallback_to_core:
+        return SANDBOX_ALLOWED_TOOLS
+    return frozenset(resolved)
 
 
 def _mcp_stub_source(tool_name: str) -> Optional[str]:

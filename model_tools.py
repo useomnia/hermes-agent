@@ -475,7 +475,14 @@ def _compute_tool_definitions(
         # one it would accept). MCP tools are included here: this list is built
         # BEFORE the tool-search bridge collapses them, so it still holds their
         # real names.
-        sandbox_enabled = _resolve_sandbox_tools(sorted(available_tool_names))
+        #
+        # fallback_to_core=False because this list is authoritative — it is the
+        # session's own filtered surface. Falling back here would reintroduce the
+        # bug this rebuild exists to fix: a session with execute_code but no
+        # sandbox-callable tools being told it can import all seven core ones.
+        sandbox_enabled = _resolve_sandbox_tools(
+            sorted(available_tool_names), fallback_to_core=False
+        )
         dynamic_schema = build_execute_code_schema(sandbox_enabled, mode=_get_execution_mode())
         for i, td in enumerate(filtered_tools):
             if td.get("function", {}).get("name") == "execute_code":
