@@ -469,8 +469,13 @@ def _compute_tool_definitions(
     # execute_code" even when the API key isn't configured or the toolset is
     # disabled (#560-discord).
     if "execute_code" in available_tool_names:
-        from tools.code_execution_tool import SANDBOX_ALLOWED_TOOLS, build_execute_code_schema, _get_execution_mode
-        sandbox_enabled = SANDBOX_ALLOWED_TOOLS & available_tool_names
+        from tools.code_execution_tool import build_execute_code_schema, _get_execution_mode, _resolve_sandbox_tools
+        # Resolved the same way the sandbox itself resolves it, so the schema
+        # can't advertise a tool the RPC allow-list would then reject (or omit
+        # one it would accept). MCP tools are included here: this list is built
+        # BEFORE the tool-search bridge collapses them, so it still holds their
+        # real names.
+        sandbox_enabled = _resolve_sandbox_tools(sorted(available_tool_names))
         dynamic_schema = build_execute_code_schema(sandbox_enabled, mode=_get_execution_mode())
         for i, td in enumerate(filtered_tools):
             if td.get("function", {}).get("name") == "execute_code":

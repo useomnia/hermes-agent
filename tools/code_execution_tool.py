@@ -57,8 +57,15 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_AVAILABLE = True
 
-# The 7 tools allowed inside the sandbox. The intersection of this list
-# and the session's enabled tools determines which stubs are generated.
+# The 7 core tools allowed inside the sandbox. Each has a hand-written stub in
+# ``_TOOL_STUBS`` below. The intersection of this list and the session's enabled
+# tools determines which core stubs are generated.
+#
+# MCP-server tools are ALSO callable — see ``_resolve_sandbox_tools``. They are
+# resolved per session rather than listed here because they are dynamic (a
+# session's servers, and for a multi-tenant deployment its per-tenant tool
+# allow-list, are only known at runtime), and their stubs are generated from
+# their registered schemas instead of being written out by hand.
 SANDBOX_ALLOWED_TOOLS = frozenset([
     "web_search",
     "web_extract",
@@ -68,6 +75,10 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
     "patch",
     "terminal",
 ])
+
+# Toolset prefix under which MCP servers register their tools
+# (``mcp-<server>``, see tools/mcp_tool.py).
+_MCP_TOOLSET_PREFIX = "mcp-"
 
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
@@ -343,32 +354,117 @@ _TOOL_STUBS = {
 }
 
 
+def _is_mcp_tool(tool_name: str) -> bool:
+    """True when *tool_name* is registered by an MCP server."""
+    try:
+        from tools.registry import registry
+
+        entry = registry.get_entry(tool_name)
+    except Exception:
+        return False
+    return entry is not None and entry.toolset.startswith(_MCP_TOOLSET_PREFIX)
+
+
+def _resolve_sandbox_tools(enabled_tools: Optional[List[str]]) -> frozenset:
+    """The tools a script may call this session: core stubs + MCP-server tools.
+
+    MCP tools are admitted by PREDICATE over the session's own tool list rather
+    than by a static allow-list, which is what keeps the sandbox's reach equal to
+    (never wider than) the session's: the list passed in is already the resolved
+    surface for this session, so a tool the session was not granted cannot appear
+    here. The RPC loops enforce the same set server-side.
+
+    Falls back to the core tools when the session list is empty or resolves to
+    nothing — callers that can't supply one (older dispatch paths) still get a
+    working sandbox.
+    """
+    session_tools = set(enabled_tools or ())
+    resolved = (SANDBOX_ALLOWED_TOOLS & session_tools) | {
+        name for name in session_tools if _is_mcp_tool(name)
+    }
+    return frozenset(resolved) or SANDBOX_ALLOWED_TOOLS
+
+
+def _mcp_stub_source(tool_name: str) -> Optional[str]:
+    """Generate a `**kwargs` stub for one MCP tool, from its registered schema.
+
+    Passing arguments through as ``**kwargs`` rather than reconstructing a typed
+    signature keeps this independent of how expressive the server's JSON Schema
+    is; the parameter names go in the docstring so a script author can read them
+    off the stub, and the tool itself still validates what it receives.
+
+    Returns None when the tool has no usable schema or its registered name is not
+    a Python identifier — a stub we cannot generate is simply absent from the
+    module rather than emitting source that would fail to import.
+    """
+    if not tool_name.isidentifier():
+        logger.debug("execute_code: skipping non-identifier MCP tool %r", tool_name)
+        return None
+    try:
+        from tools.registry import registry
+
+        schema = registry.get_schema(tool_name) or {}
+    except Exception as exc:
+        logger.debug("execute_code: no schema for MCP tool %s: %s", tool_name, exc)
+        return None
+
+    description = " ".join(str(schema.get("description") or "").split())
+    if len(description) > 300:
+        description = description[:297] + "..."
+    params = (schema.get("parameters") or {}).get("properties") or {}
+    required = [p for p in ((schema.get("parameters") or {}).get("required") or []) if p in params]
+    optional = [p for p in params if p not in required]
+
+    doc_lines = [description or f"MCP tool {tool_name}."]
+    if required:
+        doc_lines.append(f"Required: {', '.join(sorted(required))}")
+    if optional:
+        doc_lines.append(f"Optional: {', '.join(sorted(optional))}")
+    if not params:
+        doc_lines.append("Takes no arguments.")
+    doc = "\n    ".join(doc_lines)
+
+    return (
+        f"def {tool_name}(**kwargs):\n"
+        f'    """{doc}"""\n'
+        f"    return _call({tool_name!r}, kwargs)\n"
+    )
+
+
 def generate_hermes_tools_module(enabled_tools: List[str],
                                  transport: str = "uds") -> str:
     """
     Build the source code for the hermes_tools.py stub module.
 
-    Only tools in both SANDBOX_ALLOWED_TOOLS and enabled_tools get stubs.
+    *enabled_tools* is the resolved sandbox tool set (see
+    ``_resolve_sandbox_tools``), not the raw session list: core tools get their
+    hand-written stub, MCP tools get one generated from their schema, and
+    anything else is ignored.
 
     Args:
-        enabled_tools: Tool names enabled in the current session.
+        enabled_tools: Tool names callable from the sandbox this session.
         transport: ``"uds"`` for Unix domain socket (local backend) or
                    ``"file"`` for file-based RPC (remote backends).
     """
-    tools_to_generate = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+    tools_to_generate = sorted(set(enabled_tools))
 
     stub_functions = []
     export_names = []
     for tool_name in tools_to_generate:
-        if tool_name not in _TOOL_STUBS:
+        if tool_name in _TOOL_STUBS:
+            func_name, sig, doc, args_expr = _TOOL_STUBS[tool_name]
+            stub_functions.append(
+                f"def {func_name}({sig}):\n"
+                f"    {doc}\n"
+                f"    return _call({func_name!r}, {args_expr})\n"
+            )
+            export_names.append(func_name)
             continue
-        func_name, sig, doc, args_expr = _TOOL_STUBS[tool_name]
-        stub_functions.append(
-            f"def {func_name}({sig}):\n"
-            f"    {doc}\n"
-            f"    return _call({func_name!r}, {args_expr})\n"
-        )
-        export_names.append(func_name)
+        if _is_mcp_tool(tool_name):
+            source = _mcp_stub_source(tool_name)
+            if source is not None:
+                stub_functions.append(source)
+                export_names.append(tool_name)
 
     if transport == "file":
         header = _FILE_TRANSPORT_HEADER
@@ -1074,10 +1170,7 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = _resolve_sandbox_tools(enabled_tools)
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1347,11 +1440,7 @@ def execute_code(
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = _resolve_sandbox_tools(enabled_tools)
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
@@ -2012,14 +2101,53 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         doc for name, doc in _TOOL_DOC_LINES if name in enabled_sandbox_tools
     )
 
+    # MCP tools get ONE line, never a listing. A session can carry hundreds of
+    # them; spelling them out here would cost more context every turn than the
+    # deferred schemas the tool-search bridge exists to avoid. The model already
+    # knows their names (from the tools array or the bridge catalog) and can read
+    # their parameters off the generated stub or via tool_describe.
+    mcp_tools = sorted(name for name in enabled_sandbox_tools if _is_mcp_tool(name))
+    if mcp_tools:
+        count = (
+            "the MCP tool" if len(mcp_tools) == 1 else f"all {len(mcp_tools)} MCP tools"
+        )
+        tool_lines += (
+            f"\n\nAlso importable: {count} available to you this "
+            "session, under their exact tool names — e.g. "
+            f"`from hermes_tools import {mcp_tools[0]}`. Each takes keyword arguments "
+            "matching its schema and returns its result as a dict. This is the cheap way "
+            "to run one tool over many inputs: the per-call results stay in the script "
+            "instead of filling your context, so you can fetch across a whole list and "
+            "print only what you concluded."
+        )
+
     # Build example import list from enabled tools
     import_examples = [n for n in ("web_search", "terminal") if n in enabled_sandbox_tools]
+    if not import_examples:
+        import_examples = sorted(name for name in enabled_sandbox_tools if name in _TOOL_STUBS)[:2]
     if not import_examples:
         import_examples = sorted(enabled_sandbox_tools)[:2]
     if import_examples:
         import_str = ", ".join(import_examples) + ", ..."
     else:
         import_str = "..."
+
+    # Read the caps from config rather than restating the defaults: a deployment
+    # that raises max_tool_calls for fan-out work would otherwise still be
+    # telling the model the default, and the model would plan around the wrong
+    # ceiling (splitting one script into several, or overrunning mid-loop).
+    _limits_cfg = _load_config()
+    _timeout_s = int(_limits_cfg.get("timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT)
+    _max_calls = int(
+        _limits_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS) or DEFAULT_MAX_TOOL_CALLS
+    )
+    _timeout_note = (
+        f"{_timeout_s // 60}-minute" if _timeout_s % 60 == 0 else f"{_timeout_s}s"
+    )
+    limits_note = (
+        f"{_timeout_note} timeout, {MAX_STDOUT_BYTES // 1000}KB stdout cap, "
+        f"max {_max_calls} tool calls per script"
+    )
 
     # Mode-specific CWD guidance. Project mode is the default and matches
     # terminal()'s filesystem/interpreter; strict mode retains the isolated
@@ -2046,7 +2174,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "or the task requires interactive user input.\n\n"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
-        "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
+        f"Limits: {limits_note}. "
         "terminal() is foreground-only (no background or pty).\n\n"
         f"{cwd_note}\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
