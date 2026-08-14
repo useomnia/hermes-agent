@@ -1009,6 +1009,46 @@ def _flush_inner_tool_usage(tool_call_log: list) -> None:
         )
 
 
+def _resolve_remote_script_cwd(
+    mode: str,
+    staging_dir: str,
+    task_id: str = "",
+) -> Optional[str]:
+    """Working directory for a script running on a REMOTE terminal backend.
+
+    - ``strict``: the staging dir, as on the local path.
+    - ``project``: the session's own working directory, so a script's relative
+      paths land where ``terminal``'s do and a file it writes is still there
+      afterwards. ``None`` means "don't cd at all" — the backend then applies its
+      own default working directory, which is the same one a bare ``terminal``
+      command gets, and is the right answer whenever the session has not moved.
+
+    Deliberately does NOT stat the candidates the way the local resolver does:
+    these paths exist on the remote machine, so an ``isdir`` check here would ask
+    the wrong filesystem and reject every valid answer.
+    """
+    if mode != "project":
+        return staging_dir
+    if task_id:
+        try:
+            from tools.terminal_tool import get_session_cwd
+
+            recorded = get_session_cwd(task_id)
+            if recorded:
+                return str(recorded)
+        except Exception as exc:
+            logger.debug("execute_code: no session cwd record for %s: %s", task_id, exc)
+        try:
+            from tools.file_tools import _registered_task_cwd_override
+
+            override = _registered_task_cwd_override(task_id)
+            if override:
+                return str(override)
+        except Exception as exc:
+            logger.debug("execute_code: no registered cwd override for %s: %s", task_id, exc)
+    return None
+
+
 def _rpc_poll_loop(
     env,
     rpc_dir: str,
@@ -1248,21 +1288,36 @@ def _execute_remote(
         )
         rpc_thread.start()
 
-        # Build environment variable prefix for the script
+        # Build environment variable prefix for the script. PYTHONPATH carries the
+        # staging dir so `from hermes_tools import ...` resolves even when the
+        # script runs from somewhere else — the same guard the local path uses for
+        # project mode.
         env_prefix = (
             f"HERMES_RPC_DIR={shlex.quote(f'{sandbox_dir}/rpc')} "
             f"HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
+            f"PYTHONPATH={quoted_sandbox_dir} "
             f"PYTHONDONTWRITEBYTECODE=1"
         )
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
         if tz:
             env_prefix += f" TZ={shlex.quote(tz)}"
 
+        # Run from the session's working directory, not the staging dir, so a
+        # script's relative paths mean what they mean everywhere else in the
+        # session. The staging dir is deleted in the `finally` below, so a file
+        # written relative to it would vanish with it — the one place a script can
+        # silently lose its own output.
+        script_cwd = _resolve_remote_script_cwd(
+            _get_execution_mode(), sandbox_dir, effective_task_id
+        )
+        cd_prefix = f"cd {shlex.quote(script_cwd)} && " if script_cwd else ""
+        quoted_script_path = shlex.quote(f"{sandbox_dir}/script.py")
+
         # Execute the script on the remote backend
         logger.info("Executing code on %s backend (task %s)...",
                      env_type, effective_task_id[:8])
         script_result = env.execute(
-            f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
+            f"{cd_prefix}{env_prefix} python3 {quoted_script_path}",
             timeout=timeout,
         )
 
@@ -2157,13 +2212,33 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         f"max {_max_calls} tool calls per script"
     )
 
-    # Mode-specific CWD guidance. Project mode is the default and matches
-    # terminal()'s filesystem/interpreter; strict mode retains the isolated
-    # temp-dir staging and hermes-agent's own python.
+    # CWD + interpreter guidance. Both depend on the terminal backend, not just
+    # the mode: a remote backend runs the script on the same machine as terminal(),
+    # with THAT machine's python3, and never with a local virtualenv. Describing
+    # the local arrangement to a remote session is worse than saying nothing —
+    # it promises project deps and a working directory that aren't there.
+    try:
+        from tools.terminal_tool import _get_env_config
+
+        _backend = str(_get_env_config().get("env_type") or "local").lower()
+    except Exception:
+        _backend = "local"
+    _remote_backend = _backend != "local"
+
     if mode == "strict":
+        where = "on the terminal's machine" if _remote_backend else ""
         cwd_note = (
-            "Scripts run in their own temp dir, not the session's CWD — use absolute paths "
-            "(os.path.expanduser('~/.hermes/.env')) or terminal()/read_file() for user files."
+            f"Scripts run in their own temp dir{' ' + where if where else ''}, not the "
+            "session's working directory, and that dir is deleted afterwards — write files "
+            "to an absolute path, and read user files with absolute paths or "
+            "terminal()/read_file()."
+        )
+    elif _remote_backend:
+        cwd_note = (
+            "Scripts run on the same machine as terminal(), in the same working directory, "
+            "so relative paths mean what they mean in terminal() and a file you write stays "
+            "put. They run with that machine's python3 — the standard library is always "
+            "there; any other library has to be installed for that interpreter."
         )
     else:
         cwd_note = (

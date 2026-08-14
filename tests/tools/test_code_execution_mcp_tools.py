@@ -32,6 +32,7 @@ from tools.code_execution_tool import (
     SANDBOX_ALLOWED_TOOLS,
     _is_mcp_tool,
     _mcp_stub_source,
+    _resolve_remote_script_cwd,
     _resolve_sandbox_tools,
     build_execute_code_schema,
     execute_code,
@@ -280,3 +281,80 @@ class TestScriptCallsMcpTool(_WithMcpTool):
         self.assertEqual(result["status"], "success")  # the script itself ran
         self.assertIn("not available in execute_code", result["output"])
         self.assertEqual(dispatched, [])
+
+
+# ---------------------------------------------------------------------------
+# Where a remote script runs
+# ---------------------------------------------------------------------------
+
+class TestRemoteScriptCwd(unittest.TestCase):
+    """A script on a remote backend must run where terminal() runs.
+
+    The staging dir is deleted after the run, so a script that wrote a file
+    relative to it would lose that file — the one place a script can silently
+    destroy its own output.
+    """
+
+    STAGING = "/tmp/.hermes-session/hermes_exec_abc123"
+
+    def test_project_mode_defers_to_the_backend_default(self):
+        """No recorded cwd means "wherever a bare terminal command lands", which
+        the backend already knows — so don't cd at all."""
+        self.assertIsNone(
+            _resolve_remote_script_cwd("project", self.STAGING, "task-with-no-record")
+        )
+
+    def test_project_mode_follows_the_session_cwd_record(self):
+        with patch("tools.terminal_tool.get_session_cwd", return_value="/home/brand"):
+            self.assertEqual(
+                _resolve_remote_script_cwd("project", self.STAGING, "task-1"),
+                "/home/brand",
+            )
+
+    def test_project_mode_falls_back_to_a_registered_override(self):
+        with patch("tools.terminal_tool.get_session_cwd", return_value=None):
+            with patch(
+                "tools.file_tools._registered_task_cwd_override",
+                return_value="/home/work",
+            ):
+                self.assertEqual(
+                    _resolve_remote_script_cwd("project", self.STAGING, "task-1"),
+                    "/home/work",
+                )
+
+    def test_strict_mode_keeps_the_staging_dir(self):
+        self.assertEqual(
+            _resolve_remote_script_cwd("strict", self.STAGING, "task-1"), self.STAGING
+        )
+
+    def test_a_remote_path_is_never_stat_checked(self):
+        """These paths live on the remote machine. An isdir() check here asks the
+        wrong filesystem and would reject every valid answer."""
+        with patch("tools.terminal_tool.get_session_cwd", return_value="/home/brand"):
+            with patch("os.path.isdir", return_value=False):
+                self.assertEqual(
+                    _resolve_remote_script_cwd("project", self.STAGING, "task-1"),
+                    "/home/brand",
+                )
+
+
+class TestBackendAwareCwdNote(unittest.TestCase):
+    """The description must not promise a local venv to a remote session."""
+
+    def _describe(self, backend, mode="project"):
+        with patch(
+            "tools.terminal_tool._get_env_config", return_value={"env_type": backend}
+        ):
+            return build_execute_code_schema({"terminal"}, mode=mode)["description"]
+
+    def test_remote_backend_describes_the_terminal_machine(self):
+        description = self._describe("sprites")
+        self.assertIn("same machine as terminal()", description)
+        self.assertIn("that machine's python3", description)
+        self.assertNotIn("active venv's python", description)
+
+    def test_local_backend_keeps_the_venv_wording(self):
+        self.assertIn("active venv's python", self._describe("local"))
+
+    def test_strict_mode_warns_the_temp_dir_is_deleted(self):
+        self.assertIn("deleted afterwards", self._describe("sprites", mode="strict"))
