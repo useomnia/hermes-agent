@@ -236,12 +236,14 @@ class TestSchemaDescription(_WithMcpTool):
 class TestScriptCallsMcpTool(_WithMcpTool):
     """A script calls the MCP tool and only its own stdout comes back."""
 
-    def _run(self, code, enabled_tools):
+    def _run(self, code, enabled_tools, mcp_result=None):
         dispatched = []
 
         def _dispatch(function_name, function_args, task_id=None, **kwargs):
             dispatched.append((function_name, function_args))
             if function_name == MCP_TOOL:
+                if mcp_result is not None:
+                    return mcp_result
                 return json.dumps({"prompts": [{"id": "p1"}, {"id": "p2"}]})
             return json.dumps({"error": f"Unknown tool: {function_name}"})
 
@@ -273,6 +275,38 @@ class TestScriptCallsMcpTool(_WithMcpTool):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["tool_calls_made"], 3)
         self.assertEqual(result["inner_tool_calls"], {MCP_TOOL: 3})
+
+    def test_a_real_mcp_envelope_arrives_decoded(self):
+        """The shape mcp_tool.py actually returns, end to end.
+
+        This fixture is the one that matters: the sibling tests hand back a bare
+        payload, and that is why the double-encoded envelope reached production
+        unnoticed. A script must be able to walk into the payload directly.
+        """
+        envelope = json.dumps(
+            {"result": json.dumps({"data": {"prompts": [{"id": "p1"}, {"id": "p2"}]}})}
+        )
+        result, _ = self._run(
+            f"from hermes_tools import {MCP_TOOL}\n"
+            f"r = {MCP_TOOL}(brandId='b1')\n"
+            "print(len(r['result']['data']['prompts']))\n",
+            enabled_tools=[MCP_TOOL],
+            mcp_result=envelope,
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["output"].strip(), "2")
+
+    def test_a_prose_envelope_stays_a_string_end_to_end(self):
+        envelope = json.dumps({"result": "No prompts found for that brand."})
+        result, _ = self._run(
+            f"from hermes_tools import {MCP_TOOL}\n"
+            f"r = {MCP_TOOL}(brandId='b1')\n"
+            "print(type(r['result']).__name__)\n",
+            enabled_tools=[MCP_TOOL],
+            mcp_result=envelope,
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["output"].strip(), "str")
 
     def test_rpc_rejects_an_mcp_tool_the_session_lacks(self):
         """Server-side enforcement, not just an absent stub: a script that names
@@ -546,3 +580,89 @@ class TestShipFileToRemote(unittest.TestCase):
         self.assertEqual(len(env.commands), 2)  # one write + the decode
         self.assertIn(">", env.commands[0])
         self.assertNotIn(">>", env.commands[0])
+
+
+# ---------------------------------------------------------------------------
+# Decoding what an MCP server sends back
+# ---------------------------------------------------------------------------
+
+class TestResultDecoding(unittest.TestCase):
+    """An MCP tool answers with {"result": <text>}, and a server whose payload is
+    JSON therefore sends it double-encoded.
+
+    Without decoding, every caller needs a second json.loads on every call — and
+    the model has to discover that by running a probe script first, which is the
+    round trip this exists to remove. The decode is deliberately narrow: it must
+    never reinterpret an answer the server meant as text.
+    """
+
+    def _decoder(self, transport="uds"):
+        source = generate_hermes_tools_module(["terminal"], transport=transport)
+        namespace: dict = {}
+        exec(compile(source, "hermes_tools.py", "exec"), namespace)
+        return namespace["_decode_result"]
+
+    def test_both_transports_ship_the_decoder(self):
+        for transport in ("uds", "file"):
+            with self.subTest(transport=transport):
+                self.assertTrue(callable(self._decoder(transport)))
+
+    def test_json_object_payload_is_parsed(self):
+        decode = self._decoder()
+        got = decode({"result": '{"data": {"prompts": [{"id": "p1"}]}}'})
+        self.assertEqual(got, {"result": {"data": {"prompts": [{"id": "p1"}]}}})
+
+    def test_json_array_payload_is_parsed(self):
+        decode = self._decoder()
+        self.assertEqual(decode({"result": "[1, 2, 3]"}), {"result": [1, 2, 3]})
+
+    def test_structured_content_is_preserved_alongside(self):
+        decode = self._decoder()
+        got = decode({"result": '{"a": 1}', "structuredContent": {"b": 2}})
+        self.assertEqual(got, {"result": {"a": 1}, "structuredContent": {"b": 2}})
+
+    def test_prose_text_is_left_alone(self):
+        decode = self._decoder()
+        payload = {"result": "No prompts found for that brand."}
+        self.assertEqual(decode(payload), payload)
+
+    def test_a_scalar_that_looks_like_json_stays_text(self):
+        """"42" is a valid JSON document. Turning it into an int would silently
+        change a server's text answer into a number."""
+        decode = self._decoder()
+        for text in ("42", "true", "null", '"quoted"'):
+            with self.subTest(text=text):
+                self.assertEqual(decode({"result": text}), {"result": text})
+
+    def test_an_already_structured_result_is_untouched(self):
+        decode = self._decoder()
+        payload = {"result": {"data": [1]}}
+        self.assertEqual(decode(payload), payload)
+
+    def test_a_dict_with_other_keys_is_not_the_envelope(self):
+        """Our own tools may use a "result" key; only the MCP envelope shape
+        is eligible."""
+        decode = self._decoder()
+        payload = {"result": '{"a": 1}', "exit_code": 0}
+        self.assertEqual(decode(payload), payload)
+
+    def test_non_envelope_values_pass_through(self):
+        decode = self._decoder()
+        for value in ({"content": "x"}, [1, 2], "text", 7, None):
+            with self.subTest(value=value):
+                self.assertEqual(decode(value), value)
+
+    def test_malformed_json_is_returned_as_the_server_sent_it(self):
+        decode = self._decoder()
+        payload = {"result": '{"a": 1'}
+        self.assertEqual(decode(payload), payload)
+
+    def test_the_stub_docstring_states_the_envelope(self):
+        """The decode is invisible to the model, so the stub has to say it."""
+        _register_mcp_tool()
+        try:
+            source = _mcp_stub_source(MCP_TOOL)
+        finally:
+            registry.deregister(MCP_TOOL)
+        self.assertIn('Returns {"result": payload}', source)
+        self.assertIn("already decoded", source)

@@ -459,6 +459,10 @@ def _mcp_stub_source(tool_name: str) -> Optional[str]:
         doc_lines.append(f"Optional: {', '.join(sorted(optional))}")
     if not params:
         doc_lines.append("Takes no arguments.")
+    # State the envelope. The model cannot see _decode_result, so without this it
+    # discovers the shape by running a probe script first — which is exactly the
+    # round trip the decoder exists to remove.
+    doc_lines.append('Returns {"result": payload}; a JSON payload is already decoded.')
     doc = "\n    ".join(doc_lines)
 
     return (
@@ -562,6 +566,46 @@ def retry(fn, max_attempts=3, delay=2):
 
 '''
 
+# ---- Result decoding (shared by both transports) --------------------------
+
+# An MCP tool answers with {"result": <text>} — see mcp_tool.py, which renders
+# the server's content blocks into that envelope and adds "structuredContent"
+# when the server sends both. A server whose payload IS JSON therefore arrives
+# double-encoded, and without this every script would need a second json.loads
+# on every call. That is not a hypothetical papercut: in the first live run of
+# MCP-in-execute_code, three of the eight scripts the model wrote were spent
+# discovering the shape rather than doing the work.
+_RESULT_DECODER = '''\
+
+def _decode_result(result):
+    """Parse the JSON an MCP server nests inside its text result, in place.
+
+    Deliberately conservative — only the MCP envelope shape is touched, and only
+    when the nested text parses to a dict or list. Prose text, or a bare scalar
+    that merely looks like JSON, is handed back exactly as the server sent it, so
+    this can never turn a string answer into a number.
+    """
+    if not isinstance(result, dict) or "result" not in result:
+        return result
+    # The envelope and nothing else: a tool of our own that happens to use a
+    # "result" key alongside others is left alone.
+    if not set(result) <= {"result", "structuredContent"}:
+        return result
+    nested = result["result"]
+    if not isinstance(nested, str):
+        return result
+    try:
+        parsed = json.loads(nested)
+    except (ValueError, TypeError):
+        return result
+    if not isinstance(parsed, (dict, list)):
+        return result
+    decoded = dict(result)
+    decoded["result"] = parsed
+    return decoded
+
+'''
+
 # ---- UDS transport (local backend) ---------------------------------------
 
 _UDS_TRANSPORT_HEADER = '''\
@@ -574,7 +618,7 @@ _sock = None
 # threads (e.g. ThreadPoolExecutor) would race on the shared socket and get
 # each other's responses. Serialize the entire send+recv round-trip.
 _call_lock = threading.Lock()
-''' + _COMMON_HELPERS + '''\
+''' + _COMMON_HELPERS + _RESULT_DECODER + '''\
 
 def _connect():
     """Connect to the parent's RPC server via the transport it picked.
@@ -623,10 +667,10 @@ def _call(tool_name, args):
     result = json.loads(raw)
     if isinstance(result, str):
         try:
-            return json.loads(result)
+            result = json.loads(result)
         except (json.JSONDecodeError, TypeError):
             return result
-    return result
+    return _decode_result(result)
 
 '''
 
@@ -642,7 +686,7 @@ _seq = 0
 # invocations from multiple threads could allocate the same sequence number
 # and clobber each other's request files. Guard seq allocation with a lock.
 _seq_lock = threading.Lock()
-''' + _COMMON_HELPERS + '''\
+''' + _COMMON_HELPERS + _RESULT_DECODER + '''\
 
 def _call(tool_name, args):
     """Send a tool call request via file-based RPC and wait for response."""
@@ -689,10 +733,10 @@ def _call(tool_name, args):
     result = json.loads(raw)
     if isinstance(result, str):
         try:
-            return json.loads(result)
+            result = json.loads(result)
         except (json.JSONDecodeError, TypeError):
             return result
-    return result
+    return _decode_result(result)
 
 '''
 
