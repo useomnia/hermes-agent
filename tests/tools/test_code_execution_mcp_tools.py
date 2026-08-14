@@ -28,8 +28,11 @@ def _force_local_terminal(monkeypatch):
     monkeypatch.setenv("TERMINAL_ENV", "local")
 
 
+from model_tools import _uncollapse_bridge_tool_names
 from tools.code_execution_tool import (
+    DEFAULT_SANDBOX_MODULE,
     SANDBOX_ALLOWED_TOOLS,
+    _sandbox_module_name,
     _is_mcp_tool,
     _mcp_stub_source,
     _resolve_remote_script_cwd,
@@ -390,3 +393,88 @@ class TestModuleIntrospection(_WithMcpTool):
     def test_description_points_at_list_tools_when_mcp_is_available(self):
         schema = build_execute_code_schema({"terminal", MCP_TOOL}, mode="project")
         self.assertIn("list_tools()", schema["description"])
+
+
+class TestSandboxModuleName(unittest.TestCase):
+    """The stub module's name is agent-visible, so it is configurable.
+
+    It lands in the tool description AND in every script's import line, so a
+    deployment whose agent must not identify its harness has to be able to change
+    it — and the value has to be usable as both a filename and an import.
+    """
+
+    def _with_module(self, value):
+        return patch(
+            "tools.code_execution_tool._load_config", return_value={"module_name": value}
+        )
+
+    def test_default_is_unchanged_when_unset(self):
+        with patch("tools.code_execution_tool._load_config", return_value={}):
+            self.assertEqual(_sandbox_module_name(), DEFAULT_SANDBOX_MODULE)
+
+    def test_configured_name_is_used(self):
+        with self._with_module("omnio_tools"):
+            self.assertEqual(_sandbox_module_name(), "omnio_tools")
+
+    def test_invalid_names_fall_back_rather_than_breaking_the_import(self):
+        for bad in ("123bad", "has-a-dash", "two words", "class", ""):
+            with self.subTest(bad=bad), self._with_module(bad):
+                self.assertEqual(_sandbox_module_name(), DEFAULT_SANDBOX_MODULE)
+
+    def test_description_uses_the_configured_name_everywhere(self):
+        with self._with_module("omnio_tools"):
+            schema = build_execute_code_schema({"terminal"}, mode="project")
+        blob = schema["description"] + schema["parameters"]["properties"]["code"]["description"]
+        self.assertIn("from omnio_tools import", blob)
+        self.assertNotIn("hermes", blob.lower())
+
+
+class TestBridgeCollapsedSessionList(unittest.TestCase):
+    """A script must see the session's real tools, not the collapsed ones.
+
+    The agent loop passes the MODEL-FACING names. With the tool-search bridge
+    active those have MCP and plugin tools replaced by tool_search/tool_describe/
+    tool_call, so a sandbox reading them concludes the session has no MCP tools —
+    while the tool description, built before collapsing, says it does.
+    """
+
+    def test_no_bridge_tools_means_the_list_is_returned_unchanged(self):
+        original = ["terminal", "read_file"]
+        self.assertEqual(_uncollapse_bridge_tool_names(original, None, None), original)
+
+    def test_empty_input_is_returned_unchanged(self):
+        self.assertEqual(_uncollapse_bridge_tool_names([], None, None), [])
+        self.assertIsNone(_uncollapse_bridge_tool_names(None, None, None))
+
+    def test_a_collapsed_list_regains_the_deferred_tools(self):
+        collapsed = ["terminal", "tool_search", "tool_describe", "tool_call"]
+        real_defs = [
+            {"function": {"name": "terminal"}},
+            {"function": {"name": MCP_TOOL}},
+        ]
+        with patch("model_tools.get_tool_definitions", return_value=real_defs):
+            resolved = _uncollapse_bridge_tool_names(collapsed, ["hermes-cli"], None)
+        self.assertIn(MCP_TOOL, resolved)
+        self.assertIn("terminal", resolved)
+
+    def test_rebuild_is_scoped_to_the_sessions_own_toolsets(self):
+        """Scoping is what stops this widening the surface: the rebuild must be
+        asked for the session's toolsets, not the whole registry."""
+        captured = {}
+
+        def _fake_defs(**kwargs):
+            captured.update(kwargs)
+            return []
+
+        with patch("model_tools.get_tool_definitions", side_effect=_fake_defs):
+            _uncollapse_bridge_tool_names(["tool_call"], ["hermes-cli"], ["cronjob"])
+        self.assertEqual(captured.get("enabled_toolsets"), ["hermes-cli"])
+        self.assertEqual(captured.get("disabled_toolsets"), ["cronjob"])
+        self.assertTrue(captured.get("skip_tool_search_assembly"))
+
+    def test_a_failed_rebuild_leaves_the_list_alone(self):
+        with patch("model_tools.get_tool_definitions", side_effect=RuntimeError("boom")):
+            self.assertEqual(
+                _uncollapse_bridge_tool_names(["terminal", "tool_call"], None, None),
+                ["terminal", "tool_call"],
+            )

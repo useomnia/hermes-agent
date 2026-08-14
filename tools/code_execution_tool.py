@@ -80,6 +80,35 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
 # (``mcp-<server>``, see tools/mcp_tool.py).
 _MCP_TOOLSET_PREFIX = "mcp-"
 
+# Name of the generated stub module a script imports its tools from. Configurable
+# (``code_execution.module_name``) because it is one of the few strings in this tool
+# the agent both reads and writes: it appears in the tool description and in every
+# script's import line. A deployment whose agent must not identify the harness it
+# runs on needs to be able to name it something neutral.
+DEFAULT_SANDBOX_MODULE = "hermes_tools"
+
+
+def _sandbox_module_name() -> str:
+    """The stub module's name, from config, falling back to the default.
+
+    Rejects anything that is not a plain Python identifier: the value becomes a
+    filename AND an import statement, so a bad one would produce a module the
+    generated script cannot import — a confusing failure a long way from its cause.
+    """
+    import keyword
+
+    configured = str(_load_config().get("module_name") or "").strip()
+    if not configured:
+        return DEFAULT_SANDBOX_MODULE
+    if not configured.isidentifier() or keyword.iskeyword(configured):
+        logger.warning(
+            "code_execution.module_name %r is not a valid Python identifier; "
+            "using %r instead",
+            configured, DEFAULT_SANDBOX_MODULE,
+        )
+        return DEFAULT_SANDBOX_MODULE
+    return configured
+
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
@@ -1282,7 +1311,7 @@ def _execute_remote(
         tools_src = generate_hermes_tools_module(
             list(sandbox_tools), transport="file",
         )
-        _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py", tools_src)
+        _ship_file_to_remote(env, f"{sandbox_dir}/{_sandbox_module_name()}.py", tools_src)
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
 
         # Wrapped so the thread inherits the turn's approval context + callbacks
@@ -1556,7 +1585,7 @@ def execute_code(
         # sandbox_tools is already the correct set (intersection with session
         # tools, or SANDBOX_ALLOWED_TOOLS as fallback — see lines above).
         tools_src = generate_hermes_tools_module(list(sandbox_tools))
-        with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
+        with open(os.path.join(tmpdir, f"{_sandbox_module_name()}.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)
 
         # Write the user's script
@@ -2169,6 +2198,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         enabled_sandbox_tools = SANDBOX_ALLOWED_TOOLS
     if mode is None:
         mode = _get_execution_mode()
+    module = _sandbox_module_name()
 
     # Build tool documentation lines for only the enabled tools
     tool_lines = "\n".join(
@@ -2188,8 +2218,8 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         tool_lines += (
             f"\n\nAlso importable: {count} available to you this "
             "session, under their exact registered names — e.g. "
-            f"`from hermes_tools import {mcp_tools[0]}`. If you are unsure of a name, "
-            "`hermes_tools.list_tools()` returns every name this script can call; use it "
+            f"`from {module} import {mcp_tools[0]}`. If you are unsure of a name, "
+            f"`{module}.list_tools()` returns every name this script can call; use it "
             "rather than guessing at a prefix. Each takes keyword arguments "
             "matching its schema and returns its result as a dict. This is the cheap way "
             "to run one tool over many inputs: the per-call results stay in the script "
@@ -2268,14 +2298,14 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "Use normal tool calls instead when: single tool call with no processing, "
         "you need to see the full result and apply complex reasoning, "
         "or the task requires interactive user input.\n\n"
-        f"Available via `from hermes_tools import ...`:\n\n"
+        f"Available via `from {module} import ...`:\n\n"
         f"{tool_lines}\n\n"
         f"Limits: {limits_note}. "
         "terminal() is foreground-only (no background or pty).\n\n"
         f"{cwd_note}\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
         "datetime, collections, etc.) for processing between tool calls.\n\n"
-        "Also available (no import needed — built into hermes_tools):\n"
+        f"Also available (no import needed — built into {module}):\n"
         "  json_parse(text: str) — json.loads with strict=False; use for terminal() output with control chars\n"
         "  shell_quote(s: str) — shlex.quote(); use when interpolating dynamic strings into shell commands\n"
         "  retry(fn, max_attempts=3, delay=2) — retry with exponential backoff for transient failures"
@@ -2291,7 +2321,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
                     "type": "string",
                     "description": (
                         "Python code to execute. Import tools with "
-                        f"`from hermes_tools import {import_str}` "
+                        f"`from {module} import {import_str}` "
                         "and print your final result to stdout."
                     ),
                 },

@@ -2126,11 +2126,20 @@ def _handle_write_file(args, **kw):
             "both 'path' and 'content' set."
         )
     if "content" not in args:
+        # The stub module's name is configurable, so name it from the same resolver
+        # the generated module uses rather than hardcoding a value this deployment
+        # may not use.
+        try:
+            from tools.code_execution_tool import _sandbox_module_name
+
+            _module = _sandbox_module_name()
+        except Exception:
+            _module = "the code-execution tool module"
         return tool_error(
             "write_file: missing required field 'content'. The tool call included a "
             "path but no content argument — this is almost always a dropped-arg bug "
             "under context pressure. Re-emit the tool call with the full content "
-            "payload, or use execute_code with hermes_tools.write_file() for very "
+            f"payload, or use execute_code with {_module}.write_file() for very "
             "large files."
         )
     if not isinstance(args["content"], str):

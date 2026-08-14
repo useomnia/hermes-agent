@@ -1093,6 +1093,57 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+def _uncollapse_bridge_tool_names(
+    enabled_tools: Optional[List[str]],
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]],
+) -> Optional[List[str]]:
+    """Return the session's REAL tool surface, undoing tool-search collapsing.
+
+    The agent loop passes the MODEL-FACING tool names. When the tool-search bridge
+    is active those are the collapsed ones: every MCP and plugin tool has been
+    replaced by ``tool_search`` / ``tool_describe`` / ``tool_call``. A consumer that
+    needs to know what the session can actually reach — ``execute_code``, deciding
+    which tools a script may call — would otherwise conclude the session has no MCP
+    tools at all, while the tool's own description (built before collapsing) says it
+    does.
+
+    Rebuilding with ``skip_tool_search_assembly=True`` and the session's OWN
+    toolsets is the same move the bridge dispatch makes for its defence-in-depth
+    check, and it is what keeps this from widening anything: the result is scoped to
+    what the session was granted, not to the whole process registry.
+
+    Returns the input unchanged when there is nothing to undo (no list, or no bridge
+    tool present).
+    """
+    if not enabled_tools:
+        return enabled_tools
+    try:
+        from tools.tool_search import BRIDGE_TOOL_NAMES
+    except Exception:
+        return enabled_tools
+    names = set(enabled_tools)
+    if not (names & BRIDGE_TOOL_NAMES):
+        return enabled_tools
+    try:
+        # Scoped to the session's toolsets, so this also leaves the process-global
+        # _last_resolved_tool_names holding an in-scope set rather than a wider one.
+        deferred_defs = get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        ) or []
+    except Exception as exc:
+        logger.debug("Could not uncollapse bridge tool names: %s", exc)
+        return enabled_tools
+    for definition in deferred_defs:
+        name = (definition.get("function") or {}).get("name")
+        if name:
+            names.add(name)
+    return sorted(names)
+
+
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
@@ -1370,6 +1421,9 @@ def handle_function_call(
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+                sandbox_enabled = _uncollapse_bridge_tool_names(
+                    sandbox_enabled, enabled_toolsets, disabled_toolsets
+                )
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
