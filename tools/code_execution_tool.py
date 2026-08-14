@@ -843,6 +843,68 @@ def _env_temp_dir(env: Any) -> str:
     return "/tmp"
 
 
+def _inner_tool_counts(tool_call_log: list) -> Dict[str, int]:
+    """Count executed calls per tool name from the RPC log.
+
+    ``tool_call_log`` is appended to only AFTER a call clears the allow-list and
+    the call-count limit and has been dispatched, so this counts executions, not
+    attempts. A call that executed and then failed still counts — it consumed
+    whatever the provider charges for, which is the same trade-off the message-
+    row counting downstream already makes.
+    """
+    counts: Dict[str, int] = {}
+    for entry in tool_call_log:
+        name = str((entry or {}).get("tool") or "").strip()
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _flush_inner_tool_usage(tool_call_log: list) -> None:
+    """Persist this script's tool executions to ``session_tool_usage``.
+
+    A sandbox RPC call dispatches through the normal tool handler but leaves NO
+    ``role='tool'`` message behind — that's the whole point of programmatic tool
+    calling, and it means anything counting tool usage from the transcript sees
+    a script's calls as a single ``execute_code``. Recording them here is what
+    keeps usage accounting (and, for the Omnio deployment, external-tool
+    metering of paid tools like web_search or a connector) whole.
+
+    Called from the ``finally`` of both execution paths so a timed-out,
+    interrupted, or crashed script still accounts for the calls it already made.
+
+    Best-effort: never raises into the tool result. But it logs at WARNING
+    rather than DEBUG on failure, because a dropped write here is a tool call
+    that executed and will never be counted anywhere.
+    """
+    counts = _inner_tool_counts(tool_call_log)
+    if not counts:
+        return
+    try:
+        from gateway.session_context import get_session_env
+        from hermes_state import SessionDB
+
+        session_id = str(get_session_env("HERMES_SESSION_ID") or "").strip()
+        if not session_id:
+            # No session identity (bare CLI one-shot, some test harnesses) —
+            # there is nothing to attribute the calls to. Not an error.
+            logger.debug(
+                "execute_code: no session id in context; skipping tool-usage accounting"
+            )
+            return
+        # SessionDB() resolves the process's active state.db the same way every
+        # other caller does (HERMES_HOME → profile dir), which is also the file
+        # external readers watch. Do not substitute a hand-built path.
+        SessionDB().record_tool_usage(session_id, counts, source="execute_code")
+    except Exception as exc:
+        logger.warning(
+            "execute_code: failed to record inner tool usage (%s calls across "
+            "%s tools will go uncounted): %s",
+            sum(counts.values()), len(counts), exc,
+            exc_info=True,
+        )
+
+
 def _rpc_poll_loop(
     env,
     rpc_dir: str,
@@ -1133,6 +1195,10 @@ def _execute_remote(
         if rpc_thread is not None:
             rpc_thread.join(timeout=5)
 
+        # Account the calls the script made before anything else can fail.
+        # Joined the poll thread first so the log is complete.
+        _flush_inner_tool_usage(tool_call_log)
+
         # Clean up remote sandbox dir
         try:
             env.execute(
@@ -1165,6 +1231,14 @@ def _execute_remote(
         "tool_calls_made": tool_call_counter[0],
         "duration_seconds": duration,
     }
+    _inner_counts = _inner_tool_counts(tool_call_log)
+    if _inner_counts:
+        # Per-tool breakdown of what the script called. Informational — for the
+        # model, the activity feed, and debugging. NOT the accounting record:
+        # that is `session_tool_usage` (see _flush_inner_tool_usage), because a
+        # large result can be offloaded to a file and replaced with a preview
+        # (tools/tool_result_storage.py), which would silently drop this field.
+        result["inner_tool_calls"] = _inner_counts
     result.update(stdout_metadata)
 
     if status == "timeout":
@@ -1589,6 +1663,11 @@ def execute_code(
             "tool_calls_made": tool_call_counter[0],
             "duration_seconds": duration,
         }
+        _inner_counts = _inner_tool_counts(tool_call_log)
+        if _inner_counts:
+            # Informational breakdown; see the remote path for why this is not
+            # the accounting record.
+            result["inner_tool_calls"] = _inner_counts
         result.update(stdout_metadata)
 
         if status == "timeout":
@@ -1635,6 +1714,10 @@ def execute_code(
         }, ensure_ascii=False)
 
     finally:
+        # Account the calls the script made, on every exit path (success,
+        # timeout, interrupt, crash) — see _flush_inner_tool_usage.
+        _flush_inner_tool_usage(tool_call_log)
+
         # Cleanup temp dir and socket
         if server_sock is not None:
             try:
