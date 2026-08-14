@@ -1245,6 +1245,27 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
 );
 
+-- Tool executions that are NOT represented by a `role='tool'` message row.
+-- Today that means exactly one thing: calls an `execute_code` script made over
+-- the sandbox RPC transport. Those are real executions (they hit the same
+-- dispatcher, the same providers, and the same paid APIs as a normal tool call)
+-- but by design their results never enter the conversation, so counting
+-- `messages` alone under-reports them. Anything that meters or audits tool
+-- USAGE — as opposed to reading conversation history — must read this table in
+-- addition to `messages`, or a script's calls are invisible and unbilled.
+-- Aggregate counters, not per-call rows: same shape as `session_model_usage`,
+-- which is the precedent for per-session accounting that is deliberately not
+-- transcript. `source` names what produced the calls ('execute_code').
+CREATE TABLE IF NOT EXISTS session_tool_usage (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    tool_name TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    call_count INTEGER NOT NULL DEFAULT 0,
+    first_seen REAL,
+    last_seen REAL,
+    PRIMARY KEY (session_id, tool_name, source)
+);
+
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -1294,6 +1315,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestam
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+CREATE INDEX IF NOT EXISTS idx_session_tool_usage_session ON session_tool_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
 """
@@ -5311,6 +5333,87 @@ class SessionDB:
                 task=task,
             )
         self._execute_write(_do)
+
+    def record_tool_usage(
+        self,
+        session_id: str,
+        counts: Dict[str, int],
+        *,
+        source: str,
+    ) -> None:
+        """Accumulate off-transcript tool executions into ``session_tool_usage``.
+
+        *counts* maps tool name → how many times it executed. Written as one
+        upsert per distinct tool name inside a single write transaction, so a
+        script that made 120 calls across 3 tools costs 3 statements, not 120.
+
+        The caller is whatever executed tools WITHOUT leaving a ``role='tool'``
+        message behind — today only the ``execute_code`` sandbox RPC transport
+        (``source='execute_code'``). Anything metering tool usage reads the
+        union of this table and the ``messages`` rows; see the table comment in
+        SCHEMA_SQL for why both are needed.
+
+        Best-effort by contract, like :meth:`record_auxiliary_usage`: accounting
+        must never fail the tool call it is accounting for. Callers log and move
+        on. Note the asymmetry that makes a swallowed failure worth logging
+        loudly upstream: an unrecorded call is an unbilled call.
+        """
+        if not session_id or not counts:
+            return
+        # FK on session_tool_usage.session_id → sessions.id: ensure the row
+        # exists first, same guard record_auxiliary_usage uses (create_session()
+        # can lose to concurrent SQLite locking).
+        self._insert_session_row(session_id, "unknown")
+        now = time.time()
+        rows = [
+            (session_id, str(name), source or "", int(count), now, now)
+            for name, count in counts.items()
+            if name and int(count or 0) > 0
+        ]
+        if not rows:
+            return
+
+        def _do(conn):
+            conn.executemany(
+                """INSERT INTO session_tool_usage (
+                       session_id, tool_name, source, call_count, first_seen, last_seen
+                   ) VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id, tool_name, source)
+                   DO UPDATE SET
+                       call_count = call_count + excluded.call_count,
+                       last_seen = excluded.last_seen""",
+                rows,
+            )
+
+        self._execute_write(_do)
+
+    def read_tool_usage(
+        self,
+        session_id: str,
+        *,
+        source: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """Return ``{tool_name: call_count}`` recorded for *session_id*.
+
+        Scoped to one ``source`` when given, else summed across sources. Read
+        path for tests and for anything auditing a single session's off-
+        transcript tool usage; the Omnio proxy reads the table directly (it
+        queries the whole session tree, which this single-session helper does
+        not do).
+        """
+        if not session_id:
+            return {}
+        sql = (
+            "SELECT tool_name, SUM(call_count) FROM session_tool_usage "
+            "WHERE session_id = ?"
+        )
+        params: List[Any] = [session_id]
+        if source is not None:
+            sql += " AND source = ?"
+            params.append(source)
+        sql += " GROUP BY tool_name"
+        cursor = self._conn.execute(sql, params)
+        return {str(name): int(count or 0) for name, count in cursor.fetchall()}
 
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
