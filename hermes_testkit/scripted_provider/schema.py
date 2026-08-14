@@ -44,6 +44,11 @@ _RESPONSE_KINDS = frozenset({
     "hold",
 })
 _HOLD_RESPONSE_KINDS = frozenset({"text", "tool_calls", "http_error"})
+_USAGE_FIELDS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+)
 _MODEL_METADATA_FIELDS = frozenset({"pricing"})
 _PRICING_FIELDS = frozenset({
     "prompt",
@@ -192,6 +197,46 @@ def _validate_status(value: Any, *, where: str) -> int:
     return value
 
 
+def _validate_usage(value: Any, *, where: str = "response.usage") -> dict[str, int]:
+    """Validate an explicit OpenAI completion-usage override.
+
+    The scripted provider normally derives usage from the request and response
+    text.  A conformance fixture can instead provide the exact token counts it
+    wants Hermes to observe.  Keep this contract deliberately narrower than a
+    general OpenAI usage object: all three fields are required, values are
+    JSON integers (not booleans/floats), and the total is an arithmetic
+    invariant rather than another independently chosen value.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ScriptValidationError(f"{where} must be an object")
+    keys = set(value)
+    expected = set(_USAGE_FIELDS)
+    unknown = keys - expected
+    missing = expected - keys
+    if unknown:
+        fields = ", ".join(sorted(str(field) for field in unknown))
+        raise ScriptValidationError(f"{where} has unsupported field(s): {fields}")
+    if missing:
+        fields = ", ".join(field for field in _USAGE_FIELDS if field in missing)
+        raise ScriptValidationError(f"{where} is missing field(s): {fields}")
+    result: dict[str, int] = {}
+    for field_name in _USAGE_FIELDS:
+        amount = value[field_name]
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+            raise ScriptValidationError(
+                f"{where}.{field_name} must be a non-negative integer"
+            )
+        result[field_name] = amount
+    if result["total_tokens"] != (
+        result["prompt_tokens"] + result["completion_tokens"]
+    ):
+        raise ScriptValidationError(
+            f"{where}.total_tokens must equal prompt_tokens + completion_tokens"
+        )
+    return result
+
+
 def _validate_timeout(value: Any, *, where: str) -> float | None:
     if value is None:
         return None
@@ -302,6 +347,10 @@ class ResponseStep:
     # An explicit tuple (including an empty tuple) prescribes the exact SSE
     # text-delta boundaries for a text response.
     chunks: tuple[str, ...] | None = None
+    # ``None`` keeps the backwards-compatible derived usage calculation. An
+    # explicit mapping is emitted verbatim (after strict validation) on the
+    # final streamed/non-streamed response.
+    usage: Mapping[str, int] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, str) or self.kind not in _RESPONSE_KINDS:
@@ -342,6 +391,9 @@ class ResponseStep:
             raise ScriptValidationError("response.before_headers must be boolean")
         if not isinstance(self.hold_response_kind, str):
             raise ScriptValidationError("response.response.type must be a string")
+        if self.usage is not None:
+            validated_usage = _validate_usage(self.usage)
+            object.__setattr__(self, "usage", MappingProxyType(validated_usage))
         timeout = _validate_timeout(
             self.hold_timeout_seconds, where="response.timeout_seconds"
         )
@@ -373,6 +425,14 @@ class ResponseStep:
             if not self.text:
                 object.__setattr__(self, "text", concatenated)
 
+        if self.usage is not None and self.kind in {
+            "http_error",
+            "connection_close",
+        }:
+            raise ScriptValidationError(
+                f"response.usage cannot be emitted for {self.kind} responses"
+            )
+
         if self.kind == "hold":
             if self.close_after_chunks or not self.close_before_headers:
                 raise ScriptValidationError(
@@ -393,6 +453,10 @@ class ResponseStep:
                     "response.response.tool_calls are only valid for tool_calls"
                 )
             if self.hold_response_kind == "http_error":
+                if self.usage is not None:
+                    raise ScriptValidationError(
+                        "response.usage cannot be emitted for held http_error responses"
+                    )
                 if self.chunks is not None:
                     raise ScriptValidationError(
                         "response.chunks is only supported for held text responses"
@@ -538,12 +602,16 @@ class Script:
                 response["text"] = step.text
                 if step.chunks is not None:
                     response["chunks"] = list(step.chunks)
+                if step.usage is not None:
+                    response["usage"] = dict(step.usage)
             elif step.kind == "tool_calls":
                 if step.text:
                     response["text"] = step.text
                 response["tool_calls"] = [
                     _tool_call_as_dict(call) for call in step.tool_calls
                 ]
+                if step.usage is not None:
+                    response["usage"] = dict(step.usage)
             elif step.kind == "http_error":
                 response["status"] = step.status
                 if step.error is not None:
@@ -558,6 +626,8 @@ class Script:
                     inner["text"] = step.text
                 if step.hold_response_kind == "text" and step.chunks is not None:
                     inner["chunks"] = list(step.chunks)
+                if step.usage is not None:
+                    inner["usage"] = dict(step.usage)
                 if step.hold_response_kind == "tool_calls":
                     inner["tool_calls"] = [
                         _tool_call_as_dict(call) for call in step.tool_calls
@@ -644,6 +714,16 @@ def _parse_text_content(
     return concatenated, chunks
 
 
+def _parse_response_usage(
+    response: Mapping[str, Any], *, where: str
+) -> dict[str, int] | None:
+    """Parse a response usage override without conflating omission and null."""
+
+    if "usage" not in response:
+        return None
+    return _validate_usage(response["usage"], where=f"{where}.response.usage")
+
+
 def _parse_step(value: Any, index: int) -> ResponseStep:
     where = f"steps[{index}]"
     item = _as_mapping(value, where=where)
@@ -665,7 +745,13 @@ def _parse_step(value: Any, index: int) -> ResponseStep:
 
     if kind == "text":
         text, chunks = _parse_text_content(response, where=where)
-        return ResponseStep(kind=kind, request=request, text=text, chunks=chunks)
+        return ResponseStep(
+            kind=kind,
+            request=request,
+            text=text,
+            chunks=chunks,
+            usage=_parse_response_usage(response, where=where),
+        )
 
     if kind == "tool_calls":
         if "chunks" in response:
@@ -688,7 +774,13 @@ def _parse_step(value: Any, index: int) -> ResponseStep:
         text = response.get("text", response.get("content", ""))
         if not isinstance(text, str):
             raise ScriptValidationError(f"{where}.response.text must be a string")
-        return ResponseStep(kind=kind, request=request, text=text, tool_calls=parsed)
+        return ResponseStep(
+            kind=kind,
+            request=request,
+            text=text,
+            tool_calls=parsed,
+            usage=_parse_response_usage(response, where=where),
+        )
 
     if kind == "http_error":
         if "chunks" in response:
@@ -702,7 +794,13 @@ def _parse_step(value: Any, index: int) -> ResponseStep:
         error = response.get("error", response.get("body"))
         if error is not None and not isinstance(error, Mapping):
             raise ScriptValidationError(f"{where}.response.error must be an object")
-        return ResponseStep(kind=kind, request=request, status=status, error=error)
+        return ResponseStep(
+            kind=kind,
+            request=request,
+            status=status,
+            error=error,
+            usage=_parse_response_usage(response, where=where),
+        )
 
     if kind == "connection_close":
         before_headers = response.get(
@@ -726,6 +824,7 @@ def _parse_step(value: Any, index: int) -> ResponseStep:
             text=text,
             close_before_headers=before_headers,
             close_after_chunks=chunks,
+            usage=_parse_response_usage(response, where=where),
         )
 
     if kind == "hold":
@@ -744,6 +843,14 @@ def _parse_step(value: Any, index: int) -> ResponseStep:
                 inner["text"] = response["text"]
             if "chunks" in response:
                 inner["chunks"] = response["chunks"]
+        if "usage" in response:
+            if isinstance(inner, Mapping) and "usage" in inner:
+                raise ScriptValidationError(
+                    f"{where}.response.usage must be specified once"
+                )
+            if isinstance(inner, Mapping):
+                inner = dict(inner)
+                inner["usage"] = response["usage"]
         inner_item = {"response": inner}
         inner_step = _parse_step(inner_item, index)
         if inner_step.kind in {"hold", "connection_close"}:
@@ -768,6 +875,7 @@ def _parse_step(value: Any, index: int) -> ResponseStep:
             hold_timeout_seconds=timeout,
             hold_response_kind=inner_step.kind,
             chunks=inner_step.chunks,
+            usage=inner_step.usage,
         )
 
     raise ScriptValidationError(

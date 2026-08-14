@@ -796,6 +796,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 text=step.text,
                 tool_calls=step.tool_calls,
                 chunks=step.chunks,
+                usage=step.usage,
             )
         if stream:
             self._send_stream(
@@ -1265,6 +1266,12 @@ def _tool_call_payload(
 
 
 def _usage(request: Mapping[str, Any], step: ResponseStep) -> dict[str, int]:
+    if step.usage is not None:
+        # ``ResponseStep`` freezes overrides so a caller cannot mutate an
+        # armed script while a request is in flight.  Materialise a regular
+        # dict at the wire boundary because stdlib ``json`` intentionally does
+        # not encode MappingProxyType.
+        return dict(step.usage)
     messages = request.get("messages", [])
     prompt_serialized = json.dumps(
         messages,

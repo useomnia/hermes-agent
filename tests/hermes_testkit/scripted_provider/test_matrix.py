@@ -348,6 +348,27 @@ def test_inference_api_key_auth_is_optional_and_redacted_from_captures() -> None
         assert "x-api-key" not in capture.get("headers", {})
 
 
+def test_usage_override_requires_inference_auth_and_is_not_leaked_on_401() -> None:
+    usage = {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+    script = _script({"response": {"type": "text", "text": "secret", "usage": usage}})
+    with ScriptedProviderServer(
+        script,
+        control_token="matrix-token",
+        api_key="inference-secret",
+    ) as server:
+        status, body, _ = _chat(server, {"model": "matrix-model", "messages": []})
+        assert status == 401
+        assert "prompt_tokens" not in json.dumps(body)
+        assert server.state["step_index"] == 0
+        status, body, _ = _chat(
+            server,
+            {"model": "matrix-model", "messages": []},
+            api_key="inference-secret",
+        )
+        assert status == 200
+        assert body["usage"] == usage
+
+
 def test_inference_api_key_can_be_configured_by_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -424,6 +445,94 @@ def test_explicit_empty_chunks_keep_empty_non_streaming_content() -> None:
         status, body, _ = _chat(server, {"model": "matrix-model", "messages": []})
         assert status == 200
         assert body["choices"][0]["message"]["content"] == ""
+
+
+def test_explicit_usage_override_is_used_for_non_streaming_responses() -> None:
+    usage = {"prompt_tokens": 17, "completion_tokens": 5, "total_tokens": 22}
+    with ScriptedProviderServer(
+        _script({"response": {"type": "text", "text": "ignored", "usage": usage}}),
+        control_token="matrix-token",
+    ) as server:
+        status, body, _ = _chat(
+            server,
+            {
+                "model": "matrix-model",
+                "messages": [{"role": "user", "content": "a very long prompt"}],
+            },
+        )
+        assert status == 200
+        assert body["usage"] == usage
+
+
+def test_explicit_usage_override_is_only_on_stream_final_chunk() -> None:
+    usage = {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13}
+    with ScriptedProviderServer(
+        _script({"response": {"type": "text", "text": "streamed", "usage": usage}}),
+        control_token="matrix-token",
+    ) as server:
+        status, body, _ = _chat(
+            server,
+            {"model": "matrix-model", "stream": True, "messages": []},
+        )
+        assert status == 200
+        assert isinstance(body, str)
+        payloads = _sse_payloads(body)
+        usage_payloads = [
+            payload["usage"] for payload in payloads if "usage" in payload
+        ]
+        assert usage_payloads == [usage]
+        assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_explicit_usage_override_survives_a_released_hold(stream: bool) -> None:
+    usage = {"prompt_tokens": 3, "completion_tokens": 8, "total_tokens": 11}
+    script = _script({
+        "response": {
+            "type": "hold",
+            "id": "usage-hold",
+            "response": {"type": "text", "text": "held", "usage": usage},
+        }
+    })
+    with ScriptedProviderServer(script, control_token="matrix-token") as server:
+        result: list[tuple[int, dict[str, Any] | str, dict[str, str]]] = []
+
+        def request() -> None:
+            result.append(
+                _chat(
+                    server,
+                    {"model": "matrix-model", "stream": stream, "messages": []},
+                    timeout=3,
+                )
+            )
+
+        worker = threading.Thread(target=request)
+        worker.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not server.state["held"]:
+            time.sleep(0.01)
+        assert server.state["held"][0]["id"] == "usage-hold"
+        status, _, _ = _request(
+            server,
+            "POST",
+            "/__control/release",
+            {"id": "usage-hold"},
+            token="matrix-token",
+        )
+        assert status == 200
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert result[0][0] == 200
+        body = result[0][1]
+        if stream:
+            assert isinstance(body, str)
+            payloads = _sse_payloads(body)
+            assert [payload["usage"] for payload in payloads if "usage" in payload] == [
+                usage
+            ]
+        else:
+            assert isinstance(body, dict)
+            assert body["usage"] == usage
 
 
 def test_text_streaming_is_sse_and_terminates_with_done() -> None:
@@ -540,9 +649,10 @@ def test_stream_headers_are_suppressed_when_reset_wins_header_gate(
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_tool_calls_are_openai_compatible_for_both_transports(stream: bool) -> None:
-    with ScriptedProviderServer(
-        _script(_tool("lookup", {"id": 7})), control_token="matrix-token"
-    ) as server:
+    usage = {"prompt_tokens": 6, "completion_tokens": 10, "total_tokens": 16}
+    script = _script(_tool("lookup", {"id": 7}))
+    script["steps"][0]["response"]["usage"] = usage
+    with ScriptedProviderServer(script, control_token="matrix-token") as server:
         status, body, _ = _chat(
             server, {"model": "matrix-model", "stream": stream, "messages": []}
         )
@@ -552,11 +662,16 @@ def test_tool_calls_are_openai_compatible_for_both_transports(stream: bool) -> N
             assert '"name":"lookup"' in body
             assert '"arguments":"{\\"id\\":7}"' in body
             assert '"finish_reason":"tool_calls"' in body
+            payloads = _sse_payloads(body)
+            assert [payload["usage"] for payload in payloads if "usage" in payload] == [
+                usage
+            ]
         else:
             call = body["choices"][0]["message"]["tool_calls"][0]
             assert call["type"] == "function"
             assert call["function"] == {"name": "lookup", "arguments": '{"id":7}'}
             assert body["choices"][0]["finish_reason"] == "tool_calls"
+            assert body["usage"] == usage
 
 
 def test_http_error_step_is_returned_without_provider_fallback() -> None:
@@ -907,6 +1022,77 @@ def test_model_metadata_pricing_is_strict_and_round_trips_exact_strings() -> Non
     unknown_model["model_metadata"] = {"not-listed": {"pricing": {"prompt": "0.1"}}}
     with pytest.raises(ScriptValidationError, match="listed in script.models"):
         parse_script(unknown_model)
+
+
+def test_response_usage_is_strict_and_round_trips_through_holds() -> None:
+    usage = {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19}
+    original = _script(
+        {"response": {"type": "text", "text": "direct", "usage": usage}},
+        {
+            "response": {
+                "type": "hold",
+                "id": "usage-roundtrip",
+                "response": {
+                    "type": "tool_calls",
+                    "tool_calls": [_tool()["response"]["tool_calls"][0]],
+                    "usage": usage,
+                },
+            }
+        },
+    )
+    parsed = parse_script(original)
+    assert parsed.steps[0].usage == usage
+    assert parsed.steps[1].usage == usage
+    assert parsed.as_dict()["steps"][0]["response"]["usage"] == usage
+    assert parsed.as_dict()["steps"][1]["response"]["response"]["usage"] == usage
+    assert parse_script(parsed.as_dict()).as_dict() == parsed.as_dict()
+
+    invalid_values: list[Any] = [
+        None,
+        {},
+        {"prompt_tokens": 1, "completion_tokens": 2},
+        {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3, "extra": 0},
+        {"prompt_tokens": True, "completion_tokens": 2, "total_tokens": 3},
+        {"prompt_tokens": 1.0, "completion_tokens": 2, "total_tokens": 3},
+        {"prompt_tokens": -1, "completion_tokens": 2, "total_tokens": 1},
+        {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 4},
+    ]
+    for invalid in invalid_values:
+        with pytest.raises(ScriptValidationError, match="usage"):
+            parse_script(_script({"response": {"type": "text", "usage": invalid}}))
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "type": "http_error",
+            "status": 429,
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        },
+        {
+            "type": "connection_close",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        },
+        {
+            "type": "hold",
+            "response": {
+                "type": "http_error",
+                "status": 503,
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "total_tokens": 3,
+                },
+            },
+        },
+    ],
+)
+def test_usage_is_rejected_when_the_response_kind_cannot_emit_it(
+    response: dict[str, Any],
+) -> None:
+    with pytest.raises(ScriptValidationError, match="usage"):
+        parse_script(_script({"response": response}))
 
 
 def test_script_as_dict_round_trips_every_response_variant() -> None:

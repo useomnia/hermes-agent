@@ -20,6 +20,31 @@ prescribe exact SSE delta boundaries. Empty and Unicode strings are valid;
 non-streaming content, usage, and held text use the concatenated value. Chunks
 are rejected on tool-call, error, and connection-close responses.
 
+Text and tool-call responses may provide an optional strict `usage` override.
+It is emitted on the non-streaming response and on the final streamed chunk;
+held text/tool-call responses preserve it until release:
+
+```json
+{
+  "response": {
+    "type": "text",
+    "text": "fixture response",
+    "usage": {
+      "prompt_tokens": 17,
+      "completion_tokens": 5,
+      "total_tokens": 22
+    }
+  }
+}
+```
+
+All three fields are required non-negative JSON integers and
+`total_tokens` must equal `prompt_tokens + completion_tokens`. Unknown or
+missing fields, booleans, floats, negative values, and `null` are rejected.
+Usage is rejected on HTTP-error and connection-close responses because those
+responses never emit a completion usage object. Omitting `usage` retains the
+legacy deterministic token derivation exactly.
+
 Scripts may also provide optional per-model pricing metadata. The map keys must
 be model IDs listed by `models` (or the primary `model` when `models` is
 omitted), and pricing values are exact, finite, non-negative per-token decimal

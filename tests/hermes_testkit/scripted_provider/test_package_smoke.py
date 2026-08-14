@@ -93,3 +93,20 @@ def test_wheel_artifact_exposes_scripted_provider_cli(tmp_path: Path) -> None:
     )
     assert cli.returncode == 0, cli.stderr
     assert "--script" in cli.stdout
+
+    packaged_schema = subprocess.run(
+        [
+            str(venv_python),
+            "-c",
+            "from hermes_testkit.scripted_provider import parse_script; "
+            "s=parse_script({'steps':[{'response':{'type':'text','text':'ok',"
+            "'usage':{'prompt_tokens':1,'completion_tokens':2,'total_tokens':3}}}]}); "
+            "assert s.steps[0].usage == {'prompt_tokens':1,'completion_tokens':2,'total_tokens':3}",
+        ],
+        cwd=tmp_path,
+        env=isolated_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert packaged_schema.returncode == 0, packaged_schema.stderr
