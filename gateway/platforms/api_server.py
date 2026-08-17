@@ -8592,15 +8592,28 @@ class APIServerAdapter(BasePlatformAdapter):
             await _write_close_comments()
             return response
 
-        cursor = after
+        # Normalize the cursor to the floor at attach time so the loop below
+        # never re-triggers the mid-stream jump guard on its first
+        # iteration purely because of the attach-time truncation this
+        # request already declared via X-Omnio-Replay-From above.
+        cursor = max(after, retained_floor)
         try:
             while True:
-                # frames_after is floor-aware: a cursor below the floor (its
-                # frames evicted) is served from the floor forward rather
-                # than raising, which is why this loop never needs a special
-                # case for eviction happening mid-stream.
-                batch = retained.frames_after(cursor).frames
-                for stored in batch:
+                result = retained.frames_after(cursor)
+                if result.floor > cursor:
+                    # The ring evicted frames past this attachment's cursor
+                    # *after* it connected — an undeclared sequence jump.
+                    # X-Omnio-Replay-From is only ever stamped at attach
+                    # time, and both consumers (the proxy's projector, the
+                    # browser reducer) only accept a jump declared that way;
+                    # silently resuming from the new floor here would hand
+                    # them a gap they never agreed to. Close cleanly instead
+                    # — the client reattaches with its cursor, the attach
+                    # path above stamps the fresh floor, and the normal
+                    # declared-jump handling takes over from there.
+                    await _write_close_comments()
+                    break
+                for stored in result.frames:
                     await response.write(stored.frame)
                     cursor = stored.sequence_number
 

@@ -923,6 +923,12 @@ async def test_ring_evicts_oldest_frames_instead_of_failing_the_run() -> None:
         with patch.object(adapter, "_create_agent", side_effect=build_agent):
             started = await client.post("/v1/runs", json={"input": "overflow"})
             run_id = (await started.json())["run_id"]
+            # Attach only once the run is fully terminal: a still-live run
+            # keeps evicting concurrently with this GET, and a consumer that
+            # falls behind that gets legitimately closed mid-stream (see
+            # test_eviction_past_attached_cursor_closes_stream_for_reattach)
+            # — that race isn't what this test is about.
+            await _wait_for_terminal(adapter, run_id)
             events_response = await client.get(f"/v1/runs/{run_id}/events")
             body = await events_response.text()
 
@@ -939,11 +945,7 @@ async def test_ring_evicts_oldest_frames_instead_of_failing_the_run() -> None:
     assert adapter._run_statuses[run_id]["status"] == "completed"
     assert built_agent is not None
     built_agent.interrupt.assert_not_called()
-    # The header reflects the floor at connect time; the run kept evicting
-    # while this request streamed, so it only has to be a positive lower
-    # bound on the log's final floor, not an exact match.
-    replay_from = int(events_response.headers["X-Omnio-Replay-From"])
-    assert 0 < replay_from <= log.floor
+    assert events_response.headers["X-Omnio-Replay-From"] == str(log.floor)
 
 
 @pytest.mark.asyncio
@@ -1588,6 +1590,109 @@ async def test_replay_from_header_only_stamped_when_cursor_truncated() -> None:
     assert truncated.headers["X-Omnio-Replay-From"] == str(log.floor)
     assert caught_up.status == 200
     assert "X-Omnio-Replay-From" not in caught_up.headers
+
+
+@pytest.mark.asyncio
+async def test_attached_consumer_above_floor_streams_normally_through_unrelated_eviction() -> (
+    None
+):
+    """Eviction of frames an attached consumer never asked for (older than
+    its cursor) must not disturb its stream. Only a jump *past* its cursor
+    should ever close it — see the sibling test below.
+    """
+    adapter = _make_adapter()
+    store = _install_log_store(adapter, clock=_Clock(), budget=4_096)
+    run_id = "run_" + "g" * 32
+    store.create_run(run_id, run_id)
+
+    def pad(size: int) -> Dict[str, Any]:
+        return {"type": "response.omnio.warmup", "pad": "x" * size}
+
+    for _ in range(10):
+        store.append_payload(run_id, pad(50))
+    log = store.get_log(run_id)
+    assert log is not None
+    cursor = log.high_water  # attach right at the current tip
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        response = await client.get(f"/v1/runs/{run_id}/events?after={cursor}")
+        assert response.status == 200
+        assert "X-Omnio-Replay-From" not in response.headers
+
+        # A couple more frames — small enough that any eviction they cause
+        # only ever removes frames at or before the attached cursor, never
+        # past it.
+        store.append_payload(run_id, pad(50))
+        store.append_payload(run_id, pad(50))
+        assert log.floor <= cursor, "eviction must not have reached the attached cursor"
+
+        first = await _read_one_sse_event(response)
+        second = await _read_one_sse_event(response)
+        assert [first["sequence_number"], second["sequence_number"]] == [
+            cursor + 1,
+            cursor + 2,
+        ]
+
+        store.mark_terminal(run_id, "completed")
+        # Draining to the natural end confirms the handler reached its
+        # normal terminal close path, not the mid-stream jump-guard close.
+        tail = await asyncio.wait_for(response.content.read(), 2.0)
+
+    assert b"data: " not in tail
+    assert b"stream closed" in tail
+
+
+@pytest.mark.asyncio
+async def test_eviction_past_attached_cursor_closes_stream_for_reattach() -> None:
+    """If the ring evicts past a slow, already-attached consumer's cursor,
+    its stream must close cleanly instead of silently resuming from the new
+    floor — an undeclared sequence jump neither the proxy's projector nor
+    the browser reducer will accept. The declared-jump contract only exists
+    at attach time (X-Omnio-Replay-From), so the client must reattach to get
+    a correctly-stamped floor rather than be handed one mid-stream.
+    """
+    adapter = _make_adapter()
+    store = _install_log_store(adapter, clock=_Clock(), budget=4_096)
+    run_id = "run_" + "h" * 32
+    store.create_run(run_id, run_id)
+
+    def pad(size: int) -> Dict[str, Any]:
+        return {"type": "response.omnio.warmup", "pad": "x" * size}
+
+    for _ in range(5):
+        store.append_payload(run_id, pad(50))
+    log = store.get_log(run_id)
+    assert log is not None
+    cursor = log.high_water
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        response = await client.get(f"/v1/runs/{run_id}/events?after={cursor}")
+        assert response.status == 200
+        assert "X-Omnio-Replay-From" not in response.headers
+
+        # Blow well past the attached cursor while this consumer never
+        # reads — the ring doesn't know or care that anyone is attached.
+        for _ in range(80):
+            store.append_payload(run_id, pad(50))
+        assert log.floor > cursor, "the ring must have evicted past the attached cursor"
+
+        # The stream must close cleanly — no data frames, just the sentinel
+        # close comment — rather than silently jump this consumer forward.
+        tail = await asyncio.wait_for(response.content.read(), 2.0)
+        assert b"data: " not in tail
+        assert b"stream closed" in tail
+
+        reattached_count = log.high_water - log.floor
+        reattached = await client.get(f"/v1/runs/{run_id}/events?after={cursor}")
+        assert reattached.headers["X-Omnio-Replay-From"] == str(log.floor)
+        reattached_events = [
+            await _read_one_sse_event(reattached) for _ in range(reattached_count)
+        ]
+        reattached.close()
+
+    assert [event["sequence_number"] for event in reattached_events] == list(
+        range(log.floor + 1, log.high_water + 1)
+    )
 
 
 def test_terminal_frame_always_appendable_under_a_full_ring() -> None:
