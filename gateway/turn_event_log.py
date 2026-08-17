@@ -5,6 +5,17 @@ wire.  Replays resend those bytes; they never rebuild an event from mutable run
 state.  Run IDs are process-lifetime identities and MUST NEVER be reused, even
 after their retained log has been replaced by a tombstone.
 
+Each run's log is a bounded ring, not a hard cap: appending past the budget
+evicts the oldest retained frames until the new frame fits, and the log NEVER
+fails or blocks a run because of this. Eviction advances the log's ``floor``
+— the highest sequence number ever evicted — which is reported back to
+callers of ``frames_after`` so a stale cursor (one whose frames were evicted)
+is served from the floor forward instead of raising. This is the ring's whole
+point: a production incident once lost a finished turn's last step because
+hitting the old fixed cap killed the run outright. Terminal-retention expiry
+(a run's tombstone falling out of the bounded tombstone cache) is a separate,
+unrelated mechanism and still raises ``CursorExpiredError``.
+
 Hermes run IDs are ``run_<uuid hex>``. Their wire response IDs are formed by
 replacing that prefix with ``resp_`` while retaining the exact UUID hex. This
 prefix substitution is the one documented, bijective identity mapping; Omnio's
@@ -19,18 +30,37 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional
 
 from hermes_constants import MAX_TODO_ITEMS
 
 
+logger = logging.getLogger(__name__)
+
 TURN_EVENT_LOG_API_VERSION = 2
-DEFAULT_RUN_LOG_CAP_BYTES = 8 * 1024 * 1024
+# The log is a bounded ring, not a hard cap: appending past this budget evicts
+# the oldest frames rather than failing the run (see the module docstring and
+# `_make_room`). 32 MiB comfortably covers the coalesced-delta turns that used
+# to amplify past the old 8 MiB cap (see PR history on DELTA_COALESCE_BYTES).
+DEFAULT_RUN_LOG_RING_BUDGET_BYTES = 32 * 1024 * 1024
 DEFAULT_TERMINAL_RETENTION_SECONDS = 5 * 60
 DEFAULT_TOMBSTONE_LIMIT = 1000
 TERMINAL_FRAME_RESERVE_BYTES = 2048
+
+# Occupancy ratios (of the ring budget) at which a run's crossing gets a
+# structured log line. One-shot per run — unlike the log_pressure hint below,
+# these do not need hysteresis; they exist purely for after-the-fact triage.
+LOG_OCCUPANCY_LOG_MILESTONES = (0.9, 0.75, 0.5)
+
+# Hysteresis band for the in-band `response.omnio.log_pressure` hint: fires
+# once occupancy crosses the trigger ratio, then re-arms only once occupancy
+# has fallen back under the (lower) rearm ratio. This keeps the proxy from
+# getting a hint on every single frame while occupancy hovers near the top.
+LOG_PRESSURE_TRIGGER_RATIO = 0.70
+LOG_PRESSURE_REARM_RATIO = 0.50
 
 # A raw per-provider-delta frame costs ~167 bytes of envelope on top of the
 # text itself, which is how a 216 KiB turn amplified to 8 MiB and hit the cap.
@@ -64,6 +94,10 @@ OMNIO_EXTENSION_EVENT_TYPES = frozenset({
     "response.omnio.approval_request",
     "response.omnio.approval_responded",
     "response.omnio.steer_missed",
+    # Backpressure hint: the ring has crossed LOG_PRESSURE_TRIGGER_RATIO of
+    # its budget. Advisory only — a checkpoint-now hint for the proxy, not a
+    # failure signal. See TurnEventEmitter._maybe_emit_log_pressure.
+    "response.omnio.log_pressure",
 })
 
 _TOOL_EXTENSION_EVENTS = {
@@ -114,6 +148,20 @@ class RunTombstone:
     failure_reason: Optional[str]
 
 
+class FramesAfterResult(NamedTuple):
+    """Result of a floor-aware ``frames_after`` lookup.
+
+    ``floor`` is the log's current highest-evicted sequence number (0 if
+    nothing has been evicted yet). A caller whose requested cursor was below
+    ``floor`` was truncated: it is served frames from the floor forward, and
+    should stamp that fact (``X-Omnio-Replay-From``) rather than assume it
+    received a gapless replay from its original cursor.
+    """
+
+    floor: int
+    frames: List[StoredTurnEvent]
+
+
 @dataclass
 class RunEventLog:
     run_id: str
@@ -123,24 +171,45 @@ class RunEventLog:
     status: str = "queued"
     completed_at: Optional[float] = None
     failure_reason: Optional[str] = None
+    # Bytes currently retained in `events` (shrinks on eviction).
     wire_bytes: int = 0
-    cap_exceeded: bool = False
+    # Bytes ever appended to this run, retained or not (never shrinks).
+    wire_bytes_total: int = 0
+    # Highest sequence number ever evicted; 0 while nothing has been.
+    floor: int = 0
+    # Monotonic counter of sequence numbers ever minted. Survives eviction,
+    # unlike `len(events)` which shrinks as frames fall off the ring.
+    high_water: int = 0
+    # Hysteresis latch for the `response.omnio.log_pressure` hint: True means
+    # the next crossing of LOG_PRESSURE_TRIGGER_RATIO should fire.
+    log_pressure_armed: bool = True
+    # Occupancy-ratio milestones already logged for this run (one-shot).
+    logged_occupancy_milestones: set[float] = field(default_factory=set, repr=False)
     events: List[StoredTurnEvent] = field(default_factory=list)
     _waiters: set[asyncio.Future] = field(default_factory=set, repr=False)
 
     @property
     def sequence_number_high_water(self) -> int:
-        return len(self.events)
+        return self.high_water
 
     @property
     def terminal(self) -> bool:
         return self.completed_at is not None
 
-    def frames_after(self, after: int) -> List[StoredTurnEvent]:
-        # Live logs never advance their floor, so sequence N is at index N-1.
-        if after < 0:
-            return []
-        return list(self.events[after:])
+    def frames_after(self, after: int) -> FramesAfterResult:
+        """Frames strictly after ``after``, floor-aware.
+
+        A cursor below the floor is clamped to it rather than raising: the
+        ring evicted those frames, so the caller is served from the floor
+        forward. Compare the returned ``floor`` against the requested
+        ``after`` to detect that truncation (see FramesAfterResult).
+        """
+        if not self.events:
+            return FramesAfterResult(self.floor, [])
+        effective_after = max(after, self.floor)
+        start_seq = self.events[0].sequence_number
+        index = max(0, effective_after - start_seq + 1)
+        return FramesAfterResult(self.floor, list(self.events[index:]))
 
     def wake_waiters(self) -> None:
         waiters = tuple(self._waiters)
@@ -173,16 +242,14 @@ class TurnEventLogStore:
         self,
         *,
         clock: Callable[[], float] = time.time,
-        run_log_cap_bytes: int = DEFAULT_RUN_LOG_CAP_BYTES,
+        run_log_ring_budget_bytes: int = DEFAULT_RUN_LOG_RING_BUDGET_BYTES,
         terminal_retention_seconds: float = DEFAULT_TERMINAL_RETENTION_SECONDS,
         tombstone_limit: int = DEFAULT_TOMBSTONE_LIMIT,
-        on_cap_exceeded: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._clock = clock
-        self.run_log_cap_bytes = run_log_cap_bytes
+        self.run_log_ring_budget_bytes = run_log_ring_budget_bytes
         self.terminal_retention_seconds = terminal_retention_seconds
         self.tombstone_limit = max(0, tombstone_limit)
-        self.on_cap_exceeded = on_cap_exceeded
         self._logs: Dict[str, RunEventLog] = {}
         self._tombstones: Dict[str, RunTombstone] = {}
         # Kept for the process lifetime: a run ID is an identity, not a reusable
@@ -243,14 +310,54 @@ class TurnEventLogStore:
             frame=b"data: " + serialized + b"\n\n",
         )
 
-    def _mark_cap_exceeded(self, log: RunEventLog) -> None:
-        if log.cap_exceeded:
+    def _make_room(self, log: RunEventLog, needed_bytes: int, limit: int) -> None:
+        """Evict the oldest retained frames until ``needed_bytes`` fits.
+
+        This is what makes the log a ring instead of a cap: it never refuses
+        to append. If ``needed_bytes`` alone exceeds ``limit`` (a single
+        frame or batch larger than the whole budget — a schema bug, not a
+        real turn), evicting everything still cannot make it fit; the caller
+        appends anyway rather than fail the run, so the effective limit here
+        widens to admit it.
+        """
+        if needed_bytes > limit:
+            limit = needed_bytes
+        evicted_bytes = 0
+        evicted_count = 0
+        while log.events and log.wire_bytes + needed_bytes > limit:
+            oldest = log.events.pop(0)
+            log.wire_bytes -= len(oldest.frame)
+            log.floor = oldest.sequence_number
+            evicted_bytes += len(oldest.frame)
+            evicted_count += 1
+        if evicted_count:
+            logger.info(
+                "[turn_event_log] run %s evicted %d frame(s) (%d bytes) to stay "
+                "within the %d byte ring budget; floor now %d",
+                log.run_id,
+                evicted_count,
+                evicted_bytes,
+                self.run_log_ring_budget_bytes,
+                log.floor,
+            )
+
+    def _log_occupancy_milestones(self, log: RunEventLog) -> None:
+        """One-shot structured log lines as a run's occupancy climbs."""
+        if self.run_log_ring_budget_bytes <= 0:
             return
-        log.cap_exceeded = True
-        log.failure_reason = "log_cap_exceeded"
-        callback = self.on_cap_exceeded
-        if callback is not None:
-            callback(log.run_id)
+        ratio = log.wire_bytes / self.run_log_ring_budget_bytes
+        for milestone in LOG_OCCUPANCY_LOG_MILESTONES:
+            if ratio < milestone or milestone in log.logged_occupancy_milestones:
+                continue
+            log.logged_occupancy_milestones.add(milestone)
+            logger.info(
+                "[turn_event_log] run %s crossed %d%% of its ring budget "
+                "(occupancy=%d wire_bytes_total=%d)",
+                log.run_id,
+                round(milestone * 100),
+                log.wire_bytes,
+                log.wire_bytes_total,
+            )
 
     def append_payload(
         self,
@@ -264,31 +371,25 @@ class TurnEventLogStore:
             raise UnknownRunError(run_id)
         if log.terminal:
             return None
-        if log.cap_exceeded and not force_terminal:
-            return None
 
-        stored = self._stored_event(
-            payload,
-            log.sequence_number_high_water + 1,
+        stored = self._stored_event(payload, log.high_water + 1)
+
+        # Terminal frames get the full budget (they are the last frame this
+        # log will ever receive); ordinary frames leave TERMINAL_FRAME_RESERVE_BYTES
+        # of headroom so the eventual terminal frame fits without needing to
+        # evict again on the very next append.
+        limit = (
+            self.run_log_ring_budget_bytes
+            if force_terminal
+            else max(0, self.run_log_ring_budget_bytes - TERMINAL_FRAME_RESERVE_BYTES)
         )
+        self._make_room(log, len(stored.frame), limit)
 
-        ordinary_limit = max(0, self.run_log_cap_bytes - TERMINAL_FRAME_RESERVE_BYTES)
-        if not force_terminal and log.wire_bytes + len(stored.frame) > ordinary_limit:
-            self._mark_cap_exceeded(log)
-            return None
-
-        if (
-            force_terminal
-            and log.wire_bytes + len(stored.frame) > self.run_log_cap_bytes
-        ):
-            # Production's 2 KiB reserve is comfortably larger than the
-            # compact terminal shapes minted below. This guard keeps the byte
-            # cap absolute even under a test-only tiny cap or future schema
-            # growth; callers must never write more than the configured cap.
-            return None
-
+        log.high_water += 1
         log.events.append(stored)
         log.wire_bytes += len(stored.frame)
+        log.wire_bytes_total += len(stored.frame)
+        self._log_occupancy_milestones(log)
         log.wake_waiters()
         return stored
 
@@ -297,14 +398,14 @@ class TurnEventLogStore:
         run_id: str,
         payloads: Iterable[Dict[str, Any]],
     ) -> List[StoredTurnEvent]:
-        """Atomically append ordinary events or reject the complete batch."""
+        """Atomically append one batch of ordinary events, evicting to fit."""
         log = self._logs.get(run_id)
         if log is None:
             raise UnknownRunError(run_id)
-        if log.terminal or log.cap_exceeded:
+        if log.terminal:
             return []
 
-        start = log.sequence_number_high_water + 1
+        start = log.high_water + 1
         stored_events = [
             self._stored_event(payload, start + index)
             for index, payload in enumerate(payloads)
@@ -313,13 +414,14 @@ class TurnEventLogStore:
             return []
 
         batch_bytes = sum(len(stored.frame) for stored in stored_events)
-        ordinary_limit = max(0, self.run_log_cap_bytes - TERMINAL_FRAME_RESERVE_BYTES)
-        if log.wire_bytes + batch_bytes > ordinary_limit:
-            self._mark_cap_exceeded(log)
-            return []
+        limit = max(0, self.run_log_ring_budget_bytes - TERMINAL_FRAME_RESERVE_BYTES)
+        self._make_room(log, batch_bytes, limit)
 
+        log.high_water += len(stored_events)
         log.events.extend(stored_events)
         log.wire_bytes += batch_bytes
+        log.wire_bytes_total += batch_bytes
+        self._log_occupancy_milestones(log)
         log.wake_waiters()
         return stored_events
 
@@ -337,6 +439,16 @@ class TurnEventLogStore:
         log.completed_at = self._clock()
         if failure_reason is not None:
             log.failure_reason = failure_reason
+        logger.info(
+            "[turn_event_log] run %s terminal status=%s occupancy=%d "
+            "wire_bytes_total=%d floor=%d high_water=%d",
+            run_id,
+            status,
+            log.wire_bytes,
+            log.wire_bytes_total,
+            log.floor,
+            log.high_water,
+        )
         log.wake_waiters()
 
     def lookup_for_cursor(
@@ -469,11 +581,43 @@ class TurnEventEmitter:
         event_type: str,
         *,
         force_terminal: bool = False,
+        _skip_pressure_check: bool = False,
         **fields: Any,
     ) -> Optional[StoredTurnEvent]:
         payload = {"type": event_type, **fields}
-        return self.store.append_payload(
+        stored = self.store.append_payload(
             self.run_id, payload, force_terminal=force_terminal
+        )
+        if stored is not None and not force_terminal and not _skip_pressure_check:
+            self._maybe_emit_log_pressure()
+        return stored
+
+    def _maybe_emit_log_pressure(self) -> None:
+        """Emit the `response.omnio.log_pressure` checkpoint-now hint.
+
+        Hysteresis: fires once occupancy crosses LOG_PRESSURE_TRIGGER_RATIO
+        of the ring budget, then re-arms only once occupancy has fallen back
+        under LOG_PRESSURE_REARM_RATIO. This is the proxy's cue to checkpoint
+        its Postgres projection now rather than wait for its usual debounce.
+        """
+        log = self.store.get_log(self.run_id)
+        if log is None or log.terminal:
+            return
+        budget = self.store.run_log_ring_budget_bytes
+        if budget <= 0:
+            return
+        ratio = log.wire_bytes / budget
+        if ratio < LOG_PRESSURE_REARM_RATIO:
+            log.log_pressure_armed = True
+            return
+        if ratio < LOG_PRESSURE_TRIGGER_RATIO or not log.log_pressure_armed:
+            return
+        log.log_pressure_armed = False
+        self._append(
+            "response.omnio.log_pressure",
+            occupancy_bytes=log.wire_bytes,
+            budget_bytes=budget,
+            _skip_pressure_check=True,
         )
 
     def _buffer_delta(
@@ -636,7 +780,7 @@ class TurnEventEmitter:
         if output_index is None:
             return []
         self._flush_pending_deltas()
-        return self.store.append_payloads(
+        stored_events = self.store.append_payloads(
             self.run_id,
             (
                 {
@@ -650,6 +794,9 @@ class TurnEventEmitter:
                 for annotation_index, annotation in enumerate(annotations)
             ),
         )
+        if stored_events:
+            self._maybe_emit_log_pressure()
+        return stored_events
 
     def output_index_for_message(self, item_id: str) -> Optional[int]:
         return self._message_output_indexes.get(item_id)
@@ -899,14 +1046,18 @@ class TurnEventEmitter:
 __all__ = [
     "CursorExpiredError",
     "CUSTOM_TOOL_INPUT_KEYS",
-    "DEFAULT_RUN_LOG_CAP_BYTES",
+    "DEFAULT_RUN_LOG_RING_BUDGET_BYTES",
     "DEFAULT_TERMINAL_RETENTION_SECONDS",
     "DEFAULT_TOMBSTONE_LIMIT",
+    "FramesAfterResult",
     "InvalidCursorError",
+    "LOG_PRESSURE_REARM_RATIO",
+    "LOG_PRESSURE_TRIGGER_RATIO",
     "OMNIO_EXTENSION_EVENT_TYPES",
     "RunEventLog",
     "RunTombstone",
     "StoredTurnEvent",
+    "TERMINAL_FRAME_RESERVE_BYTES",
     "TURN_EVENT_LOG_API_VERSION",
     "TurnEventEmitter",
     "TurnEventLogStore",

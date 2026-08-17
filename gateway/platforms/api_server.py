@@ -1405,9 +1405,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams_created: Dict[str, float] = {}
         # Compatibility-only subscriber markers used by older extensions.
         self._run_stream_subscribers: set[str] = set()
-        self._turn_event_logs = TurnEventLogStore(
-            on_cap_exceeded=self._handle_run_log_cap_exceeded,
-        )
+        self._turn_event_logs = TurnEventLogStore()
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
@@ -6982,14 +6980,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
         return True
 
-    def _handle_run_log_cap_exceeded(self, run_id: str) -> None:
-        """Interrupt a run whose immutable wire log reached its 8 MiB cap."""
-        self._interrupt_run(
-            run_id,
-            "Turn event log cap exceeded",
-            failure_reason="log_cap_exceeded",
-        )
-
     def _make_run_custom_event_callback(
         self,
         emitter: TurnEventEmitter,
@@ -7968,28 +7958,6 @@ class APIServerAdapter(BasePlatformAdapter):
                             text=missed_steer,
                         )
                     self._interrupt_run(run_id, "Stop requested via API")
-                    queued_log = self._turn_event_logs.get_log(run_id)
-                    queued_failure = (
-                        queued_log.failure_reason if queued_log is not None else None
-                    )
-                    if queued_failure == "log_cap_exceeded":
-                        self._set_run_status(
-                            run_id,
-                            "failed",
-                            error="Turn event log exceeded the 8 MiB cap",
-                            failure_reason="log_cap_exceeded",
-                            last_event="run.failed",
-                            completed_at=time.time(),
-                        )
-                        emitter.response_failed(
-                            "Turn event log exceeded the 8 MiB cap",
-                            code="log_cap_exceeded",
-                        )
-                        _legacy_terminal(
-                            "run.failed",
-                            error="Turn event log exceeded the 8 MiB cap",
-                        )
-                        return
                     emitter.omnio_event(
                         "response.omnio.interrupted_history",
                         message="Operation interrupted before agent execution.",
@@ -8239,28 +8207,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 _close_text_item()
                 _close_reasoning_item()
 
-                log = self._turn_event_logs.get_log(run_id)
-                failure_reason = log.failure_reason if log is not None else None
                 was_interrupted = bool(
                     isinstance(result, dict) and result.get("interrupted")
                 )
                 run_failed = bool(isinstance(result, dict) and result.get("failed"))
-
-                def _close_log_cap_exceeded() -> None:
-                    error_msg = "Turn event log exceeded the 8 MiB cap"
-                    self._set_run_status(
-                        run_id,
-                        "failed",
-                        error=error_msg,
-                        failure_reason="log_cap_exceeded",
-                        last_event="run.failed",
-                        completed_at=time.time(),
-                    )
-                    emitter.response_failed(
-                        error_msg,
-                        code="log_cap_exceeded",
-                    )
-                    _legacy_terminal("run.failed", error=error_msg)
 
                 def _close_cancelled() -> None:
                     emitter.omnio_event(
@@ -8278,9 +8228,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     emitter.response_incomplete()
                     _legacy_terminal("run.cancelled")
 
-                if failure_reason == "log_cap_exceeded":
-                    _close_log_cap_exceeded()
-                elif run_id in self._stopping_run_ids or was_interrupted:
+                if run_id in self._stopping_run_ids or was_interrupted:
                     _close_cancelled()
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
@@ -8302,17 +8250,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     _legacy_terminal("run.failed", error=error_msg)
                 else:
                     await _drain_annotation_tasks()
-                    log = self._turn_event_logs.get_log(run_id)
-                    annotation_failure_reason = (
-                        log.failure_reason if log is not None else None
-                    )
-                    # A log-cap breach also marks the run stopping (it stops the
-                    # run through the same cooperative path a user stop uses),
-                    # so it is read first — the run failed on its own cap, it
-                    # was not cancelled.
-                    if annotation_failure_reason == "log_cap_exceeded":
-                        _close_log_cap_exceeded()
-                    elif run_id in self._stopping_run_ids:
+                    if run_id in self._stopping_run_ids:
                         _close_cancelled()
                     else:
                         self._set_run_status(
@@ -8618,20 +8556,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=404,
             )
 
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                # The highest sequence number already recorded at the moment
-                # this attachment connected: frames at or below it are replayed
-                # history, not live output. Consumers use it to render the
-                # replay instantly instead of re-pacing recorded text as if
-                # the model were still producing it.
-                "X-Omnio-Replay-Through": str(retained.sequence_number_high_water),
-            },
-        )
+        headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            # The highest sequence number already recorded at the moment
+            # this attachment connected: frames at or below it are replayed
+            # history, not live output. Consumers use it to render the
+            # replay instantly instead of re-pacing recorded text as if
+            # the model were still producing it.
+            "X-Omnio-Replay-Through": str(retained.sequence_number_high_water),
+        }
+        # Tombstones have no ring floor of their own — their retention story
+        # is CursorExpiredError above, not eviction. A live run's ring may
+        # have evicted everything up to and including this cursor; stamp the
+        # floor so the caller knows it resumes at floor+1, not at its own
+        # cursor+1.
+        retained_floor = getattr(retained, "floor", 0)
+        if after < retained_floor:
+            headers["X-Omnio-Replay-From"] = str(retained_floor)
+        response = web.StreamResponse(status=200, headers=headers)
         await response.prepare(request)
 
         async def _write_close_comments() -> None:
@@ -8651,7 +8595,11 @@ class APIServerAdapter(BasePlatformAdapter):
         cursor = after
         try:
             while True:
-                batch = retained.frames_after(cursor)
+                # frames_after is floor-aware: a cursor below the floor (its
+                # frames evicted) is served from the floor forward rather
+                # than raising, which is why this loop never needs a special
+                # case for eviction happening mid-stream.
+                batch = retained.frames_after(cursor).frames
                 for stored in batch:
                     await response.write(stored.frame)
                     cursor = stored.sequence_number
