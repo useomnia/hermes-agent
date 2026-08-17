@@ -203,14 +203,13 @@ def _install_log_store(
     adapter: APIServerAdapter,
     *,
     clock: Callable[[], float],
-    cap: int = 8 * 1024 * 1024,
+    budget: int = 32 * 1024 * 1024,
     retention: float = 300.0,
 ) -> TurnEventLogStore:
     store = TurnEventLogStore(
         clock=clock,
-        run_log_cap_bytes=cap,
+        run_log_ring_budget_bytes=budget,
         terminal_retention_seconds=retention,
-        on_cap_exceeded=adapter._handle_run_log_cap_exceeded,
     )
     adapter._turn_event_logs = store
     return store
@@ -245,6 +244,7 @@ def test_omnio_extension_event_types_are_explicit_and_namespaced() -> None:
         "response.omnio.approval_request",
         "response.omnio.approval_responded",
         "response.omnio.steer_missed",
+        "response.omnio.log_pressure",
     }
     assert OMNIO_EXTENSION_EVENT_TYPES == expected
 
@@ -896,10 +896,17 @@ async def test_native_and_mirrored_default_profile_routes_share_turn_logs(
 
 
 @pytest.mark.asyncio
-async def test_log_cap_interrupts_run_and_emits_machine_readable_run_error() -> None:
+async def test_ring_evicts_oldest_frames_instead_of_failing_the_run() -> None:
+    """Regression for the incident: hitting the byte budget must never kill a run.
+
+    A budget this small (4 KiB) is blown by the single oversized delta below,
+    which is itself larger than the whole budget — the pathological case
+    ``_make_room`` has to admit rather than refuse. The run still completes
+    normally; the ring just evicts the delta frame to make room for what
+    follows, advancing its floor.
+    """
     adapter = _make_adapter()
-    assert adapter._turn_event_logs.run_log_cap_bytes == 8 * 1024 * 1024
-    _install_log_store(adapter, clock=_Clock(), cap=4_096)
+    _install_log_store(adapter, clock=_Clock(), budget=4_096)
     built_agent: Optional[MagicMock] = None
 
     def build_agent(**callbacks: Any) -> MagicMock:
@@ -907,7 +914,7 @@ async def test_log_cap_interrupts_run_and_emits_machine_readable_run_error() -> 
 
         def run(**_kwargs: Any) -> Dict[str, Any]:
             callbacks["stream_delta_callback"]("x" * 8_192)
-            return {"final_response": "", "messages": []}
+            return {"final_response": "x" * 8_192, "messages": []}
 
         built_agent = _agent(run)
         return built_agent
@@ -916,6 +923,12 @@ async def test_log_cap_interrupts_run_and_emits_machine_readable_run_error() -> 
         with patch.object(adapter, "_create_agent", side_effect=build_agent):
             started = await client.post("/v1/runs", json={"input": "overflow"})
             run_id = (await started.json())["run_id"]
+            # Attach only once the run is fully terminal: a still-live run
+            # keeps evicting concurrently with this GET, and a consumer that
+            # falls behind that gets legitimately closed mid-stream (see
+            # test_eviction_past_attached_cursor_closes_stream_for_reattach)
+            # — that race isn't what this test is about.
+            await _wait_for_terminal(adapter, run_id)
             events_response = await client.get(f"/v1/runs/{run_id}/events")
             body = await events_response.text()
 
@@ -924,13 +937,15 @@ async def test_log_cap_interrupts_run_and_emits_machine_readable_run_error() -> 
     assert started.status == 202
     assert log is not None
     assert log.terminal
-    assert log.failure_reason == "log_cap_exceeded"
-    assert log.wire_bytes <= 4_096
-    assert events[-1]["type"] == "response.failed"
-    assert events[-1]["response"]["error"]["code"] == "log_cap_exceeded"
-    assert adapter._run_statuses[run_id]["status"] == "failed"
+    assert log.failure_reason is None
+    assert log.floor > 0, "the oversized delta frame must have been evicted"
+    # The client attached after the evicted delta frame fell off the ring, so
+    # its replay resumes at the floor — it never sees response.failed/failed.
+    assert events[-1]["type"] == "response.completed"
+    assert adapter._run_statuses[run_id]["status"] == "completed"
     assert built_agent is not None
-    built_agent.interrupt.assert_called_once_with("Turn event log cap exceeded")
+    built_agent.interrupt.assert_not_called()
+    assert events_response.headers["X-Omnio-Replay-From"] == str(log.floor)
 
 
 @pytest.mark.asyncio
@@ -1422,9 +1437,13 @@ async def test_finalize_hook_failure_still_emits_terminal_promptly(
 
 
 @pytest.mark.asyncio
-async def test_annotation_batch_cap_exhaustion_fails_run_without_partial_annotations(
+async def test_annotation_batch_over_budget_evicts_instead_of_failing_the_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A batch (the annotation append) too big for remaining headroom evicts
+    older frames to make room rather than rejecting the whole batch — the
+    ring never partially-fails a run the way the old cap-exceeded path did.
+    """
     final_response = "Reports: /brand/first.txt and /brand/second.txt"
     annotations = [
         {
@@ -1466,8 +1485,8 @@ async def test_annotation_batch_cap_exhaustion_fails_run_without_partial_annotat
     first_annotation_bytes = dry_log.events[-2].frame
 
     adapter = _make_adapter()
-    cap = base_wire_bytes + len(first_annotation_bytes) + TERMINAL_FRAME_RESERVE_BYTES
-    _install_log_store(adapter, clock=clock, cap=cap)
+    budget = base_wire_bytes + len(first_annotation_bytes) + TERMINAL_FRAME_RESERVE_BYTES
+    _install_log_store(adapter, clock=clock, budget=budget)
     with patch.object(
         adapter,
         "_create_agent",
@@ -1485,13 +1504,275 @@ async def test_annotation_batch_cap_exhaustion_fails_run_without_partial_annotat
     run_id = json.loads(started.text)["run_id"]
     log = adapter._turn_event_logs.get_log(run_id)
     assert log is not None
-    assert events[-1]["type"] == "response.failed"
-    assert events[-1]["response"]["error"]["code"] == "log_cap_exceeded"
-    assert adapter._run_statuses[run_id]["status"] == "failed"
-    assert log.failure_reason == "log_cap_exceeded"
-    assert not any(
-        event["type"] == "response.output_text.annotation.added" for event in events
+    assert events[-1]["type"] == "response.completed"
+    assert adapter._run_statuses[run_id]["status"] == "completed"
+    assert log.failure_reason is None
+    assert log.floor > 0, "older frames must have been evicted to fit the batch"
+    annotation_events = [
+        event
+        for event in events
+        if event["type"] == "response.output_text.annotation.added"
+    ]
+    assert len(annotation_events) == len(annotations)
+
+
+def _fill_events(store: TurnEventLogStore, run_id: str, count: int, size: int) -> None:
+    """Append ``count`` ordinary frames of roughly ``size`` bytes each."""
+    for index in range(count):
+        store.append_payload(run_id, {"type": "response.omnio.warmup", "pad": "x" * size})
+
+
+def test_eviction_preserves_sequence_numbering_and_high_water() -> None:
+    """Eviction must never renumber or rewind sequence numbers/high_water."""
+    store = TurnEventLogStore(run_log_ring_budget_bytes=2_048)
+    run_id = "run_" + "a" * 32
+    store.create_run(run_id, run_id)
+
+    _fill_events(store, run_id, 20, 100)
+
+    log = store.get_log(run_id)
+    assert log is not None
+    assert log.floor > 0, "a budget this small must have evicted something"
+    assert log.high_water == 20, "high_water counts every frame ever minted"
+    assert log.events, "the most recent frames must still be retained"
+    # Sequence numbers are contiguous and monotonic from floor+1 onward, and
+    # never repeat or rewind despite the front of the list having been
+    # popped repeatedly.
+    sequence_numbers = [event.sequence_number for event in log.events]
+    assert sequence_numbers == list(range(log.floor + 1, log.high_water + 1))
+
+
+def test_frames_after_below_floor_serves_from_floor() -> None:
+    store = TurnEventLogStore(run_log_ring_budget_bytes=2_048)
+    run_id = "run_" + "b" * 32
+    store.create_run(run_id, run_id)
+    _fill_events(store, run_id, 20, 100)
+
+    log = store.get_log(run_id)
+    assert log is not None
+    assert log.floor > 0
+
+    # A cursor at 0 (or anywhere below the floor) is clamped to the floor —
+    # it never raises, and the returned floor matches the log's.
+    result = log.frames_after(0)
+    assert result.floor == log.floor
+    assert [event.sequence_number for event in result.frames] == list(
+        range(log.floor + 1, log.high_water + 1)
     )
+
+    # A cursor already at or above the floor is unaffected by it.
+    caught_up = log.frames_after(log.high_water)
+    assert caught_up.frames == []
+
+
+@pytest.mark.asyncio
+async def test_replay_from_header_only_stamped_when_cursor_truncated() -> None:
+    clock = _Clock()
+    adapter = _make_adapter()
+    store = _install_log_store(adapter, clock=clock, budget=2_048)
+    run_id = "run_" + "c" * 32
+    store.create_run(run_id, run_id)
+    _fill_events(store, run_id, 20, 100)
+    store.mark_terminal(run_id, "completed")
+    log = store.get_log(run_id)
+    assert log is not None
+    assert log.floor > 0
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        truncated = await client.get(f"/v1/runs/{run_id}/events?after=0")
+        await truncated.text()
+        caught_up = await client.get(
+            f"/v1/runs/{run_id}/events?after={log.floor}"
+        )
+        await caught_up.text()
+
+    assert truncated.status == 200
+    assert truncated.headers["X-Omnio-Replay-From"] == str(log.floor)
+    assert caught_up.status == 200
+    assert "X-Omnio-Replay-From" not in caught_up.headers
+
+
+@pytest.mark.asyncio
+async def test_attached_consumer_above_floor_streams_normally_through_unrelated_eviction() -> (
+    None
+):
+    """Eviction of frames an attached consumer never asked for (older than
+    its cursor) must not disturb its stream. Only a jump *past* its cursor
+    should ever close it — see the sibling test below.
+    """
+    adapter = _make_adapter()
+    store = _install_log_store(adapter, clock=_Clock(), budget=4_096)
+    run_id = "run_" + "g" * 32
+    store.create_run(run_id, run_id)
+
+    def pad(size: int) -> Dict[str, Any]:
+        return {"type": "response.omnio.warmup", "pad": "x" * size}
+
+    for _ in range(10):
+        store.append_payload(run_id, pad(50))
+    log = store.get_log(run_id)
+    assert log is not None
+    cursor = log.high_water  # attach right at the current tip
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        response = await client.get(f"/v1/runs/{run_id}/events?after={cursor}")
+        assert response.status == 200
+        assert "X-Omnio-Replay-From" not in response.headers
+
+        # A couple more frames — small enough that any eviction they cause
+        # only ever removes frames at or before the attached cursor, never
+        # past it.
+        store.append_payload(run_id, pad(50))
+        store.append_payload(run_id, pad(50))
+        assert log.floor <= cursor, "eviction must not have reached the attached cursor"
+
+        first = await _read_one_sse_event(response)
+        second = await _read_one_sse_event(response)
+        assert [first["sequence_number"], second["sequence_number"]] == [
+            cursor + 1,
+            cursor + 2,
+        ]
+
+        store.mark_terminal(run_id, "completed")
+        # Draining to the natural end confirms the handler reached its
+        # normal terminal close path, not the mid-stream jump-guard close.
+        tail = await asyncio.wait_for(response.content.read(), 2.0)
+
+    assert b"data: " not in tail
+    assert b"stream closed" in tail
+
+
+@pytest.mark.asyncio
+async def test_eviction_past_attached_cursor_closes_stream_for_reattach() -> None:
+    """If the ring evicts past a slow, already-attached consumer's cursor,
+    its stream must close cleanly instead of silently resuming from the new
+    floor — an undeclared sequence jump neither the proxy's projector nor
+    the browser reducer will accept. The declared-jump contract only exists
+    at attach time (X-Omnio-Replay-From), so the client must reattach to get
+    a correctly-stamped floor rather than be handed one mid-stream.
+    """
+    adapter = _make_adapter()
+    store = _install_log_store(adapter, clock=_Clock(), budget=4_096)
+    run_id = "run_" + "h" * 32
+    store.create_run(run_id, run_id)
+
+    def pad(size: int) -> Dict[str, Any]:
+        return {"type": "response.omnio.warmup", "pad": "x" * size}
+
+    for _ in range(5):
+        store.append_payload(run_id, pad(50))
+    log = store.get_log(run_id)
+    assert log is not None
+    cursor = log.high_water
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        response = await client.get(f"/v1/runs/{run_id}/events?after={cursor}")
+        assert response.status == 200
+        assert "X-Omnio-Replay-From" not in response.headers
+
+        # Blow well past the attached cursor while this consumer never
+        # reads — the ring doesn't know or care that anyone is attached.
+        for _ in range(80):
+            store.append_payload(run_id, pad(50))
+        assert log.floor > cursor, "the ring must have evicted past the attached cursor"
+
+        # The stream must close cleanly — no data frames, just the sentinel
+        # close comment — rather than silently jump this consumer forward.
+        tail = await asyncio.wait_for(response.content.read(), 2.0)
+        assert b"data: " not in tail
+        assert b"stream closed" in tail
+
+        reattached_count = log.high_water - log.floor
+        reattached = await client.get(f"/v1/runs/{run_id}/events?after={cursor}")
+        assert reattached.headers["X-Omnio-Replay-From"] == str(log.floor)
+        reattached_events = [
+            await _read_one_sse_event(reattached) for _ in range(reattached_count)
+        ]
+        reattached.close()
+
+    assert [event["sequence_number"] for event in reattached_events] == list(
+        range(log.floor + 1, log.high_water + 1)
+    )
+
+
+def test_terminal_frame_always_appendable_under_a_full_ring() -> None:
+    """The terminal frame must never be dropped, even when a single ordinary
+    frame already occupies the entire ring budget."""
+    store = TurnEventLogStore(run_log_ring_budget_bytes=512)
+    run_id = "run_" + "d" * 32
+    store.create_run(run_id, run_id)
+
+    # One frame bigger than the whole budget — the pathological case
+    # `_make_room` has to admit rather than refuse.
+    huge = store.append_payload(
+        run_id, {"type": "response.omnio.warmup", "pad": "x" * 4_096}
+    )
+    assert huge is not None
+
+    terminal = store.append_payload(
+        run_id, {"type": "response.completed"}, force_terminal=True
+    )
+    assert terminal is not None
+    log = store.get_log(run_id)
+    assert log is not None
+    # The oversized frame had to be evicted to make room; the terminal frame
+    # is nonetheless present and is the log's last retained frame.
+    assert log.events[-1].sequence_number == terminal.sequence_number
+
+
+def test_log_pressure_emitted_once_per_crossing_with_rearm() -> None:
+    """Fires once past the trigger ratio, stays silent while still above it,
+    and only fires again after occupancy has fallen back under the rearm
+    ratio and climbed past the trigger a second time.
+
+    Occupancy is driven directly rather than through realistic ring/eviction
+    dynamics — this test is purely about the hysteresis state machine. The
+    budget is comfortably larger than TERMINAL_FRAME_RESERVE_BYTES so the
+    tiny frames appended below never themselves trigger eviction and muddy
+    the manually-set occupancy.
+    """
+    budget = 10 * TERMINAL_FRAME_RESERVE_BYTES
+    store = TurnEventLogStore(run_log_ring_budget_bytes=budget)
+    run_id = "run_" + "e" * 32
+    store.create_run(run_id, run_id)
+    emitter = TurnEventEmitter(store, run_id, run_id)
+    log = store.get_log(run_id)
+    assert log is not None
+
+    def pressure_events() -> List[Dict[str, Any]]:
+        return [
+            json.loads(stored.frame.removeprefix(b"data: ").strip())
+            for stored in log.events
+            if json.loads(stored.frame.removeprefix(b"data: ").strip())["type"]
+            == "response.omnio.log_pressure"
+        ]
+
+    above_trigger = int(budget * 0.75)
+    below_rearm = int(budget * 0.2)
+
+    log.wire_bytes = above_trigger
+    emitter.omnio_event("response.omnio.warmup")
+    first_crossing = pressure_events()
+    assert len(first_crossing) == 1
+    assert first_crossing[0]["occupancy_bytes"] > 0
+    assert first_crossing[0]["budget_bytes"] == budget
+    assert log.log_pressure_armed is False
+
+    # Still above the trigger — must not fire again without re-arming.
+    emitter.omnio_event("response.omnio.warmup")
+    assert len(pressure_events()) == 1
+
+    # Drop below the rearm ratio: re-arms, but this append alone doesn't
+    # cross the trigger, so it still doesn't fire.
+    log.wire_bytes = below_rearm
+    emitter.omnio_event("response.omnio.warmup")
+    assert len(pressure_events()) == 1
+    assert log.log_pressure_armed is True
+
+    # Climb back past the trigger: fires a second, independent hint.
+    log.wire_bytes = above_trigger
+    emitter.omnio_event("response.omnio.warmup")
+    assert len(pressure_events()) == 2
 
 
 @pytest.mark.asyncio
