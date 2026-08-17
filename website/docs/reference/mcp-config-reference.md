@@ -59,6 +59,7 @@ mcp_servers:
 | `enabled` | bool | both | Skip the server entirely when false |
 | `timeout` | number | both | Tool call timeout in seconds (default: `300`) |
 | `connect_timeout` | number | both | Initial connection timeout in seconds (default: `60`) |
+| `protocol` | string | both | Protocol-era negotiation: `auto` (default — legacy `initialize` handshake first, falling back to the 2026-07-28 `server/discover` stateless probe when the server rejects the handshake as modern-only), `stateless` (probe `server/discover` first; one legacy retry), or `legacy` (handshake only, no fallback) |
 | `supports_parallel_tool_calls` | bool | both | Allow tools from this server to run concurrently |
 | `supports_parallel_read_tool_calls` | bool | HTTP | Opt into bounded concurrency only for tools with `readOnlyHint: true` (default: `false`); requires `sampling.enabled: false` and `elicitation.enabled: false` |
 | `parallel_read_tool_call_limit` | integer | HTTP | Maximum concurrent read calls when the read-only opt-in is enabled (default: `4`, hard cap: `8`) |

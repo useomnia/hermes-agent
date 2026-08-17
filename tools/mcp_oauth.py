@@ -1125,13 +1125,26 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
+        # SEP-837 (2026-07-28 spec): clients MUST declare an application_type
+        # during registration so OIDC-strict authorization servers stop
+        # rejecting loopback redirect_uris. Hermes is a CLI/desktop app
+        # redirecting to 127.0.0.1/localhost — that is exactly "native".
+        # Overridable for the rare hosted-dashboard deployment fronting a
+        # real https redirect.
+        "application_type": cfg.get("application_type", "native"),
     }
     if scope:
         metadata_kwargs["scope"] = scope
     if cfg.get("client_secret"):
         metadata_kwargs["token_endpoint_auth_method"] = "client_secret_post"
 
-    return OAuthClientMetadata.model_validate(metadata_kwargs)
+    try:
+        return OAuthClientMetadata.model_validate(metadata_kwargs)
+    except Exception:
+        # mcp 1.x metadata models predate SEP-837 and reject the unknown
+        # field — retry without it rather than failing the whole flow.
+        metadata_kwargs.pop("application_type", None)
+        return OAuthClientMetadata.model_validate(metadata_kwargs)
 
 
 def _maybe_preregister_client(
