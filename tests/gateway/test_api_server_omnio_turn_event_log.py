@@ -24,6 +24,8 @@ from gateway.platforms import api_server as api_server_module
 from gateway.platforms.api_server import APIServerAdapter, _api_request_profile
 from gateway.turn_event_log import (
     CursorExpiredError,
+    DELTA_COALESCE_BYTES,
+    DELTA_COALESCE_SECONDS,
     OMNIO_EXTENSION_EVENT_TYPES,
     TERMINAL_FRAME_RESERVE_BYTES,
     TurnEventEmitter,
@@ -120,6 +122,14 @@ def _sse_events(body: str) -> List[Dict[str, Any]]:
         json.loads(line.removeprefix("data: "))
         for line in lines
         if line.startswith("data: ")
+    ]
+
+
+def _log_events(log: Any) -> List[Dict[str, Any]]:
+    """Decode a run's retained frames without going through the HTTP layer."""
+    return [
+        json.loads(stored.frame.removeprefix(b"data: ").strip())
+        for stored in log.events
     ]
 
 
@@ -327,15 +337,13 @@ async def test_two_concurrent_subscribers_receive_the_same_complete_stream() -> 
     first_events = _sse_events(first_body)
     second_events = _sse_events(second_body)
     assert first_events == second_events
-    assert [event["sequence_number"] for event in first_events] == list(range(1, 10))
+    assert [event["sequence_number"] for event in first_events] == list(range(1, 8))
     assert [event["type"] for event in first_events] == [
         "response.created",
         "response.in_progress",
         "response.output_item.added",
-        "response.content_part.added",
         "response.output_text.delta",
         "response.output_text.done",
-        "response.content_part.done",
         "response.output_item.done",
         "response.completed",
     ]
@@ -359,18 +367,223 @@ async def test_two_concurrent_subscribers_receive_the_same_complete_stream() -> 
         "started_at": first_events[2]["item"]["started_at"],
     }
     assert isinstance(first_events[2]["item"]["started_at"], float)
-    assert first_events[7]["item"]["content"] == [
+    assert first_events[5]["item"]["content"] == [
         {"type": "output_text", "text": "hello"}
     ]
     # The closed item reports the real interval: started when it opened,
     # completed no earlier than that.
-    done_item = first_events[7]["item"]
+    done_item = first_events[5]["item"]
     assert done_item["started_at"] == first_events[2]["item"]["started_at"]
     assert done_item["completed_at"] >= done_item["started_at"]
     assert all("seq" not in event for event in first_events)
     assert all(
         "runId" not in event and "threadId" not in event for event in first_events
     )
+
+
+def test_first_delta_flushes_immediately_and_later_small_deltas_coalesce() -> None:
+    store = TurnEventLogStore()
+    store.create_run("run_delta_coalesce", "session-delta-coalesce")
+    emitter = TurnEventEmitter(store, "run_delta_coalesce", "session-delta-coalesce")
+    emitter.response_started()
+    emitter.output_text_start("message-1")
+    log = store.get_log("run_delta_coalesce")
+    assert log is not None
+
+    emitter.output_text_delta("message-1", "he")
+    # The item's first delta protects time-to-first-token: it mints its own
+    # frame rather than waiting on a coalescing window.
+    assert _log_events(log)[-1] == {
+        "type": "response.output_text.delta",
+        "item_id": "message-1",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "he",
+        "sequence_number": 4,
+    }
+
+    emitter.output_text_delta("message-1", "llo")
+    emitter.output_text_delta("message-1", " world")
+    # Neither the byte nor the age bound has been crossed, so these stay
+    # buffered instead of minting one frame per provider delta.
+    assert _log_events(log)[-1]["delta"] == "he"
+
+    emitter.output_text_done("message-1")
+    events = _log_events(log)
+    delta_events = [e for e in events if e["type"] == "response.output_text.delta"]
+    assert [e["delta"] for e in delta_events] == ["he", "llo world"]
+    # output_text_done's guaranteed flush-before-done lands the coalesced
+    # tail ahead of the done/item-done pair, and no content_part events are
+    # minted at all — nobody reads them.
+    assert [e["type"] for e in events[-3:]] == [
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.output_item.done",
+    ]
+    assert events[-2]["text"] == "hello world"
+
+
+def test_delta_buffer_flushes_once_it_reaches_the_byte_threshold() -> None:
+    store = TurnEventLogStore()
+    store.create_run("run_delta_size", "session-delta-size")
+    emitter = TurnEventEmitter(store, "run_delta_size", "session-delta-size")
+    emitter.response_started()
+    emitter.output_text_start("message-1")
+    log = store.get_log("run_delta_size")
+    assert log is not None
+
+    emitter.output_text_delta("message-1", "a")  # first delta flushes alone
+    chunk = "b" * (DELTA_COALESCE_BYTES - 1)
+    emitter.output_text_delta("message-1", chunk)
+    assert _log_events(log)[-1]["delta"] == "a"  # still under the byte cap
+
+    emitter.output_text_delta("message-1", "c")  # tips the buffer to 512 bytes
+    events = _log_events(log)
+    assert events[-1]["type"] == "response.output_text.delta"
+    assert events[-1]["delta"] == chunk + "c"
+
+
+def test_delta_buffer_flushes_once_it_ages_past_the_time_threshold() -> None:
+    clock = _Clock()
+    store = TurnEventLogStore(clock=clock)
+    store.create_run("run_delta_age", "session-delta-age")
+    emitter = TurnEventEmitter(store, "run_delta_age", "session-delta-age")
+    emitter.response_started()
+    emitter.output_text_start("message-1")
+    log = store.get_log("run_delta_age")
+    assert log is not None
+
+    emitter.output_text_delta("message-1", "a")  # first delta flushes alone
+    emitter.output_text_delta("message-1", "b")
+    assert _log_events(log)[-1]["delta"] == "a"  # neither bound crossed yet
+
+    clock.now += DELTA_COALESCE_SECONDS + 0.001
+    emitter.output_text_delta("message-1", "c")  # now past the age deadline
+    events = _log_events(log)
+    assert events[-1]["type"] == "response.output_text.delta"
+    assert events[-1]["delta"] == "bc"
+
+
+def test_pending_text_delta_flushes_before_any_other_event_type() -> None:
+    store = TurnEventLogStore()
+    store.create_run("run_delta_preempt", "session-delta-preempt")
+    emitter = TurnEventEmitter(store, "run_delta_preempt", "session-delta-preempt")
+    emitter.response_started()
+    emitter.output_text_start("message-1")
+    emitter.output_text_delta("message-1", "a")  # first delta flushes alone
+    emitter.output_text_delta("message-1", "b")  # buffered, below both bounds
+
+    # A function-call boundary must never jump ahead of "b" — this is the
+    # emitter's own invariant, independent of caller-side close-item
+    # ordering.
+    emitter.function_call_start("call-1", "search")
+
+    log = store.get_log("run_delta_preempt")
+    assert log is not None
+    events = _log_events(log)
+    assert [e["type"] for e in events] == [
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_item.added",
+    ]
+    assert [e["delta"] for e in events[3:5]] == ["a", "b"]
+
+
+def test_pending_delta_flushes_before_a_failed_terminal_event() -> None:
+    store = TurnEventLogStore()
+    store.create_run("run_delta_failure", "session-delta-failure")
+    emitter = TurnEventEmitter(store, "run_delta_failure", "session-delta-failure")
+    emitter.response_started()
+    emitter.output_text_start("message-1")
+    emitter.output_text_delta("message-1", "a")  # first delta flushes alone
+    emitter.output_text_delta("message-1", "unflushed tail")  # left buffered
+
+    emitter.response_failed("boom", code="provider_error")
+
+    log = store.get_log("run_delta_failure")
+    assert log is not None
+    events = _log_events(log)
+    assert [e["type"] for e in events][-2:] == [
+        "response.output_text.delta",
+        "response.failed",
+    ]
+    assert events[-2]["delta"] == "unflushed tail"
+    assert log.terminal
+
+
+def test_pending_delta_flushes_before_an_interrupted_terminal_event() -> None:
+    store = TurnEventLogStore()
+    store.create_run("run_delta_interrupt", "session-delta-interrupt")
+    emitter = TurnEventEmitter(store, "run_delta_interrupt", "session-delta-interrupt")
+    emitter.response_started()
+    emitter.output_text_start("message-1")
+    emitter.output_text_delta("message-1", "a")  # first delta flushes alone
+    emitter.output_text_delta("message-1", "cut off mid-word")  # left buffered
+
+    emitter.response_incomplete()
+
+    log = store.get_log("run_delta_interrupt")
+    assert log is not None
+    events = _log_events(log)
+    assert [e["type"] for e in events][-2:] == [
+        "response.output_text.delta",
+        "response.incomplete",
+    ]
+    assert events[-2]["delta"] == "cut off mid-word"
+    assert log.terminal
+
+
+def test_sequence_numbers_stay_contiguous_across_multiple_coalesced_flushes() -> None:
+    store = TurnEventLogStore()
+    store.create_run("run_delta_contiguous", "session-delta-contiguous")
+    emitter = TurnEventEmitter(
+        store, "run_delta_contiguous", "session-delta-contiguous"
+    )
+    emitter.response_started()
+    emitter.output_text_start("message-1")
+    emitter.output_text_delta("message-1", "first")  # flush #1: item's first delta
+    chunk = "x" * DELTA_COALESCE_BYTES
+    emitter.output_text_delta("message-1", chunk)  # flush #2: crosses the byte cap
+    emitter.output_text_delta("message-1", "tail")  # left buffered
+    emitter.output_text_done("message-1")  # flush #3: flush-before-done
+
+    log = store.get_log("run_delta_contiguous")
+    assert log is not None
+    events = _log_events(log)
+    assert [e["sequence_number"] for e in events] == list(range(1, len(events) + 1))
+    delta_events = [e for e in events if e["type"] == "response.output_text.delta"]
+    assert [e["delta"] for e in delta_events] == ["first", chunk, "tail"]
+
+
+def test_reasoning_deltas_also_coalesce_and_flush_before_done() -> None:
+    store = TurnEventLogStore()
+    store.create_run("run_reasoning_coalesce", "session-reasoning-coalesce")
+    emitter = TurnEventEmitter(
+        store, "run_reasoning_coalesce", "session-reasoning-coalesce"
+    )
+    emitter.response_started()
+    emitter.reasoning_start("reasoning-1")
+    emitter.reasoning_text_delta("reasoning-1", "thinking")  # first delta, flushes alone
+    emitter.reasoning_text_delta("reasoning-1", " more")  # left buffered
+
+    log = store.get_log("run_reasoning_coalesce")
+    assert log is not None
+    assert _log_events(log)[-1]["delta"] == "thinking"
+
+    emitter.reasoning_text_done("reasoning-1")
+    events = _log_events(log)
+    delta_events = [
+        e for e in events if e["type"] == "response.reasoning_text.delta"
+    ]
+    assert [e["delta"] for e in delta_events] == ["thinking", " more"]
+    assert [e["type"] for e in events[-3:]] == [
+        "response.reasoning_text.delta",
+        "response.reasoning_text.done",
+        "response.output_item.done",
+    ]
 
 
 @pytest.mark.asyncio
@@ -384,15 +597,19 @@ async def test_cursor_replays_exact_sequence_numbers_then_follows_live() -> None
     emitter.output_text_delta("message-1", "retained")
 
     async with TestClient(TestServer(_make_app(adapter))) as client:
-        response = await client.get("/v1/runs/run_cursor/events?after=4")
+        # "retained" is the item's first delta, so it flushed immediately as
+        # sequence 4; subscribing after=3 replays it.
+        response = await client.get("/v1/runs/run_cursor/events?after=3")
 
+        # "live" is a second delta on the same item: it stays buffered until
+        # output_text_done's guaranteed flush-before-done emits it.
         emitter.output_text_delta("message-1", "live")
         emitter.output_text_done("message-1")
         emitter.response_completed()
         body = await response.text()
 
     events = _sse_events(body)
-    assert [event["sequence_number"] for event in events] == list(range(5, 11))
+    assert [event["sequence_number"] for event in events] == list(range(4, 9))
     assert [event.get("delta") for event in events[:2]] == ["retained", "live"]
 
 
@@ -533,7 +750,7 @@ async def test_disconnect_does_not_destroy_log_and_reconnect_resumes_by_cursor()
         resumed_body = await resumed.text()
 
     events = _sse_events(resumed_body)
-    assert [event["sequence_number"] for event in events] == list(range(2, 10))
+    assert [event["sequence_number"] for event in events] == list(range(2, 8))
     assert (
         next(
             event["delta"]
