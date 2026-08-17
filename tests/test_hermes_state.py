@@ -1424,6 +1424,22 @@ class TestMessageStorage:
 
         assert db.get_messages_as_conversation("s1")[0]["effect_disposition"] == "unknown"
 
+    def test_approval_denial_effect_disposition_round_trips_through_session_db(self, db):
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        db.create_session(session_id="s1", source="cli")
+        db.replace_messages(
+            "s1",
+            [make_tool_result_message(
+                "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT",
+                '{"status":"approval_denied","error":"It was NOT performed."}',
+                "c1",
+                effect_disposition="none",
+            )],
+        )
+
+        assert db.get_messages_as_conversation("s1")[0]["effect_disposition"] == "none"
+
     def test_replace_messages_handles_multimodal_content(self, db):
         """`replace_messages` (used by /retry, /undo, /compress) must also
         handle list content without crashing."""
@@ -7772,4 +7788,3 @@ class TestDisplayMetadataReadPaths:
             }],
         )
         assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
-
