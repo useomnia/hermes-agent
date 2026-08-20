@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -248,6 +249,7 @@ class SpritesEnvironment(BaseEnvironment):
         retry_exec_predispatch: bool = False,
         retry_deadline_seconds: float | None = None,
         cancel_event: threading.Event | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         data = None
         headers = {
@@ -257,6 +259,8 @@ class SpritesEnvironment(BaseEnvironment):
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
+        if request_id is not None:
+            headers["X-Request-Id"] = request_id
 
         retry_count = 0
         retry_deadline = (
@@ -508,6 +512,7 @@ class SpritesEnvironment(BaseEnvironment):
         stdin_data: str | None = None,
     ):
         cancel_event = threading.Event()
+        request_id = str(uuid.uuid4())
 
         def exec_fn() -> tuple[str, int]:
             response = self._request_json(
@@ -523,6 +528,7 @@ class SpritesEnvironment(BaseEnvironment):
                 retry_exec_predispatch=True,
                 retry_deadline_seconds=timeout,
                 cancel_event=cancel_event,
+                request_id=request_id,
             )
             output = response.get("output", "")
             exit_code = response.get("returncode", response.get("exitCode", 0))
@@ -538,7 +544,24 @@ class SpritesEnvironment(BaseEnvironment):
                 )
             return (str(output), int(exit_code))
 
-        return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel_event.set)
+        def cancel_fn() -> None:
+            cancel_event.set()
+            try:
+                self._request_json(
+                    "/exec/cancel",
+                    timeout=5,
+                    request_id=request_id,
+                )
+            except SpritesToolboxError:
+                # Toolbox cancellation is additive. Older paired runtimes do
+                # not expose the endpoint, so preserve the historical local
+                # interrupt while the fleet rolls forward.
+                logger.debug(
+                    "Toolbox exec cancellation endpoint unavailable",
+                    exc_info=True,
+                )
+
+        return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel_fn)
 
     def cleanup(self):
         return None
