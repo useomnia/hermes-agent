@@ -5009,6 +5009,7 @@ class SessionDB:
         billing_mode: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
+        usage_model: Optional[str] = None,
     ) -> None:
         """Update token counters and backfill model if not already set.
 
@@ -5142,7 +5143,10 @@ class SessionDB:
                 self._record_model_usage(
                     conn,
                     session_id,
-                    model=model,
+                    # Keep ``sessions.model`` as the requested/resumable
+                    # model. ``usage_model`` is the observed response model
+                    # used only by session_model_usage.
+                    model=usage_model or model,
                     billing_provider=billing_provider,
                     billing_base_url=billing_base_url,
                     billing_mode=billing_mode,
