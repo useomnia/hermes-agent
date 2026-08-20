@@ -77,14 +77,13 @@ def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeyp
     hermes_state.SessionDB = FakeSessionDB
     monkeypatch.setitem(sys.modules, "hermes_state", hermes_state)
 
-    session_search_mod = ModuleType("tools.session_search_tool")
-
     def fake_session_search(**kwargs):
         captured.update(kwargs)
         return json.dumps({"success": True, "results": []})
 
-    session_search_mod.session_search = fake_session_search
-    monkeypatch.setitem(sys.modules, "tools.session_search_tool", session_search_mod)
+    # The agent dispatches through the registry, whose built-in handler closes
+    # over the already-imported module. Patch that handler target directly.
+    monkeypatch.setattr("tools.session_search_tool.session_search", fake_session_search)
 
     agent = _make_agent(None, platform="acp")
     result = json.loads(agent._invoke_tool("session_search", {"query": "Hermes"}, "task-id"))
