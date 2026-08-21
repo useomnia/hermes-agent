@@ -81,6 +81,33 @@ Other response kinds are `tool_calls`, `http_error`, `connection_close`, and
 `hold`; `hold` wraps one text, tool-call, or HTTP-error response and is released
 through the authenticated control endpoint.
 
+When independent requests can race, one top-level step may be an unordered
+group:
+
+```json
+{
+  "unordered": [
+    {
+      "request": { "model": "parent-model" },
+      "response": { "type": "text", "text": "parent complete" }
+    },
+    {
+      "request": { "model": "child-model" },
+      "response": { "type": "text", "text": "child complete" }
+    }
+  ]
+}
+```
+
+Every branch must have an explicit request predicate. Remaining branches may
+arrive in any order and each is consumed exactly once. A request matching no
+remaining branch or more than one branch fails with `409` and consumes
+nothing. The next top-level step is unavailable until every branch is
+consumed. Holds remain pending independently, so a held branch does not block
+a sibling request; `complete` still waits for every hold to settle. Arm and
+reset clear all unordered progress. Omitting unordered groups preserves the
+original ordered-step behavior and state shape.
+
 The provider recognizes Hermes' deterministic local-server capability probes:
 `POST /api/show`, `GET /api/v1/models`, `/api/tags`, `/v1/props`, `/props`,
 `/version`, and `/v1/models/<model>`. They intentionally return the same 404

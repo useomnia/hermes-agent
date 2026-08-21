@@ -31,6 +31,7 @@ from .schema import (
     Script,
     ScriptValidationError,
     ToolCall,
+    UnorderedStepGroup,
     matches_request,
     parse_script,
 )
@@ -119,6 +120,7 @@ class _State:
         self.generation = 1
         self.step_index = 0
         self.request_index = 0
+        self._unordered_consumed: set[int] = set()
         self._sequence_counter = 0
         self._requests: list[CapturedRequest] = []
         self._unexpected: list[dict[str, Any]] = []
@@ -131,6 +133,7 @@ class _State:
             self.armed = True
             self.step_index = 0
             self.request_index = 0
+            self._unordered_consumed.clear()
             self._requests.clear()
             self._unexpected.clear()
 
@@ -139,6 +142,7 @@ class _State:
             self._advance_generation_locked()
             self.step_index = 0
             self.request_index = 0
+            self._unordered_consumed.clear()
             self._requests.clear()
             self._unexpected.clear()
             self.armed = not disarm and self.script is not None
@@ -284,14 +288,44 @@ class _State:
                 )
 
             step_index = self.step_index
-            step = script.steps[step_index]
+            script_step = script.steps[step_index]
             actual = {
                 "method": method,
                 "path": path,
                 "headers": headers,
                 "json": decoded,
             }
-            matched = matches_request(step.request, actual)
+            step: ResponseStep | None
+            branch_index: int | None = None
+            match_error: str | None = None
+            if isinstance(script_step, UnorderedStepGroup):
+                matching_branches = [
+                    branch_index
+                    for branch_index, branch in enumerate(script_step.steps)
+                    if branch_index not in self._unordered_consumed
+                    and matches_request(branch.request, actual)
+                ]
+                if len(matching_branches) == 1:
+                    branch_index = matching_branches[0]
+                    step = script_step.steps[branch_index]
+                elif not matching_branches:
+                    step = None
+                    match_error = (
+                        f"request did not match any remaining branch in unordered "
+                        f"step {step_index}"
+                    )
+                else:
+                    step = None
+                    branches = ", ".join(str(index) for index in matching_branches)
+                    match_error = (
+                        f"request matched multiple branches ({branches}) in unordered "
+                        f"step {step_index}"
+                    )
+            else:
+                step = script_step
+                if not matches_request(step.request, actual):
+                    match_error = f"request did not match step {step_index}"
+            matched = step is not None
             request = CapturedRequest(
                 sequence,
                 request_id,
@@ -303,7 +337,7 @@ class _State:
                 stream,
                 headers,
                 matched,
-                None if matched else f"request did not match step {step_index}",
+                match_error,
                 generation,
             )
             self._requests.append(request)
@@ -315,9 +349,18 @@ class _State:
                     script,
                     generation,
                     error_status=409,
-                    error_message=f"unexpected request for script step {step_index}",
+                    error_message=match_error
+                    or f"unexpected request for script step {step_index}",
                 )
-            self.step_index += 1
+            assert step is not None
+            if isinstance(script_step, UnorderedStepGroup):
+                assert branch_index is not None
+                self._unordered_consumed.add(branch_index)
+                if len(self._unordered_consumed) == len(script_step.steps):
+                    self.step_index += 1
+                    self._unordered_consumed.clear()
+            else:
+                self.step_index += 1
             hold = None
             if step.kind == "hold":
                 hold_id = step.hold_id or f"hold-g{generation:06d}-s{sequence:06d}"
@@ -395,6 +438,19 @@ class _State:
                     for hold in self._holds.values()
                 ],
             }
+            if script is not None and self.step_index < len(script.steps):
+                current_step = script.steps[self.step_index]
+                if isinstance(current_step, UnorderedStepGroup):
+                    consumed = sorted(self._unordered_consumed)
+                    result["unordered_progress"] = {
+                        "step_index": self.step_index,
+                        "consumed_branch_indexes": consumed,
+                        "remaining_branch_indexes": [
+                            index
+                            for index in range(len(current_step.steps))
+                            if index not in self._unordered_consumed
+                        ],
+                    }
             if script is not None:
                 result["script"] = script.as_dict()
                 result["model"] = script.model

@@ -7,6 +7,7 @@ through the control API or pass ``--script`` to
 ``python -m hermes_testkit.scripted_provider --help``.  Version 1 supports
 text, tool-call, HTTP-error, connection-close, and held responses; text may
 optionally provide ordered ``chunks`` whose concatenation is the final text.
+Top-level unordered groups support deterministic concurrent request races.
 """
 
 from .schema import (
@@ -17,6 +18,7 @@ from .schema import (
     Script,
     ScriptValidationError,
     ToolCall,
+    UnorderedStepGroup,
     matches_request,
     parse_script,
 )
@@ -33,6 +35,7 @@ __all__ = [
     "ScriptedInferenceServer",
     "ScriptedProviderServer",
     "ToolCall",
+    "UnorderedStepGroup",
     "matches_request",
     "parse_script",
 ]

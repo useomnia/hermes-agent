@@ -28,6 +28,7 @@ from hermes_testkit.scripted_provider import (
     Script,
     ScriptValidationError,
     ScriptedProviderServer,
+    UnorderedStepGroup,
     matches_request,
     parse_script,
 )
@@ -876,6 +877,149 @@ def test_control_reset_and_release_require_explicit_object_bodies() -> None:
 
 
 @pytest.mark.parametrize(
+    "models", [("parent-model", "child-model"), ("child-model", "parent-model")]
+)
+def test_unordered_group_consumes_each_branch_once_in_either_arrival_order(
+    models: tuple[str, str],
+) -> None:
+    script = _script({
+        "unordered": [
+            _text("parent", request={"model": "parent-model"}),
+            _text("child", request={"model": "child-model"}),
+        ]
+    })
+    with ScriptedProviderServer(script, control_token="matrix-token") as server:
+        responses = [
+            _chat(server, {"model": model, "messages": []}) for model in models
+        ]
+
+        assert [response[0] for response in responses] == [200, 200]
+        assert server.state["step_index"] == 1
+        assert server.state["consumed"] is True
+        assert server.state["complete"] is True
+        assert server.state["unexpected_requests"] == []
+
+
+def test_unordered_group_rejects_a_request_that_matches_no_remaining_branch() -> None:
+    script = _script({
+        "unordered": [
+            _text("parent", request={"model": "parent-model"}),
+            _text("child", request={"model": "child-model"}),
+        ]
+    })
+    with ScriptedProviderServer(script, control_token="matrix-token") as server:
+        status, body, _ = _chat(server, {"model": "other-model", "messages": []})
+
+        assert status == 409
+        assert "did not match any remaining branch" in body["error"]["message"]
+        assert server.state["step_index"] == 0
+        assert server.state["unordered_progress"]["consumed_branch_indexes"] == []
+
+
+def test_unordered_group_rejects_a_request_that_matches_multiple_branches() -> None:
+    script = _script({
+        "unordered": [
+            _text("first", request={"model": "matrix-model"}),
+            _text("second", request={"messages": []}),
+        ]
+    })
+    with ScriptedProviderServer(script, control_token="matrix-token") as server:
+        status, body, _ = _chat(server, {"model": "matrix-model", "messages": []})
+
+        assert status == 409
+        assert "matched multiple branches" in body["error"]["message"]
+        assert server.state["step_index"] == 0
+        assert server.state["unordered_progress"]["consumed_branch_indexes"] == []
+
+
+def test_unordered_group_rejects_a_duplicate_request_for_a_consumed_branch() -> None:
+    script = _script({
+        "unordered": [
+            _text("parent", request={"model": "parent-model"}),
+            _text("child", request={"model": "child-model"}),
+        ]
+    })
+    with ScriptedProviderServer(script, control_token="matrix-token") as server:
+        assert _chat(server, {"model": "parent-model", "messages": []})[0] == 200
+        status, _, _ = _chat(server, {"model": "parent-model", "messages": []})
+
+        assert status == 409
+        assert server.state["unordered_progress"] == {
+            "step_index": 0,
+            "consumed_branch_indexes": [0],
+            "remaining_branch_indexes": [1],
+        }
+
+
+def test_control_reset_clears_unordered_group_progress() -> None:
+    script = _script({
+        "unordered": [
+            _text("parent", request={"model": "parent-model"}),
+            _text("child", request={"model": "child-model"}),
+        ]
+    })
+    with ScriptedProviderServer(script, control_token="matrix-token") as server:
+        assert _chat(server, {"model": "parent-model", "messages": []})[0] == 200
+        status, reset, _ = _request(
+            server, "POST", "/__control/reset", {}, token="matrix-token"
+        )
+
+        assert status == 200
+        assert reset["unordered_progress"]["consumed_branch_indexes"] == []
+        assert _chat(server, {"model": "child-model", "messages": []})[0] == 200
+        assert server.state["unordered_progress"]["consumed_branch_indexes"] == [1]
+
+
+def test_unordered_group_allows_a_sibling_while_one_branch_is_held() -> None:
+    script = _script({
+        "unordered": [
+            {
+                "request": {"model": "child-model"},
+                "response": {
+                    "type": "hold",
+                    "id": "child-hold",
+                    "response": {"type": "text", "text": "child"},
+                },
+            },
+            _text("parent", request={"model": "parent-model"}),
+        ]
+    })
+    with ScriptedProviderServer(script, control_token="matrix-token") as server:
+        child_response: list[tuple[int, dict[str, Any] | str, dict[str, str]]] = []
+
+        def request_child() -> None:
+            child_response.append(
+                _chat(server, {"model": "child-model", "messages": []}, timeout=3)
+            )
+
+        child = threading.Thread(target=request_child)
+        child.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not server.state["held"]:
+            time.sleep(0.01)
+
+        assert server.state["held"][0]["id"] == "child-hold"
+        assert _chat(server, {"model": "parent-model", "messages": []})[0] == 200
+        assert server.state["consumed"] is True
+        assert server.state["complete"] is False
+        assert (
+            _request(
+                server,
+                "POST",
+                "/__control/release",
+                {"id": "child-hold"},
+                token="matrix-token",
+            )[0]
+            == 200
+        )
+        child.join(timeout=2)
+
+        assert not child.is_alive()
+        assert child_response[0][0] == 200
+        assert server.state["complete"] is True
+
+
+@pytest.mark.parametrize(
     "request_match",
     [
         {"messages": [{"role": "user"}]},
@@ -1171,6 +1315,50 @@ def test_script_as_dict_round_trips_every_response_variant() -> None:
     assert "mutated" not in parsed.as_dict()["metadata"]["nested"]["stable"]
     round_tripped = parse_script(parsed.as_dict())
     assert round_tripped.as_dict() == parsed.as_dict()
+
+
+def test_unordered_group_round_trips_as_an_immutable_script_step() -> None:
+    original = _script({
+        "unordered": [
+            _text("parent", request={"model": "parent-model"}),
+            _text("child", request={"model": "child-model"}),
+        ]
+    })
+
+    parsed = parse_script(original)
+
+    assert isinstance(parsed.steps[0], UnorderedStepGroup)
+    assert parse_script(parsed.as_dict()).as_dict() == parsed.as_dict()
+
+
+@pytest.mark.parametrize(
+    ("group", "message"),
+    [
+        ({"unordered": []}, "non-empty array"),
+        ({"unordered": "not-an-array"}, "non-empty array"),
+        ({"unordered": [_text("missing request")]}, "explicit request"),
+        (
+            {
+                "unordered": [
+                    {"unordered": [_text("nested", request={"model": "nested-model"})]}
+                ]
+            },
+            "cannot nest",
+        ),
+        (
+            {
+                "unordered": [_text("branch", request={"model": "branch-model"})],
+                "response": {"type": "text", "text": "sibling"},
+            },
+            "sibling fields",
+        ),
+    ],
+)
+def test_unordered_group_rejects_malformed_contracts(
+    group: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ScriptValidationError, match=message):
+        parse_script(_script(group))
 
 
 def test_explicit_chunks_validate_concatenation_and_round_trip_for_held_text() -> None:

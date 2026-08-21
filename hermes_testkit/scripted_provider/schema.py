@@ -20,6 +20,10 @@ the equivalent Python mapping) with a version and an ordered list of steps:
 match against the decoded chat-completions request.  Keeping matching in the
 schema layer makes the HTTP server useful from both Python tests and a Sprite
 process without introducing an SDK dependency.
+
+One top-level step may instead be ``{"unordered": [...]}``.  Its branches
+must each declare an explicit request predicate and may arrive in any order,
+exactly once, before the next top-level step becomes available.
 """
 
 from __future__ import annotations
@@ -518,10 +522,29 @@ class ResponseStep:
 
 
 @dataclass(frozen=True)
+class UnorderedStepGroup:
+    """Expected requests that may arrive in any order, each exactly once."""
+
+    steps: tuple[ResponseStep, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.steps, (list, tuple)) or not self.steps:
+            raise ScriptValidationError("unordered must be a non-empty array")
+        steps = tuple(self.steps)
+        if any(not isinstance(step, ResponseStep) for step in steps):
+            raise ScriptValidationError("unordered must contain ResponseStep objects")
+        if any(step.request is None for step in steps):
+            raise ScriptValidationError(
+                "every unordered branch must declare an explicit request"
+            )
+        object.__setattr__(self, "steps", steps)
+
+
+@dataclass(frozen=True)
 class Script:
     """Validated immutable script consumed by :class:`ScriptedProvider`."""
 
-    steps: tuple[ResponseStep, ...]
+    steps: tuple[ResponseStep | UnorderedStepGroup, ...]
     schema_version: int = SCRIPT_SCHEMA_VERSION
     model: str = DEFAULT_MODEL
     models: tuple[str, ...] = ()
@@ -550,9 +573,11 @@ class Script:
         if not isinstance(self.steps, (list, tuple)):
             raise ScriptValidationError("script.steps must be an array")
         steps = tuple(self.steps)
-        if any(not isinstance(step, ResponseStep) for step in steps):
+        if any(
+            not isinstance(step, (ResponseStep, UnorderedStepGroup)) for step in steps
+        ):
             raise ScriptValidationError(
-                "script.steps must contain ResponseStep objects"
+                "script.steps must contain ResponseStep or UnorderedStepGroup objects"
             )
         object.__setattr__(self, "steps", steps)
         if not isinstance(self.models, (list, tuple)):
@@ -597,55 +622,60 @@ class Script:
         if self.model_metadata:
             result["model_metadata"] = _thaw_json(self.model_metadata)
         for step in self.steps:
-            response: dict[str, Any] = {"type": step.kind}
-            if step.kind == "text":
-                response["text"] = step.text
-                if step.chunks is not None:
-                    response["chunks"] = list(step.chunks)
-                if step.usage is not None:
-                    response["usage"] = dict(step.usage)
-            elif step.kind == "tool_calls":
-                if step.text:
-                    response["text"] = step.text
-                response["tool_calls"] = [
-                    _tool_call_as_dict(call) for call in step.tool_calls
-                ]
-                if step.usage is not None:
-                    response["usage"] = dict(step.usage)
-            elif step.kind == "http_error":
-                response["status"] = step.status
-                if step.error is not None:
-                    response["error"] = _thaw_json(step.error)
-            elif step.kind == "connection_close":
-                response["before_headers"] = step.close_before_headers
-                response["after_chunks"] = step.close_after_chunks
-                response["text"] = step.text
-            elif step.kind == "hold":
-                inner: dict[str, Any] = {"type": step.hold_response_kind}
-                if step.hold_response_kind in {"text", "tool_calls"}:
-                    inner["text"] = step.text
-                if step.hold_response_kind == "text" and step.chunks is not None:
-                    inner["chunks"] = list(step.chunks)
-                if step.usage is not None:
-                    inner["usage"] = dict(step.usage)
-                if step.hold_response_kind == "tool_calls":
-                    inner["tool_calls"] = [
-                        _tool_call_as_dict(call) for call in step.tool_calls
-                    ]
-                if step.hold_response_kind == "http_error":
-                    inner["status"] = step.status
-                    if step.error is not None:
-                        inner["error"] = _thaw_json(step.error)
-                response["response"] = inner
-                if step.hold_id:
-                    response["id"] = step.hold_id
-                if step.hold_timeout_seconds is not None:
-                    response["timeout_seconds"] = step.hold_timeout_seconds
-            item: dict[str, Any] = {"response": response}
-            if step.request is not None:
-                item["request"] = _thaw_json(step.request)
-            result["steps"].append(item)
+            if isinstance(step, UnorderedStepGroup):
+                result["steps"].append({
+                    "unordered": [_step_as_dict(branch) for branch in step.steps]
+                })
+                continue
+            result["steps"].append(_step_as_dict(step))
         return result
+
+
+def _step_as_dict(step: ResponseStep) -> dict[str, Any]:
+    response: dict[str, Any] = {"type": step.kind}
+    if step.kind == "text":
+        response["text"] = step.text
+        if step.chunks is not None:
+            response["chunks"] = list(step.chunks)
+        if step.usage is not None:
+            response["usage"] = dict(step.usage)
+    elif step.kind == "tool_calls":
+        if step.text:
+            response["text"] = step.text
+        response["tool_calls"] = [_tool_call_as_dict(call) for call in step.tool_calls]
+        if step.usage is not None:
+            response["usage"] = dict(step.usage)
+    elif step.kind == "http_error":
+        response["status"] = step.status
+        if step.error is not None:
+            response["error"] = _thaw_json(step.error)
+    elif step.kind == "connection_close":
+        response["before_headers"] = step.close_before_headers
+        response["after_chunks"] = step.close_after_chunks
+        response["text"] = step.text
+    elif step.kind == "hold":
+        inner: dict[str, Any] = {"type": step.hold_response_kind}
+        if step.hold_response_kind in {"text", "tool_calls"}:
+            inner["text"] = step.text
+        if step.hold_response_kind == "text" and step.chunks is not None:
+            inner["chunks"] = list(step.chunks)
+        if step.usage is not None:
+            inner["usage"] = dict(step.usage)
+        if step.hold_response_kind == "tool_calls":
+            inner["tool_calls"] = [_tool_call_as_dict(call) for call in step.tool_calls]
+        if step.hold_response_kind == "http_error":
+            inner["status"] = step.status
+            if step.error is not None:
+                inner["error"] = _thaw_json(step.error)
+        response["response"] = inner
+        if step.hold_id:
+            response["id"] = step.hold_id
+        if step.hold_timeout_seconds is not None:
+            response["timeout_seconds"] = step.hold_timeout_seconds
+    item: dict[str, Any] = {"response": response}
+    if step.request is not None:
+        item["request"] = _thaw_json(step.request)
+    return item
 
 
 def _tool_call_as_dict(call: ToolCall) -> dict[str, Any]:
@@ -724,8 +754,8 @@ def _parse_response_usage(
     return _validate_usage(response["usage"], where=f"{where}.response.usage")
 
 
-def _parse_step(value: Any, index: int) -> ResponseStep:
-    where = f"steps[{index}]"
+def _parse_step(value: Any, index: int, *, where: str | None = None) -> ResponseStep:
+    where = where or f"steps[{index}]"
     item = _as_mapping(value, where=where)
     request = item.get(
         "request",
@@ -884,6 +914,28 @@ def _parse_step(value: Any, index: int) -> ResponseStep:
     )
 
 
+def _parse_script_step(value: Any, index: int) -> ResponseStep | UnorderedStepGroup:
+    where = f"steps[{index}]"
+    item = _as_mapping(value, where=where)
+    if "unordered" not in item:
+        return _parse_step(item, index, where=where)
+    if set(item) != {"unordered"}:
+        raise ScriptValidationError(
+            f"{where} unordered group cannot contain sibling fields"
+        )
+    branches = item["unordered"]
+    if not isinstance(branches, list) or not branches:
+        raise ScriptValidationError(f"{where}.unordered must be a non-empty array")
+    parsed: list[ResponseStep] = []
+    for branch_index, branch in enumerate(branches):
+        branch_where = f"{where}.unordered[{branch_index}]"
+        branch_mapping = _as_mapping(branch, where=branch_where)
+        if "unordered" in branch_mapping:
+            raise ScriptValidationError(f"{branch_where} cannot nest unordered groups")
+        parsed.append(_parse_step(branch_mapping, index, where=branch_where))
+    return UnorderedStepGroup(tuple(parsed))
+
+
 def parse_script(value: Any, *, allow_default_version: bool = True) -> Script:
     """Validate and convert a mapping into an immutable :class:`Script`.
 
@@ -924,7 +976,9 @@ def parse_script(value: Any, *, allow_default_version: bool = True) -> Script:
     raw_steps = root.get("steps", root.get("responses"))
     if not isinstance(raw_steps, list):
         raise ScriptValidationError("script.steps must be an array")
-    steps = tuple(_parse_step(step, index) for index, step in enumerate(raw_steps))
+    steps = tuple(
+        _parse_script_step(step, index) for index, step in enumerate(raw_steps)
+    )
 
     model = root.get("model", DEFAULT_MODEL)
     if not isinstance(model, str) or not model:
