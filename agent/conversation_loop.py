@@ -3146,6 +3146,11 @@ def run_conversation(
                             # advisor cost (each priced at its own rate). Folded
                             # here so state.db's estimated_cost_usd includes the
                             # full MoA spend, matching the folded token counts.
+                            _response_model = getattr(response, "model", None)
+                            if isinstance(_response_model, str) and _response_model.strip():
+                                _response_model = _response_model.strip()
+                            else:
+                                _response_model = agent.model
                             agent._session_db.update_token_counts(
                                 agent.session_id,
                                 input_tokens=canonical_usage.input_tokens,
@@ -3176,6 +3181,7 @@ def run_conversation(
                                 billing_mode="subscription_included"
                                 if cost_result.status == "included" else None,
                                 model=agent.model,
+                                usage_model=_response_model,
                                 api_call_count=1,
                             )
                         except Exception as e:
