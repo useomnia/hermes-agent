@@ -9352,7 +9352,7 @@ class APIServerAdapter(BasePlatformAdapter):
         against Omnia at execution, so this cannot turn stale data into a grant.
         """
         try:
-            from tools.tool_approval import (
+            from tools.omnio_approval_state import (
                 register_always_approval_authority,
                 replace_injected_always_approvals,
             )
@@ -9384,7 +9384,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _replace_omnio_approval_snapshot(
         self, *, base_url: str, api_token: str, brand_id: str
     ) -> bool:
-        from tools.tool_approval import replace_injected_always_approvals
+        from tools.omnio_approval_state import replace_injected_always_approvals
 
         try:
             tools, tool_slugs = await self._fetch_omnio_connector_toolkit_approvals(
@@ -9520,7 +9520,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise RuntimeError(f"omnia_status={status}")
             payload = json.loads(response.read())
 
-        from tools.tool_approval import connector_tool_slug
+        from tools.omnio_approval_state import connector_tool_slug
 
         tools, tool_slugs = _parse_omnio_connector_toolkit_approvals(payload)
         if function_name in tools:
