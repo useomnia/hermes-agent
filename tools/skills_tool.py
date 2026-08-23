@@ -84,6 +84,12 @@ from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     is_skill_support_path as _is_skill_support_path,
 )
+from agent.skill_sources import (
+    canonical_skill_id,
+    classify_skill_path,
+    skill_relative_path,
+    split_source_layout_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -585,8 +591,14 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
         try:
             rel_path = skill_path.relative_to(skills_dir)
             parts = rel_path.parts
+            if (
+                split_source_layout_enabled()
+                and parts
+                and parts[0] in {"system", "custom"}
+            ):
+                parts = parts[1:]
             if len(parts) >= 3:
-                return parts[0]
+                return "/".join(parts[:-2])
         except ValueError:
             continue
     return None
@@ -733,7 +745,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         return [dict(s) for s in cached[2]]
 
     skills = []
-    seen_names: set = set()
+    seen_skills: set = set()
 
     # Scan local dir first, then external dirs (local takes precedence) —
     # dirs_to_scan already resolved above for the signature.
@@ -755,9 +767,16 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     continue
 
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
-                if name in seen_names:
+                source = classify_skill_path(skill_dir, active_skills_dir)
+                skill_id = (
+                    canonical_skill_id(skill_dir, active_skills_dir)
+                    if source != "external"
+                    else name
+                )
+                dedupe_key = skill_id if split_source_layout_enabled() else name
+                if dedupe_key in seen_skills:
                     continue
-                if name in disabled:
+                if name in disabled or skill_id in disabled:
                     continue
 
                 description = frontmatter.get("description", "")
@@ -774,10 +793,13 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 category = _get_category_from_path(skill_md)
 
                 skill = {
+                    "id": skill_id,
                     "name": name,
                     "description": description,
                     "category": category,
                 }
+                if source in {"system", "custom"}:
+                    skill["source"] = source
                 metadata = frontmatter.get("metadata")
                 if (
                     isinstance(metadata, dict)
@@ -787,14 +809,14 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 if provenance_names is not None:
                     bundled_names, hub_installed_names = provenance_names
                     provenance = classify_skill_provenance(
-                        name,
+                        skill_id if split_source_layout_enabled() else name,
                         bundled_names=bundled_names,
                         hub_installed_names=hub_installed_names,
                     )
                     if provenance is not None:
                         skill["provenance"] = provenance
 
-                seen_names.add(name)
+                seen_skills.add(dedupe_key)
                 skills.append(skill)
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -1033,10 +1055,22 @@ def skill_view(
             )
 
         local_category_name: str | None = None
+        source_qualified = split_source_layout_enabled() and name.startswith(
+            ("system:", "custom:")
+        )
+        if source_qualified:
+            source, relative_name = name.split(":", 1)
+            local_category_name = f"{source}/{relative_name}"
+        elif split_source_layout_enabled() and "/" in name:
+            # A source-relative path is the concise custom alias. Canonical
+            # identities remain ``custom:path`` / ``system:path``; system
+            # paths must stay explicitly qualified so an immutable shipped
+            # skill can never be selected accidentally.
+            local_category_name = f"custom/{name}"
         # ── Qualified name dispatch (plugin skills) ──────────────────
         # Names containing ':' are routed to the plugin skill registry.
         # Bare names fall through to the existing flat-tree scan below.
-        if ":" in name:
+        if ":" in name and not source_qualified:
             from agent.skill_utils import is_valid_namespace, parse_qualified_name
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
 
@@ -1217,7 +1251,22 @@ def skill_view(
                     _record(None, found_md)
 
         if len(candidates) > 1:
-            paths = [str(smd) for _, smd in candidates]
+            if not split_source_layout_enabled():
+                paths = [str(smd) for _, smd in candidates]
+            else:
+                paths = []
+            for candidate_dir, candidate_md in candidates:
+                if not split_source_layout_enabled():
+                    continue
+                if candidate_dir is not None:
+                    try:
+                        paths.append(
+                            canonical_skill_id(candidate_dir, active_skills_dir)
+                        )
+                        continue
+                    except (OSError, ValueError):
+                        pass
+                paths.append(candidate_md.name)
             logging.getLogger(__name__).warning(
                 "Skill name collision for '%s': %d candidates — %s",
                 name, len(candidates), "; ".join(paths),
@@ -1600,13 +1649,20 @@ def skill_view(
 
         result = {
             "success": True,
+            "id": canonical_skill_id(skill_dir, active_skills_dir)
+            if skill_dir is not None
+            and classify_skill_path(skill_dir, active_skills_dir) != "external"
+            else skill_name,
             "name": skill_name,
             "description": frontmatter.get("description", ""),
             "tags": tags,
             "related_skills": related_skills,
             "content": rendered_content,
-            "path": rel_path,
-            "skill_dir": str(skill_dir) if skill_dir else None,
+            "path": skill_relative_path(skill_dir, active_skills_dir)
+            if skill_dir is not None
+            and split_source_layout_enabled()
+            and classify_skill_path(skill_dir, active_skills_dir) != "external"
+            else rel_path,
             "linked_files": linked_files if linked_files else None,
             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
             if linked_files
@@ -1626,7 +1682,7 @@ def skill_view(
         try:
             from tools.skill_usage import classify_skill_provenance
 
-            provenance = classify_skill_provenance(skill_name)
+            provenance = classify_skill_provenance(str(result["id"]))
         except Exception:
             logger.debug(
                 "Failed to classify provenance for skill %s",
@@ -1788,7 +1844,7 @@ def _skill_view_with_bump(args, **kw):
         if isinstance(parsed, dict) and parsed.get("success"):
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.
-            resolved = parsed.get("name") or name
+            resolved = parsed.get("id") or parsed.get("name") or name
             if resolved:
                 from tools.skill_usage import bump_use, bump_view
                 bump_view(str(resolved))

@@ -991,3 +991,106 @@ def test_adopt_rejects_empty_name(skills_home):
 
     assert adopt_skill("")[0] is False
 
+def test_split_layout_makes_every_custom_skill_curatable_and_system_immutable(
+    skills_home, monkeypatch
+):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"skills": {"source_layout": "split"}},
+    )
+    from tools.skill_usage import (
+        is_curation_eligible,
+        list_agent_created_skill_names,
+        list_unmanaged_skill_names,
+    )
+
+    skills = skills_home / "skills"
+    _write_skill(skills / "system", "shipped", "toolkits")
+    custom = _write_skill(skills / "custom", "brand-workflow", "toolkit/content")
+
+    assert list_agent_created_skill_names() == ["custom:toolkit/content/brand-workflow"]
+    assert is_curation_eligible("custom:toolkit/content/brand-workflow", custom) is True
+    assert is_curation_eligible("system:toolkits/shipped") is False
+    assert list_unmanaged_skill_names() == []
+
+
+def test_split_layout_bare_duplicate_name_is_not_assigned_to_one_source(
+    skills_home, monkeypatch
+):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"skills": {"source_layout": "split"}},
+    )
+    from tools.skill_usage import bump_use, load_usage
+
+    skills = skills_home / "skills"
+    _write_skill(skills / "system", "shared", "toolkit")
+    _write_skill(skills / "custom", "shared", "brand")
+
+    bump_use("shared")
+
+    assert load_usage()["shared"]["use_count"] == 1
+    assert "system:toolkit/shared" not in load_usage()
+    assert "custom:brand/shared" not in load_usage()
+
+
+def test_split_archive_preserves_path_and_marks_canonical_usage_record(
+    skills_home, monkeypatch
+):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"skills": {"source_layout": "split"}},
+    )
+    from tools.skill_usage import archive_skill, get_record
+
+    skills = skills_home / "skills"
+    _write_skill(skills / "custom", "campaign", "toolkit/content")
+
+    ok, _message = archive_skill("custom:toolkit/content/campaign")
+
+    assert ok is True
+    assert not (skills / "custom/toolkit/content/campaign").exists()
+    assert (skills / "custom/.archive/toolkit/content/campaign/SKILL.md").is_file()
+    record = get_record("custom:toolkit/content/campaign")
+    assert record["state"] == "archived"
+    assert record["archived_at"] is not None
+
+
+def test_split_archive_collision_keeps_category_path(skills_home, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"skills": {"source_layout": "split"}},
+    )
+    from tools.skill_usage import archive_skill
+
+    skills = skills_home / "skills"
+    _write_skill(skills / "custom", "campaign", "toolkit/content")
+    _write_skill(skills / "custom/.archive", "campaign", "toolkit/content")
+
+    ok, _message = archive_skill("custom:toolkit/content/campaign")
+
+    assert ok is True
+    archived_parent = skills / "custom/.archive/toolkit/content"
+    assert any(
+        path.name.startswith("campaign-") and (path / "SKILL.md").is_file()
+        for path in archived_parent.iterdir()
+    )
+
+
+def test_split_usage_report_keeps_duplicate_basenames(skills_home, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"skills": {"source_layout": "split"}},
+    )
+    from tools.skill_usage import usage_report
+
+    skills = skills_home / "skills"
+    _write_skill(skills / "system", "shared", "toolkit")
+    _write_skill(skills / "custom", "shared", "brand")
+
+    rows = usage_report()
+
+    assert [row["id"] for row in rows] == [
+        "custom:brand/shared",
+        "system:toolkit/shared",
+    ]

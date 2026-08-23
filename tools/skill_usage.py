@@ -1,7 +1,8 @@
-"""Skill usage telemetry + provenance tracking for the Curator feature.
+"""Skill usage telemetry and Curator lifecycle state.
 
 Tracks per-skill usage metadata in a sidecar JSON file (~/.hermes/skills/.usage.json)
-keyed by skill name. Counters are bumped by the existing skill tools (skill_view,
+keyed by canonical skill id in split installations and by skill name in legacy
+flat installations. Counters are bumped by the existing skill tools (skill_view,
 skill_manage); the curator orchestrator reads the derived activity timestamp to
 decide lifecycle transitions.
 
@@ -11,9 +12,9 @@ Design notes:
   - Atomic writes via tempfile + os.replace (same pattern as .bundled_manifest).
   - All counter bumps are best-effort: failures log at DEBUG and return silently.
     A broken sidecar never breaks the underlying tool call.
-  - Provenance filter: curator-managed skills are explicitly marked when
-    created through skill_manage. Bundled / hub-installed skills stay
-    off-limits, and manually authored skills are not inferred from location.
+  - In split installations, structure is policy: every custom skill is mutable
+    by the curator and every system skill is off-limits. Legacy flat installs
+    retain the explicit provenance/adoption gate.
 
 Lifecycle states:
     active    -> default
@@ -35,6 +36,14 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
 from agent.skill_utils import is_excluded_skill_path, is_external_skill_path
+from agent.skill_sources import (
+    canonical_skill_id,
+    classify_skill_path,
+    custom_skills_dir,
+    direct_skill_path,
+    skill_relative_path,
+    split_source_layout_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +132,8 @@ def _usage_file_lock():
 
 
 def _archive_dir() -> Path:
+    if split_source_layout_enabled():
+        return custom_skills_dir(_skills_dir()) / ".archive"
     return _skills_dir() / ".archive"
 
 
@@ -279,6 +290,18 @@ def classify_skill_provenance(
     Callers that classify several skills can pass preloaded name sets to avoid
     reading the manifest and hub lock for every skill.
     """
+    if split_source_layout_enabled():
+        if skill_name.startswith("system:"):
+            return "bundled"
+        if skill_name.startswith("custom:"):
+            return "learned"
+        found = _find_skill_dir(skill_name)
+        if found is not None:
+            source = classify_skill_path(found, _skills_dir())
+            if source == "system":
+                return "bundled"
+            if source == "custom":
+                return "learned"
     if bundled_names is None or hub_installed_names is None:
         provenance_names = read_skill_provenance_names()
         if provenance_names is None:
@@ -391,6 +414,17 @@ def list_agent_created_skill_names() -> List[str]:
     base = _skills_dir()
     if not base.exists():
         return []
+    if split_source_layout_enabled():
+        custom_root = custom_skills_dir(base)
+        if not custom_root.exists():
+            return []
+        return sorted(
+            canonical_skill_id(skill_md.parent, base)
+            for skill_md in custom_root.rglob("SKILL.md")
+            if not is_excluded_skill_path(skill_md, root=base)
+            and not is_external_skill_path(skill_md)
+        )
+
     hub = _read_hub_installed_names()
     bundled = _read_bundled_manifest_names()
     prune_builtins = _prune_builtins_enabled()
@@ -442,6 +476,12 @@ def list_archived_skill_names() -> List[str]:
     archive_root = _archive_dir()
     if not archive_root.exists():
         return []
+    if split_source_layout_enabled():
+        return sorted(
+            f"custom:{skill_md.parent.relative_to(archive_root).as_posix()}"
+            for skill_md in archive_root.rglob("SKILL.md")
+            if not is_excluded_skill_path(skill_md, root=archive_root)
+        )
     return sorted({p.name for p in archive_root.iterdir() if p.is_dir()})
 
 
@@ -468,6 +508,11 @@ def _read_skill_name(skill_md: Path, fallback: str) -> str:
 
 def is_agent_created(skill_name: str) -> bool:
     """Whether *skill_name* is neither bundled nor hub-installed."""
+    if split_source_layout_enabled():
+        found = _find_skill_dir(skill_name)
+        return (
+            found is not None and classify_skill_path(found, _skills_dir()) == "custom"
+        )
     off_limits = _read_bundled_manifest_names() | _read_hub_installed_names()
     if skill_name in off_limits:
         return False
@@ -484,6 +529,11 @@ def is_hub_installed(skill_name: str) -> bool:
 
 def is_bundled(skill_name: str) -> bool:
     """Whether *skill_name* was seeded from the bundled repo skills."""
+    if split_source_layout_enabled():
+        found = _find_skill_dir(skill_name)
+        return (
+            found is not None and classify_skill_path(found, _skills_dir()) == "system"
+        )
     return skill_name in _read_bundled_manifest_names()
 
 
@@ -504,6 +554,13 @@ def is_curation_eligible(skill_name: str, skill_path: Optional[Path] = None) -> 
     regardless of any flag — they back load-bearing UX and must never be
     archived or consolidated.
     """
+    if split_source_layout_enabled():
+        candidate = skill_path or _find_skill_dir(skill_name)
+        return (
+            candidate is not None
+            and classify_skill_path(candidate, _skills_dir()) == "custom"
+            and not is_external_skill_path(candidate)
+        )
     if skill_path is not None and is_external_skill_path(skill_path):
         return False
     if is_protected_builtin(skill_name):
@@ -578,6 +635,8 @@ def list_unmanaged_skill_names() -> List[str]:
     use counts are evidence of maintenance, not of authorship — the agent
     edits user-authored skills on the user's behalf routinely.
     """
+    if split_source_layout_enabled():
+        return []
     base = _skills_dir()
     if not base.exists():
         return []
@@ -646,6 +705,17 @@ def adopt_skill(skill_name: str) -> Tuple[bool, str]:
     """
     if not skill_name:
         return False, "no skill name given"
+    if split_source_layout_enabled():
+        skill_dir = _find_skill_dir(skill_name)
+        if skill_dir is None:
+            return False, f"skill '{skill_name}' not found"
+        source = classify_skill_path(skill_dir, _skills_dir())
+        if source == "custom":
+            return True, (
+                f"'{canonical_skill_id(skill_dir, _skills_dir())}' is already curator-managed "
+                "because every custom skill is mutable"
+            )
+        return False, "system skills are immutable and cannot be adopted by the curator"
     if is_protected_builtin(skill_name):
         return False, f"'{skill_name}' is a protected built-in; the curator never manages it"
     if is_hub_installed(skill_name):
@@ -715,6 +785,19 @@ def load_usage() -> Dict[str, Dict[str, Any]]:
     return clean
 
 
+def _usage_key(skill_name: str) -> str:
+    """Normalize a lookup to its source-qualified identity in split mode."""
+    raw = str(skill_name or "").strip()
+    if not raw or not split_source_layout_enabled():
+        return raw
+    if raw.startswith(("system:", "custom:")):
+        return raw
+    found = _find_skill_dir(raw)
+    if found is None:
+        return raw
+    return canonical_skill_id(found, _skills_dir())
+
+
 def save_usage(data: Dict[str, Dict[str, Any]]) -> None:
     """Write the usage map atomically. Best-effort — errors are logged, not raised."""
     path = _usage_file()
@@ -742,7 +825,10 @@ def save_usage(data: Dict[str, Dict[str, Any]]) -> None:
 def get_record(skill_name: str) -> Dict[str, Any]:
     """Return the record for *skill_name*, creating a fresh one if missing."""
     data = load_usage()
-    rec = data.get(skill_name)
+    key = _usage_key(skill_name)
+    rec = data.get(key)
+    if not isinstance(rec, dict) and key != skill_name:
+        rec = data.get(skill_name)
     if not isinstance(rec, dict):
         return _empty_record()
     # Backfill any missing keys so callers don't need to handle old files
@@ -766,9 +852,10 @@ def seed_record_if_missing(skill_name: str) -> None:
     try:
         with _usage_file_lock():
             data = load_usage()
-            if isinstance(data.get(skill_name), dict):
+            key = _usage_key(skill_name)
+            if isinstance(data.get(key), dict):
                 return
-            data[skill_name] = _empty_record()
+            data[key] = _empty_record()
             save_usage(data)
     except Exception as e:
         logger.debug("skill_usage.seed_record_if_missing(%s) failed: %s", skill_name, e, exc_info=True)
@@ -792,11 +879,14 @@ def _mutate(skill_name: str, mutator, *, require_curation_eligible: bool = False
             return
         with _usage_file_lock():
             data = load_usage()
-            rec = data.get(skill_name)
+            key = _usage_key(skill_name)
+            rec = data.get(key)
+            if not isinstance(rec, dict) and key != skill_name:
+                rec = data.pop(skill_name, None)
             if not isinstance(rec, dict):
                 rec = _empty_record()
             mutator(rec)
-            data[skill_name] = rec
+            data[key] = rec
             save_usage(data)
     except Exception as e:
         logger.debug("skill_usage._mutate(%s) failed: %s", skill_name, e, exc_info=True)
@@ -867,6 +957,20 @@ def set_state(skill_name: str, state: str) -> None:
     _mutate(skill_name, _apply, require_curation_eligible=True)
 
 
+def _set_archived_state_after_move(skill_name: str) -> None:
+    """Persist archive state after the live skill directory has moved away.
+
+    The public ``set_state`` guard deliberately requires a live, mutable custom
+    skill. After ``archive_skill`` succeeds that directory no longer exists,
+    so the archive primitive needs this narrow internal write path.
+    """
+    def _apply(rec: Dict[str, Any]) -> None:
+        rec["state"] = STATE_ARCHIVED
+        rec["archived_at"] = _now_iso()
+
+    _mutate(skill_name, _apply)
+
+
 def set_pinned(skill_name: str, pinned: bool) -> None:
     def _apply(rec: Dict[str, Any]) -> None:
         rec["pinned"] = bool(pinned)
@@ -880,8 +984,13 @@ def forget(skill_name: str) -> None:
     try:
         with _usage_file_lock():
             data = load_usage()
-            if skill_name in data:
-                del data[skill_name]
+            key = _usage_key(skill_name)
+            changed = False
+            for candidate in {skill_name, key}:
+                if candidate in data:
+                    del data[candidate]
+                    changed = True
+            if changed:
                 save_usage(data)
     except Exception as e:
         logger.debug("skill_usage.forget(%s) failed: %s", skill_name, e, exc_info=True)
@@ -928,11 +1037,18 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     except OSError as e:
         return False, f"failed to create archive dir: {e}"
 
-    # Flatten any category nesting into a single ".archive/<skill>/" so restores
-    # are simple. If a collision exists, append a timestamp.
-    dest = archive_root / skill_dir.name
+    # Split layouts preserve the full custom category path so archive/restore
+    # never destroys identity. Legacy layouts retain their historical flat
+    # archive shape.
+    usage_id = canonical_skill_id(skill_dir, _skills_dir())
+    if split_source_layout_enabled():
+        dest = archive_root / skill_relative_path(skill_dir, _skills_dir())
+    else:
+        dest = archive_root / skill_dir.name
     if dest.exists():
-        dest = archive_root / f"{skill_dir.name}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        dest = dest.with_name(
+            f"{dest.name}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        )
 
     try:
         skill_dir.rename(dest)
@@ -948,13 +1064,15 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     if is_bundled(skill_name):
         add_suppressed_name(skill_name)
 
-    set_state(skill_name, STATE_ARCHIVED)
+    _set_archived_state_after_move(usage_id)
     return True, f"archived to {dest}"
 
 
 def restore_skill(skill_name: str) -> Tuple[bool, str]:
-    """Move an archived skill back to ~/.hermes/skills/. Restores to the flat
-    top-level layout; original category nesting is NOT reconstructed.
+    """Move an archived skill back to the live skills tree.
+
+    Split layouts preserve and restore the full custom category path. Legacy
+    layouts retain the historical flat top-level restore behavior.
 
     Refuses to restore under a name that now collides with a hub-installed
     skill — that would shadow the upstream version. Also refuses to restore
@@ -979,6 +1097,31 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
     archive_root = _archive_dir()
     if not archive_root.exists():
         return False, "no archive directory"
+
+    if split_source_layout_enabled():
+        rel = (
+            skill_name.split(":", 1)[1]
+            if skill_name.startswith("custom:")
+            else skill_name
+        )
+        src = archive_root / rel
+        if not (src / "SKILL.md").is_file():
+            return False, f"skill '{skill_name}' not found in archive"
+        dest = custom_skills_dir(_skills_dir()) / rel
+        if dest.exists():
+            return False, f"destination already exists: custom:{rel}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            src.rename(dest)
+        except OSError:
+            import shutil
+
+            try:
+                shutil.move(str(src), str(dest))
+            except Exception as exc:
+                return False, f"failed to restore: {exc}"
+        set_state(f"custom:{rel}", STATE_ACTIVE)
+        return True, f"restored to custom:{rel}"
 
     # Try exact name match first, then the timestamped-duplicate fallback.
     # Recursive walk handles nested archive layouts (e.g. .archive/<category>/<skill>/)
@@ -1036,14 +1179,20 @@ def _find_skill_dir(skill_name: str) -> Optional[Path]:
     base = _skills_dir()
     if not base.exists():
         return None
+    direct = direct_skill_path(skill_name, base)
+    if direct is not None and (direct / "SKILL.md").is_file():
+        return direct
+    matches: list[Path] = []
     for skill_md in base.rglob("SKILL.md"):
         if is_excluded_skill_path(skill_md):
             continue
         if is_external_skill_path(skill_md):
             continue
         if _read_skill_name(skill_md, fallback=skill_md.parent.name) == skill_name:
-            return skill_md.parent
-    return None
+            matches.append(skill_md.parent)
+    if split_source_layout_enabled():
+        return matches[0] if len(matches) == 1 else None
+    return matches[0] if matches else None
 
 
 def _find_external_skill_dir(skill_name: str) -> Optional[Path]:
@@ -1140,10 +1289,18 @@ def usage_report() -> List[Dict[str, Any]]:
         if is_excluded_skill_path(skill_md):
             continue
         name = _read_skill_name(skill_md, fallback=skill_md.parent.name)
-        if name in seen:
+        source = classify_skill_path(skill_md.parent, base)
+        skill_id = (
+            canonical_skill_id(skill_md.parent, base)
+            if source in {"system", "custom"}
+            else name
+        )
+        if skill_id in seen:
             continue
-        seen.add(name)
-        raw = data.get(name)
+        seen.add(skill_id)
+        raw = data.get(skill_id)
+        if not isinstance(raw, dict) and skill_id != name:
+            raw = data.get(name)
         persisted = isinstance(raw, dict)
         rec: Dict[str, Any] = raw if isinstance(raw, dict) else _empty_record()
         base_rec = _empty_record()
@@ -1151,11 +1308,12 @@ def usage_report() -> List[Dict[str, Any]]:
             rec.setdefault(k, v)
         row = {
             "name": name,
+            "id": skill_id,
             **rec,
-            "provenance": provenance(name),
+            "provenance": provenance(skill_id),
             "_persisted": persisted,
         }
         row["last_activity_at"] = latest_activity_at(row)
         row["activity_count"] = activity_count(row)
         rows.append(row)
-    return sorted(rows, key=lambda r: r["name"])
+    return sorted(rows, key=lambda r: r["id"])

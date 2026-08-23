@@ -63,6 +63,20 @@ class TestScanSkillCommands:
             result = scan_skill_commands()
         assert result == {}
 
+    def test_split_layout_drops_ambiguous_bare_slash_command(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"source_layout": "split"}},
+            ),
+        ):
+            _make_skill(tmp_path, "shared", category="system/toolkit")
+            _make_skill(tmp_path, "shared", category="custom/brand")
+            result = scan_skill_commands()
+
+        assert "/shared" not in result
+
     def test_excludes_incompatible_platform(self, tmp_path):
         """macOS-only skills should not register slash commands on Linux."""
         with (
@@ -566,6 +580,28 @@ class TestBuildPreloadedSkillsPrompt:
 
 
 class TestBuildSkillInvocationMessage:
+    def test_split_source_invocation_keeps_the_real_skill_directory(self, tmp_path):
+        skill_dir = _make_skill(
+            tmp_path / "system",
+            "split-skill",
+            category="toolkit",
+            body="Run from {{ skill_dir }}.",
+        )
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"source_layout": "split"}},
+            ),
+            patch("tools.skill_usage.bump_use") as bump_use,
+        ):
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/split-skill", "go")
+
+        assert msg is not None
+        assert f"[Skill directory: {skill_dir}]" in msg
+        bump_use.assert_called_once_with("system:toolkit/split-skill")
+
     def test_loads_skill_by_stored_path_when_frontmatter_name_differs(self, tmp_path):
         skill_dir = tmp_path / "mlops" / "audiocraft"
         skill_dir.mkdir(parents=True, exist_ok=True)
