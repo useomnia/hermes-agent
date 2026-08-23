@@ -8135,14 +8135,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _plugin_allow_all_vars: tuple = ()
         try:
             from gateway.platform_registry import platform_registry
-            _plugin_allowed_vars = tuple(
-                e.allowed_users_env for e in platform_registry.plugin_entries()
-                if e.allowed_users_env
-            )
-            _plugin_allow_all_vars = tuple(
-                e.allow_all_env for e in platform_registry.plugin_entries()
-                if e.allow_all_env
-            )
+            (
+                _plugin_allowed_vars,
+                _plugin_allow_all_vars,
+            ) = platform_registry.plugin_authorization_env_vars()
         except Exception:
             pass
         _any_allowlist = any(
@@ -8184,11 +8180,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         
         # Discover Python plugins before shell hooks so plugin block
-        # decisions take precedence in tie cases.  The CLI startup path
-        # does this via an explicit call in hermes_cli/main.py; the
-        # gateway lazily imports run_agent inside per-request handlers,
-        # so the discover_plugins() side-effect in model_tools.py is NOT
-        # guaranteed to have run by the time we reach this point.
+        # decisions take precedence in tie cases. The CLI ``gateway run``
+        # path deliberately defers this agent-only preparation to the
+        # runner, while direct/programmatic starts arrive here without any
+        # CLI prelude. This is the single gateway startup boundary and must
+        # not rely on the later model_tools.py side effect.
         try:
             from hermes_cli.plugins import discover_plugins
             discover_plugins()
@@ -8236,9 +8232,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # channels (--accept-hooks on launch, HERMES_ACCEPT_HOOKS env var,
         # or hooks_auto_accept: true in config.yaml).  We pass
         # accept_hooks=False here and let register_from_config resolve
-        # the effective value from env + config itself — the CLI-side
-        # registration already honored --accept-hooks, and re-reading
-        # hooks_auto_accept here would just duplicate that lookup.
+        # the effective value from env + config itself. CLI gateway startup
+        # carries --accept-hooks into HERMES_ACCEPT_HOOKS before dispatch;
+        # this call remains the authoritative registration for direct starts.
         # Failures are logged but must never block gateway startup.
         try:
             from hermes_cli.config import load_config

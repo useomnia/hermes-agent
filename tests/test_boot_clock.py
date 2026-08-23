@@ -1,9 +1,13 @@
+import ast
 import io
 import sys
+from pathlib import Path
 
 import pytest
 
 from hermes_cli import boot_clock
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 LINUX_ONLY = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="procfs is Linux-only"
@@ -101,6 +105,98 @@ def test_preamble_reports_only_start_when_nothing_was_marked(monkeypatch):
     monkeypatch.setattr(boot_clock, "process_elapsed_seconds", lambda: 3.25)
 
     assert boot_clock.format_preamble() == "to_start_ms=3250"
+
+
+def _marked_names(relative_path: str, *callees: str) -> set[str]:
+    """Checkpoint names this file stamps via any of ``callees``.
+
+    Read from the AST rather than importing gateway modules: the imports are
+    intentionally heavyweight, and this test is pinning call sites. A dropped
+    mark otherwise fails silently and misattributes the phase to a neighbour.
+    """
+    tree = ast.parse((REPO_ROOT / relative_path).read_text(encoding="utf-8"))
+    return {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in callees
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
+
+
+def test_every_declared_gateway_checkpoint_is_still_marked():
+    expected_by_file = {
+        "hermes_cli/main.py": {
+            "main",
+            "skills",
+            "cli_import",
+        },
+        "hermes_cli/gateway.py": {
+            "dispatch",
+            "pre_start",
+        },
+        "gateway/run.py": {
+            "plugins",
+            "relay",
+            "session_recovery",
+            "platforms",
+            "runtime_ready",
+            "fingerprint",
+            "dup_guard",
+            "skills_resync",
+            "logging",
+            "audit",
+            "runner_init",
+            "pid_lock",
+            # Discovery is joined by the first agent build, not gateway boot.
+            "mcp_discovery_start",
+        },
+        "gateway/platforms/api_server.py": {
+            "api_connect",
+            "api_routes",
+            "api_bound",
+            "api_ready",
+            "api_approvals_start",
+        },
+    }
+    observed = set()
+    for path, expected in expected_by_file.items():
+        names = _marked_names(path, "mark", "_boot_mark")
+        assert names == expected
+        observed.update(names)
+
+    assert (
+        observed
+        == boot_clock.BOOT_CHECKPOINT_NAMES
+        == {
+            "main",
+            "skills",
+            "cli_import",
+            "dispatch",
+            "pre_start",
+            "plugins",
+            "relay",
+            "session_recovery",
+            "platforms",
+            "runtime_ready",
+            "fingerprint",
+            "dup_guard",
+            "skills_resync",
+            "logging",
+            "audit",
+            "runner_init",
+            "pid_lock",
+            "mcp_discovery_start",
+            "api_connect",
+            "api_routes",
+            "api_bound",
+            "api_ready",
+            "api_approvals_start",
+        }
+    )
 
 
 def test_timeline_uses_the_callers_end_name(monkeypatch):

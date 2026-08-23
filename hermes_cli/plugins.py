@@ -312,6 +312,17 @@ class PluginManifest:
     # category plugin at ``plugins/image_gen/openai/`` the key is
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
+    # Optional manifest-declared environment variables. Kept at the end of
+    # the dataclass fields so older positional PluginManifest(...) callers
+    # retain the pre-existing argument order.
+    optional_env: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
+    # Cheap manifest metadata for deferred platform selection. ``activation_env``
+    # lists env vars that can independently activate the plugin; when omitted,
+    # the registry falls back to ``requires_env``. ``provides_platforms`` makes
+    # secondary registry names explicit for plugins that register more than
+    # one adapter from a single module.
+    activation_env: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
+    provides_platforms: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -993,7 +1004,14 @@ class PluginContext:
             source="plugin",
             **entry_kwargs,
         )
-        platform_registry.register(entry)
+        registered = platform_registry.register(entry)
+        if registered is False:
+            logger.debug(
+                "Plugin %s platform registration became stale during rediscovery: %s",
+                self.manifest.name,
+                name,
+            )
+            return
         self._manager._plugin_platform_names.add(name)
         logger.debug(
             "Plugin %s registered platform: %s",
@@ -1277,6 +1295,18 @@ class PluginManager:
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
+        # Discovery is requested by several independent startup boundaries
+        # (config loading, gateway startup, and the first tool-registry
+        # import).  Keep those callers single-flight: a second caller waits
+        # for the first sweep to finish and then observes the complete
+        # registry instead of racing the manifest/module loaders.  RLock is
+        # intentional because plugin registration can re-enter discovery.
+        self._discovery_lock = threading.RLock()
+        # Deferred platform workers capture this generation.  Force
+        # rediscovery advances it while holding ``_discovery_lock``; a worker
+        # therefore either completes before the force pass clears state or
+        # observes the new generation and exits without stale side effects.
+        self._discovery_generation = 0
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
@@ -1302,36 +1332,48 @@ class PluginManager:
         changes or newly-added bundled backends become visible in long-lived
         sessions without requiring a full agent restart.
         """
-        if self._discovered and not force:
-            return
-        if env_var_enabled("HERMES_SAFE_MODE"):
-            logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+        with self._discovery_lock:
+            if self._discovered and not force:
+                return
+            if env_var_enabled("HERMES_SAFE_MODE"):
+                logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+                self._discovered = True
+                return
+            if force:
+                self._discovery_generation += 1
+                try:
+                    from gateway.platform_registry import platform_registry
+
+                    platform_registry.clear_plugin_platforms()
+                except Exception:
+                    logger.debug(
+                        "Could not clear plugin platform state for rediscovery",
+                        exc_info=True,
+                    )
+                self._plugins.clear()
+                self._hooks.clear()
+                self._middleware.clear()
+                self._plugin_tool_names.clear()
+                self._plugin_platform_names.clear()
+                self._cli_commands.clear()
+                self._plugin_commands.clear()
+                self._plugin_skills.clear()
+                self._aux_tasks.clear()
+                self._slack_action_handlers.clear()
+                self._context_engine = None
+            # Set the flag up front as a re-entrancy guard (a plugin's
+            # register() can transitively trigger discovery again), but reset
+            # it if the sweep raises so a failed scan is NOT cached as
+            # "discovered with an empty registry" — callers swallow the
+            # exception and would otherwise be permanently stranded on the
+            # early-return above (the "No web provider configured" class of
+            # failures).
             self._discovered = True
-            return
-        if force:
-            self._plugins.clear()
-            self._hooks.clear()
-            self._middleware.clear()
-            self._plugin_tool_names.clear()
-            self._plugin_platform_names.clear()
-            self._cli_commands.clear()
-            self._plugin_commands.clear()
-            self._plugin_skills.clear()
-            self._aux_tasks.clear()
-            self._slack_action_handlers.clear()
-            self._context_engine = None
-        # Set the flag up front as a re-entrancy guard (a plugin's register()
-        # can transitively trigger discovery again), but reset it if the sweep
-        # raises so a failed scan is NOT cached as "discovered with an empty
-        # registry" — callers swallow the exception and would otherwise be
-        # permanently stranded on the early-return above (the "No web provider
-        # configured" class of failures).
-        self._discovered = True
-        try:
-            self._discover_and_load_inner()
-        except BaseException:
-            self._discovered = False
-            raise
+            try:
+                self._discover_and_load_inner()
+            except BaseException:
+                self._discovered = False
+                raise
 
     def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
@@ -1657,6 +1699,9 @@ class PluginManager:
                 description=data.get("description", ""),
                 author=data.get("author", ""),
                 requires_env=data.get("requires_env", []),
+                optional_env=data.get("optional_env", []),
+                activation_env=data.get("activation_env", []),
+                provides_platforms=data.get("provides_platforms", []),
                 provides_tools=data.get("provides_tools", []),
                 provides_hooks=data.get("provides_hooks", []),
                 source=source,
@@ -1734,6 +1779,15 @@ class PluginManager:
         """
         lookup_key = manifest.key or manifest.name
         platform_name = self._platform_name_from_manifest(manifest)
+        declared_platforms = [
+            str(name).strip()
+            for name in manifest.provides_platforms
+            if isinstance(name, str) and name.strip()
+        ]
+        if platform_name not in declared_platforms:
+            declared_platforms.insert(0, platform_name)
+        aliases = tuple(name for name in declared_platforms if name != platform_name)
+        discovery_generation = self._discovery_generation
 
         # Record an enabled placeholder for introspection (`hermes plugins
         # list`). The real module load swaps in a fully-populated LoadedPlugin
@@ -1742,13 +1796,49 @@ class PluginManager:
         loaded.deferred = True
         self._plugins[lookup_key] = loaded
 
-        def _loader(_manifest: PluginManifest = manifest) -> None:
-            self._load_plugin(_manifest)
-
         try:
             from gateway.platform_registry import platform_registry
 
-            platform_registry.register_deferred(platform_name, _loader)
+            def _env_names(values: list | None) -> tuple[str, ...]:
+                names: list[str] = []
+                for value in values or []:
+                    if isinstance(value, str):
+                        name = value
+                    elif isinstance(value, dict):
+                        name = value.get("name", "")
+                    else:
+                        name = ""
+                    if isinstance(name, str) and name.strip():
+                        names.append(name.strip())
+                return tuple(names)
+
+            def _loader(_manifest: PluginManifest = manifest) -> None:
+                # A force rediscovery can invalidate a queued loader before it
+                # gets CPU time. Avoid importing/registering stale plugin state
+                # in that case; the registry also rejects any late publication
+                # from a worker that was already running.
+                # Serialize the complete plugin load with force rediscovery so
+                # the manager's hooks/tools/plugin attribution cannot be
+                # mutated after the force pass has cleared them. The lock
+                # order is manager -> platform registry, matching the force
+                # path and avoiding an import-time lock inversion.
+                with self._discovery_lock:
+                    if (
+                        discovery_generation != self._discovery_generation
+                        or not platform_registry.is_loader_current(platform_name)
+                    ):
+                        return
+                    self._load_plugin(_manifest)
+
+            platform_registry.register_deferred(
+                platform_name,
+                _loader,
+                aliases=aliases,
+                required_env=_env_names(manifest.requires_env),
+                optional_env=_env_names(manifest.optional_env),
+                activation_env=_env_names(manifest.activation_env),
+                source="plugin",
+            )
             logger.debug(
                 "Registered deferred platform loader: %s (plugin=%s)",
                 platform_name,

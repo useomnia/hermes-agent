@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import threading
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -366,6 +367,47 @@ class TestPluginDiscovery:
         }
         assert len(non_bundled) == 1
 
+    def test_concurrent_discovery_is_single_flight_and_returns_ready_registry(
+        self, monkeypatch
+    ):
+        """Concurrent startup callers wait for one complete plugin sweep."""
+        manager = PluginManager()
+        sweep_started = threading.Event()
+        release_sweep = threading.Event()
+        start_gate = threading.Barrier(5)
+        sweep_calls = []
+        ready_results = []
+        errors = []
+
+        def sweep():
+            sweep_calls.append(1)
+            sweep_started.set()
+            assert release_sweep.wait(timeout=2.0)
+            manager._plugins["ready"] = object()
+
+        monkeypatch.setattr(manager, "_discover_and_load_inner", sweep)
+
+        def worker():
+            try:
+                start_gate.wait(timeout=2.0)
+                manager.discover_and_load()
+                ready_results.append("ready" in manager._plugins)
+            except BaseException as exc:  # pragma: no cover - failure detail
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        start_gate.wait(timeout=2.0)
+        assert sweep_started.wait(timeout=2.0)
+        release_sweep.set()
+        for thread in threads:
+            thread.join(timeout=2.0)
+
+        assert not errors
+        assert sweep_calls == [1]
+        assert ready_results == [True] * 4
+
     def test_failed_discovery_is_not_cached(self, tmp_path, monkeypatch):
         """A sweep that raises must not cache 'discovered' with no plugins.
 
@@ -483,6 +525,109 @@ class TestPluginDiscovery:
         assert mgr._plugin_skills == {}
         assert mgr._aux_tasks == {}
         assert mgr._slack_action_handlers == []
+
+    def test_platform_manifest_preserves_deferred_selection_metadata(self, tmp_path):
+        manifest_file = tmp_path / "plugin.yaml"
+        plugin_dir = tmp_path / "google_chat"
+        plugin_dir.mkdir()
+        manifest_file.write_text(
+            yaml.safe_dump(
+                {
+                    "name": "wecom-platform",
+                    "kind": "platform",
+                    "requires_env": ["WECOM_BOT_ID", "WECOM_SECRET"],
+                    "optional_env": ["WECOM_CALLBACK_CORP_ID"],
+                    "activation_env": [
+                        "WECOM_CALLBACK_CORP_ID",
+                        "WECOM_CALLBACK_CORP_SECRET",
+                    ],
+                    "provides_platforms": ["wecom", "wecom_callback"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        manifest = PluginManager()._parse_manifest(
+            manifest_file,
+            plugin_dir,
+            "bundled",
+            "",
+        )
+
+        assert manifest is not None
+        assert manifest.activation_env == [
+            "WECOM_CALLBACK_CORP_ID",
+            "WECOM_CALLBACK_CORP_SECRET",
+        ]
+        assert manifest.provides_platforms == ["wecom", "wecom_callback"]
+
+    def test_deferred_platform_registration_forwards_aliases_and_env_metadata(
+        self, monkeypatch
+    ):
+        from gateway.platform_registry import platform_registry
+
+        manifest = PluginManifest(
+            name="wecom-platform",
+            kind="platform",
+            source="bundled",
+            key="wecom",
+            requires_env=["WECOM_BOT_ID", "WECOM_SECRET"],
+            optional_env=["WECOM_CALLBACK_ALLOW_ALL_USERS"],
+            activation_env=["WECOM_CALLBACK_CORP_ID"],
+            provides_platforms=["wecom", "wecom_callback"],
+        )
+        manager = PluginManager()
+        registered = {}
+
+        def fake_register_deferred(name, loader, **kwargs):
+            registered.update(name=name, loader=loader, kwargs=kwargs)
+
+        monkeypatch.setattr(platform_registry, "register_deferred", fake_register_deferred)
+        manager._register_deferred_platform(manifest)
+
+        assert registered["name"] == "wecom"
+        assert registered["kwargs"]["aliases"] == ("wecom_callback",)
+        assert registered["kwargs"]["required_env"] == (
+            "WECOM_BOT_ID",
+            "WECOM_SECRET",
+        )
+        assert registered["kwargs"]["optional_env"] == (
+            "WECOM_CALLBACK_ALLOW_ALL_USERS",
+        )
+        assert registered["kwargs"]["activation_env"] == (
+            "WECOM_CALLBACK_CORP_ID",
+        )
+
+    def test_stale_deferred_platform_loader_is_generation_gated(self, monkeypatch):
+        from gateway.platform_registry import platform_registry
+
+        manifest = PluginManifest(
+            name="stale-platform",
+            kind="platform",
+            source="bundled",
+            key="stale",
+        )
+        manager = PluginManager()
+        registered = {}
+        load_plugin = MagicMock()
+
+        monkeypatch.setattr(
+            platform_registry,
+            "register_deferred",
+            lambda name, loader, **kwargs: registered.update(loader=loader),
+        )
+        monkeypatch.setattr(
+            platform_registry,
+            "is_loader_current",
+            lambda name: True,
+        )
+        monkeypatch.setattr(manager, "_load_plugin", load_plugin)
+
+        manager._register_deferred_platform(manifest)
+        manager._discovery_generation += 1
+        registered["loader"]()
+
+        load_plugin.assert_not_called()
 
 
 # ── TestPluginLoading ──────────────────────────────────────────────────────

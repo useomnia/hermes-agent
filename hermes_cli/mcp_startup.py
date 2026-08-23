@@ -101,9 +101,13 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
                         reset_hermes_home_override(token)
                     except Exception:
                         pass
-                with _mcp_discovery_lock:
-                    global _mcp_discovery_thread, _mcp_discovery_started
-                    _mcp_discovery_thread = None
+                # Keep the completed Thread object as the single-flight
+                # marker. Clearing it here made the first agent fall through
+                # to ``discover_mcp_tools()`` and repeat the entire discovery
+                # run after the background worker had already finished. A
+                # later explicit startup call can still replace this marker
+                # and retry when no server connected (see the status check
+                # above).
 
         thread = threading.Thread(
             target=_discover,
@@ -115,16 +119,17 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
 
 
 def mcp_discovery_was_started() -> bool:
-    """True if a background discovery thread exists for this process.
+    """True if a background discovery attempt exists for this process.
 
     ``start_background_mcp_discovery`` is a no-op when the cheap config probe
     finds no ``mcp_servers``, so a caller that *depends* on discovery having run
     (rather than merely benefiting from it) needs to know the difference between
-    "already finished" and "never started". Mirrors
-    ``tui_gateway.entry.mcp_discovery_in_flight``, but reports whether the thread
-    was ever created rather than whether it is still alive.
+    "already finished" and "never started". The completed Thread object is
+    retained as that marker; ``mcp_discovery_in_flight`` remains the API for
+    checking whether it is still alive.
     """
-    return _mcp_discovery_thread is not None
+    with _mcp_discovery_lock:
+        return _mcp_discovery_thread is not None
 
 
 # Join bound for callers that must not lose tools. Sized ABOVE
@@ -217,7 +222,8 @@ def _join_startup_discovery(timeout: "float | None") -> bool:
         # it never finished. Don't re-charge that wait.
         return True
     wait_for_mcp_discovery(timeout=AGENT_BUILD_JOIN_SECONDS if timeout is None else timeout)
-    thread = _mcp_discovery_thread
+    with _mcp_discovery_lock:
+        thread = _mcp_discovery_thread
     if timeout is None and thread is not None and thread.is_alive():
         # Only the default bound retires the join. An explicit (smaller) timeout
         # is a caller saying "wait this long", not evidence discovery is wedged.
@@ -293,7 +299,8 @@ def wait_for_mcp_discovery(timeout: "float | None" = None) -> None:
     can't freeze startup; servers that miss it are picked up by the automatic
     late-binding refresh.
     """
-    thread = _mcp_discovery_thread
+    with _mcp_discovery_lock:
+        thread = _mcp_discovery_thread
     if thread is None or not thread.is_alive():
         return
     thread.join(timeout=_resolve_discovery_timeout(timeout))
@@ -310,7 +317,8 @@ def mcp_discovery_in_flight() -> bool:
     scheduler must consult both to decide whether a slow server's tools are
     still pending (see #51587).
     """
-    thread = _mcp_discovery_thread
+    with _mcp_discovery_lock:
+        thread = _mcp_discovery_thread
     return thread is not None and thread.is_alive()
 
 
@@ -322,7 +330,8 @@ def join_mcp_discovery(timeout: "float | None" = None) -> bool:
     ``wait_for_mcp_discovery`` this accepts an unbounded/long wait and reports
     the outcome, for the off-critical-path late-refresh waiter.
     """
-    thread = _mcp_discovery_thread
+    with _mcp_discovery_lock:
+        thread = _mcp_discovery_thread
     if thread is None:
         return True
     thread.join(timeout=timeout)

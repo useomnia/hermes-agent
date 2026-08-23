@@ -29,6 +29,10 @@ optional_env:
     description: "Comma-separated staff/sender IDs allowed to talk to the bot (* = any)"
     prompt: "Allowed users (comma-separated)"
     password: false
+  - name: DINGTALK_ALLOW_ALL_USERS
+    description: "Allow any DingTalk user to trigger the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
   - name: DINGTALK_HOME_CHANNEL
     description: "Default conversation ID for cron / notification delivery"
     prompt: "Home channel ID"

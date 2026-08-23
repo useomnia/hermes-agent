@@ -34,3 +34,19 @@ def test_profile_without_opt_out_still_syncs_bundled_skills(tmp_path, monkeypatc
     main._sync_bundled_skills_quietly()
 
     sync.assert_called_once_with(quiet=True)
+
+
+def test_gateway_run_leaves_bundled_skill_sync_to_gateway_start(monkeypatch):
+    sync = Mock()
+    dispatch = Mock()
+    monkeypatch.setattr(main, "_sync_bundled_skills_quietly", sync)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.gateway",
+        SimpleNamespace(gateway_command=dispatch),
+    )
+
+    main.cmd_gateway(SimpleNamespace(gateway_command="run"))
+
+    sync.assert_not_called()
+    dispatch.assert_called_once()

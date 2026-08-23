@@ -7,9 +7,11 @@ from gateway.platforms.api_server import APIServerAdapter
 
 
 def test_approval_source_uses_lightweight_state_import(monkeypatch):
-    # This test file intentionally does not import tools.tool_approval.  The
-    # runtime assertion exercises the startup path instead of inspecting its
-    # source text.
+    # Other approval tests in the same pytest process may already have loaded
+    # the heavy gate. Remove only its import-cache entry so this assertion is
+    # independent of collection/execution order while still exercising the
+    # runtime startup path instead of inspecting source text.
+    monkeypatch.delitem(sys.modules, "tools.tool_approval", raising=False)
     assert "tools.tool_approval" not in sys.modules
 
     monkeypatch.setenv("OMNIA_BASE_URL", "https://omnia.test")
