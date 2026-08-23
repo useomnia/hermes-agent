@@ -60,13 +60,13 @@ class TestIsUnusableContainerCwd:
         assert "/home/" in tt._HOST_CWD_PREFIXES
         assert "/Users/" in tt._HOST_CWD_PREFIXES
 
-    def test_sprites_host_cwd_falls_back_to_brand(self, monkeypatch):
+    def test_sprites_host_cwd_falls_back_to_home(self, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "sprites")
         monkeypatch.setenv("TERMINAL_CWD", "/home/operator/project")
 
         config = tt._get_env_config()
 
-        assert config["cwd"] == "/brand"
+        assert config["cwd"] == "/home"
 
 
 class TestOverrideCwdSanitizedAtCallSite:
