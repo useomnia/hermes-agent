@@ -8196,6 +8196,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning(
                 "plugin discovery failed at gateway startup", exc_info=True,
             )
+        _boot_mark("plugins")
 
         # Register the generic relay adapter when a connector relay URL is
         # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
@@ -8228,6 +8229,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning(
                 "relay adapter registration failed at gateway startup", exc_info=True,
             )
+        _boot_mark("relay")
 
         # Register declarative shell hooks from cli-config.yaml.  Gateway
         # has no TTY, so consent has to come from one of the three opt-in
@@ -8295,6 +8297,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Auto-suspended %d stuck-loop session(s)", stuck)
         except Exception as e:
             logger.debug("Stuck-loop detection failed: %s", e)
+        _boot_mark("session_recovery")
 
         # Serialize startup restore against inbound dispatch.  Platform
         # adapters can begin receiving messages as soon as they connect, but
@@ -8486,6 +8489,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Startup authority is one phase, not a persistent runner mode.
             # From this point onward every adapter retry is non-evicting.
             self._platform_lock_takeover_on_start = False
+        _boot_mark("platforms")
 
         # A platform we skipped on the primary for a missing credential was
         # supposed to be picked up by a secondary profile that owns the token.
@@ -8590,6 +8594,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._update_runtime_status("running")
+        _boot_mark("runtime_ready")
+        try:
+            from hermes_cli.boot_clock import format_timeline
+
+            ready_timeline = format_timeline("ready")
+        except Exception:  # noqa: BLE001 — timing must never block a boot
+            ready_timeline = ""
+        logger.info(
+            "Gateway ready%s",
+            f" [{ready_timeline}]" if ready_timeline else "",
+        )
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the

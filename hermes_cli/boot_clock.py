@@ -20,6 +20,7 @@ phases between them and the last is the gateway's own start.
 from __future__ import annotations
 
 import os
+import re
 
 # Ordered (name, process age in seconds) pairs, appended by `mark`. A list rather
 # than a dict so a checkpoint reached twice stays visible instead of overwriting.
@@ -57,16 +58,23 @@ def mark(name: str) -> None:
         _checkpoints.append((name, elapsed))
 
 
-def format_preamble() -> str:
-    """`to_<name>_ms=…` for every checkpoint plus `to_start_ms`, or ''.
+def format_timeline(end_name: str) -> str:
+    """`to_<name>_ms=…` for every checkpoint plus the named end, or ''.
 
     Values are ages rather than durations, so a phase is the difference between
     two neighbours. That keeps every field meaningful even when a checkpoint in
     the middle was never reached, which a list of durations could not.
     """
-    to_start = process_elapsed_seconds()
-    if to_start is None:
+    if re.fullmatch(r"[a-z][a-z0-9_]*", end_name) is None:
+        raise ValueError("boot timeline end name must be a lowercase identifier")
+    elapsed_at_end = process_elapsed_seconds()
+    if elapsed_at_end is None:
         return ""
     fields = [f"to_{name}_ms={elapsed * 1000:.0f}" for name, elapsed in _checkpoints]
-    fields.append(f"to_start_ms={to_start * 1000:.0f}")
+    fields.append(f"to_{end_name}_ms={elapsed_at_end * 1000:.0f}")
     return " ".join(fields)
+
+
+def format_preamble() -> str:
+    """The historical first-log timeline, ending in ``to_start_ms``."""
+    return format_timeline("start")
