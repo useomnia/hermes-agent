@@ -1663,6 +1663,10 @@ def skill_view(
             and split_source_layout_enabled()
             and classify_skill_path(skill_dir, active_skills_dir) != "external"
             else rel_path,
+            # Preserve the established absolute-path field for internal
+            # callers and profile-scope diagnostics. ``id`` is the stable
+            # model-facing identity; this remains a runtime locator.
+            "skill_dir": str(skill_dir) if skill_dir else None,
             "linked_files": linked_files if linked_files else None,
             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
             if linked_files
