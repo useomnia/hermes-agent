@@ -2710,6 +2710,47 @@ def cmd_gateway(args):
     gateway_command(args)
 
 
+def _try_fast_gateway_run(argv: list[str] | None = None) -> bool:
+    """Dispatch ``gateway run`` without constructing every CLI subparser.
+
+    The full parser registers dozens of unrelated commands and imports their
+    handlers. That is useful for an interactive CLI, but pure startup overhead
+    for the long-running gateway process. Keep all gateway-run flags and the
+    normal startup preparation by reusing the canonical gateway parser and
+    handler; only the unrelated command tree is skipped.
+    """
+    candidate = list(sys.argv[1:] if argv is None else argv)
+    if candidate[:2] != ["gateway", "run"]:
+        return False
+
+    # Managed-container routing owns every command and must remain ahead of
+    # local parsing, exactly as on the full-parser path below.
+    from hermes_cli.config import get_container_exec_info
+
+    if get_container_exec_info():
+        return False
+
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    build_gateway_parser(
+        subparsers,
+        cmd_gateway=cmd_gateway,
+        cmd_proxy=cmd_proxy,
+        cmd_gateway_enroll=cmd_gateway_enroll,
+    )
+    args = parser.parse_args(candidate)
+    from hermes_cli.boot_clock import mark
+
+    mark("fast_parser")
+    _prepare_agent_startup(args)
+    rc = args.func(args)
+    if isinstance(rc, int) and rc != 0:
+        raise SystemExit(rc)
+    return True
+
+
 def cmd_proxy(args):
     """Local OpenAI-compatible proxy to OAuth providers."""
     # Lazy import — pulls in aiohttp, which is gated behind an extras install
@@ -15544,6 +15585,9 @@ def main():
     if _try_termux_fast_tui_launch():
         return
     if _try_termux_fast_cli_launch():
+        return
+
+    if _try_fast_gateway_run():
         return
 
     from hermes_cli._parser import build_top_level_parser
