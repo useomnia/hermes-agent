@@ -2428,6 +2428,12 @@ def _sync_bundled_skills_quietly() -> None:
     empty skills library.
     """
     try:
+        # ``tools.skills_sync`` pulls in the skill scanner and its dependency
+        # graph. A profile created with --no-skills has a durable marker that
+        # makes sync_skills() an unconditional no-op, so check that marker with
+        # the already-imported config helper before paying the import cost.
+        if (get_hermes_home() / ".no-bundled-skills").exists():
+            return
         from tools.skills_sync import sync_skills
 
         sync_skills(quiet=True)

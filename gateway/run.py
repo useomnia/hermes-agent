@@ -24310,8 +24310,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # Sync bundled skills on gateway start (fast -- skips unchanged)
     try:
-        from tools.skills_sync import sync_skills
-        sync_skills(quiet=True)
+        # Match the CLI's cheap opt-out check. Importing tools.skills_sync is
+        # itself the expensive part on a cold process, while its marker branch
+        # is guaranteed to do no work.
+        if not (_hermes_home / ".no-bundled-skills").exists():
+            from tools.skills_sync import sync_skills
+
+            sync_skills(quiet=True)
     except Exception:
         pass
     _boot_mark("skills_resync")
