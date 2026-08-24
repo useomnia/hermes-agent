@@ -4,6 +4,7 @@ import base64
 import http.client
 import json
 import logging
+import posixpath
 import stat
 import threading
 import time
@@ -36,6 +37,23 @@ _MAX_SKILL_BATCH_BYTES = 16 * 1024 * 1024
 _MAX_FILE_CONTENT_BYTES = 2 * 1024 * 1024
 _EXEC_PREDISPATCH_RETRY_DELAYS_SECONDS = (2.0, 4.0)
 _EXEC_RETRY_MIN_REQUEST_BUDGET_SECONDS = 1.0
+
+
+def _expand_toolbox_home(path: str) -> str:
+    """Expand bare user-home paths in the Toolbox virtual namespace."""
+    if path == "~":
+        return "/home"
+    if path.startswith("~/"):
+        return f"/home{path[1:]}"
+    return path
+
+
+def _canonicalize_toolbox_path(path: str) -> str:
+    """Normalize absolute Toolbox paths without consulting the host filesystem."""
+    expanded = _expand_toolbox_home(path)
+    if expanded.startswith("/"):
+        return posixpath.normpath(expanded)
+    return expanded
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -386,6 +404,7 @@ class SpritesEnvironment(BaseEnvironment):
         """Read at most ``max_bytes`` from a Toolbox file as raw bytes."""
         if max_bytes < 1:
             raise ValueError("max_bytes must be positive")
+        path = _canonicalize_toolbox_path(path)
         query = urllib.parse.urlencode({"path": path})
         request = urllib.request.Request(
             f"{self.toolbox_url}/files?{query}",
@@ -426,6 +445,10 @@ class SpritesEnvironment(BaseEnvironment):
                 f"Toolbox API /files write content exceeded "
                 f"{_MAX_FILE_CONTENT_BYTES} bytes ({content_size} bytes)"
             )
+
+        path = _canonicalize_toolbox_path(path)
+        if _is_write_denied(path):
+            raise SpritesToolboxError(f"Write denied: {path} is a protected path")
 
         response = self.file_request(
             {
@@ -551,10 +574,27 @@ class SpritesFileOperations(ShellFileOperations):
         super().__init__(terminal_env)
         self.env: SpritesEnvironment = terminal_env
 
+    def _expand_path(self, path: str) -> str:
+        """Expand user-home paths in the Toolbox's virtual namespace.
+
+        The Toolbox file API speaks the Sprite filesystem, where ``/home`` is
+        the virtual home and ``/home/brand`` is the durable brand mount. The
+        Sprite process itself runs as ``/home/sprite``; delegating ``~`` to
+        ``ShellFileOperations`` would therefore route ``~/brand`` into scratch
+        instead of the mounted brand tree. Keep explicit and non-tilde paths
+        unchanged, and retain the base implementation for ``~user`` paths.
+        """
+        expanded = (
+            _expand_toolbox_home(path)
+            if path == "~" or path.startswith("~/")
+            else super()._expand_path(path)
+        )
+        return _canonicalize_toolbox_path(expanded)
+
     def _files(self, payload: dict[str, Any]) -> dict[str, Any]:
-        # The Toolbox file API does not perform shell expansion. Resolve tilde
-        # paths through the Sprite terminal so file tools and `cd ~` agree on
-        # the sandbox user's home instead of leaking the gateway host HOME.
+        # The Toolbox file API does not perform shell expansion. Resolve all
+        # path-bearing fields before delegation so single-path and multi-path
+        # operations use the same Sprite virtual namespace.
         payload = dict(payload)
         for key in ("path", "src", "dst"):
             value = payload.get(key)
@@ -618,6 +658,7 @@ class SpritesFileOperations(ShellFileOperations):
         return ReadResult(content=content, file_size=int(response.get("fileSize", 0)))
 
     def write_file(self, path: str, content: str) -> WriteResult:
+        path = self._expand_path(path)
         if _is_write_denied(path):
             return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
@@ -640,6 +681,7 @@ class SpritesFileOperations(ShellFileOperations):
         return self.delete_path(path, recursive=False)
 
     def delete_path(self, path: str, recursive: bool = False) -> WriteResult:
+        path = self._expand_path(path)
         if _is_write_denied(path):
             return WriteResult(error=f"Delete denied: {path} is a protected path")
         response = self._files(
@@ -650,6 +692,8 @@ class SpritesFileOperations(ShellFileOperations):
         return WriteResult()
 
     def move_file(self, src: str, dst: str) -> WriteResult:
+        src = self._expand_path(src)
+        dst = self._expand_path(dst)
         for path in (src, dst):
             if _is_write_denied(path):
                 return WriteResult(error=f"Move denied: {path} is a protected path")
