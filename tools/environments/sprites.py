@@ -529,7 +529,9 @@ class SpritesEnvironment(BaseEnvironment):
         login: bool = False,
         timeout: int = 120,
         stdin_data: str | None = None,
+        cwd: str | None = None,
     ):
+        request_cwd = cwd or self.cwd
         cancel_event = threading.Event()
 
         def exec_fn() -> tuple[str, int]:
@@ -537,7 +539,7 @@ class SpritesEnvironment(BaseEnvironment):
                 "/exec",
                 {
                     "command": cmd_string,
-                    "cwd": self.cwd,
+                    "cwd": request_cwd,
                     "login": login,
                     "stdin": stdin_data,
                     "timeoutSeconds": timeout,
@@ -557,11 +559,36 @@ class SpritesEnvironment(BaseEnvironment):
                 raise _toolbox_error_from_payload(
                     "/exec",
                     response,
-                    request_cwd=self.cwd,
+                    request_cwd=request_cwd,
                 )
             return (str(output), int(exit_code))
 
         return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel_event.set)
+
+    def _run_bash_with_cwd(
+        self,
+        cmd_string: str,
+        cwd: str,
+        *,
+        login: bool = False,
+        timeout: int = 120,
+        stdin_data: str | None = None,
+    ):
+        """Pass the per-command cwd through the Toolbox `/exec` boundary.
+
+        Sprites share one persistent environment across Omnio runs.  The
+        mutable ``self.cwd`` is therefore the last session's cwd, and may
+        name a workspace that has already been cleaned up.  The shell wrapper
+        also receives *cwd*, but the Toolbox validates its request cwd before
+        running that wrapper, so it must get the same per-command value here.
+        """
+        return self._run_bash(
+            cmd_string,
+            cwd=cwd,
+            login=login,
+            timeout=timeout,
+            stdin_data=stdin_data,
+        )
 
     def cleanup(self):
         return None

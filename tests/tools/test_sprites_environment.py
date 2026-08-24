@@ -138,6 +138,44 @@ def test_sprites_environment_should_send_exec_to_toolbox():
     ]
 
 
+def test_sprites_execute_forwards_effective_cwd_when_shared_env_is_stale():
+    """A new run must not send a deleted prior session cwd to Toolbox.
+
+    Sprites environments are intentionally shared across runs.  The shell
+    wrapper already receives the per-command cwd, but Toolbox validates its
+    request cwd before running that wrapper, so the outer request must use the
+    same value instead of the shared environment's mutable ``self.cwd``.
+    """
+    from tools.environments.base import BaseEnvironment
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    BaseEnvironment.__init__(env, cwd="/tmp/deleted-previous-session", timeout=60)
+    env._before_execute = lambda: None
+
+    calls = []
+
+    def fake_request(
+        path,
+        payload=None,
+        *,
+        timeout=None,
+        method="POST",
+        retry_exec_predispatch=False,
+        retry_deadline_seconds=None,
+        cancel_event=None,
+    ):
+        calls.append(payload)
+        return {"output": "ok\n", "returncode": 0}
+
+    env._request_json = fake_request
+
+    result = env.execute("echo ok", cwd="/brand")
+
+    assert result == {"output": "ok\n", "returncode": 0}
+    assert calls[0]["cwd"] == "/brand"
+
+
 def test_sprites_environment_should_stream_raw_file_bytes(monkeypatch):
     import tools.environments.sprites as sprites_module
     from tools.environments.sprites import SpritesEnvironment
