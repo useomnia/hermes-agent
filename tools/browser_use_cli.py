@@ -11,7 +11,6 @@ conversation/session (``default`` only for the unnamed live Toolbox tab).
 """
 
 import atexit
-import errno
 import hashlib
 import json
 import logging
@@ -474,25 +473,37 @@ def _write_omnio_owner_pid(runtime_dir: Path) -> Optional[str]:
 
 
 def _owner_pid_is_alive(pid: int) -> bool:
-    """Use Hermes' cross-platform PID probe without importing it at module load."""
+    """Use a cross-platform PID probe without importing it at module load.
+
+    ``gateway.status._pid_exists`` is the canonical Hermes probe and handles
+    Windows without the dangerous ``os.kill(pid, 0)`` fallback. The direct
+    ``psutil`` fallback is only for scaffold/partial-import environments. A
+    probe failure is deliberately treated as alive: uncertainty must never
+    let a restarted gateway take over another process's runtime.
+    """
+    if pid <= 0:
+        return False
     try:
         from gateway.status import _pid_exists
+    except Exception as exc:
+        logger.debug("Could not import Hermes PID probe: %s", exc)
+        _pid_exists = None
 
-        return bool(_pid_exists(pid))
-    except Exception:
-        if pid <= 0:
-            return False
+    if _pid_exists is not None:
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError as exc:
-            # ESRCH is the only definitive dead-PID result. Treat every
-            # other probe failure as alive so a permission/OS uncertainty
-            # cannot make us steal another gateway's runtime.
-            return exc.errno != errno.ESRCH
+            return bool(_pid_exists(pid))
+        except Exception as exc:
+            logger.debug("Hermes PID probe failed for %s: %s", pid, exc)
+
+    # ``psutil.pid_exists`` is the repository's dependency-backed,
+    # cross-platform fallback. Do not substitute ``os.kill(pid, 0)`` here:
+    # on Windows it sends CTRL+C to the target's console process group.
+    try:
+        import psutil
+
+        return bool(psutil.pid_exists(pid))
+    except Exception as exc:
+        logger.debug("Fallback PID probe failed for %s: %s", pid, exc)
         return True
 
 

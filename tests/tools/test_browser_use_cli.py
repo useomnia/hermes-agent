@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from tools import browser_use_cli as bu
 
@@ -352,6 +355,49 @@ def test_owner_marker_rejects_symlink(tmp_path):
 
     assert error and "owner marker" in error
     assert target.read_text(encoding="ascii") == "keep"
+
+
+def test_owner_pid_probe_uses_cross_platform_fallback(monkeypatch):
+    """PID fallback must not use the Windows-unsafe os.kill probe."""
+    from gateway import status
+
+    def unavailable_probe(_pid):
+        raise OSError("simulated helper failure")
+
+    monkeypatch.setattr(status, "_pid_exists", unavailable_probe)
+    monkeypatch.setattr(
+        bu.os,
+        "kill",
+        lambda *_args: pytest.fail("os.kill must not be used"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        SimpleNamespace(pid_exists=lambda _pid: True),
+    )
+
+    assert bu._owner_pid_is_alive(12345) is True
+
+
+def test_owner_pid_probe_keeps_uncertainty_alive(monkeypatch):
+    """A failure of both probes must not permit unsafe owner takeover."""
+    from gateway import status
+
+    def unknown_probe(_pid):
+        raise OSError("unknown")
+
+    monkeypatch.setattr(status, "_pid_exists", unknown_probe)
+
+    def unknown_psutil_probe(_pid):
+        raise OSError("unknown")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        SimpleNamespace(pid_exists=unknown_psutil_probe),
+    )
+
+    assert bu._owner_pid_is_alive(12345) is True
 
 
 def test_inactivity_cleanup_only_stops_stale_named_daemon(monkeypatch):
