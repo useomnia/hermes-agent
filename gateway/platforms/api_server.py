@@ -120,11 +120,24 @@ logger = logging.getLogger(__name__)
 
 _OMNIO_DURABLE_APPROVALS_DISABLED_ENV = "OMNIO_TOOL_APPROVAL_DURABLE_DISABLED"
 _OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS = 5.0
+_OMNIO_APPROVALS_AGENT_WAIT_TIMEOUT_SECONDS = (
+    _OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS + 1.0
+)
 _OMNIO_TURN_FINALIZE_HOOK_ENV = "OMNIO_TURN_FINALIZE_HOOK"
 _OMNIO_TURN_FINALIZE_TIMEOUT_ENV = "OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS"
 # The hook may persist deliverables to durable storage before returning, so its
 # budget covers uploads, not just the path scan.
 _OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS = 30.0
+
+
+def _boot_mark(name: str) -> None:
+    """Stamp an API-server boot checkpoint without making timing load-bearing."""
+    try:
+        from hermes_cli.boot_clock import mark
+
+        mark(name)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _turn_finalize_timeout_seconds() -> float:
@@ -1433,6 +1446,16 @@ class APIServerAdapter(BasePlatformAdapter):
         self._session_db_lock: Optional[asyncio.Lock] = None  # Single-flight for lazy init
         self._mcp_reload_lock: Optional[asyncio.Lock] = None
         self._skills_reload_lock: Optional[asyncio.Lock] = None
+        # A durable-approval snapshot is control-plane data, not a listener
+        # prerequisite. Fetch it after the socket binds so health/readiness can
+        # proceed in parallel, then join it from the executor thread before an
+        # agent is built. ``threading.Event`` is deliberate: every _create_agent
+        # call runs off the asyncio loop, so waiting here never stalls health or
+        # platform heartbeats.
+        self._omnio_approval_snapshot_ready = threading.Event()
+        self._omnio_approval_snapshot_ready.set()
+        self._omnio_approval_refresh_task: Optional["asyncio.Task[None]"] = None
+        self._omnio_approval_refresh_lock: Optional[asyncio.Lock] = None
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -2555,6 +2578,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
         """
+        self._wait_for_omnio_approval_snapshot()
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs,
@@ -9158,6 +9182,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start the aiohttp web server."""
+        _boot_mark("api_connect")
         if not AIOHTTP_AVAILABLE:
             logger.warning("[%s] aiohttp not installed", self.name)
             return False
@@ -9211,6 +9236,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app["api_server_adapter"] = self
             if self.gateway_runner is not None:
                 self._app["gateway_runner"] = self.gateway_runner
+            _boot_mark("api_routes")
 
             # Sweep compatibility shadows plus terminal Turn-log retention.
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
@@ -9301,8 +9327,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 return False
 
-            await self._refresh_omnio_connector_toolkit_approvals()
+            _boot_mark("api_bound")
+            self._start_omnio_approval_snapshot_refresh()
             self._mark_connected()
+            _boot_mark("api_ready")
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
                 self.name, self._host, self._port, self._model_name,
@@ -9313,9 +9341,18 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
 
-    async def _refresh_omnio_connector_toolkit_approvals(self) -> None:
+    def _omnia_approval_source(
+        self, *, clear_snapshot: bool
+    ) -> tuple[str, str, str] | None:
+        """Register the authority and resolve a configured Omnia source.
+
+        Startup clears a prior adapter's process-global snapshot before it
+        advertises readiness. A manual MCP reload keeps the last candidates
+        until its replacement succeeds; every candidate is still revalidated
+        against Omnia at execution, so this cannot turn stale data into a grant.
+        """
         try:
-            from tools.tool_approval import (
+            from tools.omnio_approval_state import (
                 register_always_approval_authority,
                 replace_injected_always_approvals,
             )
@@ -9325,21 +9362,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 "[api_server] Omnio approval injection unavailable",
                 exc_info=True,
             )
-            return
+            return None
 
         register_always_approval_authority(
             self._is_omnio_connector_toolkit_approval_granted
         )
+        if clear_snapshot:
+            replace_injected_always_approvals([])
         if env_var_enabled(_OMNIO_DURABLE_APPROVALS_DISABLED_ENV):
             replace_injected_always_approvals([])
-            return
+            return None
 
         base_url = os.environ.get("OMNIA_BASE_URL", "").strip().rstrip("/")
         api_token = os.environ.get("OMNIA_API_TOKEN", "").strip()
         brand_id = os.environ.get("OMNIO_BRAND_ID", "").strip()
         if not base_url or not api_token or not brand_id:
             replace_injected_always_approvals([])
-            return
+            return None
+        return base_url, api_token, brand_id
+
+    async def _replace_omnio_approval_snapshot(
+        self, *, base_url: str, api_token: str, brand_id: str
+    ) -> bool:
+        from tools.omnio_approval_state import replace_injected_always_approvals
 
         try:
             tools, tool_slugs = await self._fetch_omnio_connector_toolkit_approvals(
@@ -9350,9 +9395,95 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[api_server] Omnio approval injection failed: %s", exc)
             replace_injected_always_approvals([])
-            return
+            return False
 
         replace_injected_always_approvals(tools, tool_slugs=tool_slugs)
+        return True
+
+    async def _refresh_omnio_connector_toolkit_approvals(self) -> None:
+        source = self._omnia_approval_source(clear_snapshot=False)
+        if source is None:
+            return
+        if self._omnio_approval_refresh_lock is None:
+            self._omnio_approval_refresh_lock = asyncio.Lock()
+        async with self._omnio_approval_refresh_lock:
+            await self._replace_omnio_approval_snapshot(
+                base_url=source[0],
+                api_token=source[1],
+                brand_id=source[2],
+            )
+
+    def _start_omnio_approval_snapshot_refresh(self) -> None:
+        """Start the startup snapshot fetch without delaying socket readiness."""
+        self._omnio_approval_snapshot_ready.set()
+        source = self._omnia_approval_source(clear_snapshot=True)
+        if source is None:
+            return
+
+        self._omnio_approval_snapshot_ready.clear()
+        _boot_mark("api_approvals_start")
+
+        async def _load() -> None:
+            started = time.monotonic()
+            loaded = False
+            try:
+                if self._omnio_approval_refresh_lock is None:
+                    self._omnio_approval_refresh_lock = asyncio.Lock()
+                async with self._omnio_approval_refresh_lock:
+                    loaded = await self._replace_omnio_approval_snapshot(
+                        base_url=source[0],
+                        api_token=source[1],
+                        brand_id=source[2],
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The fetch helper is already fail-closed, but startup must also
+                # survive unexpected bookkeeping/import failures around it.
+                logger.warning(
+                    "[api_server] Omnio approval startup refresh failed",
+                    exc_info=True,
+                )
+            finally:
+                self._omnio_approval_snapshot_ready.set()
+                logger.info(
+                    "[api_server] Omnio approval snapshot ready loaded=%s total_ms=%d",
+                    loaded,
+                    (time.monotonic() - started) * 1000,
+                )
+
+        try:
+            self._omnio_approval_refresh_task = asyncio.create_task(
+                _load(), name="omnio-approval-snapshot"
+            )
+        except Exception:
+            self._omnio_approval_snapshot_ready.set()
+            logger.warning(
+                "[api_server] Could not schedule Omnio approval startup refresh",
+                exc_info=True,
+            )
+
+    def _wait_for_omnio_approval_snapshot(self) -> None:
+        """Join the startup snapshot before agent construction, bounded."""
+        if self._omnio_approval_snapshot_ready.is_set():
+            return
+        started = time.monotonic()
+        ready = self._omnio_approval_snapshot_ready.wait(
+            timeout=_OMNIO_APPROVALS_AGENT_WAIT_TIMEOUT_SECONDS
+        )
+        elapsed_ms = (time.monotonic() - started) * 1000
+        if ready:
+            logger.info(
+                "[api_server] Omnio approval snapshot joined wait_ms=%d",
+                elapsed_ms,
+            )
+        else:
+            # Candidates were cleared before the background fetch started, so
+            # continuing after the bound is fail-closed: write tools prompt.
+            logger.warning(
+                "[api_server] Omnio approval snapshot join timed out wait_ms=%d",
+                elapsed_ms,
+            )
 
     def _is_omnio_connector_toolkit_approval_granted(
         self, function_name: str
@@ -9389,7 +9520,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise RuntimeError(f"omnia_status={status}")
             payload = json.loads(response.read())
 
-        from tools.tool_approval import connector_tool_slug
+        from tools.omnio_approval_state import connector_tool_slug
 
         tools, tool_slugs = _parse_omnio_connector_toolkit_approvals(payload)
         if function_name in tools:
@@ -9449,6 +9580,17 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
+        refresh_task = self._omnio_approval_refresh_task
+        self._omnio_approval_refresh_task = None
+        if refresh_task is not None and not refresh_task.done():
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except asyncio.CancelledError:
+                pass
+        # Release any executor thread already joining startup. The snapshot was
+        # cleared before the fetch, so a cancelled refresh remains fail-closed.
+        self._omnio_approval_snapshot_ready.set()
         if self._response_store is not None:
             try:
                 self._response_store.close()

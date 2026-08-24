@@ -29,7 +29,19 @@ from gateway.platform_registry import PlatformEntry, platform_registry
 def isolated_registry():
     """Run with a registry containing only the entries the test registers."""
     original = dict(platform_registry._entries)
+    original_deferred = dict(platform_registry._deferred)
+    original_deferred_specs = dict(platform_registry._deferred_specs)
+    original_deferred_env = dict(platform_registry._deferred_env)
+    original_deferred_activation_env = dict(
+        platform_registry._deferred_activation_env
+    )
+    original_resolving = dict(platform_registry._resolving)
     platform_registry._entries.clear()
+    platform_registry._deferred.clear()
+    platform_registry._deferred_specs.clear()
+    platform_registry._deferred_env.clear()
+    platform_registry._deferred_activation_env.clear()
+    platform_registry._resolving.clear()
     try:
         # ``_apply_env_overrides`` calls ``discover_plugins()`` (idempotent),
         # which would re-register the real bundled platforms and clobber the
@@ -39,6 +51,18 @@ def isolated_registry():
     finally:
         platform_registry._entries.clear()
         platform_registry._entries.update(original)
+        platform_registry._deferred.clear()
+        platform_registry._deferred.update(original_deferred)
+        platform_registry._deferred_specs.clear()
+        platform_registry._deferred_specs.update(original_deferred_specs)
+        platform_registry._deferred_env.clear()
+        platform_registry._deferred_env.update(original_deferred_env)
+        platform_registry._deferred_activation_env.clear()
+        platform_registry._deferred_activation_env.update(
+            original_deferred_activation_env
+        )
+        platform_registry._resolving.clear()
+        platform_registry._resolving.update(original_resolving)
 
 
 def _register_fake_platform(name, *, check_fn, is_connected):
@@ -98,3 +122,50 @@ def test_failed_install_does_not_enable_configured_platform(isolated_registry):
 
     check_fn.assert_called_once()
     assert not config.platforms.get(Platform.DISCORD, PlatformConfig()).enabled
+
+
+def test_unconfigured_deferred_platform_is_not_imported(isolated_registry):
+    """Manifest candidates stay lazy when neither config nor activation env exists."""
+    loader = MagicMock()
+    platform_registry.register_deferred(
+        "lazy-platform",
+        loader,
+        required_env=("LAZY_PLATFORM_TOKEN",),
+    )
+
+    _apply_env_overrides(GatewayConfig())
+
+    loader.assert_not_called()
+
+
+def test_env_candidate_is_loaded_for_existing_enablement_hooks(isolated_registry, monkeypatch):
+    """An activation env selects only that deferred platform for normal hooks."""
+    loader_calls = []
+    check_fn = MagicMock(return_value=True)
+
+    def loader():
+        loader_calls.append("loaded")
+        platform_registry.register(
+            PlatformEntry(
+                name="env-platform",
+                label="Env Platform",
+                adapter_factory=lambda cfg: MagicMock(),
+                check_fn=check_fn,
+                is_connected=lambda cfg: True,
+                source="plugin",
+            )
+        )
+
+    platform_registry.register_deferred(
+        "env-platform",
+        loader,
+        required_env=("ENV_PLATFORM_TOKEN",),
+    )
+    monkeypatch.setenv("ENV_PLATFORM_TOKEN", "configured")
+
+    config = GatewayConfig()
+    _apply_env_overrides(config)
+
+    assert loader_calls == ["loaded"]
+    assert check_fn.call_count == 1
+    assert config.platforms[Platform("env-platform")].enabled is True

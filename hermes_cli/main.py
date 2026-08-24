@@ -2428,6 +2428,12 @@ def _sync_bundled_skills_quietly() -> None:
     empty skills library.
     """
     try:
+        # ``tools.skills_sync`` pulls in the skill scanner and its dependency
+        # graph. A profile created with --no-skills has a durable marker that
+        # makes sync_skills() an unconditional no-op, so check that marker with
+        # the already-imported config helper before paying the import cost.
+        if (get_hermes_home() / ".no-bundled-skills").exists():
+            return
         from tools.skills_sync import sync_skills
 
         sync_skills(quiet=True)
@@ -2694,7 +2700,12 @@ def cmd_gateway(args):
     """Gateway management commands."""
     from hermes_cli.boot_clock import mark
 
-    _sync_bundled_skills_quietly()
+    # ``start_gateway`` owns the gateway-run sync.  Keeping the CLI-side sync
+    # for management commands preserves their existing behavior, while the
+    # long-running path avoids doing the same work once before dispatch and
+    # once again after the runner has completed its duplicate-instance guard.
+    if getattr(args, "gateway_command", None) not in {None, "run"}:
+        _sync_bundled_skills_quietly()
     mark("skills")
 
     from hermes_cli.gateway import gateway_command
@@ -15147,6 +15158,22 @@ def _prepare_agent_startup(args) -> None:
         return
 
     _accept_hooks = bool(getattr(args, "accept_hooks", False))
+
+    # ``gateway.run`` has a second, programmatic entry point (service
+    # supervisors call ``run_gateway`` directly).  Its runner owns plugin
+    # discovery, MCP startup, and shell-hook registration so that both launch
+    # modes have one ordering and one single-flight boundary.  Keep the
+    # process-wide environment setup here because it must happen before the
+    # runner imports config or tools, especially for ``--safe-mode`` and
+    # ``--accept-hooks``.
+    if args.command == "gateway" and getattr(args, "gateway_command", None) in {
+        None,
+        "run",
+    }:
+        if _accept_hooks:
+            os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+        return
+
     try:
         from hermes_cli.plugins import discover_plugins
 
@@ -17894,20 +17921,21 @@ def main():
         cmd_version(args)
         return
 
-    # --yolo: set HERMES_YOLO_MODE *before* plugin discovery.  The call to
-    # _prepare_agent_startup() below triggers discover_plugins() → tool
-    # imports, and tools.approval freezes _YOLO_MODE_FROZEN at module
-    # import time (PR #7994, security hardening against prompt-injection).
-    # If the env var is set only later (e.g. inside cmd_chat), the frozen
-    # value is already False and --yolo silently does nothing.
+    # --yolo: set HERMES_YOLO_MODE *before* any plugin/tool discovery.  The
+    # agent-capable CLI preparation below can trigger discover_plugins() →
+    # tool imports, and gateway startup imports its own tool path later.
+    # tools.approval freezes _YOLO_MODE_FROZEN at module import time (PR #7994,
+    # security hardening against prompt-injection), so setting the env var
+    # inside cmd_chat or after gateway dispatch is too late.
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
 
-    # Discover Python plugins and register shell hooks once, before any
-    # command that can fire lifecycle hooks.  Both are idempotent; gated
-    # so introspection/management commands (hermes hooks list, cron
-    # list, gateway status, mcp add, ...) don't pay discovery cost or
-    # trigger consent prompts for hooks the user is still inspecting.
+    # Prepare agent-capable CLI paths before dispatch.  Gateway ``run`` keeps
+    # only its safety/acceptance environment setup here; GatewayRunner owns
+    # plugin/platform discovery, MCP startup, and shell hooks so direct and
+    # CLI launches share one ordering.  Management commands (hermes hooks
+    # list, cron list, gateway status, mcp add, ...) stay gated and do not pay
+    # discovery cost or trigger consent prompts while being inspected.
     _prepare_agent_startup(args)
 
     # Handle top-level --oneshot / -z: single-shot mode, stdout = final

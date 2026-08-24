@@ -1,9 +1,12 @@
 """Tests for the platform adapter registry and dynamic Platform enum."""
 
 import os
+import threading
+import time
 import pytest
 from unittest.mock import MagicMock
 
+import gateway.platform_registry as platform_registry_module
 from gateway.platform_registry import PlatformRegistry, PlatformEntry
 from gateway.config import Platform, GatewayConfig
 
@@ -199,6 +202,371 @@ class TestPlatformRegistry:
         reg.register(entry1)
         reg.register(entry2)
         assert reg.get("dup").label == "Dup v2"
+
+    def test_deferred_platform_resolution_is_single_flight(self):
+        """Concurrent first-use callers all observe the loaded platform."""
+        reg = PlatformRegistry()
+        loader_started = threading.Event()
+        release_loader = threading.Event()
+        start_gate = threading.Barrier(5)
+        loader_calls = []
+        resolved = []
+        errors = []
+
+        entry = PlatformEntry(
+            name="lazy",
+            label="Lazy",
+            adapter_factory=lambda cfg: MagicMock(),
+            check_fn=lambda: True,
+            source="plugin",
+        )
+
+        def loader():
+            loader_calls.append(1)
+            loader_started.set()
+            assert release_loader.wait(timeout=2.0)
+            reg.register(entry)
+
+        reg.register_deferred("lazy", loader)
+
+        def worker():
+            try:
+                start_gate.wait(timeout=2.0)
+                resolved.append(reg.get("lazy") is entry)
+            except BaseException as exc:  # pragma: no cover - failure detail
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        start_gate.wait(timeout=2.0)
+        assert loader_started.wait(timeout=2.0)
+        assert reg.is_registered("lazy")
+        release_loader.set()
+        for thread in threads:
+            thread.join(timeout=2.0)
+
+        assert not errors
+        assert loader_calls == [1]
+        assert resolved == [True] * 4
+
+    def test_deferred_resolution_timeout_fails_closed_without_partial_entry(
+        self, monkeypatch
+    ):
+        """A wedged loader cannot deadlock callers or expose half-registration."""
+        reg = PlatformRegistry()
+        loader_started = threading.Event()
+        release_loader = threading.Event()
+        owner_done = threading.Event()
+        entry = PlatformEntry(
+            name="stuck",
+            label="Stuck",
+            adapter_factory=lambda cfg: MagicMock(),
+            check_fn=lambda: True,
+            source="plugin",
+        )
+
+        def loader():
+            loader_started.set()
+            release_loader.wait(timeout=2.0)
+            reg.register(entry)
+
+        reg.register_deferred("stuck", loader)
+
+        def resolve_as_owner():
+            reg.get("stuck")
+            owner_done.set()
+
+        owner = threading.Thread(target=resolve_as_owner)
+        owner.start()
+        assert loader_started.wait(timeout=2.0)
+
+        monkeypatch.setattr(
+            platform_registry_module,
+            "DEFERRED_PLATFORM_LOAD_TIMEOUT_SECONDS",
+            0.01,
+        )
+        started = time.monotonic()
+        assert reg.get("stuck") is None
+        assert time.monotonic() - started < 0.5
+        assert "stuck" not in reg._entries
+        assert reg.is_registered("stuck")
+
+        release_loader.set()
+        owner.join(timeout=2.0)
+        assert owner_done.is_set()
+        assert reg.get("stuck") is entry
+
+    def test_candidate_resolution_uses_manifest_env_or_explicit_config(self):
+        """Startup selection stays lazy while explicit/configured use loads."""
+        reg = PlatformRegistry()
+        loaded = []
+
+        def make_loader(name):
+            def loader():
+                loaded.append(name)
+                reg.register(
+                    PlatformEntry(
+                        name=name,
+                        label=name.title(),
+                        adapter_factory=lambda cfg: MagicMock(),
+                        check_fn=lambda: True,
+                        source="plugin",
+                    )
+                )
+
+            return loader
+
+        reg.register_deferred(
+            "env-platform",
+            make_loader("env-platform"),
+            required_env=("ENV_PLATFORM_TOKEN",),
+            optional_env=("ENV_PLATFORM_ALLOWED_USERS",),
+        )
+        reg.register_deferred(
+            "configured-platform",
+            make_loader("configured-platform"),
+            required_env=("CONFIGURED_PLATFORM_TOKEN",),
+        )
+
+        assert reg.plugin_entries(resolve_deferred=False) == []
+        assert reg.resolve_candidates(environ={"ENV_PLATFORM_TOKEN": "yes"}) == (
+            "env-platform",
+        )
+        assert loaded == ["env-platform"]
+        assert reg.plugin_entries(resolve_deferred=False)[0].name == "env-platform"
+
+        assert reg.resolve_candidates({"configured-platform"}) == (
+            "configured-platform",
+        )
+        assert loaded == ["env-platform", "configured-platform"]
+
+    def test_activation_alternatives_extend_required_env(self):
+        reg = PlatformRegistry()
+        calls = []
+
+        def loader():
+            calls.append("loaded")
+            reg.register(
+                PlatformEntry(
+                    name="multi-mode",
+                    label="Multi Mode",
+                    adapter_factory=lambda cfg: object(),
+                    check_fn=lambda: True,
+                    source="plugin",
+                )
+            )
+
+        reg.register_deferred(
+            "multi-mode",
+            loader,
+            required_env=("NORMAL_MODE_TOKEN",),
+            activation_env=("CALLBACK_MODE_TOKEN",),
+        )
+
+        assert reg.resolve_candidates(environ={"NORMAL_MODE_TOKEN": "yes"}) == (
+            "multi-mode",
+        )
+        assert calls == ["loaded"]
+
+    def test_deferred_manifest_allowlist_names_are_available_without_import(self):
+        reg = PlatformRegistry()
+        reg.register_deferred(
+            "lazy-auth",
+            lambda: None,
+            required_env=("LAZY_AUTH_TOKEN", "LAZY_AUTH_ALLOWED_USERS"),
+            optional_env=("LAZY_AUTH_ALLOW_ALL_USERS",),
+        )
+
+        assert reg.plugin_entries(resolve_deferred=False) == []
+        assert reg.plugin_authorization_env_vars() == (
+            ("LAZY_AUTH_ALLOWED_USERS",),
+            ("LAZY_AUTH_ALLOW_ALL_USERS",),
+        )
+
+    def test_full_plugin_enumeration_still_materializes_deferred_entries(self):
+        reg = PlatformRegistry()
+        entry = PlatformEntry(
+            name="enumerated",
+            label="Enumerated",
+            adapter_factory=lambda cfg: MagicMock(),
+            check_fn=lambda: True,
+            source="plugin",
+        )
+        reg.register_deferred("enumerated", lambda: reg.register(entry))
+
+        assert [loaded.name for loaded in reg.plugin_entries()] == ["enumerated"]
+
+    def test_secondary_aliases_share_one_loader_and_publish_atomically(self):
+        reg = PlatformRegistry()
+        calls = []
+        primary = PlatformEntry(
+            name="primary",
+            label="Primary",
+            adapter_factory=lambda cfg: object(),
+            check_fn=lambda: True,
+            source="plugin",
+        )
+        secondary = PlatformEntry(
+            name="secondary",
+            label="Secondary",
+            adapter_factory=lambda cfg: object(),
+            check_fn=lambda: True,
+            source="plugin",
+        )
+
+        def loader():
+            calls.append("load")
+            reg.register(primary)
+            reg.register(secondary)
+
+        reg.register_deferred("primary", loader, aliases=("secondary",))
+
+        assert reg.get("secondary") is secondary
+        assert reg.get("primary") is primary
+        assert calls == ["load"]
+
+    def test_failed_deferred_load_retries_without_leaking_partial_entries(self):
+        reg = PlatformRegistry()
+        attempts = []
+        partial = PlatformEntry(
+            name="retryable",
+            label="Partial",
+            adapter_factory=lambda cfg: object(),
+            check_fn=lambda: True,
+            source="plugin",
+        )
+        complete = PlatformEntry(
+            name="retryable",
+            label="Complete",
+            adapter_factory=lambda cfg: object(),
+            check_fn=lambda: True,
+            source="plugin",
+        )
+
+        def loader():
+            attempts.append(len(attempts) + 1)
+            if len(attempts) == 1:
+                reg.register(partial)
+                raise RuntimeError("first import failed")
+            reg.register(complete)
+
+        reg.register_deferred("retryable", loader)
+
+        assert reg.get("retryable") is None
+        assert "retryable" not in reg._entries
+        assert reg.get("retryable") is complete
+        assert attempts == [1, 2]
+
+    def test_unregister_invalidates_inflight_loader(self):
+        reg = PlatformRegistry()
+        loader_started = threading.Event()
+        release_loader = threading.Event()
+        entry = PlatformEntry(
+            name="unregistered",
+            label="Unregistered",
+            adapter_factory=lambda cfg: object(),
+            check_fn=lambda: True,
+            source="plugin",
+        )
+
+        def loader():
+            loader_started.set()
+            release_loader.wait(timeout=2.0)
+            reg.register(entry)
+
+        reg.register_deferred("unregistered", loader)
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(reg.get("unregistered"))
+        )
+        worker.start()
+        assert loader_started.wait(timeout=2.0)
+        assert reg.unregister("unregistered") is False
+        release_loader.set()
+        worker.join(timeout=2.0)
+
+        assert result == [None]
+        assert reg.get("unregistered") is None
+        assert not reg.is_registered("unregistered")
+
+    def test_new_generation_wins_over_inflight_loader(self):
+        reg = PlatformRegistry()
+        old_started = threading.Event()
+        release_old = threading.Event()
+        old_finished = threading.Event()
+        stale_registration = []
+        old_entry = PlatformEntry(
+            name="generation",
+            label="Old",
+            adapter_factory=lambda cfg: object(),
+            check_fn=lambda: True,
+            source="plugin",
+        )
+        new_entry = PlatformEntry(
+            name="generation",
+            label="New",
+            adapter_factory=lambda cfg: object(),
+            check_fn=lambda: True,
+            source="plugin",
+        )
+
+        def old_loader():
+            old_started.set()
+            release_old.wait(timeout=2.0)
+            # The registry must reject this stale publication.
+            stale_registration.append(reg.register(old_entry))
+            old_finished.set()
+
+        reg.register_deferred("generation", old_loader)
+        worker = threading.Thread(target=lambda: reg.get("generation"))
+        worker.start()
+        assert old_started.wait(timeout=2.0)
+
+        reg.register_deferred("generation", lambda: reg.register(new_entry))
+        release_old.set()
+        assert old_finished.wait(timeout=2.0)
+        worker.join(timeout=2.0)
+
+        assert stale_registration == [False]
+        assert reg.get("generation") is new_entry
+        assert reg.get("generation").label == "New"
+
+    def test_full_enumeration_starts_independent_loaders_before_waiting(self):
+        reg = PlatformRegistry()
+        started = {name: threading.Event() for name in ("one", "two")}
+        release = threading.Event()
+
+        def make_loader(name):
+            def loader():
+                started[name].set()
+                release.wait(timeout=2.0)
+                reg.register(
+                    PlatformEntry(
+                        name=name,
+                        label=name,
+                        adapter_factory=lambda cfg: object(),
+                        check_fn=lambda: True,
+                        source="plugin",
+                    )
+                )
+
+            return loader
+
+        reg.register_deferred("one", make_loader("one"))
+        reg.register_deferred("two", make_loader("two"))
+
+        result = []
+        enumerator = threading.Thread(
+            target=lambda: result.extend(entry.name for entry in reg.plugin_entries())
+        )
+        enumerator.start()
+        assert started["one"].wait(timeout=2.0)
+        assert started["two"].wait(timeout=2.0)
+        release.set()
+        enumerator.join(timeout=2.0)
+
+        assert set(result) == {"one", "two"}
 
 
 # ── GatewayConfig integration ────────────────────────────────────────────

@@ -175,21 +175,20 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
             continue
         platforms[plat_name] = await asyncio.to_thread(_build_from_sessions, plat_name)
 
-    # Include plugin-registered platforms (dynamic enum members aren't in
-    # Platform.__members__, so the loop above misses them). Same
-    # connected-only rule: don't expose stale session targets for plugins
-    # that are not loaded.
-    try:
-        from gateway.platform_registry import platform_registry
-        for entry in platform_registry.plugin_entries():
-            if (
-                entry.name not in _SKIP_SESSION_DISCOVERY
-                and entry.name not in platforms
-                and entry.name in adapter_platform_names
-            ):
-                platforms[entry.name] = await asyncio.to_thread(_build_from_sessions, entry.name)
-    except Exception:
-        pass
+    # Dynamic plugin platforms are already represented by the connected
+    # adapter keys above. Do not enumerate the entire platform registry here:
+    # setup/status need full metadata, but the gateway's initial channel
+    # directory must not import every deferred adapter merely to discover
+    # which platforms are connected.
+    for platform_name in adapter_platform_names:
+        if (
+            platform_name not in _SKIP_SESSION_DISCOVERY
+            and platform_name not in platforms
+        ):
+            platforms[platform_name] = await asyncio.to_thread(
+                _build_from_sessions,
+                platform_name,
+            )
 
     # Overlay user-maintained friendly names before persisting.
     _apply_channel_aliases(platforms)

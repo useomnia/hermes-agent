@@ -18,6 +18,12 @@ requires_env:
     description: "Path to Service Account JSON key (or inline JSON). Leave empty to use Application Default Credentials on Cloud Run / GCE. Falls back to GOOGLE_APPLICATION_CREDENTIALS."
     prompt: "Path to SA JSON (or empty for ADC)"
     password: true
+activation_env:
+  - name: GOOGLE_CHAT_HTTP_EVENTS_URL
+  - name: GOOGLE_CHAT_PROJECT_ID
+  - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
+  - name: GOOGLE_CHAT_SUBSCRIPTION
+  - name: GOOGLE_CLOUD_PROJECT
 optional_env:
   - name: GOOGLE_CHAT_HTTP_EVENTS_URL
     description: "Authenticated HTTP endpoint for Chat message events."
@@ -43,6 +49,10 @@ optional_env:
   - name: GOOGLE_CHAT_ALLOWED_USERS
     description: "Comma-separated user emails allowed to interact with the bot."
     prompt: "Allowed user emails (comma-separated)"
+    password: false
+  - name: GOOGLE_CHAT_ALLOW_ALL_USERS
+    description: "Allow any Google Chat user to trigger the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
     password: false
   - name: GOOGLE_CHAT_HOME_CHANNEL
     description: "Default space for cron / notification delivery (e.g. spaces/AAAA...)."

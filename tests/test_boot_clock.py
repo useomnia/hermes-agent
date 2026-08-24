@@ -9,7 +9,6 @@ from hermes_cli import boot_clock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-
 LINUX_ONLY = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="procfs is Linux-only"
 )
@@ -108,6 +107,112 @@ def test_preamble_reports_only_start_when_nothing_was_marked(monkeypatch):
     assert boot_clock.format_preamble() == "to_start_ms=3250"
 
 
+def _marked_names(relative_path: str, *callees: str) -> set[str]:
+    """Checkpoint names this file stamps via any of ``callees``.
+
+    Read from the AST rather than importing gateway modules: the imports are
+    intentionally heavyweight, and this test is pinning call sites. A dropped
+    mark otherwise fails silently and misattributes the phase to a neighbour.
+    """
+    tree = ast.parse((REPO_ROOT / relative_path).read_text(encoding="utf-8"))
+    return {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in callees
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
+
+
+def test_every_declared_gateway_checkpoint_is_still_marked():
+    expected_by_file = {
+        "hermes_cli/main.py": {
+            "main",
+            "skills",
+            "cli_import",
+        },
+        "hermes_cli/gateway.py": {
+            "dispatch",
+            "pre_start",
+        },
+        "gateway/run.py": {
+            "plugins",
+            "relay",
+            "session_recovery",
+            "platforms",
+            "runtime_ready",
+            "fingerprint",
+            "dup_guard",
+            "skills_resync",
+            "logging",
+            "audit",
+            "runner_init",
+            "pid_lock",
+            # Discovery is joined by the first agent build, not gateway boot.
+            "mcp_discovery_start",
+        },
+        "gateway/platforms/api_server.py": {
+            "api_connect",
+            "api_routes",
+            "api_bound",
+            "api_ready",
+            "api_approvals_start",
+        },
+    }
+    observed = set()
+    for path, expected in expected_by_file.items():
+        names = _marked_names(path, "mark", "_boot_mark")
+        assert names == expected
+        observed.update(names)
+
+    assert (
+        observed
+        == boot_clock.BOOT_CHECKPOINT_NAMES
+        == {
+            "main",
+            "skills",
+            "cli_import",
+            "dispatch",
+            "pre_start",
+            "plugins",
+            "relay",
+            "session_recovery",
+            "platforms",
+            "runtime_ready",
+            "fingerprint",
+            "dup_guard",
+            "skills_resync",
+            "logging",
+            "audit",
+            "runner_init",
+            "pid_lock",
+            "mcp_discovery_start",
+            "api_connect",
+            "api_routes",
+            "api_bound",
+            "api_ready",
+            "api_approvals_start",
+        }
+    )
+
+
+def test_timeline_uses_the_callers_end_name(monkeypatch):
+    ages = iter([0.25, 1.5])
+    monkeypatch.setattr(boot_clock, "process_elapsed_seconds", lambda: next(ages))
+    boot_clock.mark("spawned")
+
+    assert boot_clock.format_timeline("ready") == "to_spawned_ms=250 to_ready_ms=1500"
+
+
+@pytest.mark.parametrize("name", ["", "Ready", "not-valid", "has space"])
+def test_timeline_rejects_unstructured_end_names(name):
+    with pytest.raises(ValueError, match="lowercase identifier"):
+        boot_clock.format_timeline(name)
+
+
 def test_a_checkpoint_reached_twice_is_not_collapsed(monkeypatch):
     ages = iter([1.0, 2.0, 9.0])
     monkeypatch.setattr(boot_clock, "process_elapsed_seconds", lambda: next(ages))
@@ -127,51 +232,3 @@ def test_mark_records_nothing_without_a_clock(monkeypatch):
     boot_clock.mark("main")
 
     assert boot_clock._checkpoints == []
-
-
-def _marked_names(relative_path: str, *callees: str) -> set[str]:
-    """Checkpoint names this file stamps via any of `callees`.
-
-    Read from the AST rather than by importing: `gateway.run` is a heavyweight
-    import, and what we are pinning is the call sites, not runtime behaviour.
-    A set, not a list — source order is not boot order (`hermes_cli/gateway.py`
-    defines the later checkpoint first).
-    """
-    tree = ast.parse((REPO_ROOT / relative_path).read_text(encoding="utf-8"))
-    return {
-        node.args[0].value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in callees
-        and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and isinstance(node.args[0].value, str)
-    }
-
-
-def test_every_intended_boot_phase_is_still_marked():
-    # A dropped mark does not fail anything at runtime — the phase silently
-    # disappears and its cost gets misattributed to whichever neighbour
-    # survives. That is the failure mode this guards.
-    assert _marked_names("hermes_cli/main.py", "mark") == {
-        "main",
-        "skills",
-        "cli_import",
-    }
-    assert _marked_names("hermes_cli/gateway.py", "_boot_mark") == {
-        "dispatch",
-        "pre_start",
-    }
-    assert _marked_names("gateway/run.py", "_boot_mark") == {
-        "fingerprint",
-        "dup_guard",
-        "skills_resync",
-        "logging",
-        "audit",
-        "runner_init",
-        "pid_lock",
-        # Marks when discovery is *started*, not finished — the gateway no longer
-        # waits for it here; the first agent build joins it instead.
-        "mcp_discovery_start",
-    }

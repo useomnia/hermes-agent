@@ -1495,9 +1495,30 @@ def load_gateway_config() -> GatewayConfig:
                 logger.debug("plugin discovery skipped: %s", e)
                 _pr = None
 
+            # The registry has cheap manifest metadata for deferred bundled
+            # platforms. Materialize only names explicitly present in any
+            # config layer; env-only activation is selected by
+            # ``_apply_env_overrides`` below. Full platform enumeration stays
+            # available to setup/status callers through the registry's default
+            # ``plugin_entries()`` behavior.
+            if _pr is not None:
+                _configured_plugin_platforms = {
+                    str(name)
+                    for source in (
+                        yaml_cfg,
+                        gateway_platforms,
+                        yaml_cfg.get("platforms"),
+                        platforms_data,
+                    )
+                    if isinstance(source, dict)
+                    for name, value in source.items()
+                    if isinstance(value, dict)
+                }
+                _pr.resolve_candidates(_configured_plugin_platforms)
+
             _shared_loop_targets: list = list(Platform)
             if _pr is not None:
-                for _entry in _pr.plugin_entries():
+                for _entry in _pr.plugin_entries(resolve_deferred=False):
                     try:
                         _plat = Platform(_entry.name)
                     except (ValueError, KeyError):
@@ -1644,7 +1665,7 @@ def load_gateway_config() -> GatewayConfig:
             # blocks (below; no-op when a hook already set their env var) →
             # ``_apply_env_overrides()`` after ``GatewayConfig.from_dict``.
             if _pr is not None:
-                for entry in _pr.all_entries():
+                for entry in _pr.all_entries(resolve_deferred=False):
                     if entry.apply_yaml_config_fn is None:
                         continue
                     platform_cfg = yaml_cfg.get(entry.name)
@@ -2529,7 +2550,13 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         from hermes_cli.plugins import discover_plugins
         discover_plugins()  # idempotent
         from gateway.platform_registry import platform_registry
-        for entry in platform_registry.plugin_entries():
+        platform_registry.resolve_candidates(
+            {
+                getattr(platform, "value", str(platform))
+                for platform in config.platforms
+            }
+        )
+        for entry in platform_registry.plugin_entries(resolve_deferred=False):
             try:
                 platform = Platform(entry.name)
             except Exception as e:
