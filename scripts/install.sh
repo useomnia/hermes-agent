@@ -59,6 +59,10 @@ else
 fi
 PYTHON_VERSION="3.11"
 NODE_VERSION="22"
+# Keep the production Browser Use dependency aligned with the harness shipped
+# by Hermes.  Do not replace this with an unpinned ``uvx browser-use`` run.
+BROWSER_USE_PACKAGE="browser-use==0.13.8"
+BROWSER_USE_CLI_VERSION="0.1.9"
 
 # FHS-style root install layout (set by resolve_install_layout when applicable):
 #   code at /usr/local/lib/hermes-agent, command at /usr/local/bin/hermes,
@@ -2327,6 +2331,36 @@ install_node_deps() {
     restore_dirty_lockfiles "$INSTALL_DIR"
 }
 
+install_browser_use_cli() {
+    # Browser Use CLI 3.0 is Hermes' single browser surface.  Provision the
+    # exact package into the managed bin dir; failures remain non-fatal so a
+    # later `hermes tools post-setup browser_use_cli` can retry.
+    if [ "$SKIP_BROWSER" = true ] || [ "$DISTRO" = "termux" ]; then
+        log_info "Skipping Browser Use CLI install (--skip-browser/Termux)"
+        return 0
+    fi
+    if [ -z "$UV_CMD" ]; then
+        log_info "Skipping Browser Use CLI install (uv unavailable)"
+        return 0
+    fi
+    mkdir -p "$HERMES_HOME/bin"
+    # Always use --force: an existing managed shim may point at CLI 0.1.8 /
+    # browser-use 0.13.7 from an older Hermes release.
+    log_info "Installing Browser Use CLI ($BROWSER_USE_PACKAGE)..."
+    if run_with_timeout 600 env UV_NO_CONFIG=1 UV_TOOL_BIN_DIR="$HERMES_HOME/bin" \
+        "$UV_CMD" tool install --force "$BROWSER_USE_PACKAGE" >/dev/null 2>&1; then
+        local _browser_use_version
+        _browser_use_version=$("$HERMES_HOME/bin/browser-use" --version 2>/dev/null || true)
+        if printf '%s\n' "$_browser_use_version" | grep -Eq "(^|[^0-9])${BROWSER_USE_CLI_VERSION}([^0-9]|$)"; then
+            log_success "Browser Use CLI installed (CLI $BROWSER_USE_CLI_VERSION)"
+        else
+            log_warn "Browser Use CLI install produced an unexpected version; browser_exec will report setup errors"
+        fi
+    else
+        log_warn "Browser Use CLI install failed; browser_exec will report an actionable setup error"
+    fi
+}
+
 run_setup_wizard() {
     if [ "$RUN_SETUP" = false ]; then
         log_info "Skipping setup wizard (--skip-setup)"
@@ -2662,6 +2696,15 @@ ensure_mode() {
                 check_node
                 ;;
             browser)
+                # Browser Use CLI is the production browser surface. Keep
+                # the legacy Node/Camofox dependency setup for its explicit
+                # compatibility backend, but never omit the exact CLI pin.
+                # Ensure-mode is also used by upgrade/recovery flows, so it
+                # must bootstrap the managed uv before forcing a stale CLI
+                # replacement rather than silently skipping provisioning.
+                resolve_install_layout
+                install_uv
+                install_browser_use_cli
                 check_node
                 if [ "$HAS_NODE" = true ]; then
                     ensure_browser
@@ -3091,8 +3134,10 @@ run_stage_body() {
             detect_os
             resolve_install_layout
             require_install_dir
+            install_uv
             check_node
             install_node_deps
+            install_browser_use_cli
             ;;
         path)
             detect_os
@@ -3207,6 +3252,7 @@ main() {
     setup_venv
     install_deps
     install_node_deps
+    install_browser_use_cli
     setup_path
     copy_config_templates
     run_setup_wizard
