@@ -7452,6 +7452,7 @@ class APIServerAdapter(BasePlatformAdapter):
         annotation_tasks: List["asyncio.Task[None]"] = []
         strip_tool_separator_on_next_message = False
         started_tool_calls: Dict[str, tuple[str, Dict[str, Any]]] = {}
+        semantic_tool_calls: Dict[str, str] = {}
         ended_tool_calls: set[str] = set()
         early_generating_tool_call_ids: set[str] = set()
         abandoned_pending_tool_call_ids: set[str] = set()
@@ -7625,6 +7626,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         if isinstance(function_args, dict)
                         else {},
                     )
+                elif semantic_tool_calls.get(tool_call_id) != tool_name:
+                    # Tool Search keeps the provider-authored ``tool_call``
+                    # item intact for Responses replay, while execution and
+                    # hooks see the unwrapped tool. Publish that authoritative
+                    # identity separately without exposing its arguments.
+                    semantic_tool_calls[tool_call_id] = tool_name
+                    emitter.semantic_tool_start(tool_call_id, tool_name)
                 return
             _close_pending_abandoned_tool_calls()
             ended_tool_calls.discard(tool_call_id)
@@ -7733,6 +7741,9 @@ class APIServerAdapter(BasePlatformAdapter):
             if started_tool_name == "todo" and isinstance(todos, list):
                 emitter.task_list(todos)
             emitter.function_call_done(tool_call_id)
+            if tool_call_id in semantic_tool_calls:
+                emitter.semantic_tool_done(tool_call_id)
+                semantic_tool_calls.pop(tool_call_id, None)
             ended_tool_calls.add(tool_call_id)
 
         def _tool_complete_cb(

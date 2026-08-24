@@ -245,6 +245,7 @@ def test_omnio_extension_event_types_are_explicit_and_namespaced() -> None:
         "response.omnio.approval_request",
         "response.omnio.approval_responded",
         "response.omnio.steer_missed",
+        "response.omnio.tool_progress",
     }
     assert OMNIO_EXTENSION_EVENT_TYPES == expected
 
@@ -3071,6 +3072,87 @@ async def test_runs_emit_function_call_boundary_while_arguments_are_generating()
     ]
     assert call_events[-1]["item"]["arguments"] == ""
     assert "hidden" not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+async def test_deferred_tool_keeps_raw_call_and_emits_semantic_progress() -> None:
+    adapter = _make_adapter()
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            callbacks["tool_gen_event_callback"]("tool_call", "call-deferred")
+            callbacks["tool_start_callback"](
+                "call-deferred",
+                "connect_linkedin",
+                {"secret": "MUST_NOT_LEAK"},
+            )
+            callbacks["tool_complete_callback"](
+                "call-deferred",
+                "connect_linkedin",
+                {"secret": "MUST_NOT_LEAK"},
+                "RESULT_MUST_NOT_LEAK",
+            )
+            return {"final_response": "done", "messages": []}
+
+        return _agent(run)
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", side_effect=build_agent):
+            started = await client.post("/v1/runs", json={"input": "connect linkedin"})
+            run_id = (await started.json())["run_id"]
+            response = await client.get(f"/v1/runs/{run_id}/events")
+            events = _sse_events(await response.text())
+
+    raw_items = [
+        event["item"]
+        for event in events
+        if event["type"] in {"response.output_item.added", "response.output_item.done"}
+        and event.get("item", {}).get("type") == "function_call"
+    ]
+    progress = [
+        event for event in events if event["type"] == "response.omnio.tool_progress"
+    ]
+
+    assert [item["name"] for item in raw_items] == ["tool_call", "tool_call"]
+    assert [event["status"] for event in progress] == ["running", "completed"]
+    assert all(event["source_call_id"] == "call-deferred" for event in progress)
+    assert all(event["tool"] == "connect_linkedin" for event in progress)
+    assert progress[0]["started_at"] == progress[1]["started_at"]
+    assert progress[1]["completed_at"] >= progress[1]["started_at"]
+    assert "MUST_NOT_LEAK" not in json.dumps(events)
+    assert "RESULT_MUST_NOT_LEAK" not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+async def test_deferred_wrapper_without_execution_emits_no_semantic_progress() -> None:
+    adapter = _make_adapter()
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            callbacks["tool_gen_event_callback"]("tool_call", "call-rejected")
+            callbacks["tool_gen_event_aborted_callback"]("call-rejected")
+            return {"final_response": "The deferred call was invalid.", "messages": []}
+
+        return _agent(run)
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", side_effect=build_agent):
+            started = await client.post("/v1/runs", json={"input": "use a missing tool"})
+            run_id = (await started.json())["run_id"]
+            response = await client.get(f"/v1/runs/{run_id}/events")
+            events = _sse_events(await response.text())
+
+    raw_items = [
+        event["item"]
+        for event in events
+        if event["type"] in {"response.output_item.added", "response.output_item.done"}
+        and event.get("item", {}).get("type") == "function_call"
+    ]
+    assert [(item["name"], item["status"]) for item in raw_items] == [
+        ("tool_call", "in_progress"),
+        ("tool_call", "incomplete"),
+    ]
+    assert not any(event["type"] == "response.omnio.tool_progress" for event in events)
 
 
 @pytest.mark.asyncio
