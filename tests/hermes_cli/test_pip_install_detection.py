@@ -41,6 +41,19 @@ def test_stamp_file_takes_precedence(tmp_path):
         assert detect_install_method(project_root=tmp_path) == "docker"
 
 
+def test_archive_stamp_is_detected_and_has_managed_update_guidance(tmp_path):
+    (tmp_path / ".install_method").write_text("archive\n")
+    with patch("hermes_cli.config.get_managed_system", return_value=None), \
+         patch("hermes_cli.config.get_hermes_home", return_value=tmp_path):
+        from hermes_cli.config import (
+            detect_install_method,
+            recommended_update_command_for_method,
+        )
+
+        assert detect_install_method(project_root=tmp_path) == "archive"
+        assert "managing platform" in recommended_update_command_for_method("archive")
+
+
 @pytest.mark.parametrize("retired_method", ["pip", "homebrew"])
 def test_code_scoped_retired_stamp_falls_back_to_unknown(tmp_path, retired_method):
     """Removed install methods must not survive in an upgraded code stamp."""

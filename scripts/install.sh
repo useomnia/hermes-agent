@@ -74,6 +74,8 @@ SKIP_BROWSER=false
 NO_SKILLS=false
 BRANCH="${HERMES_BRANCH:-main}"
 INSTALL_COMMIT=""
+SOURCE_ARCHIVE=""
+INSTALL_METHOD="git"
 ENSURE_DEPS=""
 
 MANIFEST_MODE=false
@@ -119,6 +121,11 @@ while [[ $# -gt 0 ]]; do
             ;;
         --commit|-Commit)
             INSTALL_COMMIT="$2"
+            shift 2
+            ;;
+        --source-archive)
+            SOURCE_ARCHIVE="$2"
+            INSTALL_METHOD="archive"
             shift 2
             ;;
         --manifest|-Manifest)
@@ -185,6 +192,7 @@ while [[ $# -gt 0 ]]; do
             echo "                   'hermes update' runs never inject bundled skills either"
             echo "  --branch NAME  Git branch to install (default: main, or \$HERMES_BRANCH)"
             echo "  --commit SHA   Pin checkout to a specific commit after clone/update"
+            echo "  --source-archive PATH  Install an exact source archive (requires --commit)"
             echo "  --manifest     Print desktop bootstrap stage manifest as JSON"
             echo "  --stage NAME   Run one desktop bootstrap stage"
             echo "  --json         Print a JSON result frame for --stage"
@@ -1350,6 +1358,206 @@ EOF
     log_success "Repository ready"
 }
 
+# Install from an Omnia-prepared exact Hermes source archive. This is an
+# additive, explicitly-selected path for environments that already fetched and
+# verified the source. The normal git checkout/update path above remains the
+# default for every existing caller.
+install_source_archive() {
+    if [ -z "$SOURCE_ARCHIVE" ]; then
+        log_error "Source archive path is empty"
+        return 1
+    fi
+    if [ -z "$INSTALL_COMMIT" ] || [[ ! "$INSTALL_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        log_error "--source-archive requires a 40-character hexadecimal --commit"
+        return 1
+    fi
+    if [ ! -f "$SOURCE_ARCHIVE" ] || [ -L "$SOURCE_ARCHIVE" ]; then
+        log_error "Source archive is not a regular file: $SOURCE_ARCHIVE"
+        return 1
+    fi
+
+    local archive_python="${PYTHON_PATH:-}"
+    if [ -z "$archive_python" ] || [ ! -x "$archive_python" ]; then
+        archive_python="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+    fi
+    if [ -z "$archive_python" ] || [ ! -x "$archive_python" ]; then
+        log_error "A Python 3 interpreter is required to validate the source archive"
+        return 1
+    fi
+
+    # Use Python's tarfile API rather than parsing tar's human-readable listing.
+    # It rejects traversal, ambiguous names, links/devices, duplicate entries,
+    # and malformed manifests before writing anything. Extraction happens into
+    # a sibling temp directory and is published with an atomic rename.
+    if ! "$archive_python" - "$SOURCE_ARCHIVE" "$INSTALL_DIR" "$INSTALL_COMMIT" <<'PY'
+import datetime
+import os
+import posixpath
+import re
+import shutil
+import stat
+import sys
+import tarfile
+import tempfile
+
+
+archive_path, target_path, expected_revision = sys.argv[1:]
+revision_pattern = re.compile(r"^[0-9a-fA-F]{40}$")
+max_source_bytes = 512 * 1024 * 1024
+
+
+def fail(message: str) -> "NoReturn":
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+if not revision_pattern.fullmatch(expected_revision):
+    fail("--source-archive requires a 40-character hexadecimal --commit")
+if os.path.islink(archive_path) or not os.path.isfile(archive_path):
+    fail(f"Source archive is not a regular file: {archive_path}")
+
+target_path = os.path.abspath(target_path)
+if target_path == os.path.abspath(os.sep):
+    fail("Refusing to install a source archive at the filesystem root")
+parent = os.path.dirname(target_path)
+os.makedirs(parent, exist_ok=True)
+target_name = os.path.basename(target_path) or "hermes-agent"
+temp_path = tempfile.mkdtemp(prefix=f".{target_name}.archive-", dir=parent)
+backup_path = None
+published = False
+
+try:
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        members = archive.getmembers()
+        names = set()
+        total_bytes = 0
+        manifest = None
+
+        for member in members:
+            name = member.name
+            if not name or "\x00" in name or "\n" in name or "\r" in name:
+                fail(f"Source archive contains an unsafe path: {name!r}")
+            if "\\" in name or name.startswith("/"):
+                fail(f"Source archive contains an unsafe path: {name!r}")
+            normalized = name[:-1] if name.endswith("/") else name
+            parts = normalized.split("/")
+            if (
+                not normalized
+                or normalized in {".", ".."}
+                or any(part in {"", ".", ".."} for part in parts)
+                or posixpath.normpath(normalized) != normalized
+            ):
+                fail(f"Source archive contains an unsafe path: {name!r}")
+            if normalized in names:
+                fail(f"Source archive contains a duplicate path: {name!r}")
+            names.add(normalized)
+
+            if not (member.isfile() or member.isdir()):
+                fail(f"Source archive contains a link or special entry: {name!r}")
+            if member.isfile():
+                if member.size < 0:
+                    fail(f"Source archive contains a negative file size: {name!r}")
+                total_bytes += member.size
+                if total_bytes > max_source_bytes:
+                    fail("Source archive exceeds the maximum uncompressed size")
+            if normalized == ".hermes-source-manifest":
+                if not member.isfile():
+                    fail(".hermes-source-manifest must be a regular file")
+                manifest = archive.extractfile(member).read()
+
+        if manifest is None:
+            fail("Source archive is missing .hermes-source-manifest")
+        try:
+            manifest_lines = manifest.decode("ascii").splitlines()
+        except UnicodeDecodeError:
+            fail("Source archive manifest is not ASCII")
+        expected_manifest = ["format=hermes-source-v1", f"revision={expected_revision}"]
+        if manifest_lines != expected_manifest:
+            fail("Source archive manifest does not match --commit")
+
+        for member in members:
+            normalized = member.name[:-1] if member.name.endswith("/") else member.name
+            destination = os.path.join(temp_path, *normalized.split("/"))
+            if member.isdir():
+                os.makedirs(destination, exist_ok=True)
+                os.chmod(destination, member.mode & 0o777 or 0o755)
+                continue
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            source = archive.extractfile(member)
+            if source is None:
+                fail(f"Could not read source archive entry: {member.name!r}")
+            with open(destination, "xb") as output:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+            os.chmod(destination, member.mode & 0o777 or 0o644)
+
+    method_path = os.path.join(temp_path, ".install_method")
+    with open(method_path, "x", encoding="ascii") as method:
+        method.write("archive\n")
+    os.chmod(method_path, 0o644)
+
+    if os.path.lexists(target_path):
+        if os.path.islink(target_path):
+            fail(f"Refusing to replace a symlinked installation directory: {target_path}")
+        git_marker = os.path.join(target_path, ".git")
+        if os.path.lexists(git_marker):
+            fail(f"Refusing to replace the existing Git checkout at {target_path}")
+        method_marker = os.path.join(target_path, ".install_method")
+        try:
+            with open(method_marker, encoding="ascii") as method:
+                managed_method = method.read().strip()
+        except (OSError, UnicodeError):
+            managed_method = ""
+        if managed_method != "archive":
+            fail(f"Refusing to replace an unmanaged installation directory: {target_path}")
+
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup_path = os.path.join(parent, f"{target_name}.archive-old-{stamp}-{os.getpid()}")
+        counter = 1
+        while os.path.lexists(backup_path):
+            backup_path = os.path.join(
+                parent,
+                f"{target_name}.archive-old-{stamp}-{os.getpid()}-{counter}",
+            )
+            counter += 1
+        os.replace(target_path, backup_path)
+
+    os.replace(temp_path, target_path)
+    published = True
+    temp_path = None
+    if backup_path:
+        shutil.rmtree(backup_path, ignore_errors=True)
+        backup_path = None
+except (OSError, tarfile.TarError) as error:
+    fail(str(error))
+finally:
+    if not published and backup_path and not os.path.lexists(target_path):
+        try:
+            os.replace(backup_path, target_path)
+        except OSError:
+            pass
+    if temp_path:
+        shutil.rmtree(temp_path, ignore_errors=True)
+PY
+    then
+        log_error "Could not install the source archive"
+        return 1
+    fi
+    cd "$INSTALL_DIR"
+    log_success "Exact source archive ready (revision $INSTALL_COMMIT)"
+}
+
+install_repository() {
+    if [ -n "$SOURCE_ARCHIVE" ]; then
+        install_source_archive
+    else
+        clone_repo
+    fi
+}
+
 setup_venv() {
     if [ "$USE_VENV" = false ]; then
         log_info "Skipping virtual environment (--no-venv)"
@@ -2490,10 +2698,12 @@ write_bootstrap_marker() {
 
     local marker_path="$INSTALL_DIR/.hermes-bootstrap-complete"
     local tmp_path="$marker_path.tmp"
+    local install_method="${INSTALL_METHOD:-git}"
 
     # Atomic publish: the macOS launcher predicate only checks existence, so a
     # torn write would arm the fast path against a half-written marker.
-    printf '{\n  "schemaVersion": 1,\n  "pinnedCommit": "%s",\n  "pinnedBranch": "%s",\n  "completedAt": "%s"\n}\n' \
+    printf '{\n  "schemaVersion": 1,\n  "installMethod": "%s",\n  "pinnedCommit": "%s",\n  "pinnedBranch": "%s",\n  "completedAt": "%s"\n}\n' \
+        "$install_method" \
         "$pinned_commit" \
         "$BRANCH" \
         "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" > "$tmp_path"
@@ -3060,7 +3270,9 @@ run_stage_body() {
             resolve_install_layout
             install_uv
             check_python
-            check_git
+            if [ -z "$SOURCE_ARCHIVE" ]; then
+                check_git
+            fi
             check_node
             check_network_prerequisites
             install_system_packages
@@ -3068,8 +3280,16 @@ run_stage_body() {
         repository)
             detect_os
             resolve_install_layout
-            check_git
-            clone_repo
+            if [ -z "$SOURCE_ARCHIVE" ]; then
+                check_git
+            else
+                # Archive extraction is clone-free and only needs Python's
+                # standard-library tarfile validator.
+                if [ -z "${PYTHON_PATH:-}" ]; then
+                    PYTHON_PATH="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+                fi
+            fi
+            install_repository
             ;;
         venv)
             detect_os
@@ -3139,7 +3359,11 @@ run_stage_body() {
             # bind-mounted into a Docker gateway too), so a stamp there gets
             # clobbered by the container's 'docker' stamp and wrongly blocks
             # 'hermes update' on this host install. See detect_install_method().
-            echo "git" > "$INSTALL_DIR/.install_method"
+            if [ "$INSTALL_METHOD" = "archive" ]; then
+                echo "archive" > "$INSTALL_DIR/.install_method"
+            else
+                echo "git" > "$INSTALL_DIR/.install_method"
+            fi
             ;;
         *)
             log_error "Unknown stage: $stage"
@@ -3198,12 +3422,14 @@ main() {
     resolve_install_layout
     install_uv
     check_python
-    check_git
+    if [ -z "$SOURCE_ARCHIVE" ]; then
+        check_git
+    fi
     check_node
     check_network_prerequisites
     install_system_packages
 
-    clone_repo
+    install_repository
     setup_venv
     install_deps
     install_node_deps
@@ -3225,7 +3451,11 @@ main() {
     # gateway too), so a stamp there gets clobbered by the container's 'docker'
     # stamp and wrongly blocks 'hermes update' on this host install.
     # See detect_install_method().
-    echo "git" > "$INSTALL_DIR/.install_method"
+    if [ "$INSTALL_METHOD" = "archive" ]; then
+        echo "archive" > "$INSTALL_DIR/.install_method"
+    else
+        echo "git" > "$INSTALL_DIR/.install_method"
+    fi
 }
 
 if [ "$MANIFEST_MODE" = true ]; then

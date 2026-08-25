@@ -32,6 +32,15 @@ DEFAULT_TERMINAL_RETENTION_SECONDS = 5 * 60
 DEFAULT_TOMBSTONE_LIMIT = 1000
 TERMINAL_FRAME_RESERVE_BYTES = 2048
 
+# A raw per-provider-delta frame costs ~167 bytes of envelope on top of the
+# text itself, which is how a 216 KiB turn amplified to 8 MiB and hit the cap.
+# Deltas after an item's first one are buffered and coalesced into one frame
+# once either bound is crossed, so the log stays close to the byte cost of
+# the text it carries. The first delta of every item still flushes on its
+# own to protect time-to-first-token.
+DELTA_COALESCE_BYTES = 512
+DELTA_COALESCE_SECONDS = 0.05
+
 # This is the security boundary for model-authored tool arguments entering a
 # client-visible event. Keep it default-deny. The chat-completions projector
 # imports the same mapping so both surfaces make the same allowlist decision.
@@ -55,6 +64,7 @@ OMNIO_EXTENSION_EVENT_TYPES = frozenset({
     "response.omnio.approval_request",
     "response.omnio.approval_responded",
     "response.omnio.steer_missed",
+    "response.omnio.tool_progress",
 })
 
 _TOOL_EXTENSION_EVENTS = {
@@ -88,7 +98,7 @@ class InvalidCursorError(ValueError):
     """A live run cannot reach the requested future cursor."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StoredTurnEvent:
     """One immutable event in exactly the form sent over SSE."""
 
@@ -404,6 +414,16 @@ class TurnEventLogStore:
         ]
 
 
+@dataclass
+class _PendingDelta:
+    """One item's buffered, not-yet-flushed text/reasoning delta frame."""
+
+    event_type: str
+    output_index: int
+    buffer: str
+    started_at: float
+
+
 class TurnEventEmitter:
     """Mint the Responses-native vocabulary into one run's immutable log."""
 
@@ -427,8 +447,26 @@ class TurnEventEmitter:
         self._reasoning_items: Dict[str, Dict[str, Any]] = {}
         self._function_calls: Dict[str, Dict[str, Any]] = {}
         self._function_call_occurrences: Dict[str, int] = {}
+        self._semantic_tool_calls: Dict[str, Dict[str, Any]] = {}
+        # Per-item text/reasoning delta buffers awaiting coalesced flush, and
+        # the set of item IDs whose first delta has already been flushed.
+        self._pending_deltas: Dict[str, _PendingDelta] = {}
+        self._delta_started_item_ids: set[str] = set()
 
     def _emit(
+        self,
+        event_type: str,
+        *,
+        force_terminal: bool = False,
+        **fields: Any,
+    ) -> Optional[StoredTurnEvent]:
+        # Every non-delta event must be preceded by any text it logically
+        # follows. Flushing here — rather than trusting caller ordering — is
+        # what keeps that invariant true regardless of call site.
+        self._flush_pending_deltas()
+        return self._append(event_type, force_terminal=force_terminal, **fields)
+
+    def _append(
         self,
         event_type: str,
         *,
@@ -439,6 +477,74 @@ class TurnEventEmitter:
         return self.store.append_payload(
             self.run_id, payload, force_terminal=force_terminal
         )
+
+    def _buffer_delta(
+        self,
+        item_id: str,
+        event_type: str,
+        output_index: int,
+        delta: str,
+    ) -> None:
+        """Coalesce one provider delta into the item's pending frame.
+
+        The first delta for an item flushes immediately so first-token
+        latency is unaffected; later deltas accumulate until the buffer
+        reaches ``DELTA_COALESCE_BYTES`` or has aged past
+        ``DELTA_COALESCE_SECONDS``, whichever comes first.
+        """
+        is_first_delta = item_id not in self._delta_started_item_ids
+        pending = self._pending_deltas.get(item_id)
+        if pending is None:
+            pending = _PendingDelta(
+                event_type=event_type,
+                output_index=output_index,
+                buffer=delta,
+                started_at=self.clock(),
+            )
+            self._pending_deltas[item_id] = pending
+        else:
+            pending.buffer += delta
+
+        if is_first_delta:
+            self._delta_started_item_ids.add(item_id)
+            self._flush_one_pending_delta(item_id)
+            return
+
+        buffered_bytes = len(pending.buffer.encode("utf-8"))
+        buffered_seconds = self.clock() - pending.started_at
+        if (
+            buffered_bytes >= DELTA_COALESCE_BYTES
+            or buffered_seconds >= DELTA_COALESCE_SECONDS
+        ):
+            self._flush_one_pending_delta(item_id)
+
+    def _flush_one_pending_delta(self, item_id: str) -> None:
+        pending = self._pending_deltas.pop(item_id, None)
+        if pending is None or not pending.buffer:
+            return
+        self._append(
+            pending.event_type,
+            item_id=item_id,
+            output_index=pending.output_index,
+            content_index=0,
+            delta=pending.buffer,
+        )
+
+    def _flush_pending_deltas(self) -> None:
+        if not self._pending_deltas:
+            return
+        pending_items = list(self._pending_deltas.items())
+        self._pending_deltas.clear()
+        for item_id, pending in pending_items:
+            if not pending.buffer:
+                continue
+            self._append(
+                pending.event_type,
+                item_id=item_id,
+                output_index=pending.output_index,
+                content_index=0,
+                delta=pending.buffer,
+            )
 
     def _response(self, status: str, **fields: Any) -> Dict[str, Any]:
         return {
@@ -470,7 +576,6 @@ class TurnEventEmitter:
             "content": [],
             "started_at": started_at,
         }
-        part = {"type": "output_text", "text": ""}
         self._messages[item_id] = {
             "output_index": output_index,
             "text": "",
@@ -482,40 +587,32 @@ class TurnEventEmitter:
             output_index=output_index,
             item=item,
         )
-        self._emit(
-            "response.content_part.added",
-            item_id=item_id,
-            output_index=output_index,
-            content_index=0,
-            part=part,
-        )
 
     def output_text_delta(self, item_id: str, delta: str) -> None:
         state = self._messages.get(item_id)
         if state is None:
             return
         state["text"] += delta
-        self._emit(
+        self._buffer_delta(
+            item_id,
             "response.output_text.delta",
-            item_id=item_id,
-            output_index=state["output_index"],
-            content_index=0,
-            delta=delta,
+            state["output_index"],
+            delta,
         )
 
     def output_text_done(self, item_id: str) -> None:
         state = self._messages.pop(item_id, None)
         if state is None:
             return
+        self._delta_started_item_ids.discard(item_id)
         output_index = state["output_index"]
         text = state["text"]
-        part = {"type": "output_text", "text": text}
         item = {
             "id": item_id,
             "type": "message",
             "status": "completed",
             "role": "assistant",
-            "content": [part],
+            "content": [{"type": "output_text", "text": text}],
             "started_at": state["started_at"],
             "completed_at": self.clock(),
         }
@@ -525,13 +622,6 @@ class TurnEventEmitter:
             output_index=output_index,
             content_index=0,
             text=text,
-        )
-        self._emit(
-            "response.content_part.done",
-            item_id=item_id,
-            output_index=output_index,
-            content_index=0,
-            part=part,
         )
         self._emit(
             "response.output_item.done",
@@ -547,6 +637,7 @@ class TurnEventEmitter:
         output_index = self._message_output_indexes.get(item_id)
         if output_index is None:
             return []
+        self._flush_pending_deltas()
         return self.store.append_payloads(
             self.run_id,
             (
@@ -592,18 +683,18 @@ class TurnEventEmitter:
         if state is None:
             return
         state["text"] += delta
-        self._emit(
+        self._buffer_delta(
+            item_id,
             "response.reasoning_text.delta",
-            item_id=item_id,
-            output_index=state["output_index"],
-            content_index=0,
-            delta=delta,
+            state["output_index"],
+            delta,
         )
 
     def reasoning_text_done(self, item_id: str) -> None:
         state = self._reasoning_items.pop(item_id, None)
         if state is None:
             return
+        self._delta_started_item_ids.discard(item_id)
         output_index = state["output_index"]
         text = state["text"]
         self._emit(
@@ -740,6 +831,36 @@ class TurnEventEmitter:
                 "started_at": state["started_at"],
                 "completed_at": self.clock(),
             },
+        )
+
+    def semantic_tool_start(self, source_call_id: str, tool: str) -> None:
+        """Expose the executed tool when it differs from the model-facing call."""
+        if source_call_id in self._semantic_tool_calls:
+            return
+        started_at = self.clock()
+        self._semantic_tool_calls[source_call_id] = {
+            "tool": tool,
+            "started_at": started_at,
+        }
+        self.omnio_event(
+            "response.omnio.tool_progress",
+            source_call_id=source_call_id,
+            tool=tool,
+            status="running",
+            started_at=started_at,
+        )
+
+    def semantic_tool_done(self, source_call_id: str) -> None:
+        state = self._semantic_tool_calls.pop(source_call_id, None)
+        if state is None:
+            return
+        self.omnio_event(
+            "response.omnio.tool_progress",
+            source_call_id=source_call_id,
+            tool=state["tool"],
+            status="completed",
+            started_at=state["started_at"],
+            completed_at=self.clock(),
         )
 
     def task_list(self, todos: list) -> None:

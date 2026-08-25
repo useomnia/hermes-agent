@@ -507,6 +507,31 @@ class BaseEnvironment(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} must implement _run_bash()")
 
+    def _run_bash_with_cwd(
+        self,
+        cmd_string: str,
+        cwd: str,
+        *,
+        login: bool = False,
+        timeout: int = 120,
+        stdin_data: str | None = None,
+    ) -> ProcessHandle:
+        """Run a command whose effective cwd is *cwd*.
+
+        Most backends launch a shell process whose command wrapper performs
+        the actual ``cd``.  A remote backend may also need to send the cwd to
+        its outer execution API, though; that API runs before the wrapper and
+        must not inherit another session's mutable ``self.cwd``.  The default
+        keeps the existing backend contract, while such backends can override
+        this narrow hook without changing every ``_run_bash`` implementation.
+        """
+        return self._run_bash(
+            cmd_string,
+            login=login,
+            timeout=timeout,
+            stdin_data=stdin_data,
+        )
+
     @abstractmethod
     def cleanup(self):
         """Release backend resources (container, instance, connection)."""
@@ -1179,8 +1204,12 @@ class BaseEnvironment(ABC):
         # unless login itself is broken — then non-login is the only path.
         login = not self._snapshot_ready and not self._prefer_nonlogin
 
-        proc = self._run_bash(
-            wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
+        proc = self._run_bash_with_cwd(
+            wrapped,
+            cwd=effective_cwd,
+            login=login,
+            timeout=effective_timeout,
+            stdin_data=effective_stdin,
         )
         result = self._wait_for_process(
             proc, timeout=effective_timeout, bounded_capture=bounded_capture

@@ -138,6 +138,44 @@ def test_sprites_environment_should_send_exec_to_toolbox():
     ]
 
 
+def test_sprites_execute_forwards_effective_cwd_when_shared_env_is_stale():
+    """A new run must not send a deleted prior session cwd to Toolbox.
+
+    Sprites environments are intentionally shared across runs.  The shell
+    wrapper already receives the per-command cwd, but Toolbox validates its
+    request cwd before running that wrapper, so the outer request must use the
+    same value instead of the shared environment's mutable ``self.cwd``.
+    """
+    from tools.environments.base import BaseEnvironment
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    BaseEnvironment.__init__(env, cwd="/tmp/deleted-previous-session", timeout=60)
+    env._before_execute = lambda: None
+
+    calls = []
+
+    def fake_request(
+        path,
+        payload=None,
+        *,
+        timeout=None,
+        method="POST",
+        retry_exec_predispatch=False,
+        retry_deadline_seconds=None,
+        cancel_event=None,
+    ):
+        calls.append(payload)
+        return {"output": "ok\n", "returncode": 0}
+
+    env._request_json = fake_request
+
+    result = env.execute("echo ok", cwd="/brand")
+
+    assert result == {"output": "ok\n", "returncode": 0}
+    assert calls[0]["cwd"] == "/brand"
+
+
 def test_sprites_environment_should_stream_raw_file_bytes(monkeypatch):
     import tools.environments.sprites as sprites_module
     from tools.environments.sprites import SpritesEnvironment
@@ -182,6 +220,41 @@ def test_sprites_environment_should_stream_raw_file_bytes(monkeypatch):
         "brand": "brand-123",
         "method": "GET",
         "timeout": 60,
+        "limit": 7,
+    }
+
+
+def test_sprites_environment_should_expand_tilde_for_raw_file_bytes(monkeypatch):
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.toolbox_url = "https://toolbox.example"
+    env.bearer_token = "pair-secret"
+    env.brand = "brand-123"
+    env.timeout = 60
+    observed = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, limit):
+            observed["limit"] = limit
+            return b"raw-image-bytes"[:limit]
+
+    def fake_open(request, timeout):
+        observed["url"] = request.full_url
+        return FakeResponse()
+
+    monkeypatch.setattr(sprites_module._URL_OPENER, "open", fake_open)
+
+    assert env.read_file_bytes("~/brand/image.png", max_bytes=7) == b"raw-ima"
+    assert observed == {
+        "url": "https://toolbox.example/files?path=%2Fhome%2Fbrand%2Fimage.png",
         "limit": 7,
     }
 
@@ -1131,7 +1204,7 @@ def test_sprites_file_operations_should_render_toolbox_errors(caplog):
     assert 'HTTP 400: {"detail":"bad path"}' in caplog.text
 
 
-def test_sprites_file_operations_expand_tilde_with_sprite_home():
+def test_sprites_file_operations_expand_tilde_with_toolbox_virtual_home():
     from tools.environments.sprites import SpritesEnvironment, SpritesFileOperations
 
     class FakeEnv:
@@ -1142,8 +1215,7 @@ def test_sprites_file_operations_expand_tilde_with_sprite_home():
             self.requests = []
 
         def execute(self, command, cwd=None, **kwargs):
-            assert command == "echo $HOME"
-            return {"output": "/home/oai/share\n", "returncode": 0}
+            raise AssertionError("Sprite file paths must not consult process $HOME")
 
         def file_request(self, payload):
             self.requests.append(payload)
@@ -1158,7 +1230,85 @@ def test_sprites_file_operations_expand_tilde_with_sprite_home():
     assert env.requests == [
         {
             "operation": "read",
-            "path": "/home/oai/share/brand/brief.md",
+            "path": "/home/brand/brief.md",
+            "offset": 1,
+            "limit": 500,
+        }
+    ]
+
+
+def test_sprites_file_operations_preserve_absolute_relative_and_multi_paths():
+    from tools.environments.sprites import SpritesEnvironment, SpritesFileOperations
+
+    class FakeEnv:
+        cwd = "/brand"
+        config = None
+
+        def __init__(self):
+            self.requests = []
+
+        def file_request(self, payload):
+            self.requests.append(payload)
+            if payload["operation"] == "move":
+                return {}
+            return {"content": "brief", "totalLines": 1, "fileSize": 5}
+
+    env = FakeEnv()
+    ops = SpritesFileOperations(cast(SpritesEnvironment, env))
+
+    assert ops.read_file("/brand/absolute.md").error is None
+    assert ops.read_file("relative.md").error is None
+    assert ops.move_file("~/brand/source.md", "~/brand/destination.md").error is None
+
+    assert env.requests == [
+        {
+            "operation": "read",
+            "path": "/brand/absolute.md",
+            "offset": 1,
+            "limit": 500,
+        },
+        {
+            "operation": "read",
+            "path": "relative.md",
+            "offset": 1,
+            "limit": 500,
+        },
+        {
+            "operation": "move",
+            "src": "/home/brand/source.md",
+            "dst": "/home/brand/destination.md",
+        },
+    ]
+
+
+def test_read_file_tool_routes_tilde_through_sprites_virtual_home(monkeypatch):
+    import tools.file_tools as file_tools
+    from tools.environments.sprites import SpritesEnvironment, SpritesFileOperations
+
+    class FakeEnv:
+        cwd = "/brand"
+        config = None
+
+        def __init__(self):
+            self.requests = []
+
+        def file_request(self, payload):
+            self.requests.append(payload)
+            return {"content": "brief", "totalLines": 1, "fileSize": 5}
+
+    env = FakeEnv()
+    ops = SpritesFileOperations(cast(SpritesEnvironment, env))
+    monkeypatch.setattr(file_tools, "_uses_container_paths", lambda _task_id: True)
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda _task_id: ops)
+    monkeypatch.setattr(file_tools, "_read_tracker", {})
+
+    result = json.loads(file_tools.read_file_tool("~/brand/brief.md", task_id="sprite"))
+
+    assert "error" not in result
+    assert env.requests == [
+        {
+            "operation": "read",
+            "path": "/home/brand/brief.md",
             "offset": 1,
             "limit": 500,
         }
@@ -1186,6 +1336,57 @@ def test_sprites_environment_should_write_content_through_files_endpoint():
             "encoding": "utf-8",
         }
     ]
+
+
+def test_sprites_environment_should_expand_tilde_for_write_content():
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    requests = []
+
+    def file_request(payload):
+        requests.append(payload)
+        return {"bytesWritten": len(payload["content"].encode("utf-8"))}
+
+    env.file_request = file_request
+
+    assert env.write_file_content("~/brand/brief.md", "full result") is True
+    assert requests == [
+        {
+            "operation": "write",
+            "path": "/home/brand/brief.md",
+            "content": "full result",
+            "encoding": "utf-8",
+        }
+    ]
+
+
+def test_sprites_file_operations_canonicalize_before_sensitive_write_checks():
+    from tools.environments.sprites import SpritesEnvironment, SpritesFileOperations
+
+    class FakeEnv:
+        cwd = "/brand"
+        config = None
+
+        def file_request(self, payload):
+            raise AssertionError(f"blocked path reached Toolbox: {payload}")
+
+    ops = SpritesFileOperations(cast(SpritesEnvironment, FakeEnv()))
+
+    assert ops.write_file("~/../etc/passwd", "blocked").error is not None
+    assert ops.delete_path("~/../etc/passwd").error is not None
+    assert ops.move_file("~/../etc/passwd", "/tmp/destination").error is not None
+
+
+def test_sprites_environment_write_content_canonicalizes_before_sensitive_check():
+    import pytest
+    from tools.environments.sprites import SpritesEnvironment, SpritesToolboxError
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.file_request = lambda _payload: pytest.fail("blocked path reached Toolbox")
+
+    with pytest.raises(SpritesToolboxError, match="Write denied"):
+        env.write_file_content("~/../etc/passwd", "blocked")
 
 
 def test_sprites_environment_should_reject_file_content_over_two_mib():

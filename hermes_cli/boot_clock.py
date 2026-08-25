@@ -3,14 +3,11 @@
 `Starting Hermes Gateway...` is the first thing the gateway logs, and everything
 before it — interpreter startup, the CLI's import graph, argument parsing, the
 lazy import of the gateway and agent modules, building the gateway itself — is
-invisible. On a freshly provisioned sandbox that window measures ~10-11 s.
-
-Import weight is not the cause: reaching the CLI entry point is ~0.5-1.0 s, the
-lazy `gateway.run` import ~20 ms, and a cold read of a 12 MB shared object on the
-same box runs at 1090 MB/s, so it is not first-read cost either. Measured with
-the checkpoints below, the window is dominated by work rather than loading —
-~2.5 s in the cold bundled-skills sync, and ~7.3 s inside `start_gateway` before
-it logs anything.
+invisible. The original instrumented baseline on a freshly provisioned sandbox
+was roughly 10–11 s (about 2.5 s in the cold bundled-skills sync and 7.3 s in
+`start_gateway`). Those figures are historical, not a current startup target:
+platform discovery, skills preparation, and approval setup now overlap or defer
+work, so use the emitted checkpoints to attribute the current path.
 
 Checkpoints stamped along the way turn one opaque number into a breakdown. Each
 records the process's age when it was reached, so consecutive differences are the
@@ -20,6 +17,40 @@ phases between them and the last is the gateway's own start.
 from __future__ import annotations
 
 import os
+import re
+
+# This is the monitoring contract for the gateway startup timeline. Keep it
+# declarative rather than inspecting source text at test time: the names are
+# shared by the CLI, runner, and API readiness phases, and a typo should be
+# visible in review while instrumentation remains safe to call from any
+# embedding. ``mark`` still accepts caller-defined names for compatibility.
+BOOT_CHECKPOINT_NAMES = frozenset(
+    {
+        "main",
+        "skills",
+        "cli_import",
+        "dispatch",
+        "pre_start",
+        "plugins",
+        "relay",
+        "session_recovery",
+        "platforms",
+        "runtime_ready",
+        "fingerprint",
+        "dup_guard",
+        "skills_resync",
+        "logging",
+        "audit",
+        "runner_init",
+        "pid_lock",
+        "mcp_discovery_start",
+        "api_connect",
+        "api_routes",
+        "api_bound",
+        "api_ready",
+        "api_approvals_start",
+    }
+)
 
 # Ordered (name, process age in seconds) pairs, appended by `mark`. A list rather
 # than a dict so a checkpoint reached twice stays visible instead of overwriting.
@@ -57,16 +88,23 @@ def mark(name: str) -> None:
         _checkpoints.append((name, elapsed))
 
 
-def format_preamble() -> str:
-    """`to_<name>_ms=…` for every checkpoint plus `to_start_ms`, or ''.
+def format_timeline(end_name: str) -> str:
+    """`to_<name>_ms=…` for every checkpoint plus the named end, or ''.
 
     Values are ages rather than durations, so a phase is the difference between
     two neighbours. That keeps every field meaningful even when a checkpoint in
     the middle was never reached, which a list of durations could not.
     """
-    to_start = process_elapsed_seconds()
-    if to_start is None:
+    if re.fullmatch(r"[a-z][a-z0-9_]*", end_name) is None:
+        raise ValueError("boot timeline end name must be a lowercase identifier")
+    elapsed_at_end = process_elapsed_seconds()
+    if elapsed_at_end is None:
         return ""
     fields = [f"to_{name}_ms={elapsed * 1000:.0f}" for name, elapsed in _checkpoints]
-    fields.append(f"to_start_ms={to_start * 1000:.0f}")
+    fields.append(f"to_{end_name}_ms={elapsed_at_end * 1000:.0f}")
     return " ".join(fields)
+
+
+def format_preamble() -> str:
+    """The historical first-log timeline, ending in ``to_start_ms``."""
+    return format_timeline("start")

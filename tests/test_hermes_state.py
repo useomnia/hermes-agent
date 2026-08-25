@@ -648,6 +648,29 @@ class TestSessionLifecycle:
         assert row["input_tokens"] == 300
         assert row["output_tokens"] == 150
 
+    def test_observed_model_is_per_call_without_overwriting_requested_session_model(self, db):
+        """Preset requested model stays resumable while usage carries observed model."""
+        db.create_session(session_id="preset", source="cli", model="openrouter/auto")
+        db.update_token_counts(
+            "preset",
+            input_tokens=10,
+            output_tokens=5,
+            model="openrouter/auto",
+            usage_model="anthropic/claude-sonnet-4",
+            billing_provider="openrouter",
+            api_call_count=1,
+        )
+
+        session = db.get_session("preset")
+        assert session["model"] == "openrouter/auto"
+        row = db._conn.execute(
+            "SELECT model, billing_provider, task FROM session_model_usage "
+            "WHERE session_id = 'preset'"
+        ).fetchone()
+        assert (row["model"], row["billing_provider"], row["task"]) == (
+            "anthropic/claude-sonnet-4", "openrouter", ""
+        )
+
     def test_mid_session_switch_splits_per_model_usage(self, db):
         """The headline #51607 case: tokens after a /model switch are
         attributed to the new model, not the session's initial model.
@@ -7788,3 +7811,21 @@ class TestDisplayMetadataReadPaths:
             }],
         )
         assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
+
+    def test_usage_model_defaults_to_requested_model_when_response_model_missing(self, db):
+        db.create_session(session_id="preset-fallback", source="cli", model="openrouter/auto")
+        db.update_token_counts(
+            "preset-fallback",
+            input_tokens=10,
+            output_tokens=5,
+            model="openrouter/auto",
+            usage_model=None,
+            billing_provider="openrouter",
+            api_call_count=1,
+        )
+
+        row = db._conn.execute(
+            "SELECT model FROM session_model_usage "
+            "WHERE session_id = 'preset-fallback'"
+        ).fetchone()
+        assert row["model"] == "openrouter/auto"

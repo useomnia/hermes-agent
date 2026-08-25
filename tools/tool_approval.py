@@ -46,6 +46,17 @@ from tools.mcp_tool import (
     mcp_tool_has_read_only_hint,
     mcp_tool_is_read_only,
 )
+from tools.omnio_approval_state import (
+    CONNECTORS_TOOL_PREFIXES,
+    _always_approved,
+    _injected_always_approved,
+    _injected_always_approved_slugs,
+    connector_tool_slug,
+    is_always_approved,
+    record_always_approval as _record_always_approval_state,
+    register_always_approval_authority as _register_always_approval_authority_state,
+    replace_injected_always_approvals as _replace_injected_always_approvals_state,
+)
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -56,26 +67,6 @@ _ENV_DISABLED = "OMNIO_TOOL_APPROVAL_DISABLED"
 # tools/approval.py's gateway_timeout default; the chat keepalive holds the SSE.
 _ENV_TIMEOUT = "OMNIO_TOOL_APPROVAL_TIMEOUT"
 _DEFAULT_TIMEOUT_S = 300
-# Native MCP names use ``mcp__<server>__<tool>``. Existing durable approval
-# records may still contain the earlier flattened connector names, so both
-# forms remain in the connector-write trust boundary.
-CONNECTORS_TOOL_PREFIXES = ("mcp__connectors__", "mcp_connectors_")
-
-
-def connector_tool_slug(function_name: str) -> Optional[str]:
-    """The harness-agnostic tool slug behind a connector wire name, or None.
-
-    The slug (e.g. ``GMAIL_SEND_EMAIL``) is the stable identifier durable
-    grants are keyed on; the ``mcp*connectors*`` prefix is transport dressing
-    this harness mints and can rename. Matching grants by slug is what keeps a
-    standing approval valid across such renames.
-    """
-    for prefix in CONNECTORS_TOOL_PREFIXES:
-        if function_name.startswith(prefix):
-            return function_name[len(prefix) :]
-    return None
-
-
 # User-facing option labels and the scope each one grants. Index-aligned so the
 # Omnia frontend can map a chosen label back to its scope.
 APPROVAL_OPTIONS = ["Allow once", "Allow for this chat", "Allow always", "Deny"]
@@ -107,24 +98,6 @@ class ToolApprovalDenial(str):
 _lock = threading.Lock()
 # session_key -> tool names approved for the whole conversation.
 _session_approved: dict[str, set[str]] = {}
-# Tool names approved for EVERY conversation on this gateway (the `always` scope).
-# Gateway-wide, not session-keyed, so it spans chats. This is only a bridge for
-# user clicks made since the last Omnia refresh; every refresh clears it and
-# replaces _injected_always_approved from the database snapshot.
-_always_approved: set[str] = set()
-# Tool names injected from Omnia's durable per-toolkit grants.
-_injected_always_approved: set[str] = set()
-# Harness-agnostic tool slugs injected from the same grants. Slug matching is
-# what keeps a durable grant valid when the wire-name prefix convention
-# changes; the exact-name set above covers payloads and tools alike only while
-# their spellings happen to agree.
-_injected_always_approved_slugs: set[str] = set()
-# Fresh server-authoritative check for one exact standing grant. The in-memory
-# sets above are only candidate indexes: they must never authorize a later write
-# by themselves because Omnia can revoke a shared grant while this process stays
-# warm. The API server registers this callback after it has loaded its Omnia
-# authority configuration.
-_always_approval_authority: Callable[[str], bool] | None = None
 # Mechanical surface/wait state stays isolated from the user-input gate by this
 # module's own registry instance. The waiter payload is the gated tool name.
 _wait_registry: BlockingWaitRegistry[
@@ -242,54 +215,16 @@ def record_session_approval(session_key: str, function_name: str) -> None:
         _session_approved.setdefault(session_key, set()).add(function_name)
 
 
-def is_always_approved(function_name: str) -> bool:
-    """Return whether Omnia still grants this exact standing approval.
-
-    Local and injected names only identify possible grants. Every positive
-    candidate is checked against the server authority before a later write can
-    skip its prompt. There is deliberately no positive cache: a shared revoke
-    must take effect on every warm gateway without reload or reprovision.
-    """
-    slug = connector_tool_slug(function_name)
-    with _lock:
-        candidate = (
-            function_name in _always_approved
-            or function_name in _injected_always_approved
-            or (slug is not None and slug in _injected_always_approved_slugs)
-        )
-        authority = _always_approval_authority
-    if not candidate:
-        return False
-    if authority is None:
-        logger.warning(
-            "standing tool approval authority unavailable; prompting for %s",
-            function_name,
-        )
-        return False
-    try:
-        return authority(function_name) is True
-    except Exception:
-        logger.warning(
-            "standing tool approval check failed; prompting for %s",
-            function_name,
-            exc_info=True,
-        )
-        return False
-
-
 def register_always_approval_authority(
     cb: Callable[[str], bool] | None,
 ) -> None:
     """Set the server-authoritative checker used for standing grant candidates."""
-    global _always_approval_authority
-    with _lock:
-        _always_approval_authority = cb
+    _register_always_approval_authority_state(cb)
 
 
 def record_always_approval(function_name: str) -> None:
     """Grant a tool for every conversation on this gateway (the `always` scope)."""
-    with _lock:
-        _always_approved.add(function_name)
+    _record_always_approval_state(function_name)
 
 
 def replace_injected_always_approvals(
@@ -313,22 +248,10 @@ def replace_injected_always_approvals(
         if isinstance(name, str)
         and _is_recordable_tool_name(name.strip(), require_hint=False)
     }
-    if tool_slugs is None:
-        slugs = {
-            slug for slug in (connector_tool_slug(name) for name in exact_names) if slug
-        }
-    else:
-        slugs = {
-            slug.strip()
-            for slug in tool_slugs
-            if isinstance(slug, str) and slug.strip()
-        }
-    with _lock:
-        _always_approved.clear()
-        _injected_always_approved.clear()
-        _injected_always_approved.update(exact_names)
-        _injected_always_approved_slugs.clear()
-        _injected_always_approved_slugs.update(slugs)
+    _replace_injected_always_approvals_state(
+        list(exact_names),
+        tool_slugs=tool_slugs,
+    )
 
 
 def register_tool_approval_notify(

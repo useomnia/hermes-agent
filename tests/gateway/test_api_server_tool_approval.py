@@ -24,6 +24,7 @@ def _clean_approval_state():
     tool_approval._session_approved.clear()
     tool_approval._always_approved.clear()
     tool_approval._injected_always_approved.clear()
+    tool_approval._injected_always_approved_slugs.clear()
     tool_approval.clear_session(SESSION)
     mcp_tool._mcp_tool_read_only_hints.clear()
     mcp_tool._track_mcp_tool_read_only(GATED, False)
@@ -33,8 +34,125 @@ def _clean_approval_state():
     tool_approval._session_approved.clear()
     tool_approval._always_approved.clear()
     tool_approval._injected_always_approved.clear()
+    tool_approval._injected_always_approved_slugs.clear()
     tool_approval.clear_session(SESSION)
     mcp_tool._mcp_tool_read_only_hints.clear()
+
+
+@pytest.mark.asyncio
+async def test_connect_overlaps_approval_snapshot_with_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The listener is ready while the control-plane snapshot is in flight.
+
+    The first agent-builder thread still joins that snapshot, so moving it off
+    the connect critical path is real overlap rather than a consistency race.
+    """
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "host": "127.0.0.1",
+                "port": 0,
+                "key": "sk-test-strong-key-0123456789",
+            },
+        )
+    )
+    fetch_started = asyncio.Event()
+    release_fetch = asyncio.Event()
+
+    async def fetch(**_kwargs):
+        fetch_started.set()
+        await release_fetch.wait()
+        return [GATED], ["GMAIL_CREATE_EMAIL_DRAFT"]
+
+    monkeypatch.setenv("OMNIA_BASE_URL", "https://omnia.test")
+    monkeypatch.setenv("OMNIA_API_TOKEN", "test-token")
+    monkeypatch.setenv("OMNIO_BRAND_ID", "brand-1")
+    monkeypatch.setattr(
+        adapter,
+        "_fetch_omnio_connector_toolkit_approvals",
+        fetch,
+    )
+
+    try:
+        assert await asyncio.wait_for(adapter.connect(), timeout=1) is True
+        assert adapter.is_connected is True
+        await asyncio.wait_for(fetch_started.wait(), timeout=1)
+        assert adapter._omnio_approval_refresh_task is not None
+        assert not adapter._omnio_approval_refresh_task.done()
+
+        join = asyncio.create_task(
+            asyncio.to_thread(adapter._wait_for_omnio_approval_snapshot)
+        )
+        await asyncio.sleep(0)
+        assert not join.done()
+
+        release_fetch.set()
+        await asyncio.wait_for(join, timeout=1)
+        assert GATED in tool_approval._injected_always_approved
+    finally:
+        release_fetch.set()
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_approval_refresh_and_releases_joiner(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "host": "127.0.0.1",
+                "port": 0,
+                "key": "sk-test-strong-key-0123456789",
+            },
+        )
+    )
+    fetch_started = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def fetch(**_kwargs):
+        fetch_started.set()
+        await never_release.wait()
+        return [GATED], None
+
+    monkeypatch.setenv("OMNIA_BASE_URL", "https://omnia.test")
+    monkeypatch.setenv("OMNIA_API_TOKEN", "test-token")
+    monkeypatch.setenv("OMNIO_BRAND_ID", "brand-1")
+    monkeypatch.setattr(
+        adapter,
+        "_fetch_omnio_connector_toolkit_approvals",
+        fetch,
+    )
+
+    assert await adapter.connect() is True
+    await asyncio.wait_for(fetch_started.wait(), timeout=1)
+    join = asyncio.create_task(
+        asyncio.to_thread(adapter._wait_for_omnio_approval_snapshot)
+    )
+    await asyncio.sleep(0)
+    assert not join.done()
+
+    await adapter.disconnect()
+    await asyncio.wait_for(join, timeout=1)
+    assert adapter._omnio_approval_refresh_task is None
+    assert tool_approval._injected_always_approved == set()
+
+
+def test_every_agent_build_joins_the_startup_approval_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+
+    def joined() -> None:
+        raise LookupError("snapshot joined before agent imports")
+
+    monkeypatch.setattr(adapter, "_wait_for_omnio_approval_snapshot", joined)
+
+    with pytest.raises(LookupError, match="snapshot joined before agent imports"):
+        adapter._create_agent()
 
 
 def _create_app(adapter: APIServerAdapter) -> web.Application:

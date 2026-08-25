@@ -57,8 +57,15 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_AVAILABLE = True
 
-# The 7 tools allowed inside the sandbox. The intersection of this list
-# and the session's enabled tools determines which stubs are generated.
+# The 7 core tools allowed inside the sandbox. Each has a hand-written stub in
+# ``_TOOL_STUBS`` below. The intersection of this list and the session's enabled
+# tools determines which core stubs are generated.
+#
+# MCP-server tools are ALSO callable — see ``_resolve_sandbox_tools``. They are
+# resolved per session rather than listed here because they are dynamic (a
+# session's servers, and for a multi-tenant deployment its per-tenant tool
+# allow-list, are only known at runtime), and their stubs are generated from
+# their registered schemas instead of being written out by hand.
 SANDBOX_ALLOWED_TOOLS = frozenset([
     "web_search",
     "web_extract",
@@ -68,6 +75,39 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
     "patch",
     "terminal",
 ])
+
+# Toolset prefix under which MCP servers register their tools
+# (``mcp-<server>``, see tools/mcp_tool.py).
+_MCP_TOOLSET_PREFIX = "mcp-"
+
+# Name of the generated stub module a script imports its tools from. Configurable
+# (``code_execution.module_name``) because it is one of the few strings in this tool
+# the agent both reads and writes: it appears in the tool description and in every
+# script's import line. A deployment whose agent must not identify the harness it
+# runs on needs to be able to name it something neutral.
+DEFAULT_SANDBOX_MODULE = "hermes_tools"
+
+
+def _sandbox_module_name() -> str:
+    """The stub module's name, from config, falling back to the default.
+
+    Rejects anything that is not a plain Python identifier: the value becomes a
+    filename AND an import statement, so a bad one would produce a module the
+    generated script cannot import — a confusing failure a long way from its cause.
+    """
+    import keyword
+
+    configured = str(_load_config().get("module_name") or "").strip()
+    if not configured:
+        return DEFAULT_SANDBOX_MODULE
+    if not configured.isidentifier() or keyword.iskeyword(configured):
+        logger.warning(
+            "code_execution.module_name %r is not a valid Python identifier; "
+            "using %r instead",
+            configured, DEFAULT_SANDBOX_MODULE,
+        )
+        return DEFAULT_SANDBOX_MODULE
+    return configured
 
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
@@ -343,39 +383,147 @@ _TOOL_STUBS = {
 }
 
 
+def _is_mcp_tool(tool_name: str) -> bool:
+    """True when *tool_name* is registered by an MCP server."""
+    try:
+        from tools.registry import registry
+
+        entry = registry.get_entry(tool_name)
+    except Exception:
+        return False
+    return entry is not None and entry.toolset.startswith(_MCP_TOOLSET_PREFIX)
+
+
+def _resolve_sandbox_tools(
+    enabled_tools: Optional[List[str]],
+    *,
+    fallback_to_core: bool = True,
+) -> frozenset:
+    """The tools a script may call this session: core stubs + MCP-server tools.
+
+    MCP tools are admitted by PREDICATE over the session's own tool list rather
+    than by a static allow-list. That is what keeps the MCP surface equal to (never
+    wider than) the session's: the list passed in is already the resolved surface,
+    so a server or tool the session was not granted cannot appear here. The RPC
+    loops enforce the same set server-side.
+
+    ``fallback_to_core`` keeps the execution path's long-standing behaviour of
+    treating a session list that yields nothing as "caller could not tell us",
+    handing back the core tools so the sandbox still works. Callers whose list IS
+    authoritative pass False, so a session with no sandbox-callable tools resolves
+    to nothing rather than being handed the core seven.
+    """
+    session_tools = set(enabled_tools or ())
+    resolved = (SANDBOX_ALLOWED_TOOLS & session_tools) | {
+        name for name in session_tools if _is_mcp_tool(name)
+    }
+    if not resolved and fallback_to_core:
+        return SANDBOX_ALLOWED_TOOLS
+    return frozenset(resolved)
+
+
+def _mcp_stub_source(tool_name: str) -> Optional[str]:
+    """Generate a `**kwargs` stub for one MCP tool, from its registered schema.
+
+    Passing arguments through as ``**kwargs`` rather than reconstructing a typed
+    signature keeps this independent of how expressive the server's JSON Schema
+    is; the parameter names go in the docstring so a script author can read them
+    off the stub, and the tool itself still validates what it receives.
+
+    Returns None when the tool has no usable schema or its registered name is not
+    a Python identifier — a stub we cannot generate is simply absent from the
+    module rather than emitting source that would fail to import.
+    """
+    if not tool_name.isidentifier():
+        logger.debug("execute_code: skipping non-identifier MCP tool %r", tool_name)
+        return None
+    try:
+        from tools.registry import registry
+
+        schema = registry.get_schema(tool_name) or {}
+    except Exception as exc:
+        logger.debug("execute_code: no schema for MCP tool %s: %s", tool_name, exc)
+        return None
+
+    description = " ".join(str(schema.get("description") or "").split())
+    if len(description) > 300:
+        description = description[:297] + "..."
+    params = (schema.get("parameters") or {}).get("properties") or {}
+    required = [p for p in ((schema.get("parameters") or {}).get("required") or []) if p in params]
+    optional = [p for p in params if p not in required]
+
+    doc_lines = [description or f"MCP tool {tool_name}."]
+    if required:
+        doc_lines.append(f"Required: {', '.join(sorted(required))}")
+    if optional:
+        doc_lines.append(f"Optional: {', '.join(sorted(optional))}")
+    if not params:
+        doc_lines.append("Takes no arguments.")
+    # State the envelope. The model cannot see _decode_result, so without this it
+    # discovers the shape by running a probe script first — which is exactly the
+    # round trip the decoder exists to remove.
+    doc_lines.append('Returns {"result": payload}; a JSON payload is already decoded.')
+    doc = "\n    ".join(doc_lines)
+
+    return (
+        f"def {tool_name}(**kwargs):\n"
+        f'    """{doc}"""\n'
+        f"    return _call({tool_name!r}, kwargs)\n"
+    )
+
+
 def generate_hermes_tools_module(enabled_tools: List[str],
                                  transport: str = "uds") -> str:
     """
     Build the source code for the hermes_tools.py stub module.
 
-    Only tools in both SANDBOX_ALLOWED_TOOLS and enabled_tools get stubs.
+    *enabled_tools* is the resolved sandbox tool set (see
+    ``_resolve_sandbox_tools``), not the raw session list: core tools get their
+    hand-written stub, MCP tools get one generated from their schema, and
+    anything else is ignored.
 
     Args:
-        enabled_tools: Tool names enabled in the current session.
+        enabled_tools: Tool names callable from the sandbox this session.
         transport: ``"uds"`` for Unix domain socket (local backend) or
                    ``"file"`` for file-based RPC (remote backends).
     """
-    tools_to_generate = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+    tools_to_generate = sorted(set(enabled_tools))
 
     stub_functions = []
     export_names = []
     for tool_name in tools_to_generate:
-        if tool_name not in _TOOL_STUBS:
+        if tool_name in _TOOL_STUBS:
+            func_name, sig, doc, args_expr = _TOOL_STUBS[tool_name]
+            stub_functions.append(
+                f"def {func_name}({sig}):\n"
+                f"    {doc}\n"
+                f"    return _call({func_name!r}, {args_expr})\n"
+            )
+            export_names.append(func_name)
             continue
-        func_name, sig, doc, args_expr = _TOOL_STUBS[tool_name]
-        stub_functions.append(
-            f"def {func_name}({sig}):\n"
-            f"    {doc}\n"
-            f"    return _call({func_name!r}, {args_expr})\n"
-        )
-        export_names.append(func_name)
+        if _is_mcp_tool(tool_name):
+            source = _mcp_stub_source(tool_name)
+            if source is not None:
+                stub_functions.append(source)
+                export_names.append(tool_name)
 
     if transport == "file":
         header = _FILE_TRANSPORT_HEADER
     else:
         header = _UDS_TRANSPORT_HEADER
 
-    return header + "\n".join(stub_functions)
+    # Make the module introspectable. A script author who does not know a tool's
+    # exact name — likely once MCP tools are in here, since their registered name
+    # carries a server prefix — can list what this module actually exports instead
+    # of guessing at prefixes and failing an import.
+    footer = (
+        "\n\n__all__ = " + repr(sorted(export_names)) + "\n\n"
+        "def list_tools():\n"
+        '    """Exact names of every tool this script can call."""\n'
+        "    return list(__all__)\n"
+    )
+
+    return header + "\n".join(stub_functions) + footer
 
 
 # ---- Shared helpers section (embedded in both transport headers) ----------
@@ -418,6 +566,46 @@ def retry(fn, max_attempts=3, delay=2):
 
 '''
 
+# ---- Result decoding (shared by both transports) --------------------------
+
+# An MCP tool answers with {"result": <text>} — see mcp_tool.py, which renders
+# the server's content blocks into that envelope and adds "structuredContent"
+# when the server sends both. A server whose payload IS JSON therefore arrives
+# double-encoded, and without this every script would need a second json.loads
+# on every call. That is not a hypothetical papercut: in the first live run of
+# MCP-in-execute_code, three of the eight scripts the model wrote were spent
+# discovering the shape rather than doing the work.
+_RESULT_DECODER = '''\
+
+def _decode_result(result):
+    """Parse the JSON an MCP server nests inside its text result, in place.
+
+    Deliberately conservative — only the MCP envelope shape is touched, and only
+    when the nested text parses to a dict or list. Prose text, or a bare scalar
+    that merely looks like JSON, is handed back exactly as the server sent it, so
+    this can never turn a string answer into a number.
+    """
+    if not isinstance(result, dict) or "result" not in result:
+        return result
+    # The envelope and nothing else: a tool of our own that happens to use a
+    # "result" key alongside others is left alone.
+    if not set(result) <= {"result", "structuredContent"}:
+        return result
+    nested = result["result"]
+    if not isinstance(nested, str):
+        return result
+    try:
+        parsed = json.loads(nested)
+    except (ValueError, TypeError):
+        return result
+    if not isinstance(parsed, (dict, list)):
+        return result
+    decoded = dict(result)
+    decoded["result"] = parsed
+    return decoded
+
+'''
+
 # ---- UDS transport (local backend) ---------------------------------------
 
 _UDS_TRANSPORT_HEADER = '''\
@@ -430,7 +618,7 @@ _sock = None
 # threads (e.g. ThreadPoolExecutor) would race on the shared socket and get
 # each other's responses. Serialize the entire send+recv round-trip.
 _call_lock = threading.Lock()
-''' + _COMMON_HELPERS + '''\
+''' + _COMMON_HELPERS + _RESULT_DECODER + '''\
 
 def _connect():
     """Connect to the parent's RPC server via the transport it picked.
@@ -479,10 +667,10 @@ def _call(tool_name, args):
     result = json.loads(raw)
     if isinstance(result, str):
         try:
-            return json.loads(result)
+            result = json.loads(result)
         except (json.JSONDecodeError, TypeError):
             return result
-    return result
+    return _decode_result(result)
 
 '''
 
@@ -498,7 +686,7 @@ _seq = 0
 # invocations from multiple threads could allocate the same sequence number
 # and clobber each other's request files. Guard seq allocation with a lock.
 _seq_lock = threading.Lock()
-''' + _COMMON_HELPERS + '''\
+''' + _COMMON_HELPERS + _RESULT_DECODER + '''\
 
 def _call(tool_name, args):
     """Send a tool call request via file-based RPC and wait for response."""
@@ -545,10 +733,10 @@ def _call(tool_name, args):
     result = json.loads(raw)
     if isinstance(result, str):
         try:
-            return json.loads(result)
+            result = json.loads(result)
         except (json.JSONDecodeError, TypeError):
             return result
-    return result
+    return _decode_result(result)
 
 '''
 
@@ -810,18 +998,49 @@ def _get_or_create_env(task_id: str):
         return env, env_type
 
 
+# Base64 characters per shipping command when falling back to the shell. Backends
+# cap how long a single command may be, and the generated tools module is as big as
+# the session's tool surface — one stub per MCP tool — so a whole file will not
+# reliably fit in one command.
+_SHIP_CHUNK_CHARS = 24_000
+
+
 def _ship_file_to_remote(env, remote_path: str, content: str) -> None:
     """Write *content* to *remote_path* on the remote environment.
 
-    Uses ``echo … | base64 -d`` rather than stdin piping because some
-    backends (Modal) don't reliably deliver stdin_data to chained
-    commands.  Base64 output is shell-safe ([A-Za-z0-9+/=]) so single
-    quotes are fine.
+    Prefers the backend's own file write when it has one: the shell fallback puts
+    the file's bytes INSIDE a command string, and a command has a length limit that
+    a file does not.
+
+    The fallback uses ``base64 -d`` rather than stdin piping because some backends
+    (Modal) don't reliably deliver stdin_data to chained commands. Base64 output is
+    shell-safe ([A-Za-z0-9+/=]) so single quotes are fine, and it is appended in
+    chunks so file size never becomes command length.
     """
+    writer = getattr(env, "write_file_content", None)
+    if callable(writer):
+        try:
+            if writer(remote_path, content):
+                return
+        except Exception as exc:
+            logger.debug(
+                "First-class write of %s failed (%s); falling back to the shell",
+                remote_path, exc,
+            )
+
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     quoted_remote_path = shlex.quote(remote_path)
+    quoted_b64_path = shlex.quote(f"{remote_path}.b64")
+    for index in range(0, len(encoded), _SHIP_CHUNK_CHARS):
+        chunk = encoded[index:index + _SHIP_CHUNK_CHARS]
+        redirect = ">" if index == 0 else ">>"
+        env.execute(
+            f"printf %s '{chunk}' {redirect} {quoted_b64_path}",
+            cwd="/",
+            timeout=30,
+        )
     env.execute(
-        f"echo '{encoded}' | base64 -d > {quoted_remote_path}",
+        f"base64 -d < {quoted_b64_path} > {quoted_remote_path} && rm -f {quoted_b64_path}",
         cwd="/",
         timeout=30,
     )
@@ -841,6 +1060,108 @@ def _env_temp_dir(env: Any) -> str:
     if isinstance(candidate, str) and candidate.startswith("/"):
         return candidate.rstrip("/") or "/"
     return "/tmp"
+
+
+def _inner_tool_counts(tool_call_log: list) -> Dict[str, int]:
+    """Count executed calls per tool name from the RPC log.
+
+    ``tool_call_log`` is appended to only AFTER a call clears the allow-list and
+    the call-count limit and has been dispatched, so this counts executions, not
+    attempts. A call that executed and then failed still counts — it consumed
+    whatever the provider charges for, which is the same trade-off the message-
+    row counting downstream already makes.
+    """
+    counts: Dict[str, int] = {}
+    for entry in tool_call_log:
+        name = str((entry or {}).get("tool") or "").strip()
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _flush_inner_tool_usage(tool_call_log: list) -> None:
+    """Persist this script's tool executions to ``session_tool_usage``.
+
+    A sandbox RPC call dispatches through the normal tool handler but leaves NO
+    ``role='tool'`` message behind — that's the whole point of programmatic tool
+    calling, and it means anything counting tool usage from the transcript sees
+    a script's calls as a single ``execute_code``. Recording them here is what
+    keeps usage accounting (and, for the Omnio deployment, external-tool
+    metering of paid tools like web_search or a connector) whole.
+
+    Called from the ``finally`` of both execution paths so a timed-out,
+    interrupted, or crashed script still accounts for the calls it already made.
+
+    Best-effort: never raises into the tool result. But it logs at WARNING
+    rather than DEBUG on failure, because a dropped write here is a tool call
+    that executed and will never be counted anywhere.
+    """
+    counts = _inner_tool_counts(tool_call_log)
+    if not counts:
+        return
+    try:
+        from gateway.session_context import get_session_env
+        from hermes_state import SessionDB
+
+        session_id = str(get_session_env("HERMES_SESSION_ID") or "").strip()
+        if not session_id:
+            # No session identity (bare CLI one-shot, some test harnesses) —
+            # there is nothing to attribute the calls to. Not an error.
+            logger.debug(
+                "execute_code: no session id in context; skipping tool-usage accounting"
+            )
+            return
+        # SessionDB() resolves the process's active state.db the same way every
+        # other caller does (HERMES_HOME → profile dir), which is also the file
+        # external readers watch. Do not substitute a hand-built path.
+        SessionDB().record_tool_usage(session_id, counts, source="execute_code")
+    except Exception as exc:
+        logger.warning(
+            "execute_code: failed to record inner tool usage (%s calls across "
+            "%s tools will go uncounted): %s",
+            sum(counts.values()), len(counts), exc,
+            exc_info=True,
+        )
+
+
+def _resolve_remote_script_cwd(
+    mode: str,
+    staging_dir: str,
+    task_id: str = "",
+) -> Optional[str]:
+    """Working directory for a script running on a REMOTE terminal backend.
+
+    - ``strict``: the staging dir, as on the local path.
+    - ``project``: the session's own working directory, so a script's relative
+      paths land where ``terminal``'s do and a file it writes is still there
+      afterwards. ``None`` means "don't cd at all" — the backend then applies its
+      own default working directory, which is the same one a bare ``terminal``
+      command gets, and is the right answer whenever the session has not moved.
+
+    Deliberately does NOT stat the candidates the way the local resolver does:
+    these paths exist on the remote machine, so an ``isdir`` check here would ask
+    the wrong filesystem and reject every valid answer.
+    """
+    if mode != "project":
+        return staging_dir
+    if task_id:
+        try:
+            from tools.terminal_tool import get_session_cwd
+
+            recorded = get_session_cwd(task_id)
+            if recorded:
+                return str(recorded)
+        except Exception as exc:
+            logger.debug("execute_code: no session cwd record for %s: %s", task_id, exc)
+        try:
+            from tools.file_tools import _registered_task_cwd_override
+
+            override = _registered_task_cwd_override(task_id)
+            if override:
+                return str(override)
+        except Exception as exc:
+            logger.debug("execute_code: no registered cwd override for %s: %s", task_id, exc)
+    return None
 
 
 def _rpc_poll_loop(
@@ -1012,10 +1333,7 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = _resolve_sandbox_tools(enabled_tools)
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1068,7 +1386,7 @@ def _execute_remote(
         tools_src = generate_hermes_tools_module(
             list(sandbox_tools), transport="file",
         )
-        _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py", tools_src)
+        _ship_file_to_remote(env, f"{sandbox_dir}/{_sandbox_module_name()}.py", tools_src)
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
 
         # Wrapped so the thread inherits the turn's approval context + callbacks
@@ -1085,21 +1403,36 @@ def _execute_remote(
         )
         rpc_thread.start()
 
-        # Build environment variable prefix for the script
+        # Build environment variable prefix for the script. PYTHONPATH carries the
+        # staging dir so `from hermes_tools import ...` resolves even when the
+        # script runs from somewhere else — the same guard the local path uses for
+        # project mode.
         env_prefix = (
             f"HERMES_RPC_DIR={shlex.quote(f'{sandbox_dir}/rpc')} "
             f"HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
+            f"PYTHONPATH={quoted_sandbox_dir} "
             f"PYTHONDONTWRITEBYTECODE=1"
         )
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
         if tz:
             env_prefix += f" TZ={shlex.quote(tz)}"
 
+        # Run from the session's working directory, not the staging dir, so a
+        # script's relative paths mean what they mean everywhere else in the
+        # session. The staging dir is deleted in the `finally` below, so a file
+        # written relative to it would vanish with it — the one place a script can
+        # silently lose its own output.
+        script_cwd = _resolve_remote_script_cwd(
+            _get_execution_mode(), sandbox_dir, effective_task_id
+        )
+        cd_prefix = f"cd {shlex.quote(script_cwd)} && " if script_cwd else ""
+        quoted_script_path = shlex.quote(f"{sandbox_dir}/script.py")
+
         # Execute the script on the remote backend
         logger.info("Executing code on %s backend (task %s)...",
                      env_type, effective_task_id[:8])
         script_result = env.execute(
-            f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
+            f"{cd_prefix}{env_prefix} python3 {quoted_script_path}",
             timeout=timeout,
         )
 
@@ -1133,6 +1466,10 @@ def _execute_remote(
         if rpc_thread is not None:
             rpc_thread.join(timeout=5)
 
+        # Account the calls the script made before anything else can fail.
+        # Joined the poll thread first so the log is complete.
+        _flush_inner_tool_usage(tool_call_log)
+
         # Clean up remote sandbox dir
         try:
             env.execute(
@@ -1165,6 +1502,14 @@ def _execute_remote(
         "tool_calls_made": tool_call_counter[0],
         "duration_seconds": duration,
     }
+    _inner_counts = _inner_tool_counts(tool_call_log)
+    if _inner_counts:
+        # Per-tool breakdown of what the script called. Informational — for the
+        # model, the activity feed, and debugging. NOT the accounting record:
+        # that is `session_tool_usage` (see _flush_inner_tool_usage), because a
+        # large result can be offloaded to a file and replaced with a preview
+        # (tools/tool_result_storage.py), which would silently drop this field.
+        result["inner_tool_calls"] = _inner_counts
     result.update(stdout_metadata)
 
     if status == "timeout":
@@ -1273,11 +1618,7 @@ def execute_code(
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = _resolve_sandbox_tools(enabled_tools)
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
@@ -1319,7 +1660,7 @@ def execute_code(
         # sandbox_tools is already the correct set (intersection with session
         # tools, or SANDBOX_ALLOWED_TOOLS as fallback — see lines above).
         tools_src = generate_hermes_tools_module(list(sandbox_tools))
-        with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
+        with open(os.path.join(tmpdir, f"{_sandbox_module_name()}.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)
 
         # Write the user's script
@@ -1589,6 +1930,11 @@ def execute_code(
             "tool_calls_made": tool_call_counter[0],
             "duration_seconds": duration,
         }
+        _inner_counts = _inner_tool_counts(tool_call_log)
+        if _inner_counts:
+            # Informational breakdown; see the remote path for why this is not
+            # the accounting record.
+            result["inner_tool_calls"] = _inner_counts
         result.update(stdout_metadata)
 
         if status == "timeout":
@@ -1635,6 +1981,10 @@ def execute_code(
         }, ensure_ascii=False)
 
     finally:
+        # Account the calls the script made, on every exit path (success,
+        # timeout, interrupt, crash) — see _flush_inner_tool_usage.
+        _flush_inner_tool_usage(tool_call_log)
+
         # Cleanup temp dir and socket
         if server_sock is not None:
             try:
@@ -1923,14 +2273,39 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         enabled_sandbox_tools = SANDBOX_ALLOWED_TOOLS
     if mode is None:
         mode = _get_execution_mode()
+    module = _sandbox_module_name()
 
     # Build tool documentation lines for only the enabled tools
     tool_lines = "\n".join(
         doc for name, doc in _TOOL_DOC_LINES if name in enabled_sandbox_tools
     )
 
+    # MCP tools get ONE line, never a listing. A session can carry hundreds of
+    # them; spelling them out here would cost more context every turn than the
+    # deferred schemas the tool-search bridge exists to avoid. The model already
+    # knows their names (from the tools array or the bridge catalog) and can read
+    # their parameters off the generated stub or via tool_describe.
+    mcp_tools = sorted(name for name in enabled_sandbox_tools if _is_mcp_tool(name))
+    if mcp_tools:
+        count = (
+            "the MCP tool" if len(mcp_tools) == 1 else f"all {len(mcp_tools)} MCP tools"
+        )
+        tool_lines += (
+            f"\n\nAlso importable: {count} available to you this "
+            "session, under their exact registered names — e.g. "
+            f"`from {module} import {mcp_tools[0]}`. If you are unsure of a name, "
+            f"`{module}.list_tools()` returns every name this script can call; use it "
+            "rather than guessing at a prefix. Each takes keyword arguments "
+            "matching its schema and returns its result as a dict. This is the cheap way "
+            "to run one tool over many inputs: the per-call results stay in the script "
+            "instead of filling your context, so you can fetch across a whole list and "
+            "print only what you concluded."
+        )
+
     # Build example import list from enabled tools
     import_examples = [n for n in ("web_search", "terminal") if n in enabled_sandbox_tools]
+    if not import_examples:
+        import_examples = sorted(name for name in enabled_sandbox_tools if name in _TOOL_STUBS)[:2]
     if not import_examples:
         import_examples = sorted(enabled_sandbox_tools)[:2]
     if import_examples:
@@ -1938,13 +2313,50 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     else:
         import_str = "..."
 
-    # Mode-specific CWD guidance. Project mode is the default and matches
-    # terminal()'s filesystem/interpreter; strict mode retains the isolated
-    # temp-dir staging and hermes-agent's own python.
+    # Read the caps from config rather than restating the defaults: a deployment
+    # that raises max_tool_calls for fan-out work would otherwise still be
+    # telling the model the default, and the model would plan around the wrong
+    # ceiling (splitting one script into several, or overrunning mid-loop).
+    _limits_cfg = _load_config()
+    _timeout_s = int(_limits_cfg.get("timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT)
+    _max_calls = int(
+        _limits_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS) or DEFAULT_MAX_TOOL_CALLS
+    )
+    _timeout_note = (
+        f"{_timeout_s // 60}-minute" if _timeout_s % 60 == 0 else f"{_timeout_s}s"
+    )
+    limits_note = (
+        f"{_timeout_note} timeout, {MAX_STDOUT_BYTES // 1000}KB stdout cap, "
+        f"max {_max_calls} tool calls per script"
+    )
+
+    # CWD + interpreter guidance. Both depend on the terminal backend, not just
+    # the mode: a remote backend runs the script on the same machine as terminal(),
+    # with THAT machine's python3, and never with a local virtualenv. Describing
+    # the local arrangement to a remote session is worse than saying nothing —
+    # it promises project deps and a working directory that aren't there.
+    try:
+        from tools.terminal_tool import _get_env_config
+
+        _backend = str(_get_env_config().get("env_type") or "local").lower()
+    except Exception:
+        _backend = "local"
+    _remote_backend = _backend != "local"
+
     if mode == "strict":
+        where = "on the terminal's machine" if _remote_backend else ""
         cwd_note = (
-            "Scripts run in their own temp dir, not the session's CWD — use absolute paths "
-            "(os.path.expanduser('~/.hermes/.env')) or terminal()/read_file() for user files."
+            f"Scripts run in their own temp dir{' ' + where if where else ''}, not the "
+            "session's working directory, and that dir is deleted afterwards — write files "
+            "to an absolute path, and read user files with absolute paths or "
+            "terminal()/read_file()."
+        )
+    elif _remote_backend:
+        cwd_note = (
+            "Scripts run on the same machine as terminal(), in the same working directory, "
+            "so relative paths mean what they mean in terminal() and a file you write stays "
+            "put. They run with that machine's python3 — the standard library is always "
+            "there; any other library has to be installed for that interpreter."
         )
     else:
         cwd_note = (
@@ -1961,14 +2373,14 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "Use normal tool calls instead when: single tool call with no processing, "
         "you need to see the full result and apply complex reasoning, "
         "or the task requires interactive user input.\n\n"
-        f"Available via `from hermes_tools import ...`:\n\n"
+        f"Available via `from {module} import ...`:\n\n"
         f"{tool_lines}\n\n"
-        "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
+        f"Limits: {limits_note}. "
         "terminal() is foreground-only (no background or pty).\n\n"
         f"{cwd_note}\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
         "datetime, collections, etc.) for processing between tool calls.\n\n"
-        "Also available (no import needed — built into hermes_tools):\n"
+        f"Also available (no import needed — built into {module}):\n"
         "  json_parse(text: str) — json.loads with strict=False; use for terminal() output with control chars\n"
         "  shell_quote(s: str) — shlex.quote(); use when interpolating dynamic strings into shell commands\n"
         "  retry(fn, max_attempts=3, delay=2) — retry with exponential backoff for transient failures"
@@ -1984,7 +2396,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
                     "type": "string",
                     "description": (
                         "Python code to execute. Import tools with "
-                        f"`from hermes_tools import {import_str}` "
+                        f"`from {module} import {import_str}` "
                         "and print your final result to stdout."
                     ),
                 },

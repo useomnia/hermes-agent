@@ -1315,19 +1315,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
         elif function_name == "session_search":
             def _execute(next_args: dict) -> Any:
+                from tools.registry import registry
+                from tools.session_search_tool import is_builtin_session_search_handler
+
+                entry = registry.get_entry(function_name)
                 session_db = agent._get_session_db_for_recall()
-                if not session_db:
+                if not session_db and entry and is_builtin_session_search_handler(entry.handler):
                     from hermes_state import format_session_db_unavailable
                     return json.dumps({"success": False, "error": format_session_db_unavailable()})
-                from tools.session_search_tool import session_search as _session_search
-                return _session_search(
-                    query=next_args.get("query", ""),
-                    role_filter=next_args.get("role_filter"),
-                    limit=next_args.get("limit", 3),
-                    session_id=next_args.get("session_id"),
-                    around_message_id=next_args.get("around_message_id"),
-                    window=next_args.get("window", 5),
-                    sort=next_args.get("sort"),
+                # The built-in handler consumes the SessionDB; an override
+                # owns its own storage requirements.
+                return registry.dispatch(
+                    function_name,
+                    next_args,
                     db=session_db,
                     current_session_id=agent.session_id,
                 )

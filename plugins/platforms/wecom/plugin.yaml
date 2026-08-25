@@ -17,6 +17,12 @@ requires_env:
     description: "WeCom Smart Robot secret"
     prompt: "WeCom secret"
     password: true
+activation_env:
+  - name: WECOM_CALLBACK_CORP_ID
+  - name: WECOM_CALLBACK_CORP_SECRET
+provides_platforms:
+  - wecom
+  - wecom_callback
 optional_env:
   - name: WECOM_WEBSOCKET_URL
     description: "WeCom Smart Robot WebSocket URL"
@@ -29,6 +35,10 @@ optional_env:
   - name: WECOM_ALLOWED_USERS
     description: "Comma-separated WeCom user IDs allowed to talk to the bot"
     prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: WECOM_ALLOW_ALL_USERS
+    description: "Allow any WeCom user to trigger the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
     password: false
   - name: WECOM_CALLBACK_CORP_ID
     description: "WeCom callback-mode corp ID (self-built apps)"
@@ -50,3 +60,11 @@ optional_env:
     description: "WeCom callback EncodingAESKey for message crypto"
     prompt: "WeCom callback EncodingAESKey"
     password: true
+  - name: WECOM_CALLBACK_ALLOWED_USERS
+    description: "Comma-separated WeCom callback user IDs allowed to talk to the bot"
+    prompt: "Callback allowed users (comma-separated)"
+    password: false
+  - name: WECOM_CALLBACK_ALLOW_ALL_USERS
+    description: "Allow any WeCom callback user to trigger the bot (dev only)"
+    prompt: "Allow all callback users? (true/false)"
+    password: false
