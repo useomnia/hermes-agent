@@ -846,6 +846,10 @@ def _omnio_remote_binding(
     headers = {
         "Authorization": f"Bearer {bearer}",
         "Content-Type": "application/json",
+        # The paired proxy may buffer/decode the response before forwarding
+        # it. Request identity explicitly so it cannot retain a stale
+        # Content-Encoding header after that transformation.
+        "Accept-Encoding": "identity",
         "X-Omnio-Brand": brand,
     }
     if session_id:
@@ -1152,6 +1156,12 @@ def _browser_exec_remote(
             f"Omnio Toolbox browser exec timed out after {timeout}s. "
             f"{cancel_note}; do not replay this call automatically. Retry "
             f"with a larger timeout_s (max {_MAX_TIMEOUT_S}) or split the work."
+        )
+    except requests.exceptions.ContentDecodingError:
+        return tool_error(
+            "Omnio Toolbox browser exec received an invalid remote response "
+            "encoding. The request may already have executed; do not replay "
+            "this call automatically. Inspect the sandbox state before retrying."
         )
     except (requests.RequestException, OSError, ValueError, TypeError):
         return tool_error(

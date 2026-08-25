@@ -622,6 +622,7 @@ def test_remote_browser_exec_preserves_result_contract_and_pair_headers(monkeypa
     assert kwargs["headers"] == {
         "Authorization": "Bearer pair-secret",
         "Content-Type": "application/json",
+        "Accept-Encoding": "identity",
         "X-Omnio-Brand": "brand-a",
         "X-Hermes-Session-Id": "hermes-session",
     }
@@ -743,6 +744,25 @@ def test_remote_browser_exec_timeout_cancels_once_without_replay(monkeypatch):
     assert "do not replay" in result["error"]
     assert [url.rsplit("/", 1)[-1] for url, _kwargs in calls] == ["exec", "cancel"]
     assert calls[1][1]["json"]["executionId"] == calls[0][1]["json"]["executionId"]
+
+
+def test_remote_browser_exec_invalid_response_encoding_is_not_replayed(monkeypatch):
+    _configure_remote_omnio(monkeypatch)
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        raise bu.requests.exceptions.ContentDecodingError(
+            "response body was not valid gzip"
+        )
+
+    monkeypatch.setattr(bu.requests, "post", fake_post)
+    result = json.loads(bu.browser_exec("print('maybe ran')", task_id="child"))
+
+    assert "invalid remote response encoding" in result["error"]
+    assert "may already have executed" in result["error"]
+    assert "do not replay" in result["error"]
+    assert [url.rsplit("/", 1)[-1] for url, _kwargs in calls] == ["exec"]
 
 
 def test_remote_browser_exec_rejects_unsafe_screenshot_without_fetch(monkeypatch):
