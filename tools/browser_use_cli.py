@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -22,8 +23,11 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 
 from utils import is_truthy_value
 
@@ -42,6 +46,22 @@ _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
 _STDERR_CAP_CHARS = 4000
+
+# Omnio's paired Toolbox owns the Browser Use process. The HTTP request must
+# outlive the runner's own timeout by a small amount so the client can receive
+# the final result, but never gets an unbounded transport timeout. A timed-out
+# request is *not* replayed: the runner may already have executed model code.
+_REMOTE_TRANSPORT_HEADROOM_S = 5.0
+_REMOTE_CANCEL_TIMEOUT_S = 5.0
+
+# A screenshot is an image artifact, not an arbitrary Toolbox file. Keep the
+# temporary vision copy bounded even if a hostile/buggy Toolbox lies about its
+# Content-Length. This is intentionally lower than the general file broker
+# artifact cap because native vision only needs a resized rendering.
+_REMOTE_SCREENSHOT_MAX_BYTES = 16 * 1024 * 1024
+_REMOTE_SCREENSHOT_READ_CHUNK_BYTES = 64 * 1024
+_REMOTE_SCREENSHOT_FETCH_TIMEOUT_S = 30.0
+_REMOTE_SCREENSHOT_ROOTS = ("/tmp/screenshots",)
 
 # Screenshot paths printed by capture_screenshot() in the exec output.
 # Two alternatives: POSIX absolute (/tmp/shot.png) and Windows drive-letter
@@ -305,7 +325,10 @@ def install_cli(timeout_s: int = 600) -> Tuple[bool, str]:
     if bin_dir:
         managed = _find_cli()
         if managed:
-            return True, f"browser-use CLI {BROWSER_USE_CLI_VERSION} already installed ({managed[0]})"
+            return (
+                True,
+                f"browser-use CLI {BROWSER_USE_CLI_VERSION} already installed ({managed[0]})",
+            )
 
     uv_bin: Optional[str] = None
     try:
@@ -343,7 +366,10 @@ def install_cli(timeout_s: int = 600) -> Tuple[bool, str]:
             timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
-        return False, f"`uv tool install {BROWSER_USE_PACKAGE}` timed out after {timeout_s}s"
+        return (
+            False,
+            f"`uv tool install {BROWSER_USE_PACKAGE}` timed out after {timeout_s}s",
+        )
     except Exception as e:
         return False, f"Failed to run `uv tool install {BROWSER_USE_PACKAGE}`: {e}"
 
@@ -565,13 +591,13 @@ def _configure_omnio_harness_dirs(
                 stat.S_ISLNK(verified.st_mode)
                 or not stat.S_ISDIR(verified.st_mode)
                 or verified.st_uid != owner
-                or (
-                    os.name != "nt" and stat.S_IMODE(verified.st_mode) != 0o700
-                )
+                or (os.name != "nt" and stat.S_IMODE(verified.st_mode) != 0o700)
             ):
                 return f"Browser Harness directory {path} could not be made private"
         except OSError as exc:
-            logger.debug("Could not prepare Browser Harness directory %s: %s", path, exc)
+            logger.debug(
+                "Could not prepare Browser Harness directory %s: %s", path, exc
+            )
             return f"Browser Harness directory {path} is unavailable: {exc}"
     if not _SESSION_RE.match(harness_name):
         return "Browser Harness name is invalid"
@@ -614,7 +640,9 @@ def _browser_use_cloud_autospawn_enabled() -> bool:
     billable remote browser when a paired CDP endpoint is absent.
     """
     cfg = _read_browser_cfg()
-    if not isinstance(cfg, dict) or is_truthy_value(cfg.get("use_gateway"), default=False):
+    if not isinstance(cfg, dict) or is_truthy_value(
+        cfg.get("use_gateway"), default=False
+    ):
         return False
     provider = str(cfg.get("cloud_provider") or "").strip().lower()
     if provider not in {"", _DIRECT_PROVIDER_KEY}:
@@ -678,8 +706,18 @@ def _find_screenshot(stdout: str, since: float) -> Optional[str]:
     return None
 
 
-def _native_screenshot_result(result: Dict[str, Any], path: str) -> Optional[Dict[str, Any]]:
-    """Build a multimodal tool result attaching path for vision models"""
+def _native_screenshot_result(
+    result: Dict[str, Any],
+    path: str,
+    *,
+    display_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build a multimodal result while retaining a remote virtual path.
+
+    ``path`` is the local file used for image decoding. ``display_path`` is
+    optionally the Toolbox virtual path that must remain in tool metadata and
+    text so Omnia's ``omnio_paths`` wrapper can compose with this result.
+    """
     try:
         from pathlib import Path
 
@@ -703,26 +741,496 @@ def _native_screenshot_result(result: Dict[str, Any], path: str) -> Optional[Dic
             max_dimension=_EMBED_MAX_DIMENSION,
             force_jpeg=True,
         )
-        text = json.dumps(result, ensure_ascii=False)
+        visible_path = display_path or path
+        if display_path is not None:
+            visible_result = dict(result)
+            visible_result["screenshot_path"] = visible_path
+            visible_meta = visible_result.get("meta")
+            visible_meta = dict(visible_meta) if isinstance(visible_meta, dict) else {}
+            visible_meta["screenshot_path"] = visible_path
+            visible_meta["native_vision"] = True
+            visible_result["meta"] = visible_meta
+        else:
+            # Keep standalone/legacy Browser Use result text byte-compatible.
+            visible_result = result
+        text = json.dumps(visible_result, ensure_ascii=False)
         return {
             "_multimodal": True,
             "content": [
                 {
                     "type": "text",
                     "text": (
-                        text
-                        + "\n\nThe screenshot from this call is attached — "
+                        text + "\n\nThe screenshot from this call is attached — "
                         "inspect it with your native vision."
                     ),
                 },
                 {"type": "image_url", "image_url": {"url": data_url}},
             ],
             "text_summary": text,
-            "meta": {"screenshot_path": path, "native_vision": True},
+            "meta": {"screenshot_path": visible_path, "native_vision": True},
         }
     except Exception as e:
         logger.debug("Native screenshot attach failed (falling back to text): %s", e)
         return None
+
+
+def _native_vision_enabled() -> bool:
+    """Return whether this model can consume native image attachments."""
+    try:
+        from tools.vision_tools import _should_use_native_vision_fast_path
+
+        return bool(_should_use_native_vision_fast_path())
+    except Exception:
+        return False
+
+
+def _omnio_browser_exec_url() -> str:
+    """Return the explicit Toolbox Browser Use capability, if provisioned.
+
+    The URL is deliberately a separately injected capability rather than a
+    deduction from ``BROWSER_CDP_URL_TEMPLATE``. Older Omnio proxies expose
+    the CDP relay but do not own the Browser Use runner; keeping those proxies
+    on the managed local CLI path makes mixed-version rollout safe.
+    """
+    return os.environ.get("OMNIO_BROWSER_EXEC_URL", "").strip().rstrip("/")
+
+
+def _canonical_browser_session_id(task_id: Optional[str]) -> str:
+    """Resolve the infrastructure-owned session id used by Toolbox headers."""
+    try:
+        from tools.browser_tool import _browser_session_id
+
+        return str(_browser_session_id(task_id) or "").strip()
+    except Exception as exc:  # pragma: no cover - defensive partial imports
+        logger.debug("Could not resolve the Omnio browser session id: %s", exc)
+        return ""
+
+
+def _omnio_remote_binding(
+    task_id: Optional[str],
+) -> Tuple[Optional[str], Optional[Dict[str, str]], Optional[str]]:
+    """Build the authenticated remote execution binding.
+
+    Returns ``(url, headers, error)``. Once the explicit execution capability
+    is present, missing pair credentials are an error and never permit a local
+    CLI fallback.
+    """
+    exec_url = _omnio_browser_exec_url()
+    if not exec_url:
+        return None, None, None
+
+    base_url = os.environ.get("OMNIO_TOOLBOX_URL", "").strip().rstrip("/")
+    bearer = os.environ.get("OMNIO_TOOLBOX_BEARER", "").strip()
+    if not base_url:
+        # A few bootstrap callers inject only the full capability URL. Derive
+        # the file API origin when it has the canonical suffix, while still
+        # requiring the pair bearer below.
+        suffix = "/browser/exec"
+        if exec_url.endswith(suffix):
+            base_url = exec_url[: -len(suffix)].rstrip("/")
+    if not bearer:
+        return (
+            None,
+            None,
+            "Omnio's paired Toolbox browser runner is configured but its "
+            "pair credentials are unavailable. Reprovision this Omnio "
+            "sandbox, then retry.",
+        )
+
+    brand = (
+        os.environ.get("OMNIO_TOOLBOX_BRAND", "").strip()
+        or os.environ.get("OMNIO_BRAND_ID", "").strip()
+        or "__default__"
+    )
+    session_id = _canonical_browser_session_id(task_id)
+    headers = {
+        "Authorization": f"Bearer {bearer}",
+        "Content-Type": "application/json",
+        "X-Omnio-Brand": brand,
+    }
+    if session_id:
+        headers["X-Hermes-Session-Id"] = session_id
+    return exec_url, headers, None
+
+
+def _bounded_timeout(timeout_s: Any) -> int:
+    """Normalize browser execution timeouts to the public 5..1800 contract."""
+    try:
+        return max(_MIN_TIMEOUT_S, min(int(timeout_s), _MAX_TIMEOUT_S))
+    except (TypeError, ValueError):
+        return _DEFAULT_TIMEOUT_S
+
+
+def _remote_screenshot_path_error(path: str) -> Optional[str]:
+    """Reject screenshot paths outside the Toolbox's virtual roots."""
+    if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+        return "Toolbox returned an unsafe screenshot path; refusing to fetch it."
+    # Keep this lexical and strict. ``/tmp/../home`` is not accepted even
+    # though it starts with an allowed prefix, and ``//tmp`` is not an alias
+    # for the Toolbox's virtual /tmp root.
+    normalized = posixpath.normpath(path)
+    if normalized != path:
+        return "Toolbox returned an unsafe screenshot path; refusing to fetch it."
+    if not any(
+        path == root or path.startswith(root + "/") for root in _REMOTE_SCREENSHOT_ROOTS
+    ):
+        return "Toolbox returned an unsafe screenshot path; refusing to fetch it."
+    return None
+
+
+def _fetch_remote_screenshot(
+    path: str,
+    *,
+    task_id: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Fetch one authenticated Toolbox screenshot to a bounded temp file.
+
+    The returned local path is for native image decoding only and must be
+    deleted by the caller. No redirects are followed, preventing pair bearer
+    forwarding to an untrusted origin.
+    """
+    path_error = _remote_screenshot_path_error(path)
+    if path_error:
+        return None, path_error
+
+    base_url = os.environ.get("OMNIO_TOOLBOX_URL", "").strip().rstrip("/")
+    if not base_url:
+        exec_url = _omnio_browser_exec_url()
+        suffix = "/browser/exec"
+        if exec_url.endswith(suffix):
+            base_url = exec_url[: -len(suffix)].rstrip("/")
+    bearer = os.environ.get("OMNIO_TOOLBOX_BEARER", "").strip()
+    if not base_url or not bearer:
+        return (
+            None,
+            "Toolbox returned a screenshot but its pair file transport is "
+            "unavailable. Reprovision this Omnio sandbox, then retry.",
+        )
+    brand = (
+        os.environ.get("OMNIO_TOOLBOX_BRAND", "").strip()
+        or os.environ.get("OMNIO_BRAND_ID", "").strip()
+        or "__default__"
+    )
+    headers = {
+        "Authorization": f"Bearer {bearer}",
+        "X-Omnio-Brand": brand,
+    }
+    session_id = _canonical_browser_session_id(task_id)
+    if session_id:
+        headers["X-Hermes-Session-Id"] = session_id
+
+    suffix = Path(path).suffix[:16]
+    temp_path: Optional[str] = None
+    keep_temp = False
+    response = None
+    try:
+        response = requests.get(
+            f"{base_url}/files",
+            params={"path": path},
+            headers=headers,
+            timeout=_REMOTE_SCREENSHOT_FETCH_TIMEOUT_S,
+            stream=True,
+            allow_redirects=False,
+        )
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status_code != 200:
+            return (
+                None,
+                "Toolbox screenshot download failed; retry the browser step "
+                f"(HTTP {status_code}).",
+            )
+        response_headers = getattr(response, "headers", {}) or {}
+        content_length = response_headers.get("Content-Length") or response_headers.get(
+            "content-length"
+        )
+        if content_length:
+            try:
+                declared_size = int(content_length)
+                if declared_size < 0:
+                    return None, "Toolbox returned an invalid screenshot size."
+                if declared_size > _REMOTE_SCREENSHOT_MAX_BYTES:
+                    return None, "Toolbox screenshot exceeds the maximum allowed size."
+            except (TypeError, ValueError):
+                return None, "Toolbox returned an invalid screenshot size."
+
+        handle = tempfile.NamedTemporaryFile(
+            prefix="hermes-toolbox-screenshot-",
+            suffix=suffix,
+            delete=False,
+        )
+        temp_path = handle.name
+        total_bytes = 0
+        try:
+            with handle:
+                iterator = getattr(response, "iter_content", None)
+                if callable(iterator):
+                    chunks = iterator(chunk_size=_REMOTE_SCREENSHOT_READ_CHUNK_BYTES)
+                else:
+                    chunks = [getattr(response, "content", b"")]
+                for chunk in chunks:
+                    if not chunk:
+                        continue
+                    if not isinstance(chunk, (bytes, bytearray)):
+                        return None, "Toolbox returned an invalid screenshot body."
+                    total_bytes += len(chunk)
+                    if total_bytes > _REMOTE_SCREENSHOT_MAX_BYTES:
+                        return (
+                            None,
+                            "Toolbox screenshot exceeds the maximum allowed size.",
+                        )
+                    handle.write(chunk)
+            if total_bytes <= 0:
+                return None, "Toolbox returned an empty screenshot."
+        except Exception:
+            return None, "Toolbox screenshot download failed; retry the browser step."
+        keep_temp = True
+        return temp_path, None
+    except requests.RequestException:
+        return (
+            None,
+            "Toolbox screenshot download timed out or was unreachable; "
+            "retry the browser step.",
+        )
+    except (OSError, ValueError, TypeError):
+        return None, "Toolbox screenshot download failed; retry the browser step."
+    finally:
+        try:
+            if response is not None:
+                response.close()
+        except Exception:
+            pass
+        if temp_path is not None and not keep_temp:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+def _cancel_remote_execution(
+    exec_url: str,
+    headers: Dict[str, str],
+    execution_id: str,
+) -> bool:
+    """Best-effort cancellation of one timed-out remote execution."""
+    response = None
+    try:
+        response = requests.post(
+            f"{exec_url}/cancel",
+            headers=headers,
+            json={"executionId": execution_id},
+            timeout=_REMOTE_CANCEL_TIMEOUT_S,
+            allow_redirects=False,
+        )
+        return 200 <= int(getattr(response, "status_code", 0) or 0) < 300
+    except (requests.RequestException, OSError, ValueError, TypeError):
+        return False
+    finally:
+        try:
+            if response is not None:
+                response.close()
+        except Exception:
+            pass
+
+
+def _remote_browser_result(
+    payload: Any,
+    *,
+    requested_session: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Validate and map the Toolbox response to Hermes result fields."""
+    if not isinstance(payload, dict):
+        return None, "Toolbox returned an invalid browser execution response."
+    output = payload.get("output")
+    returncode = payload.get("returncode")
+    workspace = payload.get("workspace")
+    if (
+        not isinstance(output, str)
+        or isinstance(returncode, bool)
+        or not isinstance(returncode, int)
+        or not isinstance(workspace, str)
+    ):
+        return None, "Toolbox returned an invalid browser execution response."
+    downloads = payload.get("downloads", [])
+    if not isinstance(downloads, list) or any(
+        not isinstance(item, str) or not item.startswith("/tmp/downloads/")
+        for item in downloads
+    ):
+        return None, "Toolbox returned an invalid browser execution response."
+
+    result: Dict[str, Any] = {
+        "success": returncode == 0,
+        "exit_code": returncode,
+        "output": output,
+        "workspace": workspace,
+        # The Omnia paths wrapper uses presence of this field to identify the
+        # remote runner and skips its legacy post-call drain. Keep [] too.
+        "downloads": downloads,
+    }
+    response_session = payload.get("session")
+    if response_session is not None:
+        if not isinstance(response_session, str):
+            return None, "Toolbox returned an invalid browser execution response."
+        if response_session or requested_session:
+            result["session"] = response_session or requested_session
+    elif requested_session:
+        result["session"] = requested_session
+
+    stderr = payload.get("stderr")
+    if stderr is not None:
+        if not isinstance(stderr, str):
+            return None, "Toolbox returned an invalid browser execution response."
+        stderr = stderr.strip()
+        if stderr:
+            if len(stderr) > _STDERR_CAP_CHARS:
+                stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
+            result["stderr"] = stderr
+
+    screenshot_path = payload.get("screenshotPath")
+    if screenshot_path is not None:
+        if not isinstance(screenshot_path, str):
+            return None, "Toolbox returned an invalid browser screenshot path."
+        if screenshot_path:
+            path_error = _remote_screenshot_path_error(screenshot_path)
+            if path_error:
+                return None, path_error
+            result["screenshot_path"] = screenshot_path
+    return result, None
+
+
+def _browser_exec_remote(
+    code: str,
+    *,
+    session: str,
+    timeout_s: Any,
+    task_id: Optional[str],
+):
+    """Execute model-supplied Browser Use code in the paired Toolbox."""
+    from tools.registry import tool_error, tool_result
+
+    if session and not _SESSION_RE.match(session):
+        return tool_error(
+            f"Invalid session name {session!r}: use 1-64 letters, digits, "
+            "dashes, or underscores (e.g. 'r7k2')."
+        )
+    timeout = _bounded_timeout(timeout_s)
+    exec_url, headers, binding_error = _omnio_remote_binding(task_id)
+    if binding_error:
+        return tool_error(binding_error)
+    if not exec_url or headers is None:
+        # This helper is only called after the capability check, so reaching
+        # here means the binding changed during the call. Fail closed.
+        return tool_error(
+            "Omnio's paired Toolbox browser runner is unavailable. "
+            "Reprovision this Omnio sandbox, then retry."
+        )
+
+    execution_id = uuid.uuid4().hex
+    payload = {
+        "code": code,
+        "session": session,
+        "timeoutSeconds": timeout,
+        # Infrastructure-generated, never model-selected. It lets a client
+        # timeout cancel exactly this request without replaying model code.
+        "executionId": execution_id,
+    }
+    try:
+        response = requests.post(
+            exec_url,
+            headers=headers,
+            json=payload,
+            timeout=timeout + _REMOTE_TRANSPORT_HEADROOM_S,
+            allow_redirects=False,
+        )
+    except requests.Timeout:
+        cancelled = _cancel_remote_execution(exec_url, headers, execution_id)
+        cancel_note = (
+            "Cancellation requested"
+            if cancelled
+            else "Cancellation could not be confirmed"
+        )
+        return tool_error(
+            f"Omnio Toolbox browser exec timed out after {timeout}s. "
+            f"{cancel_note}; do not replay this call automatically. Retry "
+            f"with a larger timeout_s (max {_MAX_TIMEOUT_S}) or split the work."
+        )
+    except (requests.RequestException, OSError, ValueError, TypeError):
+        return tool_error(
+            "Omnio Toolbox browser exec was unreachable or timed out before "
+            "a result was received. The request was not replayed; verify the "
+            "sandbox is ready and retry."
+        )
+
+    try:
+        try:
+            status_code = int(getattr(response, "status_code", 0) or 0)
+        except (TypeError, ValueError):
+            return tool_error(
+                "Omnio Toolbox returned an invalid browser execution status."
+            )
+        if status_code in {404, 405, 422, 501}:
+            return tool_error(
+                "This Omnio sandbox's Toolbox does not support Browser Use "
+                "execution yet. Reprovision this Omnio sandbox, then retry."
+            )
+        if status_code >= 500:
+            return tool_error(
+                f"Omnio Toolbox browser exec failed with HTTP {status_code}. "
+                "Retry after the sandbox is ready or reprovision the Omnio "
+                "sandbox; the request was not replayed."
+            )
+        if status_code < 200 or status_code >= 300:
+            return tool_error(
+                f"Omnio Toolbox rejected browser exec (HTTP {status_code}). "
+                "Check the paired sandbox and retry; the request was not replayed."
+            )
+        try:
+            response_payload = response.json()
+        except (AttributeError, ValueError, TypeError):
+            return tool_error(
+                "Omnio Toolbox returned an invalid browser execution response."
+            )
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+
+    result, result_error = _remote_browser_result(
+        response_payload,
+        requested_session=session,
+    )
+    if result_error:
+        return tool_error(result_error)
+    assert result is not None
+
+    screenshot_path = result.get("screenshot_path")
+    if screenshot_path and _native_vision_enabled():
+        local_path, fetch_error = _fetch_remote_screenshot(
+            screenshot_path,
+            task_id=task_id,
+        )
+        if fetch_error:
+            # Execution already succeeded. Do not turn an optional native
+            # attachment failure into an error that invites the model to run
+            # the browser code twice; retain the Toolbox path for an explicit
+            # later image read instead.
+            logger.debug("Remote native screenshot attach skipped: %s", fetch_error)
+            return tool_result(result)
+        assert local_path is not None
+        try:
+            native = _native_screenshot_result(
+                result,
+                local_path,
+                display_path=screenshot_path,
+            )
+        finally:
+            try:
+                os.unlink(local_path)
+            except OSError:
+                pass
+        if native is not None:
+            return native
+    return tool_result(result)
 
 
 def _resolve_backend_cdp(
@@ -799,7 +1307,11 @@ def _resolve_backend_cdp(
             "canonical Hermes session id and Toolbox browser relay."
         )
     if override:
-        env["BU_CDP_URL" if override.startswith(("http://", "https://")) else "BU_CDP_WS"] = override
+        env[
+            "BU_CDP_URL"
+            if override.startswith(("http://", "https://"))
+            else "BU_CDP_WS"
+        ] = override
         return None
 
     try:
@@ -1071,11 +1583,25 @@ def browser_exec(
     from tools.registry import tool_error, tool_result
 
     if not code or not code.strip():
-        return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
+        return tool_error(
+            'No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab("https://example.com") then print(page_info()).'
+        )
 
     blocked = _blocked_url_in_code(code)
     if blocked:
         return tool_error(blocked)
+
+    # The explicit capability is authoritative. New paired Omnio runtimes
+    # execute model code inside Toolbox; they must never resolve, launch, or
+    # track the local managed Browser Use CLI. Older Omnio runtimes omit the
+    # capability and continue through the unchanged local path below.
+    if _omnio_browser_exec_url():
+        return _browser_exec_remote(
+            code,
+            session=session,
+            timeout_s=timeout_s,
+            task_id=task_id,
+        )
 
     omnio_local_cdp = _omnio_template_cdp_configured()
     cmd = _find_cli()
@@ -1186,14 +1712,12 @@ def browser_exec(
         else:
             # Same conversation/name may issue concurrent calls; keep one
             # daemon record while leasing it once per subprocess.
-            entry.update(
-                {
-                    "task_id": str(task_id or ""),
-                    "conversation_id": _canonical_conversation_id(task_id),
-                    "cmd": list(cmd),
-                    "env": dict(env),
-                }
-            )
+            entry.update({
+                "task_id": str(task_id or ""),
+                "conversation_id": _canonical_conversation_id(task_id),
+                "cmd": list(cmd),
+                "env": dict(env),
+            })
         entry["in_flight"] = int(entry.get("in_flight", 0) or 0) + 1
         _touch_harness(bu_name, entry)
 
@@ -1329,6 +1853,7 @@ def _description_header() -> str:
     except Exception:
         pass
     return _HEADER_BASE + _HEADER_TEXT_ONLY
+
 
 _skill_text_cache: Optional[str] = None
 _skill_text_fetched = False
