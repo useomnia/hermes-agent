@@ -106,6 +106,44 @@ def test_stale_managed_cli_is_not_resolved(tmp_path, monkeypatch):
     assert bu._find_cli() is None
 
 
+def test_managed_browser_use_cli_is_shared_from_root_for_profile_gateway(
+    tmp_path, monkeypatch
+):
+    profile_home = tmp_path / "profiles" / "brand-a"
+    managed_bin = tmp_path / "bin"
+    managed_bin.mkdir()
+    executable = managed_bin / "browser-use"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(
+        bu, "_managed_cli_is_current", lambda path: path == str(executable)
+    )
+
+    assert bu._find_cli() == [str(executable)]
+
+
+def test_missing_managed_cli_explains_omnio_agent_side_reprovision(monkeypatch):
+    monkeypatch.setattr(bu, "_find_cli", lambda: None)
+    monkeypatch.setattr(bu, "_omnio_template_cdp_configured", lambda: True)
+
+    result = json.loads(bu.browser_exec("print(page_info())"))
+
+    assert "Reprovision this Omnio sandbox" in result["error"]
+    assert "Toolbox terminal" in result["error"]
+    assert "hermes tools" not in result["error"]
+
+
+def test_missing_managed_cli_keeps_standalone_install_guidance(monkeypatch):
+    monkeypatch.setattr(bu, "_find_cli", lambda: None)
+    monkeypatch.setattr(bu, "_omnio_template_cdp_configured", lambda: False)
+
+    result = json.loads(bu.browser_exec("print(page_info())"))
+
+    assert "hermes tools" in result["error"]
+    assert "Reprovision this Omnio sandbox" not in result["error"]
+
+
 def test_install_cli_forces_exact_package_pin(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(bu, "_managed_bin_dir", lambda: str(tmp_path))

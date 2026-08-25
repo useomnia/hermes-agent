@@ -192,11 +192,18 @@ def is_browser_use_cli_mode() -> bool:
 
 
 def _managed_bin_dir() -> Optional[str]:
-    """Hermes' own bin dir, the only production Browser Use bin directory."""
-    try:
-        from hermes_constants import get_hermes_home
+    """Hermes' install-scoped bin dir, shared by every profile.
 
-        return str(Path(get_hermes_home()) / "bin")
+    Profile gateways replace ``HERMES_HOME`` with
+    ``<root>/profiles/<name>``.  Browser Use is installed once by Hermes (and
+    by Omnio provisioning) under ``<root>/bin``; profile cloning deliberately
+    does not duplicate managed executables.  Resolve the root explicitly so a
+    brand gateway sees the same pinned CLI as the default profile.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        return str(get_default_hermes_root() / "bin")
     except Exception as e:  # pragma: no cover — defensive
         logger.debug("Could not resolve managed bin dir: %s", e)
         return None
@@ -283,8 +290,9 @@ def install_cli(timeout_s: int = 600) -> Tuple[bool, str]:
 
     Resolution order for uv: Hermes' managed uv (bootstrapped on demand via
     ``hermes_cli.managed_uv.ensure_uv``) → uv on PATH. The binary is linked
-    into ``$HERMES_HOME/bin`` (``UV_TOOL_BIN_DIR``) so ``_find_cli()``
-    resolves it for every profile without touching the user's PATH.
+    into the installation root's ``bin`` directory (``UV_TOOL_BIN_DIR``) so
+    ``_find_cli()`` resolves it for every profile without touching the user's
+    PATH.
 
     Returns ``(ok, message)`` — never raises.
     """
@@ -1069,8 +1077,16 @@ def browser_exec(
     if blocked:
         return tool_error(blocked)
 
+    omnio_local_cdp = _omnio_template_cdp_configured()
     cmd = _find_cli()
     if not cmd:
+        if omnio_local_cdp:
+            return tool_error(
+                "Omnio's pinned Browser Use CLI is unavailable in the agent "
+                "runtime. Reprovision this Omnio sandbox, then retry; installing "
+                "browser-use from the Toolbox terminal or PATH cannot repair "
+                "the agent-side managed runtime."
+            )
         return tool_error(
             "The Hermes-managed Browser Use CLI is not installed. Install the "
             f"pinned package `{BROWSER_USE_PACKAGE}` with `hermes tools`, then "
@@ -1078,7 +1094,6 @@ def browser_exec(
         )
 
     env = _base_subprocess_env()
-    omnio_local_cdp = _omnio_template_cdp_configured()
     if omnio_local_cdp:
         # Omnio runs Browser Use locally against Toolbox-owned Chrome. Never
         # pass a Browser Use cloud credential or permit cloud autospawn on
