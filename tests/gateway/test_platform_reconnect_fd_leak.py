@@ -21,6 +21,7 @@ this file would have caught the regression and now pins the fix.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -297,6 +298,9 @@ class TestAPIServerDisconnectClosesResponseStore:
         adapter._runner = None
         adapter._app = None
         adapter._response_store = store
+        adapter._omnio_approval_refresh_task = None
+        adapter._omnio_approval_snapshot_ready = threading.Event()
+        adapter._omnio_approval_snapshot_ready.set()
         adapter.platform = Platform.API_SERVER
         return adapter
 

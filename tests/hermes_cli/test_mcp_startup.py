@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 from contextlib import nullcontext
+import os
 import sys
 import threading
 import time
@@ -43,6 +44,51 @@ def _agent_args(**overrides) -> Namespace:
     }
     base.update(overrides)
     return Namespace(**base)
+
+
+def test_prepare_agent_startup_defers_gateway_agent_work_to_runner(monkeypatch):
+    """Gateway startup has one canonical plugin/MCP/hook preparation owner."""
+    safe_mode_calls = []
+    deferred_import_calls = []
+    monkeypatch.setattr(
+        main_mod,
+        "_apply_safe_mode",
+        lambda args: safe_mode_calls.append(args.command),
+    )
+    monkeypatch.delenv("HERMES_ACCEPT_HOOKS", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        types.SimpleNamespace(
+            discover_plugins=lambda: deferred_import_calls.append("plugins"),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        types.SimpleNamespace(
+            discover_mcp_tools=lambda: deferred_import_calls.append("mcp"),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.shell_hooks",
+        types.SimpleNamespace(
+            register_from_config=lambda *_a, **_k: deferred_import_calls.append("hooks"),
+        ),
+    )
+
+    main_mod._prepare_agent_startup(
+        _agent_args(
+            command="gateway",
+            gateway_command="run",
+            accept_hooks=True,
+        )
+    )
+
+    assert safe_mode_calls == ["gateway"]
+    assert os.environ["HERMES_ACCEPT_HOOKS"] == "1"
+    assert deferred_import_calls == []
 
 
 def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
@@ -294,4 +340,22 @@ def test_background_discovery_does_not_retry_when_servers_connected(monkeypatch)
     mcp_startup.start_background_mcp_discovery(
         logger=_retry_logger(), thread_name="test-mcp-noretry-2"
     )
+    assert calls["mcp"] == 1
+
+
+def test_agent_join_does_not_repeat_finished_background_discovery(monkeypatch):
+    """The first agent joins the completed run instead of starting a second one."""
+    calls = {"mcp": 0}
+    _install_retry_stubs(monkeypatch, connected=True, calls=calls)
+    monkeypatch.setattr(mcp_startup, "_join_abandoned", False)
+
+    mcp_startup.start_background_mcp_discovery(
+        logger=_retry_logger(), thread_name="test-mcp-single-flight"
+    )
+    thread = mcp_startup._mcp_discovery_thread
+    assert thread is not None
+    thread.join(timeout=1.0)
+
+    mcp_startup.ensure_mcp_discovery_complete()
+
     assert calls["mcp"] == 1

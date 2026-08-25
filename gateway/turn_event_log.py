@@ -64,6 +64,7 @@ OMNIO_EXTENSION_EVENT_TYPES = frozenset({
     "response.omnio.approval_request",
     "response.omnio.approval_responded",
     "response.omnio.steer_missed",
+    "response.omnio.tool_progress",
 })
 
 _TOOL_EXTENSION_EVENTS = {
@@ -446,6 +447,7 @@ class TurnEventEmitter:
         self._reasoning_items: Dict[str, Dict[str, Any]] = {}
         self._function_calls: Dict[str, Dict[str, Any]] = {}
         self._function_call_occurrences: Dict[str, int] = {}
+        self._semantic_tool_calls: Dict[str, Dict[str, Any]] = {}
         # Per-item text/reasoning delta buffers awaiting coalesced flush, and
         # the set of item IDs whose first delta has already been flushed.
         self._pending_deltas: Dict[str, _PendingDelta] = {}
@@ -829,6 +831,36 @@ class TurnEventEmitter:
                 "started_at": state["started_at"],
                 "completed_at": self.clock(),
             },
+        )
+
+    def semantic_tool_start(self, source_call_id: str, tool: str) -> None:
+        """Expose the executed tool when it differs from the model-facing call."""
+        if source_call_id in self._semantic_tool_calls:
+            return
+        started_at = self.clock()
+        self._semantic_tool_calls[source_call_id] = {
+            "tool": tool,
+            "started_at": started_at,
+        }
+        self.omnio_event(
+            "response.omnio.tool_progress",
+            source_call_id=source_call_id,
+            tool=tool,
+            status="running",
+            started_at=started_at,
+        )
+
+    def semantic_tool_done(self, source_call_id: str) -> None:
+        state = self._semantic_tool_calls.pop(source_call_id, None)
+        if state is None:
+            return
+        self.omnio_event(
+            "response.omnio.tool_progress",
+            source_call_id=source_call_id,
+            tool=state["tool"],
+            status="completed",
+            started_at=state["started_at"],
+            completed_at=self.clock(),
         )
 
     def task_list(self, todos: list) -> None:

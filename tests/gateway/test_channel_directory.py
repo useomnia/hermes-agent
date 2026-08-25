@@ -127,8 +127,6 @@ class TestBuildChannelDirectoryOffload:
         cache_file = tmp_path / "channel_directory.json"
         loop_thread = threading.get_ident()
         calls = []
-        plugin_entry = SimpleNamespace(name="irc")
-
         def fake_build_from_sessions(platform_name):
             calls.append((platform_name, threading.get_ident()))
             return []
@@ -137,12 +135,12 @@ class TestBuildChannelDirectoryOffload:
              patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
              patch(
                  "gateway.platform_registry.platform_registry.plugin_entries",
-                 return_value=[plugin_entry],
-             ):
+             ) as plugin_entries:
             asyncio.run(build_channel_directory({"irc": object()}))
 
         assert [name for name, _ in calls] == ["irc"]
         assert calls[0][1] != loop_thread
+        plugin_entries.assert_not_called()
 
     def test_slack_session_merge_runs_off_event_loop_thread(self):
         loop_thread = threading.get_ident()

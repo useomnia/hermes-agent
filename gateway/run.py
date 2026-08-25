@@ -8135,14 +8135,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _plugin_allow_all_vars: tuple = ()
         try:
             from gateway.platform_registry import platform_registry
-            _plugin_allowed_vars = tuple(
-                e.allowed_users_env for e in platform_registry.plugin_entries()
-                if e.allowed_users_env
-            )
-            _plugin_allow_all_vars = tuple(
-                e.allow_all_env for e in platform_registry.plugin_entries()
-                if e.allow_all_env
-            )
+            (
+                _plugin_allowed_vars,
+                _plugin_allow_all_vars,
+            ) = platform_registry.plugin_authorization_env_vars()
         except Exception:
             pass
         _any_allowlist = any(
@@ -8184,11 +8180,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         
         # Discover Python plugins before shell hooks so plugin block
-        # decisions take precedence in tie cases.  The CLI startup path
-        # does this via an explicit call in hermes_cli/main.py; the
-        # gateway lazily imports run_agent inside per-request handlers,
-        # so the discover_plugins() side-effect in model_tools.py is NOT
-        # guaranteed to have run by the time we reach this point.
+        # decisions take precedence in tie cases. The CLI ``gateway run``
+        # path deliberately defers this agent-only preparation to the
+        # runner, while direct/programmatic starts arrive here without any
+        # CLI prelude. This is the single gateway startup boundary and must
+        # not rely on the later model_tools.py side effect.
         try:
             from hermes_cli.plugins import discover_plugins
             discover_plugins()
@@ -8196,6 +8192,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning(
                 "plugin discovery failed at gateway startup", exc_info=True,
             )
+        _boot_mark("plugins")
 
         # Register the generic relay adapter when a connector relay URL is
         # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
@@ -8228,15 +8225,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning(
                 "relay adapter registration failed at gateway startup", exc_info=True,
             )
+        _boot_mark("relay")
 
         # Register declarative shell hooks from cli-config.yaml.  Gateway
         # has no TTY, so consent has to come from one of the three opt-in
         # channels (--accept-hooks on launch, HERMES_ACCEPT_HOOKS env var,
         # or hooks_auto_accept: true in config.yaml).  We pass
         # accept_hooks=False here and let register_from_config resolve
-        # the effective value from env + config itself — the CLI-side
-        # registration already honored --accept-hooks, and re-reading
-        # hooks_auto_accept here would just duplicate that lookup.
+        # the effective value from env + config itself. CLI gateway startup
+        # carries --accept-hooks into HERMES_ACCEPT_HOOKS before dispatch;
+        # this call remains the authoritative registration for direct starts.
         # Failures are logged but must never block gateway startup.
         try:
             from hermes_cli.config import load_config
@@ -8295,6 +8293,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Auto-suspended %d stuck-loop session(s)", stuck)
         except Exception as e:
             logger.debug("Stuck-loop detection failed: %s", e)
+        _boot_mark("session_recovery")
 
         # Serialize startup restore against inbound dispatch.  Platform
         # adapters can begin receiving messages as soon as they connect, but
@@ -8486,6 +8485,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Startup authority is one phase, not a persistent runner mode.
             # From this point onward every adapter retry is non-evicting.
             self._platform_lock_takeover_on_start = False
+        _boot_mark("platforms")
 
         # A platform we skipped on the primary for a missing credential was
         # supposed to be picked up by a secondary profile that owns the token.
@@ -8590,6 +8590,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._update_runtime_status("running")
+        _boot_mark("runtime_ready")
+        try:
+            from hermes_cli.boot_clock import format_timeline
+
+            ready_timeline = format_timeline("ready")
+        except Exception:  # noqa: BLE001 — timing must never block a boot
+            ready_timeline = ""
+        logger.info(
+            "Gateway ready%s",
+            f" [{ready_timeline}]" if ready_timeline else "",
+        )
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
@@ -24295,8 +24306,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # Sync bundled skills on gateway start (fast -- skips unchanged)
     try:
-        from tools.skills_sync import sync_skills
-        sync_skills(quiet=True)
+        # Match the CLI's cheap opt-out check. Importing tools.skills_sync is
+        # itself the expensive part on a cold process, while its marker branch
+        # is guaranteed to do no work.
+        if not (_hermes_home / ".no-bundled-skills").exists():
+            from tools.skills_sync import sync_skills
+
+            sync_skills(quiet=True)
     except Exception:
         pass
     _boot_mark("skills_resync")
