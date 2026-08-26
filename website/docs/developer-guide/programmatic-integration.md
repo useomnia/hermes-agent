@@ -99,6 +99,36 @@ GET  /api/model/options          Provider-aware picker inventory
 GET  /health, /health/detailed
 ```
 
+### Retrying `/v1/runs` safely
+
+Omnio callers should send a non-empty `turn_id` with each product turn. Hermes
+records only a scalar SHA-256 fingerprint of the immutable request semantics,
+the assigned `run_id`, and lifecycle metadata in the profile's `state.db`; it
+never stores request input in this idempotency relation. Repeating the same
+`turn_id` and request returns the original `run_id` and current status without
+starting another agent. Reusing it with changed input, instructions, session,
+model, or other request fields returns HTTP 409 with error code
+`turn_id_conflict`.
+
+The relation is created additively on first open and survives gateway restart.
+If a restarted gateway receives a retry for a previously active run, it keeps
+the original identity and closes the orphaned execution as
+`gateway_restart_interrupted`; it does not start a second writer. Callers that
+omit `turn_id` retain the historical non-idempotent behavior. During rollout,
+deploy Hermes with this capability before enabling automatic `turn_id` retries
+in a proxy: an older Hermes accepts unknown JSON fields but cannot provide the
+durable duplicate guarantee.
+
+The same capability document advertises Omnio handover support as
+`features.omnio_quiescence` when the installed gateway implements the
+authenticated `POST /v1/omnio/quiescence` contract. Its
+`atomicWriterSnapshot` flag covers API reservations, background/process work,
+and durable delegation delivery; `forceCancel` means force mode interrupts
+work and reports zero only after it has settled. A proxy must treat a missing,
+malformed, or older capability document as unsupported and must not substitute
+an environment version stamp. A stopped gateway is not evidence of zero work
+unless its durable state has been inspected or the process was cleanly retired.
+
 Setup, headers (`X-Hermes-Session-Id`, `X-Hermes-Session-Key`), and frontend wiring: [API Server](../user-guide/features/api-server).
 
 ### Model catalog surfaces

@@ -17,8 +17,12 @@ available as additive aliases. A successful response has
 `generation`, the canonical aggregate `total`, and per-class `counts`; Omnia
 should retain these proof-identity fields with its handover barrier. A busy
 response is HTTP 409; an unavailable/unknown count is HTTP 503. `request_id`
-is an opaque caller correlation value and prepares are idempotent: repeating
-one observes current state without creating another gate or writer.
+is an opaque caller/barrier identity. For a force prepare, a caller-supplied
+ID is persisted and the matching release must carry that exact ID in addition
+to the `generation` and `boot_id` proof; a release with a stale ID is rejected.
+If force prepare omits it, Hermes returns a generated ID and retains
+generation+boot compatibility for older callers. Repeating a prepare observes
+current state without creating another gate or writer.
 Graceful status/prepare polling does not advance `generation`; it changes only
 when a force epoch is created or successfully released.
 
@@ -79,7 +83,8 @@ proof is in progress. Hermes returns `quiescent` only after a fresh known zero
 snapshot; timeout or interruption failure returns busy/error and leaves the
 force gate latched. `POST ...` with `operation="release"` (or the release
 alias) must include the exact `generation` and `boot_id` returned by force
-prepare; stale or missing proof identity is rejected with 409 and leaves the
+prepare. When prepare included `request_id`, release must also include that
+exact ID; stale or missing proof identity is rejected with 409 and leaves the
 gate latched. A matching release is idempotent and reopens the gate after the
 caller has completed its handover. Hermes writes and reads back the force
 marker before reporting force success; marker write/readback failure returns

@@ -294,7 +294,9 @@ def _offline_marker_lock():
 def write_offline_quiescence_snapshot(
     snapshot: Dict[str, Any], *, lifecycle: str = "unknown",
     force_latched: bool = False, generation: Optional[int] = None,
-    force_boot_id: Optional[str] = None
+    force_boot_id: Optional[str] = None,
+    force_request_id: Optional[str] = None,
+    force_request_required: bool = False,
 ) -> bool:
     """Persist a fail-closed handover snapshot for a stopped gateway.
 
@@ -322,6 +324,13 @@ def write_offline_quiescence_snapshot(
         "force_latched": bool(force_latched),
         "generation": int(generation) if generation is not None else None,
         "force_boot_id": str(force_boot_id or (_OFFLINE_BOOT_ID if force_latched else "")),
+        # ``force_request_id`` binds a release to the exact force barrier.
+        # ``force_request_required`` is additive compatibility metadata: old
+        # callers that omitted request_id still have the generation+boot proof
+        # and remain releasable, while new callers that supplied one must
+        # present it exactly.
+        "force_request_id": str(force_request_id or ""),
+        "force_request_required": bool(force_request_required),
         "observed_at": time.time(),
     }
     path = _offline_snapshot_path()
@@ -369,6 +378,13 @@ def mark_offline_quiescence_unknown() -> bool:
             previous.get("force_boot_id") or previous.get("boot_id")
             if previous.get("force_latched")
             else None
+        ),
+        force_request_id=(
+            previous.get("force_request_id") if previous.get("force_latched") else None
+        ),
+        force_request_required=bool(
+            previous.get("force_latched")
+            and previous.get("force_request_required", False)
         ),
     )
     if not written:
@@ -421,8 +437,20 @@ def offline_quiescence_marker_well_formed(payload: Any) -> bool:
     for key in ("boot_id", "force_boot_id"):
         if key in payload and payload[key] is not None and not isinstance(payload[key], str):
             return False
+    if "force_request_id" in payload and payload["force_request_id"] is not None and not isinstance(
+        payload["force_request_id"], str
+    ):
+        return False
+    if "force_request_required" in payload and not isinstance(
+        payload["force_request_required"], bool
+    ):
+        return False
     if payload.get("force_latched") and not (
         payload.get("force_boot_id") or payload.get("boot_id")
+    ):
+        return False
+    if payload.get("force_latched") and payload.get("force_request_required") and not (
+        payload.get("force_request_id")
     ):
         return False
     if "state" in payload and payload["state"] not in {"unknown", "busy", "quiescent"}:

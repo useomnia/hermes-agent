@@ -8,6 +8,7 @@ turns once the gateway starts draining.
 """
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -143,6 +144,58 @@ class TestAPIServerAdapterWorkCount:
         adapter._active_run_agents = {"run-1": object()}
 
         assert adapter.active_agent_work_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_cancelled_chat_executor_remains_counted_until_thread_exit(self):
+        """A cancelled HTTP owner cannot hide its still-writing worker thread."""
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        started = threading.Event()
+        release = threading.Event()
+
+        agent = MagicMock()
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        def run_conversation(*_args, **_kwargs):
+            started.set()
+            release.wait(timeout=5)
+            return {"final_response": "late"}
+
+        agent.run_conversation.side_effect = run_conversation
+
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            task = asyncio.create_task(
+                adapter._run_agent(
+                    user_message="hello",
+                    conversation_history=[],
+                    session_id="cancelled-chat",
+                )
+            )
+            try:
+                deadline = asyncio.get_running_loop().time() + 3
+                while not started.is_set() and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.01)
+                assert started.is_set()
+                assert adapter.active_agent_work_count() == 1
+
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+                # The request/in-flight counters have unwound, but the
+                # executor lease keeps this writer visible until the worker's
+                # finally block unregisters the active agent.
+                assert adapter._inflight_agent_runs == 0
+                assert adapter.active_agent_work_count() == 1
+            finally:
+                release.set()
+
+            for _ in range(40):
+                if adapter.active_agent_work_count() == 0:
+                    break
+                await asyncio.sleep(0.05)
+            assert adapter.active_agent_work_count() == 0
 
 
 class TestDrainWaitsForApiWork:

@@ -508,6 +508,56 @@ async def test_force_release_rejects_stale_generation():
 
 
 @pytest.mark.asyncio
+async def test_force_release_requires_exact_request_id_when_supplied():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "secret"}))
+    adapter.gateway_runner = SimpleNamespace(
+        _running_agent_count=lambda: 0,
+        _active_cron_job_count=lambda: 0,
+    )
+    zero = {"counts": {}, "total": 0, "known": True, "errors": []}
+    with patch("gateway.quiescence.collect_writer_work_snapshot", return_value=zero), patch(
+        "gateway.quiescence.interrupt_writer_work",
+        return_value={"actions": {}, "errors": []},
+    ):
+        async with TestClient(TestServer(_app(adapter))) as client:
+            prepared = await client.post(
+                "/v1/omnio/quiescence",
+                headers={"Authorization": "Bearer secret"},
+                json={"mode": "force", "request_id": "barrier-1"},
+            )
+            proof = await prepared.json()
+            proof_identity = {
+                "generation": proof["generation"],
+                "boot_id": proof["boot_id"],
+            }
+
+            stale = await client.post(
+                "/v1/omnio/quiescence/release",
+                headers={"Authorization": "Bearer secret"},
+                json={**proof_identity, "request_id": "barrier-2"},
+            )
+            assert stale.status == 409
+            assert (await stale.json())["errors"] == ["stale_barrier"]
+            assert adapter._quiescence_force_latched is True
+
+            missing = await client.post(
+                "/v1/omnio/quiescence/release",
+                headers={"Authorization": "Bearer secret"},
+                json=proof_identity,
+            )
+            assert missing.status == 409
+            assert (await missing.json())["errors"] == ["stale_barrier"]
+
+            released = await client.post(
+                "/v1/omnio/quiescence/release",
+                headers={"Authorization": "Bearer secret"},
+                json={**proof_identity, "request_id": "barrier-1"},
+            )
+            assert released.status == 200
+            assert adapter._quiescence_force_latched is False
+
+
+@pytest.mark.asyncio
 async def test_old_release_cannot_reopen_new_force_epoch():
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "secret"}))
     adapter.gateway_runner = SimpleNamespace(

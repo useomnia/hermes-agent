@@ -19,6 +19,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
+from gateway.run_idempotency import RunIdempotencyStore
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _approval_event_choices,
@@ -143,6 +144,172 @@ def auth_adapter():
 
 class TestStartRun:
     @pytest.mark.asyncio
+    async def test_turn_id_setup_failure_closes_reserved_run(self, tmp_path):
+        """A reservation must not remain queued when Turn-log setup fails."""
+        adapter = _make_adapter()
+        store = RunIdempotencyStore(tmp_path / "state.db")
+        adapter._run_idempotency = store
+        app = _create_runs_app(adapter)
+        body = {"input": "hello", "turn_id": "turn-setup-failure"}
+
+        with patch.object(
+            adapter._turn_event_logs,
+            "create_run",
+            side_effect=RuntimeError("simulated log setup failure"),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                first = await cli.post("/v1/runs", json=body)
+                first_data = await first.json()
+
+        record = store.get("turn-setup-failure")
+        assert first.status == 503
+        assert first_data["error"]["code"] == "run_initialization_failed"
+        assert record is not None
+        assert record.status == "failed"
+        assert record.failure_reason == "run_initialization_failed"
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                retry = await cli.post("/v1/runs", json=body)
+                retry_data = await retry.json()
+
+        assert retry.status == 202
+        assert retry_data["run_id"] == first_data.get("run_id", record.run_id)
+        assert retry_data["status"] == "failed"
+        assert retry_data["idempotent"] is True
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_turn_id_retry_returns_original_run_without_second_agent(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._run_idempotency = RunIdempotencyStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+        body = {"input": "hello", "turn_id": "turn-retry"}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                first = await cli.post("/v1/runs", json=body)
+                first_data = await first.json()
+                await asyncio.sleep(0.05)
+                second = await cli.post("/v1/runs", json=body)
+                second_data = await second.json()
+
+        assert first.status == 202
+        assert second.status == 202
+        assert second_data["run_id"] == first_data["run_id"]
+        assert second_data["idempotent"] is True
+        mock_create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_turn_id_changed_request_returns_409(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._run_idempotency = RunIdempotencyStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                assert (await cli.post(
+                    "/v1/runs", json={"input": "hello", "turn_id": "turn-mismatch"}
+                )).status == 202
+                response = await cli.post(
+                    "/v1/runs", json={"input": "changed", "turn_id": "turn-mismatch"}
+                )
+                data = await response.json()
+
+        assert response.status == 409
+        assert data["error"]["code"] == "turn_id_conflict"
+        mock_create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_turn_id_retry_after_adapter_restart_keeps_run_identity(self, tmp_path):
+        path = tmp_path / "state.db"
+        first_adapter = _make_adapter()
+        first_adapter._run_idempotency = RunIdempotencyStore(path)
+        first_app = _create_runs_app(first_adapter)
+        body = {"input": "hello", "turn_id": "turn-restart"}
+        async with TestClient(TestServer(first_app)) as cli:
+            with patch.object(first_adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                first = await cli.post("/v1/runs", json=body)
+                first_data = await first.json()
+
+        second_adapter = _make_adapter()
+        second_adapter._run_idempotency = RunIdempotencyStore(path)
+        second_app = _create_runs_app(second_adapter)
+        async with TestClient(TestServer(second_app)) as cli:
+            with patch.object(second_adapter, "_create_agent") as mock_create:
+                second = await cli.post("/v1/runs", json=body)
+                second_data = await second.json()
+
+        assert second.status == 202
+        assert second_data["run_id"] == first_data["run_id"]
+        assert second_data["idempotent"] is True
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_turn_id_isolated_between_multiplex_profiles(self, tmp_path, monkeypatch):
+        """The shared listener must use each profile's own state.db relation."""
+        from gateway.config import GatewayConfig
+
+        profile_homes = {
+            name: tmp_path / name for name in ("foo", "bar")
+        }
+        for home in profile_homes.values():
+            home.mkdir()
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex=True: list(profile_homes.items()),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir",
+            lambda name: profile_homes[name],
+        )
+
+        adapter = _make_adapter()
+        adapter.gateway_runner = MagicMock(config=GatewayConfig(multiplex_profiles=True))
+        app = web.Application(
+            middlewares=[adapter._make_profile_prefix_middleware()]
+        )
+        app.router.add_post("/p/{profile}/v1/runs", adapter._handle_runs)
+        body = {"input": "hello", "turn_id": "same-turn"}
+
+        with patch.object(adapter, "_create_agent") as mock_create:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            mock_create.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                foo = await cli.post("/p/foo/v1/runs", json=body)
+                bar = await cli.post("/p/bar/v1/runs", json=body)
+                foo_data = await foo.json()
+                bar_data = await bar.json()
+                await asyncio.sleep(0.05)
+
+        assert foo.status == bar.status == 202
+        assert foo_data["run_id"] != bar_data["run_id"]
+        assert mock_create.call_count == 2
+        assert (profile_homes["foo"] / "state.db").exists()
+        assert (profile_homes["bar"] / "state.db").exists()
+
+    @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -221,6 +388,13 @@ class TestStartRun:
                 data="not json",
                 headers={"Content-Type": "application/json"},
             )
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_start_non_object_json_returns_400(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs", json=[{"input": "hello"}])
         assert resp.status == 400
 
     @pytest.mark.asyncio
