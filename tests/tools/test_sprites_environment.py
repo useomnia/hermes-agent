@@ -27,7 +27,7 @@ def _run_terminal_with_existing_env(monkeypatch, env):
     return json.loads(terminal_tool.terminal_tool("echo hello"))
 
 
-def test_get_env_config_should_default_sprites_to_brand_workspace(monkeypatch):
+def test_get_env_config_should_default_sprites_to_home_workspace(monkeypatch):
     from tools.terminal_tool import _get_env_config
 
     monkeypatch.setenv("TERMINAL_ENV", "sprites")
@@ -39,7 +39,7 @@ def test_get_env_config_should_default_sprites_to_brand_workspace(monkeypatch):
     config = _get_env_config()
 
     assert config["env_type"] == "sprites"
-    assert config["cwd"] == "/brand"
+    assert config["cwd"] == "/home"
     assert config["sprites_url"] == "https://toolbox.example"
     assert config["sprites_bearer"] == "pair-secret"
     assert config["sprites_brand"] == "brand-123"

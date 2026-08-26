@@ -67,6 +67,43 @@ def _list_and_view_skill(skills_dir: Path, name: str):
     return listed, viewed
 
 
+def test_split_sources_list_duplicate_names_and_resolve_canonical_ids(tmp_path):
+    system = _make_skill(tmp_path / "system", "shared", category="toolkit")
+    custom = _make_skill(tmp_path / "custom", "shared", category="brand")
+
+    with (
+        patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+        patch("tools.skill_usage._skills_dir", return_value=tmp_path),
+        patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+        patch(
+            "hermes_cli.config.load_config",
+            return_value={"skills": {"source_layout": "split"}},
+        ),
+    ):
+        skills_tool_module._SKILLS_CACHE.clear()
+        listed = _find_all_skills()
+        ambiguous = json.loads(skill_view("shared"))
+        system_view = json.loads(skill_view("system:toolkit/shared"))
+        custom_view = json.loads(skill_view("custom:brand/shared"))
+        custom_path_alias = json.loads(skill_view("brand/shared"))
+
+    assert {skill["id"] for skill in listed} == {
+        "system:toolkit/shared",
+        "custom:brand/shared",
+    }
+    assert ambiguous["success"] is False
+    assert set(ambiguous["matches"]) == {
+        "system:toolkit/shared",
+        "custom:brand/shared",
+    }
+    assert system_view["id"] == "system:toolkit/shared"
+    assert system_view["path"] == "toolkit/shared"
+    assert custom_view["id"] == "custom:brand/shared"
+    assert custom_path_alias["id"] == "custom:brand/shared"
+    assert custom_view["path"] == "brand/shared"
+    assert system.is_dir() and custom.is_dir()
+
+
 # ---------------------------------------------------------------------------
 # _parse_frontmatter
 # ---------------------------------------------------------------------------

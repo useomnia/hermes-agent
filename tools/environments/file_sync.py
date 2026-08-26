@@ -105,6 +105,9 @@ def iter_sprites_sync_files(
     return [
         (entry["host_path"], entry["container_path"])
         for entry in iter_skills_files(container_base=container_base)
+        # Internal delta checkpoint; /skills/.usage.json is the generated
+        # user-facing projection, while this baseline never leaves the gateway.
+        if not entry["container_path"].endswith("/.usage.synced.json")
     ]
 
 

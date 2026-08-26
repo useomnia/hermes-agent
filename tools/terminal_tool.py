@@ -1390,7 +1390,7 @@ def _get_env_config() -> Dict[str, Any]:
     elif env_type == "ssh":
         default_cwd = "~"
     elif env_type == "sprites":
-        default_cwd = "/brand"
+        default_cwd = "/home"
     else:
         default_cwd = "/root"
 

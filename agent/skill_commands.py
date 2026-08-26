@@ -17,6 +17,7 @@ from agent.skill_preprocessing import (
     load_skills_config as _load_skills_config,
     substitute_template_vars as _substitute_template_vars,
 )
+from agent.skill_sources import split_source_layout_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +232,14 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
     abs_skill_dir = loaded_skill.get("skill_dir")
     if abs_skill_dir:
         skill_dir = Path(abs_skill_dir)
-    elif skill_path:
+    if skill_dir is None and loaded_skill.get("id"):
+        try:
+            from agent.skill_sources import direct_skill_path
+
+            skill_dir = direct_skill_path(str(loaded_skill["id"]), SKILLS_DIR)
+        except Exception:
+            skill_dir = None
+    if skill_dir is None and skill_path:
         try:
             skill_dir = SKILLS_DIR / Path(skill_path).parent
         except Exception:
@@ -397,6 +405,8 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
         seen_names: set = set()
+        ambiguous_commands: set[str] = set()
+        split_layout = split_source_layout_enabled()
 
         # Scan local dir first, then external dirs
         dirs_to_scan = []
@@ -419,7 +429,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     if not skill_matches_environment(frontmatter):
                         continue
                     name = frontmatter.get('name', skill_md.parent.name)
-                    if name in seen_names:
+                    if name in seen_names and not split_layout:
                         continue
                     # Respect user's disabled skills config
                     if name in disabled:
@@ -453,7 +463,19 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # slug (e.g. "git_helper" vs "git-helper"). First-wins
                     # preserves local-before-external precedence.
                     cmd_key = f"/{cmd_name}"
+                    if cmd_key in ambiguous_commands:
+                        continue
                     if cmd_key in _skill_commands:
+                        if split_layout:
+                            previous = _skill_commands.pop(cmd_key)
+                            ambiguous_commands.add(cmd_key)
+                            logger.warning(
+                                "Skills %r and %r both map to slash command %s; "
+                                "removing the ambiguous auto-command. Use a "
+                                "source-qualified or categorized skill_view instead.",
+                                previous["name"], name, cmd_key,
+                            )
+                            continue
                         logger.warning(
                             "Skill %r maps to slash command %s already claimed "
                             "by %r; keeping the first and skipping this one.",
@@ -601,7 +623,7 @@ def build_skill_invocation_message(
     # Track active usage for Curator lifecycle management (#17782)
     try:
         from tools.skill_usage import bump_use
-        bump_use(skill_name)
+        bump_use(str(loaded_skill.get("id") or skill_name))
     except Exception:
         pass  # Non-critical — skill invocation proceeds regardless
 
@@ -709,7 +731,7 @@ def build_stacked_skill_invocation_message(
         # Track active usage for Curator lifecycle management (#17782)
         try:
             from tools.skill_usage import bump_use
-            bump_use(skill_name)
+            bump_use(str(loaded_skill.get("id") or skill_name))
         except Exception:
             pass  # Non-critical
 
@@ -796,7 +818,7 @@ def build_preloaded_skills_prompt(
         # Track active usage for Curator lifecycle management (#17782)
         try:
             from tools.skill_usage import bump_use
-            bump_use(skill_name)
+            bump_use(str(loaded_skill.get("id") or skill_name))
         except Exception:
             pass  # Non-critical
 

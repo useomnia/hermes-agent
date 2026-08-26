@@ -18,6 +18,7 @@ from tools.skill_manager_tool import (
     _delete_skill,
     _write_file,
     _remove_file,
+    _fork_system_skill,
     skill_manage,
     MAX_NAME_LENGTH,
 )
@@ -34,6 +35,19 @@ def _skill_dir(tmp_path):
     only the temp directory — not the real ~/.hermes/skills/."""
     with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
          patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]):
+        yield
+
+
+@contextmanager
+def _split_skill_dir(tmp_path):
+    """Opt the temp tree into the structural system/custom policy."""
+    with (
+        _skill_dir(tmp_path),
+        patch(
+            "hermes_cli.config.load_config",
+            return_value={"skills": {"source_layout": "split"}},
+        ),
+    ):
         yield
 
 
@@ -585,6 +599,68 @@ class TestRemoveFile:
 # ---------------------------------------------------------------------------
 # skill_manage dispatcher
 # ---------------------------------------------------------------------------
+
+
+class TestSplitSkillSources:
+    def test_create_supports_nested_custom_categories(self, tmp_path):
+        with _split_skill_dir(tmp_path):
+            result = _create_skill(
+                "test-skill", VALID_SKILL_CONTENT, category="toolkit/content"
+            )
+
+        assert result["success"] is True
+        assert result["skill_id"] == "custom:toolkit/content/test-skill"
+        assert (tmp_path / "custom/toolkit/content/test-skill/SKILL.md").is_file()
+
+    def test_system_skill_cannot_be_edited(self, tmp_path):
+        system_skill = tmp_path / "system/toolkits/test-skill"
+        system_skill.mkdir(parents=True)
+        (system_skill / "SKILL.md").write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+
+        with _split_skill_dir(tmp_path):
+            result = _edit_skill("system:toolkits/test-skill", VALID_SKILL_CONTENT_2)
+
+        assert result["success"] is False
+        assert "immutable" in result["error"]
+        assert (system_skill / "SKILL.md").read_text(
+            encoding="utf-8"
+        ) == VALID_SKILL_CONTENT
+
+    def test_explicit_fork_copies_system_skill_into_custom(self, tmp_path):
+        system_skill = tmp_path / "system/toolkits/test-skill"
+        system_skill.mkdir(parents=True)
+        (system_skill / "SKILL.md").write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+
+        with _split_skill_dir(tmp_path):
+            result = _fork_system_skill(
+                "system:toolkits/test-skill", "brand-test-skill", "toolkit/brand"
+            )
+
+        fork = tmp_path / "custom/toolkit/brand/brand-test-skill/SKILL.md"
+        assert result["success"] is True
+        assert result["skill_id"] == "custom:toolkit/brand/brand-test-skill"
+        assert "name: brand-test-skill" in fork.read_text(encoding="utf-8")
+        assert (system_skill / "SKILL.md").read_text(
+            encoding="utf-8"
+        ) == VALID_SKILL_CONTENT
+
+    def test_explicit_fork_makes_release_read_only_snapshot_editable(self, tmp_path):
+        system_skill = tmp_path / "system/toolkits/test-skill"
+        system_skill.mkdir(parents=True)
+        skill_md = system_skill / "SKILL.md"
+        skill_md.write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+        skill_md.chmod(0o444)
+        system_skill.chmod(0o555)
+
+        with _split_skill_dir(tmp_path):
+            result = _fork_system_skill(
+                "system:toolkits/test-skill", "editable-fork", "toolkit/brand"
+            )
+
+        fork = tmp_path / "custom/toolkit/brand/editable-fork/SKILL.md"
+        assert result["success"] is True
+        assert "name: editable-fork" in fork.read_text(encoding="utf-8")
+        assert fork.stat().st_mode & 0o200
 
 
 class TestSkillManageDispatcher:
@@ -1783,3 +1859,29 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+def test_registered_fork_handler_forwards_new_name():
+    from tools.registry import registry
+
+    entry = registry.get_entry("skill_manage")
+    with (
+        patch("tools.skill_manager_tool._apply_skill_write_gate", return_value=None),
+        patch(
+            "tools.skill_manager_tool._fork_system_skill",
+            return_value={"success": True, "skill_id": "custom:variant"},
+        ) as fork,
+    ):
+        result = json.loads(
+            entry.handler(
+                {
+                    "action": "fork",
+                    "name": "system:toolkit/base",
+                    "new_name": "variant",
+                    "category": "brand",
+                }
+            )
+        )
+
+    assert result["success"] is True
+    fork.assert_called_once_with("system:toolkit/base", "variant", "brand")

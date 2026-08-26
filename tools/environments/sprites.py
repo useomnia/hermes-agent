@@ -232,7 +232,7 @@ class SpritesEnvironment(BaseEnvironment):
         toolbox_url: str,
         bearer_token: str,
         brand: str,
-        cwd: str = "/brand",
+        cwd: str = "/home",
         timeout: int = 60,
     ):
         if not toolbox_url:

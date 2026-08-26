@@ -3,9 +3,10 @@
 Skill Manager Tool -- Agent-Managed Skill Creation & Editing
 
 Allows the agent to create, update, and delete skills, turning successful
-approaches into reusable procedural knowledge. New skills are created in
-~/.hermes/skills/. Existing skills (bundled, hub-installed, or user-created)
-can be modified or deleted wherever they live.
+approaches into reusable procedural knowledge. In split installations, new
+skills are created below ``~/.hermes/skills/custom``; the shipped ``system``
+source is immutable and can only be copied by an explicit user-requested fork.
+Legacy flat installations retain their historical behavior.
 
 Skills are the agent's procedural memory: they capture *how to do a specific
 type of task* based on proven experience. General memory (MEMORY.md, USER.md) is
@@ -19,8 +20,8 @@ Actions:
   write_file -- Add/overwrite a supporting file (reference, template, script, asset)
   remove_file-- Remove a supporting file from a user skill
 
-Directory layout for user skills:
-    ~/.hermes/skills/
+Directory layout for user skills in split installations:
+    ~/.hermes/skills/custom/
     ├── my-skill/
     │   ├── SKILL.md
     │   ├── references/
@@ -50,6 +51,13 @@ from agent.skill_utils import (
     is_skill_description_truncated_for_prompt,
     parse_frontmatter as _parse_frontmatter,
     SKILL_PROMPT_DESC_LIMIT,
+)
+from agent.skill_sources import (
+    canonical_skill_id,
+    classify_skill_path,
+    custom_skills_dir,
+    direct_skill_path,
+    split_source_layout_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -312,6 +320,10 @@ def _background_review_write_guard(
     it is autonomous lifecycle maintenance, so its write surface is restricted
     to local curator-owned sediment.
     """
+    immutable = _immutable_skill_error(name, skill_dir, action)
+    if immutable:
+        return immutable
+
     try:
         from tools.skill_provenance import is_background_review
         if not is_background_review():
@@ -380,6 +392,13 @@ def _background_review_write_guard(
                     f"skill '{name}'."
                 ),
             }
+        # In a split installation, location IS the management policy: every
+        # custom skill may be maintained by the curator and every system skill
+        # was rejected structurally above. No adoption/provenance gate exists.
+        if split_source_layout_enabled():
+            return None
+
+        # Legacy flat installations retain the explicit adoption policy.
         # Skills that are not curator-managed are off-limits to autonomous
         # curation. This prevents the LLM consolidation pass from mutating
         # skills the user owns (manually authored, URL-installed, or created by
@@ -541,7 +560,12 @@ def _validate_name(name: str) -> Optional[str]:
 
 
 def _validate_category(category: Optional[str]) -> Optional[str]:
-    """Validate an optional category name used as a single directory segment."""
+    """Validate an optional nested category path.
+
+    Categories are structural namespaces (``toolkit/content``), not one opaque
+    label. Every segment follows the skill-name grammar and traversal is
+    rejected before a filesystem path is constructed.
+    """
     if category is None:
         return None
     if not isinstance(category, str):
@@ -550,17 +574,15 @@ def _validate_category(category: Optional[str]) -> Optional[str]:
     category = category.strip()
     if not category:
         return None
-    if "/" in category or "\\" in category:
+    if "\\" in category or category.startswith("/") or category.endswith("/"):
+        return f"Invalid category '{category}'. Use relative '/'-separated segments."
+    if len(category) > 256:
+        return "Category path exceeds 256 characters."
+    parts = category.split("/")
+    if any(part in {"", ".", ".."} or not VALID_NAME_RE.match(part) for part in parts):
         return (
-            f"Invalid category '{category}'. Use lowercase letters, numbers, "
-            "hyphens, dots, and underscores. Categories must be a single directory name."
-        )
-    if len(category) > MAX_NAME_LENGTH:
-        return f"Category exceeds {MAX_NAME_LENGTH} characters."
-    if not VALID_NAME_RE.match(category):
-        return (
-            f"Invalid category '{category}'. Use lowercase letters, numbers, "
-            "hyphens, dots, and underscores. Categories must be a single directory name."
+            f"Invalid category '{category}'. Every segment must use lowercase "
+            "letters, numbers, hyphens, dots, or underscores and traversal is forbidden."
         )
     return None
 
@@ -639,9 +661,10 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
 
 def _resolve_skill_dir(name: str, category: str = None) -> Path:
     """Build the directory path for a new skill, optionally under a category."""
+    root = custom_skills_dir(_skills_dir())
     if category:
-        return _skills_dir() / category / name
-    return _skills_dir() / name
+        return root / category.strip() / name
+    return root / name
 
 
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
@@ -653,6 +676,12 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     {"path": Path} or None.
     """
     from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+
+    direct = direct_skill_path(name, _skills_dir())
+    if direct is not None and (direct / "SKILL.md").is_file():
+        return {"path": direct}
+    matches: list[Path] = []
+    seen: set[Path] = set()
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
@@ -660,8 +689,42 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
             if is_excluded_skill_path(skill_md):
                 continue
             if skill_md.parent.name == name:
-                return {"path": skill_md.parent}
-    return None
+                try:
+                    candidate = skill_md.parent.resolve()
+                except OSError:
+                    candidate = skill_md.parent
+                if candidate not in seen:
+                    seen.add(candidate)
+                    matches.append(candidate)
+    return {"path": matches[0]} if len(matches) == 1 else None
+
+
+def _immutable_skill_error(
+    name: str, skill_dir: Path, action: str
+) -> Optional[Dict[str, Any]]:
+    """Block every runtime mutation outside the custom source in split mode."""
+    if not split_source_layout_enabled():
+        return None
+    source = classify_skill_path(skill_dir, _skills_dir())
+    if source == "custom":
+        return None
+    if source == "system":
+        return {
+            "success": False,
+            "error": (
+                f"Refusing to {action} system skill '{canonical_skill_id(skill_dir, _skills_dir())}'. "
+                "System skills are shipped by Omnio and immutable at runtime. "
+                "If the user explicitly wants a variant, use skill_manage(action='fork', ...) "
+                "to create a custom skill."
+            ),
+        }
+    return {
+        "success": False,
+        "error": (
+            f"Refusing to {action} skill '{name}': split source layout only permits "
+            "runtime changes below skills/custom."
+        ),
+    }
 
 
 def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
@@ -884,16 +947,16 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if err:
         return {"success": False, "error": err}
 
-    # Check for name collisions across all directories
-    existing = _find_skill(name)
-    if existing:
+    # Full relative path is identity. The same basename may exist in another
+    # category, but this exact custom destination may not already exist.
+    skill_dir = _resolve_skill_dir(name, category)
+    if skill_dir.exists():
         return {
             "success": False,
-            "error": f"A skill named '{name}' already exists at {existing['path']}."
+            "error": f"A skill already exists at {canonical_skill_id(skill_dir, _skills_dir())}.",
         }
 
     # Create the skill directory
-    skill_dir = _resolve_skill_dir(name, category)
     skill_dir.mkdir(parents=True, exist_ok=True)
 
     # Write SKILL.md atomically
@@ -919,8 +982,8 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     result = {
         "success": True,
         "message": f"Skill '{name}' created.",
-        "path": str(skill_dir.relative_to(_skills_dir())),
-        "skill_md": str(skill_md),
+        "path": canonical_skill_id(skill_dir, _skills_dir()),
+        "skill_id": canonical_skill_id(skill_dir, _skills_dir()),
         "_change": {"description": _desc},
     }
     if category:
@@ -931,6 +994,109 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     )
     _add_description_prompt_preview(result, content)
     return result
+
+
+def _rewrite_fork_name(skill_md: Path, new_name: str) -> Optional[str]:
+    """Rewrite the first frontmatter ``name`` in a copied system skill."""
+    try:
+        content = skill_md.read_text(encoding="utf-8")
+    except OSError as exc:
+        return f"Could not read copied SKILL.md: {exc}"
+    if not content.startswith("---"):
+        return "System skill has no YAML frontmatter."
+    end = content.find("\n---", 3)
+    if end < 0:
+        return "System skill frontmatter is not closed."
+    head, tail = content[:end], content[end:]
+    rewritten, count = re.subn(
+        r"^name\s*:.*$", f"name: {new_name}", head, count=1, flags=re.MULTILINE
+    )
+    if count != 1:
+        return "System skill frontmatter has no name field."
+    _atomic_write_text(skill_md, rewritten + tail)
+    return None
+
+
+def _make_tree_user_writable(root: Path) -> None:
+    """Remove release snapshot read-only modes from a newly copied fork."""
+    for path in [root, *root.rglob("*")]:
+        try:
+            path.chmod(path.stat().st_mode | 0o200 | (0o100 if path.is_dir() else 0))
+        except OSError:
+            continue
+
+
+def _fork_system_skill(
+    source: str,
+    new_name: str,
+    category: str = None,
+) -> Dict[str, Any]:
+    """Copy one immutable system skill into the editable custom source."""
+    if not split_source_layout_enabled():
+        return {
+            "success": False,
+            "error": "Explicit system/custom forks require skills.source_layout: split.",
+        }
+    try:
+        from tools.skill_provenance import is_background_review
+
+        if is_background_review():
+            return {
+                "success": False,
+                "error": "The background curator cannot fork system skills; only an explicit user request may create a system fork.",
+            }
+    except Exception:
+        pass
+    err = _validate_name(new_name)
+    if err:
+        return {"success": False, "error": err}
+    err = _validate_category(category)
+    if err:
+        return {"success": False, "error": err}
+
+    existing = _find_skill(source)
+    if not existing:
+        return {"success": False, "error": _skill_not_found_error(source)}
+    source_dir = existing["path"]
+    if classify_skill_path(source_dir, _skills_dir()) != "system":
+        return {
+            "success": False,
+            "error": f"Skill '{source}' is not a system skill; edit the custom skill directly.",
+        }
+    if category is None:
+        system_rel = source_dir.relative_to(_skills_dir() / "system")
+        parent = system_rel.parent.as_posix()
+        category = None if parent == "." else parent
+    destination = _resolve_skill_dir(new_name, category)
+    if destination.exists():
+        return {
+            "success": False,
+            "error": f"Fork destination already exists: {destination}",
+        }
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copytree(source_dir, destination)
+        _make_tree_user_writable(destination)
+        rewrite_error = _rewrite_fork_name(destination / "SKILL.md", new_name)
+        if rewrite_error:
+            shutil.rmtree(destination, ignore_errors=True)
+            return {"success": False, "error": rewrite_error}
+        scan_error = _security_scan_skill(destination)
+        if scan_error:
+            shutil.rmtree(destination, ignore_errors=True)
+            return {"success": False, "error": scan_error}
+    except Exception as exc:
+        shutil.rmtree(destination, ignore_errors=True)
+        return {"success": False, "error": f"Could not fork system skill: {exc}"}
+
+    return {
+        "success": True,
+        "message": f"Forked '{source}' as custom skill '{new_name}'.",
+        "source": canonical_skill_id(source_dir, _skills_dir()),
+        "path": canonical_skill_id(destination, _skills_dir()),
+        "skill_id": canonical_skill_id(destination, _skills_dir()),
+        "category": category,
+    }
 
 
 def _edit_skill(name: str, content: str) -> Dict[str, Any]:
@@ -946,6 +1112,9 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    immutable = _immutable_skill_error(name, existing["path"], "edit")
+    if immutable:
+        return immutable
     guard = _background_review_write_guard(name, existing["path"], "edit")
     if guard:
         return guard
@@ -981,7 +1150,8 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     result = {
         "success": True,
         "message": f"Skill '{name}' updated (full rewrite).",
-        "path": str(existing["path"]),
+        "path": canonical_skill_id(existing["path"], _skills_dir()),
+        "skill_id": canonical_skill_id(existing["path"], _skills_dir()),
         "_change": {"description": _desc},
     }
     _add_description_prompt_preview(result, content)
@@ -1010,6 +1180,9 @@ def _patch_skill(
         return {"success": False, "error": _skill_not_found_error(name)}
 
     skill_dir = existing["path"]
+    immutable = _immutable_skill_error(name, skill_dir, "patch")
+    if immutable:
+        return immutable
     guard = _background_review_write_guard(name, skill_dir, "patch")
     if guard:
         return guard
@@ -1092,6 +1265,7 @@ def _patch_skill(
     result = {
         "success": True,
         "message": f"Patched {'SKILL.md' if not file_path else file_path} in skill '{name}' ({match_count} replacement{'s' if match_count > 1 else ''}).",
+        "skill_id": canonical_skill_id(skill_dir, _skills_dir()),
     }
     # Include change previews for verbose notifications
     result["_change"] = {
@@ -1116,6 +1290,9 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    immutable = _immutable_skill_error(name, existing["path"], "delete")
+    if immutable:
+        return immutable
     guard = _background_review_write_guard(name, existing["path"], "delete")
     if guard:
         return guard
@@ -1187,7 +1364,12 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
         message = f"Skill '{name}' archived ({archive_msg})."
         if is_consolidation:
             message += f" Content absorbed into '{absorbed_target}'."
-        return {"success": True, "message": message, "_archived": True}
+        return {
+            "success": True,
+            "message": message,
+            "skill_id": canonical_skill_id(skill_dir, _skills_dir()),
+            "_archived": True,
+        }
 
     shutil.rmtree(skill_dir)
 
@@ -1203,6 +1385,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     return {
         "success": True,
         "message": message,
+        "skill_id": canonical_skill_id(skill_dir, _skills_dir()),
     }
 
 
@@ -1233,6 +1416,9 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name, " Create it first with action='create'.")}
+    immutable = _immutable_skill_error(name, existing["path"], "write a file in")
+    if immutable:
+        return immutable
     guard = _background_review_write_guard(name, existing["path"], "write_file")
     if guard:
         return guard
@@ -1264,7 +1450,8 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     return {
         "success": True,
         "message": f"File '{file_path}' written to skill '{name}'.",
-        "path": str(target),
+        "path": f"{canonical_skill_id(existing['path'], _skills_dir())}/{file_path}",
+        "skill_id": canonical_skill_id(existing["path"], _skills_dir()),
     }
 
 
@@ -1279,6 +1466,9 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
         return {"success": False, "error": _skill_not_found_error(name)}
 
     skill_dir = existing["path"]
+    immutable = _immutable_skill_error(name, skill_dir, "remove a file from")
+    if immutable:
+        return immutable
     guard = _background_review_write_guard(name, skill_dir, "remove_file")
     if guard:
         return guard
@@ -1318,6 +1508,7 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     return {
         "success": True,
         "message": f"File '{file_path}' removed from skill '{name}'.",
+        "skill_id": canonical_skill_id(skill_dir, _skills_dir()),
     }
 
 
@@ -1338,7 +1529,15 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     write should NOT proceed (blocked or staged), or None to perform the real
     write. Bypassed during approved-pending replay.
     """
-    if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
+    if action not in {
+        "create",
+        "fork",
+        "edit",
+        "patch",
+        "delete",
+        "write_file",
+        "remove_file",
+    }:
         return None
     if _skill_gate_bypass.get():
         return None
@@ -1381,6 +1580,7 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
         return skill_manage(
             action=payload.get("action", ""),
             name=payload.get("name", ""),
+            new_name=payload.get("new_name"),
             content=payload.get("content"),
             category=payload.get("category"),
             file_path=payload.get("file_path"),
@@ -1397,6 +1597,7 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
 def skill_manage(
     action: str,
     name: str,
+    new_name: str = None,
     content: str = None,
     category: str = None,
     file_path: str = None,
@@ -1420,7 +1621,7 @@ def skill_manage(
     # (default) passes straight through. The gate is bypassed when this call is
     # itself replaying an already-approved staged write (_skill_apply_pending).
     gate_result = _apply_skill_write_gate(
-        action, name, content=content, category=category,
+        action, name, new_name=new_name, content=content, category=category,
         file_path=file_path, file_content=file_content,
         old_string=old_string, new_string=new_string,
         replace_all=replace_all, absorbed_into=absorbed_into,
@@ -1432,6 +1633,14 @@ def skill_manage(
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
         result = _create_skill(name, content, category)
+
+    elif action == "fork":
+        if not new_name:
+            return tool_error(
+                "new_name is required for 'fork'. System forks must have a distinct custom name.",
+                success=False,
+            )
+        result = _fork_system_skill(name, new_name, category)
 
     elif action == "edit":
         if not content:
@@ -1461,7 +1670,10 @@ def skill_manage(
         result = _remove_file(name, file_path)
 
     else:
-        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+        result = {
+            "success": False,
+            "error": f"Unknown action '{action}'. Use: create, fork, edit, patch, delete, write_file, remove_file",
+        }
 
     if result.get("success"):
         try:
@@ -1475,7 +1687,7 @@ def skill_manage(
         # as /<command> and reflected by GET /v1/skills — without it, a just-created
         # skill comes back command=null and can't be invoked until the gateway
         # restarts. (write_file/remove_file touch only supporting files, not names.)
-        if action in {"create", "edit", "patch", "delete"}:
+        if action in {"create", "fork", "edit", "patch", "delete"}:
             try:
                 from agent.skill_commands import scan_skill_commands
                 scan_skill_commands()
@@ -1495,17 +1707,19 @@ def skill_manage(
         try:
             from tools.skill_usage import bump_patch, forget, mark_agent_created
             from tools.skill_provenance import is_background_review
-            if action == "create":
+
+            usage_id = str(result.get("skill_id") or new_name or name)
+            if action in {"create", "fork"}:
                 if is_background_review():
-                    mark_agent_created(name)
+                    mark_agent_created(usage_id)
             elif action in {"patch", "edit", "write_file", "remove_file"}:
-                bump_patch(name)
+                bump_patch(usage_id)
             elif action == "delete":
                 # A recoverable curator archive (routed through archive_skill)
                 # keeps its usage record as STATE_ARCHIVED so `hermes curator
                 # status`/`restore` still see it. Only a hard delete forgets.
                 if not result.get("_archived"):
-                    forget(name)
+                    forget(usage_id)
         except Exception:
             pass
 
@@ -1521,8 +1735,10 @@ SKILL_MANAGE_SCHEMA = {
     "description": (
         "Manage skills (create, update, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
-        f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
-        "Actions: create (full SKILL.md + optional category), "
+        f"New skills go to {display_hermes_home()}/skills/custom/ in split installations. "
+        "Only custom skills are mutable; system skills require an explicit user-requested fork.\n\n"
+        "Actions: create (full SKILL.md + optional nested category), "
+        "fork (copy an immutable system skill into custom; only after an explicit user request), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "
         "delete, write_file, remove_file.\n\n"
@@ -1557,8 +1773,16 @@ SKILL_MANAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
-                "description": "The action to perform."
+                "enum": [
+                    "create",
+                    "fork",
+                    "patch",
+                    "edit",
+                    "delete",
+                    "write_file",
+                    "remove_file",
+                ],
+                "description": "The action to perform.",
             },
             "name": {
                 "type": "string",
@@ -1566,6 +1790,13 @@ SKILL_MANAGE_SCHEMA = {
                     "Skill name (lowercase, hyphens/underscores, max 64 chars). "
                     "Must match an existing skill for patch/edit/delete/write_file/remove_file."
                 )
+            },
+            "new_name": {
+                "type": "string",
+                "description": (
+                    "Distinct custom skill name required for action='fork'. The source system "
+                    "skill stays unchanged. Use fork only when the user explicitly requests it."
+                ),
             },
             "content": {
                 "type": "string",
@@ -1597,10 +1828,10 @@ SKILL_MANAGE_SCHEMA = {
             "category": {
                 "type": "string",
                 "description": (
-                    "Optional category/domain for organizing the skill (e.g., 'devops', "
-                    "'data-science', 'mlops'). Creates a subdirectory grouping. "
-                    "Only used with 'create'."
-                )
+                    "Optional nested category/domain (e.g., 'toolkit/content'). "
+                    "Every slash-separated segment is validated. Used with 'create' "
+                    "and 'fork'."
+                ),
             },
             "file_path": {
                 "type": "string",
@@ -1645,6 +1876,7 @@ registry.register(
     handler=lambda args, **kw: skill_manage(
         action=args.get("action", ""),
         name=args.get("name", ""),
+        new_name=args.get("new_name"),
         content=args.get("content"),
         category=args.get("category"),
         file_path=args.get("file_path"),
