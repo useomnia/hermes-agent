@@ -209,6 +209,40 @@ class TestGetCategoryFromPath:
             skill_md.touch()
             assert _get_category_from_path(skill_md) == "mlops"
 
+    def test_nested_category_returns_the_whole_path(self, tmp_path):
+        # A multi-level tree groups by the category a user sees, not by the
+        # top-level set that every skill in the tree shares.
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_md = tmp_path / "marketing" / "audits" / "site-audit" / "SKILL.md"
+            skill_md.parent.mkdir(parents=True)
+            skill_md.touch()
+            assert _get_category_from_path(skill_md) == "marketing/audits"
+
+    def test_agrees_with_the_category_the_system_prompt_advertises(self, tmp_path):
+        # `skills_list` filters categories by exact match, and the names the
+        # agent has to filter on are the ones the system prompt showed it. The
+        # two derivations disagreeing is a skills_list call that silently
+        # returns nothing, so pin them against each other rather than trusting
+        # two copies of the same rule to stay in step.
+        #
+        # Only skills that sit IN a category are pinned. A skill at the skills
+        # root diverges: `_build_snapshot_entry` reports its own directory name
+        # as its category, where this returns None. That predates the nested
+        # tree and is left alone here — a root skill has no category to filter
+        # on either way, so it cannot produce the empty-filter failure above.
+        from agent.prompt_builder import _build_snapshot_entry
+
+        for rel in ("marketing/audits/site-audit", "mlops/axolotl"):
+            skill_md = tmp_path / rel / "SKILL.md"
+            skill_md.parent.mkdir(parents=True)
+            skill_md.touch()
+
+            entry = _build_snapshot_entry(skill_md, tmp_path, {}, "")
+            with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+                listed = _get_category_from_path(skill_md)
+
+            assert listed == entry["category"], rel
+
     def test_uncategorized_skill(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             skill_md = tmp_path / "my-skill" / "SKILL.md"
