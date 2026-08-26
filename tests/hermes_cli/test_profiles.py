@@ -237,6 +237,27 @@ class TestCreateProfile:
         assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert cloned_config["model"]["provider"] == "openrouter"
 
+    def test_clone_config_migration_preserves_split_skill_layout(self, profile_env):
+        """A managed deployment's ownership boundary survives profile clone.
+
+        Omnio clones its release config into every Brand profile. The clone is
+        then migrated from the deployment's pinned schema version to the
+        running Hermes schema, so ``skills.source_layout`` must be a recognized
+        non-default setting rather than getting stripped as an unknown default.
+        """
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        (default_home / "config.yaml").write_text(
+            "_config_version: 25\nskills:\n  source_layout: split\n",
+            encoding="utf-8",
+        )
+
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+        cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+
+        assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        assert cloned_config["skills"]["source_layout"] == "split"
+
     def test_clone_config_copies_source_skills(self, profile_env):
         tmp_path = profile_env
         default_home = tmp_path / ".hermes"

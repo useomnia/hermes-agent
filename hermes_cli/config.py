@@ -2531,6 +2531,15 @@ DEFAULT_CONFIG = {
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
     # always goes to ~/.hermes/skills/.
     "skills": {
+        # Filesystem ownership policy for local skills. ``legacy`` preserves
+        # the historical flat layout for existing Hermes installs. Managed
+        # deployments can opt into structurally separated, immutable system
+        # skills and mutable custom skills with ``source_layout: split``.
+        # This key must live in DEFAULT_CONFIG even though legacy is the
+        # default: config migrations strip values unknown to the schema, which
+        # would otherwise silently remove a deployment's explicit split mode
+        # when cloning an older profile config.
+        "source_layout": "legacy",
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
