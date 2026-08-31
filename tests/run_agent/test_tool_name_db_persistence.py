@@ -43,3 +43,27 @@ def test_tool_name_persisted_to_session_db():
     ]
     assert len(tool_appends) == 1
     assert tool_appends[0].kwargs["tool_name"] == "terminal"
+
+
+def test_effect_disposition_persisted_to_session_db():
+    """The flush path must carry the no-effect marker into Hermes state.db."""
+    session_db = MagicMock()
+    agent = _make_agent(session_db)
+
+    messages = [
+        {"role": "user", "content": "send the draft"},
+        make_tool_result_message(
+            "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT",
+            '{"status":"approval_denied","error":"It was NOT performed."}',
+            "c1",
+            effect_disposition="none",
+        ),
+    ]
+    agent._flush_messages_to_session_db(messages)
+
+    tool_appends = [
+        c for c in session_db.append_message.call_args_list
+        if c.kwargs.get("role") == "tool"
+    ]
+    assert len(tool_appends) == 1
+    assert tool_appends[0].kwargs["effect_disposition"] == "none"

@@ -15,6 +15,7 @@ from tools.tool_approval import (
     APPROVAL_OPTIONS,
     CREDIT_APPROVAL_OPTION_SCOPES,
     CREDIT_APPROVAL_OPTIONS,
+    ToolApprovalDenial,
     _always_approved,
     _decisions,
     _injected_always_approved,
@@ -167,6 +168,7 @@ class TestMaybeRequireToolApproval:
         result = maybe_require_tool_approval(GATED, "call-1")
         assert result is not None
         assert "not performed" in result.lower()
+        assert isinstance(result, ToolApprovalDenial)
         # Machine-readable status: an explicit deny is NOT turn-ending — the
         # agent continues and reports the denial inline.
         assert json.loads(result)["status"] == "approval_denied"
@@ -179,6 +181,7 @@ class TestMaybeRequireToolApproval:
         assert result is not None
         parsed = json.loads(result)
         assert parsed["status"] == "approval_skipped"
+        assert isinstance(result, ToolApprovalDenial)
         assert "sending a new message instead" in parsed["error"]
         assert "arrives as the next user turn" in parsed["error"]
         assert "address their new message instead" in parsed["error"]
@@ -206,6 +209,7 @@ class TestMaybeRequireToolApproval:
         result = maybe_require_tool_approval(GATED, "call-1")
         assert result is not None
         assert "approval" in result.lower()
+        assert isinstance(result, ToolApprovalDenial)
         # No surface at all → NOT the turn-ending status: interrupting a
         # headless run on its first gated write would be wrong (there was
         # never anyone who could have answered in time).
@@ -218,6 +222,7 @@ class TestMaybeRequireToolApproval:
         assert result is not None
         # A genuine timeout with a real interactive surface IS turn-ending.
         assert json.loads(result)["status"] == "approval_no_response"
+        assert isinstance(result, ToolApprovalDenial)
         assert (
             consume_tool_approval_completion_reason(SESSION, "call-1") == "expired"
         )
@@ -233,6 +238,7 @@ class TestMaybeRequireToolApproval:
         result = maybe_require_tool_approval(GATED, "call-1")
         assert result is not None
         assert json.loads(result)["status"] == "approval_error"
+        assert isinstance(result, ToolApprovalDenial)
 
     def test_should_surface_the_interaction_with_options_and_scopes(self):
         captured = {}
@@ -522,6 +528,7 @@ class TestCreditApprovalDispatch:
         )
 
         assert json.loads(result)["status"] == "approval_denied"
+        assert isinstance(result, ToolApprovalDenial)
         assert dispatched == []
 
     def test_should_not_execute_the_call_when_skipped(self, monkeypatch):
@@ -544,6 +551,7 @@ class TestCreditApprovalDispatch:
         )
 
         assert json.loads(result)["status"] == "approval_skipped"
+        assert isinstance(result, ToolApprovalDenial)
         assert dispatched == []
 
     def test_should_fail_closed_without_dispatch_when_the_gate_raises(
@@ -573,6 +581,7 @@ class TestCreditApprovalDispatch:
         )
 
         assert json.loads(result)["status"] == "approval_error"
+        assert isinstance(result, ToolApprovalDenial)
         assert dispatched == []
 
 class TestAlwaysScope:
