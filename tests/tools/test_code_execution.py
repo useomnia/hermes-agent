@@ -780,6 +780,12 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
         self.assertIn("shell_quote", desc)
         self.assertIn("retry", desc)
 
+    def test_description_routes_independent_mcp_reads_to_normal_calls(self):
+        description = build_execute_code_schema()["description"]
+        self.assertIn("not as a latency optimization", description)
+        self.assertIn("independent read-only MCP calls", description)
+        self.assertIn("normal tool calls so Hermes can parallelize them", description)
+
     def test_none_defaults_to_all_tools(self):
         schema_none = build_execute_code_schema(None)
         schema_all = build_execute_code_schema(SANDBOX_ALLOWED_TOOLS)

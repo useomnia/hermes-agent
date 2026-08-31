@@ -692,6 +692,24 @@ mcp_servers:
 
 When `supports_parallel_tool_calls` is `true`, Hermes may execute multiple tools from that server at the same time within a single tool-call batch, just like it does for built-in read-only tools (web_search, read_file, etc.).
 
+For a mixed read/write HTTP server, prefer the narrower read-only opt-in:
+
+```yaml
+mcp_servers:
+  omnia:
+    url: "https://example.com/mcp"
+    supports_parallel_read_tool_calls: true
+    parallel_read_tool_call_limit: 4
+    sampling: {enabled: false}
+    elicitation: {enabled: false}
+```
+
+This admits only tools that advertise `readOnlyHint: true`; missing or false
+annotations, writes, and stdio servers remain serialized. The read limit
+defaults to 4 and is hard-capped at 8. Sampling and elicitation must be
+explicitly disabled because their callbacks use per-call context that cannot
+be shared by concurrent requests.
+
 :::caution
 Only enable parallel calls for MCP servers whose tools are safe to run at the same time. If tools read and write shared state, files, databases, or external resources, review the read/write race conditions before enabling this setting.
 :::

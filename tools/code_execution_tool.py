@@ -2366,6 +2366,9 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
 
     description = (
         "Run a Python script that can call your tools programmatically. "
+        "Use this for programmatic processing, control flow, or context reduction "
+        "across tool calls — not as a latency optimization. For several independent "
+        "read-only MCP calls, emit normal tool calls so Hermes can parallelize them. "
         "Use this when you need 3+ tool calls with processing logic between them, "
         "need to filter/reduce large tool outputs before they enter your context, "
         "need conditional branching (if X then Y else Z), or need to loop "
