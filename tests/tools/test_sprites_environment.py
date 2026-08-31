@@ -1,4 +1,5 @@
 import json
+import uuid
 from typing import cast
 
 
@@ -100,6 +101,7 @@ def test_sprites_environment_should_send_exec_to_toolbox():
         retry_exec_predispatch=False,
         retry_deadline_seconds=None,
         cancel_event=None,
+        request_id=None,
     ):
         calls.append(
             {
@@ -110,6 +112,7 @@ def test_sprites_environment_should_send_exec_to_toolbox():
                 "retry_exec_predispatch": retry_exec_predispatch,
                 "retry_deadline_seconds": retry_deadline_seconds,
                 "cancel_event": cancel_event is not None,
+                "request_id": request_id,
             }
         )
         return {"output": "ok\n", "returncode": 0}
@@ -119,23 +122,73 @@ def test_sprites_environment_should_send_exec_to_toolbox():
 
     assert handle.wait(timeout=2) == 0
     assert handle.stdout.read() == "ok\n"
-    assert calls == [
-        {
-            "path": "/exec",
-            "payload": {
-                "command": "echo ok",
-                "cwd": "/brand",
-                "login": False,
-                "stdin": "payload",
-                "timeoutSeconds": 9,
-            },
-            "timeout": 14,
-            "method": "POST",
-            "retry_exec_predispatch": True,
-            "retry_deadline_seconds": 9,
-            "cancel_event": True,
-        }
-    ]
+    assert len(calls) == 1
+    assert calls[0] == {
+        "path": "/exec",
+        "payload": {
+            "command": "echo ok",
+            "cwd": "/brand",
+            "login": False,
+            "stdin": "payload",
+            "timeoutSeconds": 9,
+        },
+        "timeout": 14,
+        "method": "POST",
+        "retry_exec_predispatch": True,
+        "retry_deadline_seconds": 9,
+        "cancel_event": True,
+        "request_id": calls[0]["request_id"],
+    }
+    assert str(uuid.UUID(calls[0]["request_id"])) == calls[0]["request_id"]
+
+
+def test_sprites_environment_kill_should_cancel_exact_toolbox_exec():
+    import threading
+
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.cwd = "/brand"
+    env.timeout = 60
+    env.toolbox_url = "https://toolbox.example"
+    env.bearer_token = "pair-secret"
+    env.brand = "brand-123"
+    exec_started = threading.Event()
+    cancellation_seen = threading.Event()
+    calls = []
+
+    def fake_request(
+        path,
+        payload=None,
+        *,
+        timeout=None,
+        method="POST",
+        retry_exec_predispatch=False,
+        retry_deadline_seconds=None,
+        cancel_event=None,
+        request_id=None,
+    ):
+        calls.append((path, request_id, timeout))
+        if path == "/exec":
+            exec_started.set()
+            assert cancellation_seen.wait(timeout=2)
+            return {"output": "[Command interrupted]", "returncode": 130}
+        assert path == "/exec/cancel"
+        cancellation_seen.set()
+        return {"status": "cancellation_requested", "active": True}
+
+    env._request_json = fake_request
+    handle = env._run_bash("sleep 20", timeout=30)
+    assert exec_started.wait(timeout=2)
+
+    handle.kill()
+
+    assert handle.wait(timeout=2) == 130
+    assert handle.stdout.read() == "[Command interrupted]"
+    assert calls[0][0] == "/exec"
+    assert calls[1][0] == "/exec/cancel"
+    assert calls[0][1] == calls[1][1]
+    assert calls[1][2] == 5
 
 
 def test_sprites_execute_forwards_effective_cwd_when_shared_env_is_stale():
@@ -400,13 +453,19 @@ def test_sprites_request_should_send_bearer_and_brand_headers(monkeypatch):
 
     monkeypatch.setattr(sprites_module._URL_OPENER, "open", fake_urlopen)
 
-    response = env._request_json("/health", {"ping": True}, timeout=5)
+    response = env._request_json(
+        "/health",
+        {"ping": True},
+        timeout=5,
+        request_id="request-123",
+    )
 
     assert response == {"ok": True}
     assert captured["url"] == "https://toolbox.example/health"
     assert captured["timeout"] == 5
     assert captured["headers"]["Authorization"] == "Bearer pair-secret"
     assert captured["headers"]["X-omnio-brand"] == "brand-123"
+    assert captured["headers"]["X-request-id"] == "request-123"
     assert json.loads(captured["body"]) == {"ping": True}
 
 
@@ -801,10 +860,24 @@ def test_sprites_exec_should_stop_retrying_when_handle_is_killed(monkeypatch):
     env.brand = "brand-123"
     env.timeout = 60
     attempts = 0
+    cancel_calls = 0
     first_attempt = threading.Event()
 
+    class FakeCancelResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, _limit):
+            return b'{"status":"cancellation_requested","active":true}'
+
     def fake_open(request, timeout):
-        nonlocal attempts
+        nonlocal attempts, cancel_calls
+        if request.full_url.endswith("/exec/cancel"):
+            cancel_calls += 1
+            return FakeCancelResponse()
         attempts += 1
         first_attempt.set()
         body = json.dumps(
@@ -834,6 +907,7 @@ def test_sprites_exec_should_stop_retrying_when_handle_is_killed(monkeypatch):
 
     assert handle.wait(timeout=1) == 1
     assert attempts == 1
+    assert cancel_calls == 1
 
 
 def test_sprites_exec_should_not_retry_unsafe_http_errors(monkeypatch):
