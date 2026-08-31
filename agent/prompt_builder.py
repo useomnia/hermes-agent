@@ -1354,7 +1354,11 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 2
+# Bump whenever the meaning of a snapshot field changes. The manifest only
+# catches SKILL.md/DESCRIPTION.md mtime and size changes, so a change to how an
+# entry is DERIVED leaves an existing snapshot looking valid and serving the old
+# values indefinitely.
+_SKILLS_SNAPSHOT_VERSION = 3
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1453,12 +1457,15 @@ def _build_snapshot_entry(
     """Build a serialisable metadata dict for one skill."""
     rel_path = skill_file.relative_to(skills_dir)
     parts = rel_path.parts
-    if len(parts) >= 2:
-        skill_name = parts[-2]
-        category = "/".join(parts[:-2]) if len(parts) > 2 else parts[0]
-    else:
-        category = "general"
-        skill_name = skill_file.parent.name
+    # Every directory between the skills root and the skill's own directory is
+    # the category, joined with "/" — the same derivation as
+    # tools.skills_tool._get_category_from_path, which the skills_list filter
+    # matches against. A skill sitting at the root has no category directory, so
+    # it falls in the "general" bucket (the name the category DESCRIPTION.md
+    # lookup below already uses for the root) rather than becoming a category
+    # named after itself.
+    category = "/".join(parts[:-2]) or "general"
+    skill_name = parts[-2] if len(parts) >= 2 else skill_file.parent.name
 
     platforms = frontmatter.get("platforms") or []
     if isinstance(platforms, str):

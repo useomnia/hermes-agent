@@ -12,6 +12,7 @@
 import { expect, test, type Page } from '@playwright/test'
 
 import {
+  approvePendingCommand,
   type MockBackendFixture,
   setupMockBackend,
   waitForAppReady,
@@ -210,6 +211,18 @@ test.describe('sidebar states — cross-session dot transition', () => {
     await composer.click()
     await composer.type('E2E_SIDEBAR_CROSS', { delay: 20 })
     await page.keyboard.press('Enter')
+
+    // Wait for the user's message before resolving the command-guard prompt.
+    await page.waitForFunction(
+      () => (document.body.textContent ?? '').includes('E2E_SIDEBAR_CROSS'),
+      undefined,
+      { timeout: 15_000 },
+    )
+
+    // The held sentinel command is intentionally compound, so the real
+    // command guard asks for approval before it can start. Resolve that
+    // user-facing event before observing the background process state.
+    await approvePendingCommand(page, `[aria-label="${BG_DOT_LABEL}"]`)
 
     // Wait for the background dot to appear.
     await expect

@@ -570,7 +570,19 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     """
     Extract category from skill path based on directory structure.
 
-    For paths like: ~/.hermes/skills/mlops/axolotl/SKILL.md -> "mlops"
+    The category is every directory between the skills root and the skill's own
+    directory, joined with "/". A single level behaves as it always has:
+
+        ~/.hermes/skills/mlops/axolotl/SKILL.md          -> "mlops"
+        ~/.hermes/skills/marketing/audits/site-audit/... -> "marketing/audits"
+        ~/.hermes/skills/my-skill/SKILL.md               -> None
+
+    This must agree with the category the system prompt advertises, which
+    `agent.prompt_builder` derives the same way. `skills_list` filters on an
+    exact match, so a first-segment category would collapse every skill in a
+    multi-level tree under its top directory and make a filter on the category
+    name the prompt showed return nothing.
+
     Also works for external skill dirs configured via skills.external_dirs.
     """
     # Try the active profile skills dir first (respects monkeypatching in tests),
@@ -585,8 +597,9 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
         try:
             rel_path = skill_path.relative_to(skills_dir)
             parts = rel_path.parts
+            # parts[-1] is the file, parts[-2] the skill's own directory.
             if len(parts) >= 3:
-                return parts[0]
+                return "/".join(parts[:-2])
         except ValueError:
             continue
     return None
