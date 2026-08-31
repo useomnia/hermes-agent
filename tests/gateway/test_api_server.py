@@ -1116,7 +1116,9 @@ class TestHealthDetailedEndpoint:
             "active_agents": 2,
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
-        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
+        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"), patch(
+            "gateway.readiness._probe_disk", return_value={"status": "ok"}
+        ):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
@@ -1384,6 +1386,12 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["run_turn_idempotency"] == {"apiVersion": 1}
+            assert data["features"]["omnio_quiescence"] == {
+                "apiVersion": 1,
+                "atomicWriterSnapshot": True,
+                "forceCancel": True,
+            }
             assert data["features"]["model_options"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"

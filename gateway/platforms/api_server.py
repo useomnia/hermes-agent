@@ -115,6 +115,12 @@ from gateway.turn_event_log import (
     TurnEventLogStore,
     UnknownRunError,
 )
+from gateway.run_idempotency import (
+    RunIdempotencyMismatch,
+    RunIdempotencyRecord,
+    RunIdempotencyStore,
+    request_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +134,9 @@ _OMNIO_TURN_FINALIZE_TIMEOUT_ENV = "OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS"
 # The hook may persist deliverables to durable storage before returning, so its
 # budget covers uploads, not just the path scan.
 _OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS = 30.0
+_OMNIO_QUIESCENCE_DEFAULT_FORCE_TIMEOUT_SECONDS = 30.0
+_OMNIO_QUIESCENCE_MAX_FORCE_TIMEOUT_SECONDS = 120.0
+_OMNIO_QUIESCENCE_OBJECT = "hermes.gateway.quiescence"
 
 
 def _boot_mark(name: str) -> None:
@@ -1106,6 +1115,55 @@ _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextV
 )
 
 
+class _APIExecutorLease:
+    """Track an API worker after its asyncio owner has been cancelled.
+
+    ``run_in_executor`` cancellation only detaches the asyncio future; it
+    cannot stop a worker which already entered a blocking agent call.  The
+    normal request/run counters are intentionally released when their async
+    owner unwinds, so keep a separate lease for that detached worker.  The
+    lease is published before the worker invokes user/provider code and is
+    removed only after the worker has returned.
+    """
+
+    __slots__ = ("adapter", "lock", "started", "finished", "cancelled")
+
+    def __init__(self, adapter: "APIServerAdapter") -> None:
+        self.adapter = adapter
+        self.lock = threading.Lock()
+        self.started = False
+        self.finished = False
+        self.cancelled = False
+
+    def _retain_if_detached(self) -> None:
+        with self.adapter._detached_api_work_lock:
+            self.adapter._detached_api_work.add(self)
+
+    def run(self, func):
+        with self.lock:
+            self.started = True
+            cancelled = self.cancelled
+        # If cancellation won the race before this executor thread started,
+        # publish ownership before invoking the blocking function.  A worker
+        # which never starts remains cancellable and needs no lease.
+        if cancelled:
+            self._retain_if_detached()
+        try:
+            return func()
+        finally:
+            with self.lock:
+                self.finished = True
+            with self.adapter._detached_api_work_lock:
+                self.adapter._detached_api_work.discard(self)
+
+    def mark_cancelled(self) -> None:
+        with self.lock:
+            self.cancelled = True
+            should_retain = self.started and not self.finished
+        if should_retain:
+            self._retain_if_detached()
+
+
 def _admit_api_agent_request(handler):
     """Reserve an authenticated API turn before its handler first awaits.
 
@@ -1121,12 +1179,28 @@ def _admit_api_agent_request(handler):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-        draining = self._draining_response()
-        if draining is not None:
-            return draining
-        reservation = {"active": True}
-        token = _api_agent_request_reservation.set(reservation)
-        self._pending_agent_requests += 1
+        # Keep the force-quiescence admission check and request reservation in
+        # one synchronous critical section. A graceful snapshot takes the same
+        # lock, so it cannot return zero in the handoff between checking the
+        # gate and publishing this request's reservation.
+        admission_lock = getattr(self, "_quiescence_lock", None)
+        with admission_lock if admission_lock is not None else nullcontext():
+            draining = self._draining_response()
+            # A completion wake already emitted by an admitted child must be
+            # allowed to drain while force mode is still proving zero. The
+            # wake carries the API key plus this narrow marker; it is never
+            # accepted once force mode has latched or while normal gateway
+            # shutdown/external drain is active.
+            force_wake = bool(
+                getattr(self, "_quiescence_force_in_progress", False)
+                and not self._gateway_is_draining()
+                and request.headers.get("X-Hermes-Internal-Wake") == "1"
+            )
+            if draining is not None and not force_wake:
+                return draining
+            reservation = {"active": True}
+            token = _api_agent_request_reservation.set(reservation)
+            self._pending_agent_requests += 1
         try:
             return await handler(self, request, *args, **kwargs)
         finally:
@@ -1134,6 +1208,32 @@ def _admit_api_agent_request(handler):
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
             _api_agent_request_reservation.reset(token)
+
+    return _wrapped
+
+
+def _admit_api_control_request(handler):
+    """Keep external control writes visible while the gateway drains.
+
+    Approval, steering, user-input, and reload endpoints are not agent-entry
+    routes, but they can still mutate or prolong writer-owned work.  They must
+    share the same reservation fence as agent requests so force quiescence
+    cannot snapshot zero between the drain check and the handler's first
+    await.  The explicit stop/cancel endpoints intentionally do not use this
+    decorator: they are the cooperative escape hatch during a force drain.
+    """
+    @wraps(handler)
+    async def _wrapped(self, request, *args, **kwargs):
+        # Authenticate before taking a shared pending-work slot.  Otherwise a
+        # flood of unauthenticated control requests could hold reservations
+        # across body parsing and make a graceful/force proof appear busy.
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        with _reserve_pending_api_work(self) as reservation:
+            if reservation.get("blocked"):
+                return self._draining_response()
+            return await handler(self, request, *args, **kwargs)
 
     return _wrapped
 
@@ -1152,8 +1252,16 @@ def _reserve_pending_api_work(adapter):
     A handler can detach the reservation to an asyncio task; its done callback
     then owns release so shutdown cannot miss the handoff to background work.
     """
-    reservation = {"active": True, "detached": False}
-    adapter._pending_agent_requests += 1
+    admission_lock = getattr(adapter, "_quiescence_lock", None)
+    with admission_lock if admission_lock is not None else nullcontext():
+        blocked = bool(
+            getattr(adapter, "_quiescence_force_latched", False)
+            or getattr(adapter, "_quiescence_force_in_progress", False)
+            or adapter._gateway_is_draining()
+        )
+        reservation = {"active": not blocked, "detached": False, "blocked": blocked}
+        if not blocked:
+            adapter._pending_agent_requests += 1
     try:
         yield reservation
     finally:
@@ -1226,7 +1334,9 @@ class _IdempotencyCache:
         while len(self._store) > self._max:
             self._store.popitem(last=False)
 
-    async def get_or_set(self, key: str, fingerprint: str, compute_coro):
+    async def get_or_set(
+        self, key: str, fingerprint: str, compute_coro, *, task_registry=None
+    ):
         self._purge()
         item = self._store.get(key)
         if item and item["fp"] == fingerprint:
@@ -1244,12 +1354,20 @@ class _IdempotencyCache:
 
             task = asyncio.create_task(_compute_and_store())
             self._inflight[inflight_key] = task
+            if task_registry is not None:
+                # The cache task is shielded from a disconnected request and
+                # can therefore outlive the request reservation. Publish it
+                # synchronously, before the event loop can run the coroutine,
+                # so quiescence cannot observe a false zero in that handoff.
+                task_registry.add(task)
 
             def _clear_inflight(done_task: "asyncio.Task[Any]") -> None:
                 if self._inflight.get(inflight_key) is done_task:
                     self._inflight.pop(inflight_key, None)
 
             task.add_done_callback(_clear_inflight)
+            if task_registry is not None:
+                task.add_done_callback(task_registry.discard)
 
         return await asyncio.shield(task)
 
@@ -1421,9 +1539,23 @@ class APIServerAdapter(BasePlatformAdapter):
         self._turn_event_logs = TurnEventLogStore(
             on_cap_exceeded=self._handle_run_log_cap_exceeded,
         )
+        # Durable turn_id → run_id admission. The relation stores only a
+        # request fingerprint and scalar lifecycle state; the request body
+        # remains ephemeral and is never written to state.db.
+        self._run_idempotency = RunIdempotencyStore()
+        # The listener is shared by multiplexed profiles, but each profile
+        # owns a different state.db. Keep the default-profile store injectable
+        # for compatibility/tests and lazily open secondary-profile stores
+        # only while that profile's request scope is active.
+        self._run_idempotency_stores: Dict[str, RunIdempotencyStore] = {}
+        self._run_idempotency_stores_lock = threading.Lock()
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # Detached one-shot work (notably shielded idempotency computations)
+        # may outlive the HTTP request reservation. Keep an explicit owner
+        # set so handover accounting covers its pre-start and running window.
+        self._background_agent_tasks: set["asyncio.Task"] = set()
         # Each run serializes steering with its own lifecycle lock so a slow
         # native steer cannot delay unrelated runs.
         self._run_lifecycles: Dict[str, Dict[str, Any]] = {}
@@ -1474,6 +1606,74 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # A cancelled asyncio owner does not cancel a blocking executor
+        # thread. Such a thread is counted here until its finally block runs;
+        # otherwise force handover can report zero while the worker still
+        # writes through SessionDB/provider callbacks.
+        self._detached_api_work: set[_APIExecutorLease] = set()
+        self._detached_api_work_lock = threading.Lock()
+        # Handover snapshots serialize with synchronous request admission. A
+        # graceful prepare does not latch this lock as a gate; force mode uses
+        # the state below to reject new writer-capable API requests while it
+        # interrupts existing work.
+        self._quiescence_lock = threading.RLock()
+        try:
+            from gateway.quiescence import quiescence_boot_id
+
+            self._quiescence_boot_id = quiescence_boot_id()
+        except Exception:
+            # The fallback is process-local and only used if the optional
+            # handover module cannot load during minimal adapter tests.
+            self._quiescence_boot_id = uuid.uuid4().hex
+        self._quiescence_generation: int = 0
+        self._quiescence_mode: str = "graceful"
+        self._quiescence_force_latched: bool = False
+        self._quiescence_force_in_progress: bool = False
+        self._quiescence_force_boot_id: str = self._quiescence_boot_id
+        self._quiescence_force_request_id: str = ""
+        self._quiescence_force_request_required: bool = False
+        from gateway.quiescence import (
+            offline_quiescence_marker_exists,
+            offline_quiescence_marker_well_formed,
+            read_offline_quiescence_snapshot,
+        )
+
+        previous_quiescence = read_offline_quiescence_snapshot()
+        if offline_quiescence_marker_exists() and (
+            previous_quiescence is None
+            or not offline_quiescence_marker_well_formed(previous_quiescence)
+        ):
+            raise RuntimeError(
+                "Offline quiescence marker is unreadable; refusing API admission"
+            )
+        previous_quiescence = previous_quiescence or {}
+        raw_generation = previous_quiescence.get("generation")
+        if raw_generation is not None:
+            try:
+                self._quiescence_generation = int(raw_generation)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Offline quiescence generation is malformed; refusing API admission"
+                ) from exc
+        if previous_quiescence.get("force_latched"):
+            self._quiescence_force_latched = True
+            self._quiescence_mode = "force"
+            self._quiescence_force_boot_id = str(
+                previous_quiescence.get("force_boot_id")
+                or previous_quiescence.get("boot_id")
+                or self._quiescence_boot_id
+            )
+            self._quiescence_force_request_id = str(
+                previous_quiescence.get("force_request_id") or ""
+            )[:128]
+            self._quiescence_force_request_required = bool(
+                previous_quiescence.get("force_request_required", False)
+            )
+        # Agent references for chat/responses paths (which otherwise only keep
+        # a local ``agent_ref``) so force mode can interrupt every API agent,
+        # not just structured /v1/runs entries.
+        self._active_api_agents: Dict[int, Any] = {}
+        self._active_api_agents_lock = threading.Lock()
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1484,13 +1684,93 @@ class APIServerAdapter(BasePlatformAdapter):
         covers that gap and excludes completed tasks retained until cleanup.
         """
         try:
+            with self._detached_api_work_lock:
+                detached = len(self._detached_api_work)
             return (
                 int(getattr(self, "_pending_agent_requests", 0))
                 + int(self._inflight_agent_runs)
                 + sum(not task.done() for task in self._active_run_tasks.values())
+                + sum(not task.done() for task in self._background_agent_tasks)
+                + detached
             )
         except Exception:
             return 0
+
+    def quiescence_agent_work_count(self) -> int:
+        """Return API work or raise if accounting state is unavailable.
+
+        Operational callers retain the historical fail-soft
+        ``active_agent_work_count`` behavior. Handover proof callers must
+        distinguish an unavailable counter from a genuine zero.
+        """
+        with self._detached_api_work_lock:
+            detached = len(self._detached_api_work)
+        return (
+            int(getattr(self, "_pending_agent_requests", 0))
+            + int(self._inflight_agent_runs)
+            + sum(not task.done() for task in self._active_run_tasks.values())
+            + sum(not task.done() for task in self._background_agent_tasks)
+            + detached
+        )
+
+    def _register_active_api_agent(self, agent: Any) -> None:
+        """Expose an off-loop API agent to force-quiescence interruption."""
+        if agent is None:
+            return
+        try:
+            with self._active_api_agents_lock:
+                self._active_api_agents[id(agent)] = agent
+        except Exception:
+            # Counting/admission remains conservative through _inflight_agent_runs;
+            # an unavailable interrupt registry must not break a user turn.
+            logger.debug("Could not register active API agent", exc_info=True)
+
+    def _unregister_active_api_agent(self, agent: Any) -> None:
+        if agent is None:
+            return
+        try:
+            with self._active_api_agents_lock:
+                self._active_api_agents.pop(id(agent), None)
+        except Exception:
+            logger.debug("Could not unregister active API agent", exc_info=True)
+
+    def interrupt_active_agents(self, reason: str) -> int:
+        """Interrupt every API agent currently executing off the event loop."""
+        try:
+            with self._active_api_agents_lock:
+                agents = list(self._active_api_agents.values())
+        except Exception:
+            agents = []
+
+        interrupted = 0
+        for agent in agents:
+            try:
+                agent.interrupt(reason)
+                interrupted += 1
+            except Exception:
+                logger.debug("Could not interrupt active API agent", exc_info=True)
+
+        # Structured runs expose a task/agent pair even before their agent is
+        # published to the generic registry. Latch their stopping status so a
+        # queued build cannot turn into a successful run after force mode.
+        run_ids = set(getattr(self, "_active_run_tasks", {}) or {})
+        run_ids.update(getattr(self, "_active_run_agents", {}) or {})
+        for run_id in run_ids:
+            if self._interrupt_run(run_id, reason):
+                interrupted += 1
+
+        # Shielded idempotency computations and detached session-stream
+        # workers are not necessarily present in an agent map yet. Cancel
+        # their asyncio ownership explicitly; the quiescence proof still
+        # waits for the task set to settle before reporting zero.
+        for task in tuple(getattr(self, "_background_agent_tasks", ())):
+            try:
+                if not task.done():
+                    task.cancel()
+                    interrupted += 1
+            except Exception:
+                logger.debug("Could not cancel detached API work", exc_info=True)
+        return interrupted
 
     @staticmethod
     def _gateway_is_draining() -> bool:
@@ -1511,12 +1791,22 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _draining_response(self) -> Optional["web.Response"]:
         """Return a retryable response while the gateway drains existing work."""
-        if not self._gateway_is_draining():
+        force_quiescing = bool(
+            getattr(self, "_quiescence_force_latched", False)
+            or getattr(self, "_quiescence_force_in_progress", False)
+        )
+        if not self._gateway_is_draining() and not force_quiescing:
             return None
+        if force_quiescing and not self._gateway_is_draining():
+            message = "Gateway is force-quiescing existing work; retry shortly."
+            code = "gateway_quiescing"
+        else:
+            message = "Gateway is draining existing work; retry shortly."
+            code = "gateway_draining"
         return web.json_response(
             _openai_error(
-                "Gateway is draining existing work; retry shortly.",
-                code="gateway_draining",
+                message,
+                code=code,
             ),
             status=503,
             headers={"Retry-After": "1"},
@@ -1772,6 +2062,18 @@ class APIServerAdapter(BasePlatformAdapter):
         return None
 
     async def _handle_platform_event_callback(self, request: "web.Request") -> "web.Response":
+        """Gate platform callback ingress while the gateway is draining."""
+        # Platform callbacks use the target adapter's platform signature rather
+        # than API_SERVER_KEY, so they cannot use _admit_api_agent_request.
+        # Reserve before the verifier's first await: otherwise force mode can
+        # observe zero after the gate check and a verified callback can still
+        # dispatch a new messaging turn.
+        with _reserve_pending_api_work(self) as reservation:
+            if reservation.get("blocked"):
+                return self._draining_response()
+            return await self._dispatch_platform_event_callback(request)
+
+    async def _dispatch_platform_event_callback(self, request: "web.Request") -> "web.Response":
         platform_name = self._normalize_callback_platform(
             request.match_info.get("platform", "")
         )
@@ -1934,6 +2236,32 @@ class APIServerAdapter(BasePlatformAdapter):
             return "default"
         return None
 
+    def _run_idempotency_store_for_profile(
+        self, profile: Optional[str] = None
+    ) -> RunIdempotencyStore:
+        """Return the durable turn-id store for one served profile.
+
+        ``APIServerAdapter`` is the one port-owning adapter in multiplex mode,
+        so a store captured in ``__init__`` would incorrectly put every
+        ``/p/<profile>/v1/runs`` request in the default profile's relation.
+        The profile name is not part of the primary key: the database itself
+        is the isolation boundary.
+        """
+        profile = profile if profile is not None else self._effective_request_profile()
+        if not profile or profile == "default":
+            return self._run_idempotency
+        with self._run_idempotency_stores_lock:
+            store = self._run_idempotency_stores.get(profile)
+            if store is not None:
+                return store
+            # The request middleware already entered this profile scope. Keep
+            # the explicit scope for status updates/restored retries invoked
+            # from a task whose ContextVar may no longer be at the edge.
+            with self._profile_scope(profile):
+                store = RunIdempotencyStore()
+            self._run_idempotency_stores[profile] = store
+            return store
+
     @staticmethod
     def _scoped_tool_approval_session_key(
         session_id: str,
@@ -2019,6 +2347,14 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
             ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
+            # Authenticated Omnio handover contract. The operation-in-body
+            # route is canonical; explicit aliases keep control-plane clients
+            # simple and make feature detection additive.
+            ("GET", "/v1/omnio/quiescence", self._handle_omnio_quiescence_status),
+            ("POST", "/v1/omnio/quiescence", self._handle_omnio_quiescence),
+            ("GET", "/v1/omnio/quiescence/status", self._handle_omnio_quiescence_status),
+            ("POST", "/v1/omnio/quiescence/prepare", self._handle_omnio_quiescence_prepare),
+            ("POST", "/v1/omnio/quiescence/release", self._handle_omnio_quiescence_release),
             ("POST", "/v1/omnio/tool-approval", self._handle_omnio_tool_approval),
             ("POST", "/v1/omnio/user-input", self._handle_omnio_user_input),
             ("POST", "/v1/mcp/reload", self._handle_mcp_reload),
@@ -2997,6 +3333,587 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
         })
 
+    # ------------------------------------------------------------------
+    # Omnio handover quiescence
+    # ------------------------------------------------------------------
+
+    def _collect_quiescence_snapshot(self) -> Dict[str, Any]:
+        """Read the cross-subsystem writer snapshot at an API admission edge."""
+        from gateway.quiescence import collect_writer_work_snapshot
+
+        lock = getattr(self, "_quiescence_lock", None)
+        with lock if lock is not None else nullcontext():
+            return collect_writer_work_snapshot(
+                adapter=self,
+                runner=getattr(self, "gateway_runner", None),
+            )
+
+    @staticmethod
+    def _quiescence_force_timeout(body: Dict[str, Any]) -> Optional[float]:
+        raw = body.get("timeout_seconds", _OMNIO_QUIESCENCE_DEFAULT_FORCE_TIMEOUT_SECONDS)
+        try:
+            timeout = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if timeout < 0:
+            return None
+        return min(timeout, _OMNIO_QUIESCENCE_MAX_FORCE_TIMEOUT_SECONDS)
+
+    def _quiescence_response(
+        self,
+        *,
+        state: str,
+        mode: str,
+        snapshot: Dict[str, Any],
+        operation: str,
+        request_id: str = "",
+        status: Optional[int] = None,
+        force_errors: Optional[List[str]] = None,
+    ) -> "web.Response":
+        known = bool(snapshot.get("known"))
+        counts = dict(snapshot.get("counts") or {})
+        errors = list(snapshot.get("errors") or [])
+        for error in force_errors or []:
+            if error not in errors:
+                errors.append(error)
+        if errors:
+            known = False
+        body: Dict[str, Any] = {
+            "object": _OMNIO_QUIESCENCE_OBJECT,
+            "operation": operation,
+            "state": state,
+            "mode": mode,
+            "latched": bool(getattr(self, "_quiescence_force_latched", False)),
+            "boot_id": str(
+                getattr(self, "_quiescence_force_boot_id", "")
+                if getattr(self, "_quiescence_force_latched", False)
+                else getattr(self, "_quiescence_boot_id", "")
+            ),
+            "generation": int(getattr(self, "_quiescence_generation", 0)),
+            "known": known,
+            "counts": counts,
+            "total": int(snapshot.get("total") or 0),
+            "observed_at": time.time(),
+        }
+        if request_id:
+            body["request_id"] = request_id
+        if errors:
+            # Names are stable subsystem labels, not exception text; avoid
+            # leaking credentials or filesystem details over the API boundary.
+            body["errors"] = errors
+        if status is None:
+            if state in {"quiescent", "released"}:
+                status = 200
+            elif not known:
+                status = 503
+            else:
+                status = 409
+        return web.json_response(body, status=status)
+
+    def _persist_force_marker(
+        self,
+        snapshot: Dict[str, Any],
+        *,
+        latched: bool,
+        generation: int,
+        force_boot_id: str,
+        force_request_id: str = "",
+        force_request_required: bool = False,
+    ) -> bool:
+        """Write and verify the restart-safe force barrier marker."""
+        try:
+            from gateway.quiescence import (
+                read_offline_quiescence_snapshot,
+                write_offline_quiescence_snapshot,
+            )
+
+            if not write_offline_quiescence_snapshot(
+                snapshot,
+                lifecycle="force_latched" if latched else "running",
+                force_latched=latched,
+                generation=generation,
+                force_boot_id=force_boot_id if latched else None,
+                force_request_id=force_request_id if latched else None,
+                force_request_required=(
+                    force_request_required if latched else False
+                ),
+            ):
+                return False
+            marker = read_offline_quiescence_snapshot() or {}
+            return bool(
+                marker.get("boot_id") == getattr(self, "_quiescence_boot_id", "")
+                and bool(marker.get("force_latched")) is latched
+                and int(marker.get("generation")) == generation
+                and (
+                    not latched
+                    or marker.get("force_boot_id") == force_boot_id
+                )
+                and (
+                    not latched
+                    or marker.get("force_request_id", "") == force_request_id
+                )
+                and (
+                    not latched
+                    or bool(marker.get("force_request_required", False))
+                    == bool(force_request_required)
+                )
+            )
+        except Exception:
+            logger.warning("Could not persist/read back force quiescence marker", exc_info=True)
+            return False
+
+    async def _handle_omnio_quiescence(
+        self, request: "web.Request", *, forced_operation: Optional[str] = None
+    ) -> "web.Response":
+        """Authenticated generic quiescence contract for the Omnio proxy.
+
+        ``prepare`` is a read-only proof: graceful mode never latches a local
+        gate, because pending completion wakes must remain deliverable. Force
+        mode is intentionally stronger and leaves a gate latched on success or
+        failure; callers must explicitly release it after their handover.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        body: Dict[str, Any] = {}
+        if request.method != "GET":
+            try:
+                parsed = await request.json()
+            except Exception:
+                parsed = {}
+            if parsed is None:
+                parsed = {}
+            if not isinstance(parsed, dict):
+                return web.json_response(
+                    _openai_error("Quiescence request body must be an object."),
+                    status=400,
+                )
+            body = parsed
+
+        operation = forced_operation or str(
+            body.get("operation", "prepare")
+        ).strip().lower()
+        if operation not in {"prepare", "status", "release"}:
+            return web.json_response(
+                _openai_error(
+                    "Unknown quiescence operation; expected prepare, status, or release.",
+                    param="operation",
+                ),
+                status=400,
+            )
+        request_id = str(body.get("request_id") or "").strip()[:128]
+        supplied_request_id = bool(request_id)
+
+        if operation == "status":
+            snapshot = self._collect_quiescence_snapshot()
+            force_active = bool(
+                getattr(self, "_quiescence_force_in_progress", False)
+            )
+            force_latched = bool(
+                getattr(self, "_quiescence_force_latched", False)
+            )
+            state = (
+                "quiescent"
+                if snapshot.get("known") and snapshot.get("total", 0) == 0
+                and not force_active and not force_latched
+                else "busy"
+            )
+            mode = "force" if force_active or force_latched else "graceful"
+            return self._quiescence_response(
+                state=state,
+                mode=mode,
+                snapshot=snapshot,
+                operation="status",
+                request_id=request_id,
+            )
+
+        if operation == "release":
+            lock = getattr(self, "_quiescence_lock", None)
+            target_generation: Optional[int] = None
+            was_latched = bool(
+                getattr(self, "_quiescence_force_latched", False)
+            )
+            with lock if lock is not None else nullcontext():
+                if getattr(self, "_quiescence_force_in_progress", False):
+                    snapshot = self._collect_quiescence_snapshot()
+                    return self._quiescence_response(
+                        state="busy",
+                        mode="force",
+                        snapshot=snapshot,
+                        operation="release",
+                        request_id=request_id,
+                        status=409,
+                        force_errors=["force_in_progress"],
+                    )
+                if was_latched:
+                    # Force release is the only operation that reopens a
+                    # Hermes writer gate. Require the exact proof identity so
+                    # a delayed release from an older handover/gateway boot
+                    # cannot reopen a retired generation.
+                    try:
+                        requested_generation = int(body.get("generation"))
+                    except (TypeError, ValueError):
+                        requested_generation = None
+                    requested_boot_id = str(body.get("boot_id") or "")
+                    current_request_id = str(
+                        getattr(self, "_quiescence_force_request_id", "")
+                    )
+                    request_required = bool(
+                        getattr(self, "_quiescence_force_request_required", False)
+                    )
+                    current_generation = int(
+                        getattr(self, "_quiescence_generation", 0)
+                    )
+                    current_boot_id = str(
+                        getattr(
+                            self,
+                            "_quiescence_force_boot_id",
+                            getattr(self, "_quiescence_boot_id", ""),
+                        )
+                    )
+                    if (
+                        requested_generation != current_generation
+                        or not requested_boot_id
+                        or requested_boot_id != current_boot_id
+                    ):
+                        snapshot = self._collect_quiescence_snapshot()
+                        return self._quiescence_response(
+                            state="busy",
+                            mode="force",
+                            snapshot=snapshot,
+                            operation="release",
+                            request_id=request_id,
+                            status=409,
+                            force_errors=["stale_generation"],
+                        )
+                    # New force callers bind the release to the exact
+                    # request/barrier id. Keep generation+boot-only release
+                    # as an additive compatibility path for old callers that
+                    # omitted request_id entirely; generation+boot remains
+                    # exact and prevents stale epochs from reopening.
+                    if request_required and request_id != current_request_id:
+                        snapshot = self._collect_quiescence_snapshot()
+                        return self._quiescence_response(
+                            state="busy",
+                            mode="force",
+                            snapshot=snapshot,
+                            operation="release",
+                            request_id=request_id,
+                            status=409,
+                            force_errors=["stale_barrier"],
+                        )
+                    if request_id and request_id != current_request_id:
+                        snapshot = self._collect_quiescence_snapshot()
+                        return self._quiescence_response(
+                            state="busy",
+                            mode="force",
+                            snapshot=snapshot,
+                            operation="release",
+                            request_id=request_id,
+                            status=409,
+                            force_errors=["stale_barrier"],
+                        )
+                    target_generation = current_generation + 1
+                    snapshot = self._collect_quiescence_snapshot()
+                    if not self._persist_force_marker(
+                        snapshot,
+                        latched=False,
+                        generation=target_generation,
+                        force_boot_id=current_boot_id,
+                    ):
+                        return self._quiescence_response(
+                            state="busy",
+                            mode="force",
+                            snapshot=snapshot,
+                            operation="release",
+                            request_id=request_id,
+                            status=503,
+                            force_errors=["force_marker_clear_failed"],
+                        )
+                    self._quiescence_force_latched = False
+                    self._quiescence_force_boot_id = str(
+                        getattr(self, "_quiescence_boot_id", "")
+                    )
+                    self._quiescence_force_request_id = ""
+                    self._quiescence_force_request_required = False
+                    self._quiescence_mode = "graceful"
+                    self._quiescence_generation = int(target_generation)
+                else:
+                    # A retry after a lost successful release is idempotent.
+                    # Do not advance the force epoch or rewrite its identity
+                    # when there is no latch left to release.
+                    snapshot = self._collect_quiescence_snapshot()
+                    return self._quiescence_response(
+                        state="released",
+                        mode="graceful",
+                        snapshot=snapshot,
+                        operation="release",
+                        request_id=request_id,
+                    )
+            snapshot = self._collect_quiescence_snapshot()
+            return self._quiescence_response(
+                state="released",
+                mode="graceful",
+                snapshot=snapshot,
+                operation="release",
+                request_id=request_id,
+            )
+
+        mode = str(body.get("mode", "graceful")).strip().lower()
+        if mode not in {"graceful", "force"}:
+            return web.json_response(
+                _openai_error(
+                    "Unknown quiescence mode; expected graceful or force.",
+                    param="mode",
+                ),
+                status=400,
+            )
+
+        if mode == "graceful":
+            # The lock serializes this snapshot with API reservation admission.
+            # There is deliberately no latch: Omnia's durable admission_state
+            # closes new external turns before it asks Hermes for this proof.
+            lock = getattr(self, "_quiescence_lock", None)
+            with lock if lock is not None else nullcontext():
+                snapshot = self._collect_quiescence_snapshot()
+                force_latched = bool(
+                    getattr(self, "_quiescence_force_latched", False)
+                    or getattr(self, "_quiescence_force_in_progress", False)
+                )
+                # A force proof owns its generation until matching release;
+                # an overlapping graceful probe must not advance that token
+                # and strand the force gate behind an otherwise valid release.
+                if not force_latched:
+                    self._quiescence_mode = "graceful"
+            if force_latched:
+                return self._quiescence_response(
+                    state="busy",
+                    mode="force",
+                    snapshot=snapshot,
+                    operation="prepare",
+                    request_id=request_id,
+                    status=409 if snapshot.get("known") else 503,
+                    force_errors=["force_active"],
+                )
+            state = (
+                "quiescent"
+                if snapshot.get("known") and snapshot.get("total", 0) == 0
+                else "busy"
+            )
+            return self._quiescence_response(
+                state=state,
+                mode="graceful",
+                snapshot=snapshot,
+                operation="prepare",
+                request_id=request_id,
+            )
+
+        timeout = self._quiescence_force_timeout(body)
+        if timeout is None:
+            return web.json_response(
+                _openai_error(
+                    "timeout_seconds must be a non-negative number.",
+                    param="timeout_seconds",
+                ),
+                status=400,
+            )
+
+        # Set the transient gate before signaling anything. New API requests
+        # then receive 503, while the internal wake marker remains allowed to
+        # drain already-emitted completions during this proof.
+        lock = getattr(self, "_quiescence_lock", None)
+        with lock if lock is not None else nullcontext():
+            already_latched = bool(getattr(self, "_quiescence_force_latched", False))
+            if getattr(self, "_quiescence_force_in_progress", False):
+                snapshot = self._collect_quiescence_snapshot()
+                return self._quiescence_response(
+                    state="busy",
+                    mode="force",
+                    snapshot=snapshot,
+                    operation="prepare",
+                    request_id=(
+                        getattr(self, "_quiescence_force_request_id", "")
+                        or request_id
+                    ),
+                    status=409,
+                    force_errors=["force_in_progress"],
+                )
+            if already_latched:
+                current_request_id = str(
+                    getattr(self, "_quiescence_force_request_id", "")
+                )
+                if supplied_request_id and request_id != current_request_id:
+                    snapshot = self._collect_quiescence_snapshot()
+                    return self._quiescence_response(
+                        state="busy",
+                        mode="force",
+                        snapshot=snapshot,
+                        operation="prepare",
+                        request_id=request_id,
+                        status=409,
+                        force_errors=["stale_barrier"],
+                    )
+                snapshot = self._collect_quiescence_snapshot()
+                state = (
+                    "quiescent"
+                    if snapshot.get("known") and snapshot.get("total", 0) == 0
+                    else "busy"
+                )
+                return self._quiescence_response(
+                    state=state,
+                    mode="force",
+                    snapshot=snapshot,
+                    operation="prepare",
+                    request_id=current_request_id or request_id,
+                    status=(
+                        200
+                        if state == "quiescent"
+                        else 503
+                        if not snapshot.get("known")
+                        else 409
+                    ),
+                    force_errors=[] if state == "quiescent" else ["force_latched"],
+                )
+            force_request_id = request_id or uuid.uuid4().hex
+            force_request_required = supplied_request_id
+            self._quiescence_force_in_progress = True
+            self._quiescence_mode = "force"
+            self._quiescence_generation = int(
+                getattr(self, "_quiescence_generation", 0)
+            ) + 1
+            self._quiescence_force_boot_id = str(
+                getattr(self, "_quiescence_boot_id", "")
+            )
+            self._quiescence_force_request_id = force_request_id
+            self._quiescence_force_request_required = force_request_required
+            force_generation = self._quiescence_generation
+            force_boot_id = self._quiescence_force_boot_id
+
+        # Record the retirement before any interrupt can run. If the gateway
+        # crashes during force cancellation, its replacement must rehydrate a
+        # latched barrier instead of reopening admission on an incomplete
+        # proof.
+        force_marker_persisted = self._persist_force_marker(
+            {
+                "known": False,
+                "total": 1,
+                "counts": {"force_in_progress": 1},
+                "errors": ["force_in_progress"],
+            },
+            latched=True,
+            generation=force_generation,
+            force_boot_id=force_boot_id,
+            force_request_id=force_request_id,
+            force_request_required=force_request_required,
+        )
+
+        if not force_marker_persisted:
+            with lock if lock is not None else nullcontext():
+                self._quiescence_force_in_progress = False
+                self._quiescence_force_latched = True
+            final_snapshot = self._collect_quiescence_snapshot()
+            return self._quiescence_response(
+                state="busy",
+                mode="force",
+                snapshot=final_snapshot,
+                operation="prepare",
+                request_id=force_request_id,
+                status=503,
+                force_errors=["force_marker_persistence"],
+            )
+
+        from gateway.quiescence import interrupt_writer_work
+
+        force_result = interrupt_writer_work(
+            adapter=self,
+            runner=getattr(self, "gateway_runner", None),
+            reason="Omnio force quiescence",
+        )
+
+        deadline = asyncio.get_running_loop().time() + timeout
+        final_snapshot: Dict[str, Any] = {}
+        while True:
+            final_snapshot = self._collect_quiescence_snapshot()
+            if (
+                not force_result.get("errors")
+                and final_snapshot.get("known")
+                and final_snapshot.get("total", 0) == 0
+            ):
+                with lock if lock is not None else nullcontext():
+                    self._quiescence_force_in_progress = False
+                    self._quiescence_force_latched = True
+                    # The force prepare owns one generation. Keep that
+                    # identity stable from the durable start marker through
+                    # the final proof and subsequent matching release.
+                    force_generation = self._quiescence_generation
+                    force_boot_id = self._quiescence_force_boot_id
+                force_marker_persisted = self._persist_force_marker(
+                    final_snapshot,
+                    latched=True,
+                    generation=force_generation,
+                    force_boot_id=force_boot_id,
+                    force_request_id=force_request_id,
+                    force_request_required=force_request_required,
+                )
+                if not force_marker_persisted:
+                    return self._quiescence_response(
+                        state="busy",
+                        mode="force",
+                        snapshot=final_snapshot,
+                        operation="prepare",
+                        request_id=force_request_id,
+                        status=503,
+                        force_errors=["force_marker_persistence"],
+                    )
+                return self._quiescence_response(
+                    state="quiescent",
+                    mode="force",
+                    snapshot=final_snapshot,
+                    operation="prepare",
+                    request_id=force_request_id,
+                )
+            if asyncio.get_running_loop().time() >= deadline:
+                with lock if lock is not None else nullcontext():
+                    # Preserve the block after a failed force proof so the
+                    # caller cannot accidentally admit a new writer.
+                    self._quiescence_force_in_progress = False
+                    self._quiescence_force_latched = True
+                    force_generation = self._quiescence_generation
+                    force_boot_id = self._quiescence_force_boot_id
+                force_marker_persisted = self._persist_force_marker(
+                    final_snapshot,
+                    latched=True,
+                    generation=force_generation,
+                    force_boot_id=force_boot_id,
+                    force_request_id=force_request_id,
+                    force_request_required=force_request_required,
+                )
+                timeout_errors = list(force_result.get("errors") or [])
+                if not force_marker_persisted:
+                    timeout_errors.append("force_marker_persistence")
+                if not timeout_errors:
+                    timeout_errors.append("force_timeout")
+                return self._quiescence_response(
+                    state="busy",
+                    mode="force",
+                    snapshot=final_snapshot,
+                    operation="prepare",
+                    request_id=force_request_id,
+                    status=503 if force_result.get("errors") or not final_snapshot.get("known") else 409,
+                    force_errors=timeout_errors,
+                )
+            await asyncio.sleep(0.05)
+
+    async def _handle_omnio_quiescence_prepare(self, request: "web.Request") -> "web.Response":
+        return await self._handle_omnio_quiescence(request, forced_operation="prepare")
+
+    async def _handle_omnio_quiescence_status(self, request: "web.Request") -> "web.Response":
+        return await self._handle_omnio_quiescence(request, forced_operation="status")
+
+    async def _handle_omnio_quiescence_release(self, request: "web.Request") -> "web.Response":
+        return await self._handle_omnio_quiescence(request, forced_operation="release")
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — list hermes-agent and any configured model_routes aliases.
 
@@ -3118,6 +4035,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "run_turn_idempotency": {"apiVersion": 1},
+                # Omnia's handover controller uses this as a feature gate.  It
+                # is intentionally an explicit runtime capability rather than
+                # a version stamp: the endpoint accounts for all durable and
+                # process-owned writer work, and force mode proves settlement.
+                "omnio_quiescence": {
+                    "apiVersion": 1,
+                    "atomicWriterSnapshot": True,
+                    "forceCancel": True,
+                },
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -3162,6 +4089,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
+                "omnio_quiescence": {
+                    "method": "POST",
+                    "path": "/v1/omnio/quiescence",
+                },
+                "omnio_quiescence_status": {
+                    "method": "GET",
+                    "path": "/v1/omnio/quiescence/status",
+                },
+                "omnio_quiescence_prepare": {
+                    "method": "POST",
+                    "path": "/v1/omnio/quiescence/prepare",
+                },
+                "omnio_quiescence_release": {
+                    "method": "POST",
+                    "path": "/v1/omnio/quiescence/release",
+                },
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -4047,6 +4990,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 await queue.put(None)
 
         task = asyncio.create_task(_run_and_signal())
+        # Publish detached ownership before the coroutine can run. The HTTP
+        # reservation normally spans the SSE response, but a disconnect or
+        # response setup failure can release it while this task is still
+        # finalizing durable session output.
+        self._background_agent_tasks.add(task)
+        task.add_done_callback(self._background_agent_tasks.discard)
         try:
             self._background_tasks.add(task)
         except TypeError:
@@ -4648,7 +5597,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 ],
             )
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+                result, usage = await _idem_cache.get_or_set(
+                    idempotency_key,
+                    fp,
+                    _compute_completion,
+                    task_registry=self._background_agent_tasks,
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -5807,7 +6761,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 ],
             )
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
+                result, usage = await _idem_cache.get_or_set(
+                    idempotency_key,
+                    fp,
+                    _compute_response,
+                    task_registry=self._background_agent_tasks,
+                )
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
@@ -6159,13 +7118,16 @@ class APIServerAdapter(BasePlatformAdapter):
         job_id, id_err = self._check_job_id(request)
         if id_err:
             return id_err
-        try:
-            job = _cron_trigger(job_id)
-            if not job:
-                return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
-        except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+        with _reserve_pending_api_work(self) as reservation:
+            if reservation.get("blocked"):
+                return self._draining_response()
+            try:
+                job = _cron_trigger(job_id)
+                if not job:
+                    return web.json_response({"error": "Job not found"}, status=404)
+                return web.json_response({"job": job})
+            except Exception as e:
+                return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
     async def _handle_cron_fire(self, request: "web.Request") -> "web.Response":
         """POST /api/cron/fire — Chronos managed-cron fire webhook (NAS → agent).
@@ -6203,6 +7165,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return draining
 
         with _reserve_pending_api_work(self) as reservation:
+            if reservation.get("blocked"):
+                return self._draining_response()
             try:
                 body = await request.json()
             except Exception:
@@ -6431,12 +7395,30 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return None
 
+    async def _run_in_executor_tracked(self, func):
+        """Run blocking API work while retaining ownership on cancellation.
+
+        An asyncio task may be cancelled by an SSE disconnect, ``/stop``, or
+        force handover while the default executor continues running the
+        callable.  ``run_in_executor`` by itself provides no completion hook
+        for that detached thread, so wrap it in an explicit lease consumed by
+        quiescence accounting.
+        """
+        loop = asyncio.get_running_loop()
+        lease = _APIExecutorLease(self)
+        try:
+            return await loop.run_in_executor(None, lease.run, func)
+        except asyncio.CancelledError:
+            lease.mark_cancelled()
+            raise
+
     @staticmethod
     def _bind_api_server_session(
         *,
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        profile: str = "",
         origin_turn_id: str = "",
         delegation_sync_only: bool = False,
     ) -> list:
@@ -6474,6 +7456,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            profile=profile,
             async_delivery=True,
             origin_turn_id=origin_turn_id,
             delegation_sync_only=delegation_sync_only,
@@ -6563,12 +7546,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    profile=request_profile or "",
                 )
                 approval_token = None
                 approval_notify_token = None
                 tool_approval_session_token = None
                 tool_approval_surface_token = None
                 user_input_token = None
+                active_agent = None
                 try:
                     if approval_session_key:
                         from tools.approval import set_current_session_key
@@ -6621,6 +7606,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         prefill_messages=prefill_messages,
                         prefill_before_current_user=prefill_before_current_user,
                     )
+                    active_agent = agent
+                    self._register_active_api_agent(agent)
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
@@ -6746,6 +7733,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                     )
                 finally:
+                    self._unregister_active_api_agent(active_agent)
                     if approval_session_key:
                         if approval_notify_token is not None:
                             from tools.tool_approval import (
@@ -6787,7 +7775,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
-            return await loop.run_in_executor(None, _run)
+            return await self._run_in_executor_tracked(_run)
         finally:
             self._inflight_agent_runs -= 1
 
@@ -6799,6 +7787,52 @@ class APIServerAdapter(BasePlatformAdapter):
     # live Turn logs have no age-based expiry.
     _RUN_STREAM_TTL = 300
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+
+    def _restore_idempotent_run(self, record: RunIdempotencyRecord) -> Dict[str, Any]:
+        """Restore scalar status for a run admitted by an earlier process.
+
+        Event frames are intentionally not reconstructed from the request: the
+        durable idempotency row proves ownership, while the in-memory event log
+        remains the only source of replay bytes. A restarted process can still
+        answer the retry with the original run identity and status.
+        """
+        current = self._run_statuses.get(record.run_id)
+        if current is not None:
+            return current
+        status = record.status
+        failure_reason = record.failure_reason
+        if status in {"queued", "running", "waiting_for_approval", "stopping"}:
+            # The old process cannot still own this event loop after a gateway
+            # restart. Preserve the run identity, but close the orphaned
+            # execution instead of presenting a never-ending active stream.
+            status = "failed"
+            failure_reason = "gateway_restart_interrupted"
+        try:
+            self._turn_event_logs.create_run(
+                record.run_id,
+                record.session_id,
+                owner_profile=record.owner_profile,
+            )
+        except ValueError:
+            # The process may have already swept this run's in-memory log;
+            # the durable idempotency relation still proves its identity.
+            pass
+        current = self._set_run_status(
+            record.run_id,
+            status,
+            created_at=record.created_at,
+            session_id=record.session_id,
+            owner_profile=record.owner_profile,
+            turn_id=record.turn_id,
+            failure_reason=failure_reason,
+        )
+        if status in {"completed", "failed", "cancelled"}:
+            self._turn_event_logs.mark_terminal(
+                record.run_id,
+                status,
+                failure_reason=failure_reason,
+            )
+        return current
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -6818,6 +7852,19 @@ class APIServerAdapter(BasePlatformAdapter):
             status,
             failure_reason=current.get("failure_reason"),
         )
+        turn_id = current.get("turn_id")
+        if isinstance(turn_id, str) and turn_id:
+            try:
+                self._run_idempotency_store_for_profile(
+                    current.get("owner_profile")
+                ).update_status(
+                    turn_id=turn_id,
+                    status=status,
+                    failure_reason=current.get("failure_reason"),
+                    updated_at=now,
+                )
+            except Exception:  # noqa: BLE001 - execution must finish; log durability is observable
+                logger.exception("Failed to persist /v1/runs status for turn_id=%s", turn_id)
         return current
 
     @staticmethod
@@ -7293,6 +8340,11 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("Request body must be an object"),
+                status=400,
+            )
 
         raw_input = body.get("input")
         if not raw_input:
@@ -7316,6 +8368,18 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         explicit_session_id = body.get("session_id")
         turn_id = body.get("turn_id")
+        if turn_id is not None:
+            if not isinstance(turn_id, str) or not turn_id.strip():
+                return web.json_response(
+                    _openai_error("turn_id must be a non-empty string", code="invalid_turn_id"),
+                    status=400,
+                )
+            turn_id = turn_id.strip()
+            if len(turn_id) > 255:
+                return web.json_response(
+                    _openai_error("turn_id is too long", code="invalid_turn_id"),
+                    status=400,
+                )
         # Omnio proxy flag: headless surfaces (crons, trigger.dev runs) have
         # no channel to ever receive a background delegation's wake, so they
         # force delegate_task(background=True) onto its synchronous fallback
@@ -7432,8 +8496,76 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        request_profile = self._effective_request_profile()
         run_id = f"run_{uuid.uuid4().hex}"
-        session_id = session_id or run_id
+        # Do not include turn_id itself in the fingerprint. The caller's
+        # immutable request semantics are hashed in memory; the durable row
+        # stores only that scalar digest and the resulting run identity.
+        if turn_id:
+            try:
+                idempotency_fingerprint = request_fingerprint(
+                    {
+                        "body": {
+                            key: value
+                            for key, value in body.items()
+                            if key != "turn_id"
+                        },
+                        "session_id": session_id,
+                        "gateway_session_key": gateway_session_key,
+                        "owner_profile": request_profile,
+                    }
+                )
+            except (TypeError, ValueError, OverflowError):
+                # ``json.loads`` accepts non-standard NaN/Infinity values while
+                # the durable fingerprint deliberately rejects them. Surface
+                # that as a client error instead of a 500 after reserving no
+                # row.
+                return web.json_response(
+                    _openai_error(
+                        "Request contains values that cannot be fingerprinted",
+                        code="invalid_request_fingerprint",
+                    ),
+                    status=400,
+                )
+            idempotency_store = self._run_idempotency_store_for_profile(
+                request_profile
+            )
+            try:
+                record, is_new = idempotency_store.reserve(
+                    turn_id=turn_id,
+                    run_id=run_id,
+                    request_fingerprint=idempotency_fingerprint,
+                    session_id=session_id or run_id,
+                    owner_profile=request_profile,
+                )
+            except RunIdempotencyMismatch:
+                return web.json_response(
+                    _openai_error(
+                        "turn_id was already used with different request semantics",
+                        code="turn_id_conflict",
+                    ),
+                    status=409,
+                )
+            if not is_new:
+                status = self._restore_idempotent_run(record)
+                response_headers = (
+                    {"X-Hermes-Session-Key": gateway_session_key}
+                    if gateway_session_key
+                    else {}
+                )
+                return web.json_response(
+                    {
+                        "run_id": record.run_id,
+                        "status": status.get("status", record.status),
+                        "idempotent": True,
+                    },
+                    status=202,
+                    headers=response_headers,
+                )
+            run_id = record.run_id
+            session_id = record.session_id
+        else:
+            session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -7443,22 +8575,47 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_approval_surface_key = run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
-        request_profile = self._effective_request_profile()
         tool_approval_grant_session_key = self._scoped_tool_approval_session_key(
             session_id,
             request_profile,
         )
-        self._turn_event_logs.create_run(
-            run_id,
-            session_id,
-            owner_profile=request_profile,
-        )
+        created_at = time.time()
+        try:
+            self._turn_event_logs.create_run(
+                run_id,
+                session_id,
+                owner_profile=request_profile,
+            )
+        except Exception:
+            # The idempotency row was committed before the in-memory Turn log
+            # is created.  Preserve that scalar identity as a terminal failure
+            # instead of leaving a retry pointing at an unobservable run.
+            logger.exception("[api_server] could not initialize run %s", run_id)
+            self._set_run_status(
+                run_id,
+                "failed",
+                created_at=created_at,
+                session_id=session_id,
+                model=body.get("model", self._model_name),
+                owner_profile=request_profile,
+                **({"turn_id": turn_id} if turn_id else {}),
+                error="Unable to initialize run",
+                last_event="run.failed",
+                failure_reason="run_initialization_failed",
+                completed_at=time.time(),
+            )
+            return web.json_response(
+                _openai_error(
+                    "Unable to initialize run",
+                    code="run_initialization_failed",
+                ),
+                status=503,
+            )
         emitter = TurnEventEmitter(self._turn_event_logs, run_id, session_id)
 
         # Compatibility-only queue shadow. New subscribers and event producers
         # use _turn_event_logs exclusively.
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
-        created_at = time.time()
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
@@ -7929,6 +9086,8 @@ class APIServerAdapter(BasePlatformAdapter):
             created_at=created_at,
             session_id=session_id,
             model=body.get("model", self._model_name),
+            owner_profile=request_profile,
+            **({"turn_id": turn_id} if turn_id else {}),
         )
         self._run_lifecycles[run_id] = {
             "accepting": True,
@@ -7993,7 +9152,8 @@ class APIServerAdapter(BasePlatformAdapter):
                             route=route,
                         )
 
-                agent = await loop.run_in_executor(None, _build_agent)
+                agent = await self._run_in_executor_tracked(_build_agent)
+                self._register_active_api_agent(agent)
                 await self._publish_run_agent(run_id, agent)
                 if run_id in self._stopping_run_ids:
                     missed_steer = await self._close_run_steering(run_id, agent)
@@ -8124,6 +9284,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 chat_id=session_id or "",
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
+                                profile=request_profile or "",
                                 origin_turn_id=str(turn_id) if turn_id else "",
                                 delegation_sync_only=delegation_sync_only,
                             )
@@ -8223,9 +9384,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(
-                    None, _run_sync
-                )
+                result, usage = await self._run_in_executor_tracked(_run_sync)
                 missed_steer = await self._close_run_steering(run_id, agent)
                 result_pending_steer = (
                     result.get("pending_steer") if isinstance(result, dict) else None
@@ -8473,14 +9632,52 @@ class APIServerAdapter(BasePlatformAdapter):
                         q.put_nowait(None)
                     except Exception:
                         pass
+                self._unregister_active_api_agent(agent)
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
                 await self._discard_run_lifecycle(run_id)
 
-        self._activate_admitted_request()
-        task = asyncio.create_task(_run_and_close())
+        run_coro = _run_and_close()
+        try:
+            self._activate_admitted_request()
+            task = asyncio.create_task(run_coro)
+        except Exception:
+            run_coro.close()
+            # A durable reservation can outlive this request if task creation
+            # races loop shutdown. Close the scalar run identity and its local
+            # transport immediately so an ambiguous retry cannot start a
+            # second execution or observe a permanently queued run.
+            logger.exception("[api_server] could not schedule run %s", run_id)
+            self._set_run_status(
+                run_id,
+                "failed",
+                error="Unable to schedule run",
+                last_event="run.failed",
+                failure_reason="run_initialization_failed",
+                completed_at=time.time(),
+            )
+            emitter.response_failed(
+                "Unable to schedule run",
+                code="run_initialization_failed",
+            )
+            _legacy_terminal("run.failed", error="Unable to schedule run")
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
+            self._run_streams.pop(run_id, None)
+            self._run_streams_created.pop(run_id, None)
+            self._run_approval_sessions.pop(run_id, None)
+            await self._discard_run_lifecycle(run_id)
+            return web.json_response(
+                _openai_error(
+                    "Unable to schedule run",
+                    code="run_initialization_failed",
+                ),
+                status=503,
+            )
         self._active_run_tasks[run_id] = task
         try:
             self._background_tasks.add(task)
@@ -8706,6 +9903,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return response
 
 
+    @_admit_api_control_request
     async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
         auth_err = self._check_auth(request)
@@ -8803,6 +10001,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    @_admit_api_control_request
     async def _handle_omnio_tool_approval(
         self, request: "web.Request"
     ) -> "web.Response":
@@ -8904,6 +10103,7 @@ class APIServerAdapter(BasePlatformAdapter):
             }
         )
 
+    @_admit_api_control_request
     async def _handle_omnio_user_input(
         self, request: "web.Request"
     ) -> "web.Response":
@@ -8962,6 +10162,7 @@ class APIServerAdapter(BasePlatformAdapter):
             {"object": "omnio.user_input_response", "resolved": resolved}
         )
 
+    @_admit_api_control_request
     async def _handle_mcp_reload(self, request: "web.Request") -> "web.Response":
         """Reconnect MCP servers and refresh their tool registry in place."""
         auth_err = self._check_auth(request)
@@ -9017,6 +10218,7 @@ class APIServerAdapter(BasePlatformAdapter):
             }
         )
 
+    @_admit_api_control_request
     async def _handle_skills_reload(
         self, request: "web.Request"
     ) -> "web.Response":
@@ -9054,6 +10256,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    @_admit_api_control_request
     async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/steer — steer an active running agent."""
         auth_err = self._check_auth(request)

@@ -3375,6 +3375,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        # Invalidate any prior clean quiescence marker before this process can
+        # admit work. A cold reader must never mistake a stale marker from a
+        # previous gateway generation for proof about this one.
+        from gateway.quiescence import mark_offline_quiescence_unknown
+
+        if not mark_offline_quiescence_unknown():
+            raise RuntimeError(
+                "Could not durably invalidate the offline quiescence marker; "
+                "refusing to admit gateway work"
+            )
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -4899,12 +4909,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profiles cannot create an ``api_server`` adapter because it binds a port,
         so only the primary registry is a supported source of this work.
         """
+        strict = False
         try:
             adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
-            helper = getattr(adapter, "active_agent_work_count", None)
+            # Handover/shutdown must use the strict counter when available:
+            # the operational helper intentionally fails soft to zero, which
+            # would let a broken accounting path reopen/finish shutdown as if
+            # detached API executor work had settled.
+            helper = getattr(adapter, "quiescence_agent_work_count", None)
+            strict = callable(helper)
+            if not callable(helper):
+                helper = getattr(adapter, "active_agent_work_count", None)
             return max(0, int(helper())) if callable(helper) else 0
         except Exception:
-            return 0
+            # A strict handover counter that cannot be read is not evidence of
+            # zero work. Keep shutdown polling alive until the owner recovers.
+            return 1 if strict else 0
+
+    def _omnio_quiescence_force_active(self) -> bool:
+        """Whether the API adapter has a force-quiescence admission gate."""
+        try:
+            adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
+            return bool(
+                getattr(adapter, "_quiescence_force_latched", False)
+                or getattr(adapter, "_quiescence_force_in_progress", False)
+            )
+        except Exception:
+            return False
 
     # ── scale-to-zero idle detection / dormant-quiesce (Phase 0) ──────────────
     # The gateway-side BEHAVIOUR that consumes the relay scale-to-zero primitives
@@ -9956,6 +9987,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _task.cancel()
             self._background_tasks.clear()
 
+            # Preserve a force-retired handover generation in the cold marker
+            # even when this process exits cleanly. A replacement gateway
+            # must not silently reopen writer admission after a force proof.
+            _api_quiescence_adapter = self.adapters.get(Platform.API_SERVER)
+            _force_quiescence_latched = bool(
+                getattr(_api_quiescence_adapter, "_quiescence_force_latched", False)
+            )
+            _force_quiescence_generation = getattr(
+                _api_quiescence_adapter, "_quiescence_generation", None
+            )
+            _force_quiescence_boot_id = getattr(
+                _api_quiescence_adapter, "_quiescence_force_boot_id", None
+            )
+            _force_quiescence_request_id = getattr(
+                _api_quiescence_adapter, "_quiescence_force_request_id", None
+            )
+            _force_quiescence_request_required = bool(
+                getattr(
+                    _api_quiescence_adapter,
+                    "_quiescence_force_request_required",
+                    False,
+                )
+            )
             self.adapters.clear()
             for _session_key in list(self._running_agents):
                 self._release_running_agent_state(_session_key)
@@ -10016,6 +10070,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Shutdown phase: SessionDB close done at +%.2fs",
                 _phase_elapsed(),
             )
+
+            # Persist the final handover proof for supervisors that inspect a
+            # stopped profile without a live HTTP listener.  This is only a
+            # point-in-time cold-state marker: a non-zero or unknown snapshot
+            # remains busy/unknown, never an optimistic zero. Startup
+            # invalidates the marker before admitting any new work.
+            try:
+                from gateway.quiescence import (
+                    collect_writer_work_snapshot,
+                    write_offline_quiescence_snapshot,
+                )
+
+                write_offline_quiescence_snapshot(
+                    # Keep the API adapter captured above as the accounting
+                    # owner.  ``self.adapters`` is cleared before this cold
+                    # marker is written; falling back to the runner alone
+                    # would report api_runs=0 while a canceled default
+                    # executor worker is still writing through that adapter.
+                    collect_writer_work_snapshot(
+                        adapter=_api_quiescence_adapter,
+                        runner=self,
+                    ),
+                    lifecycle="stopped",
+                    force_latched=_force_quiescence_latched,
+                    generation=_force_quiescence_generation,
+                    force_boot_id=_force_quiescence_boot_id,
+                    force_request_id=_force_quiescence_request_id,
+                    force_request_required=_force_quiescence_request_required,
+                )
+            except Exception as _e:
+                logger.debug("Could not persist offline quiescence snapshot: %s", _e)
 
             from gateway.status import remove_pid_file, release_gateway_runtime_lock
             remove_pid_file()
@@ -12458,6 +12543,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "⏳ This agent is draining for a maintenance action and isn't "
                 "accepting new turns right now. It'll be back in a moment — "
                 "please resend shortly."
+            )
+
+        # Force handover is a process-wide writer gate, not just an API
+        # listener gate. Internal completion/recovery events continue to flow,
+        # but no new external messaging turn may create another agent while
+        # the force endpoint is proving that all writers have stopped.
+        if self._omnio_quiescence_force_active() and not is_internal:
+            logger.info(
+                "Refusing new turn for session %s — Omnio force quiescence active.",
+                _quick_key,
+            )
+            return (
+                "⏳ This agent is quiescing for a maintenance action and isn't "
+                "accepting new turns right now. Please resend shortly."
             )
 
         # ── Claim this session before any await ───────────────────────
@@ -18585,18 +18684,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         while self._running:
             try:
-                watchers = process_registry.drain_pending_watchers()
-                for i, watcher in enumerate(watchers):
-                    self._spawn_supervised(
-                        lambda w=watcher: self._run_process_watcher(w),
-                        f"process_watcher:{watcher.get('session_id')}",
-                        restart=False,
-                    )
+                watchers = process_registry.claim_pending_watchers()
+                for i, (watcher, watcher_id) in enumerate(watchers):
+                    try:
+                        self._spawn_supervised(
+                            lambda w=watcher, wid=watcher_id: self._run_process_watcher_tracked(w, wid),
+                            f"process_watcher:{watcher.get('session_id')}",
+                            restart=False,
+                        )
+                    except Exception:
+                        # A failed task spawn still owns the watcher claim;
+                        # return it to pending before releasing that claim so
+                        # the notification is not lost and the next dispatch
+                        # can retry. The pending descriptor keeps snapshots
+                        # fail-closed while the retry is outstanding.
+                        process_registry.enqueue_pending_watcher(watcher)
+                        process_registry.release_watcher(watcher_id)
+                        raise
                     if i % 100 == 99:
                         await asyncio.sleep(0)
             except Exception as exc:
                 logger.error("Process watcher dispatch error: %s", exc)
             await asyncio.sleep(interval)
+
+    async def _run_process_watcher_tracked(
+        self, watcher: dict, watcher_id: str | None = None
+    ) -> None:
+        """Run one process watcher while exposing its lifetime to handover.
+
+        Watcher descriptors are removed from ``pending_watchers`` before the
+        supervised task is started.  Registering the task itself closes that
+        gap so a quiescence snapshot cannot miss a watcher which can still
+        enqueue a completion notification.
+        """
+        from tools.process_registry import process_registry
+
+        watcher_id = watcher_id or process_registry._watcher_id(watcher)
+        # The dispatcher claims ownership before spawning. Re-registering is
+        # harmless for direct/test callers that invoke this helper.
+        process_registry.register_watcher(watcher_id)
+        try:
+            await self._run_process_watcher(watcher)
+        finally:
+            process_registry.release_watcher(watcher_id)
 
     async def _run_process_watcher(self, watcher: dict) -> None:
         """
@@ -24667,9 +24797,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # in-process ticker polls local due jobs, so only it receives the local
     # external-drain dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
-        cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active
-        )
+        def _cron_admission_open() -> bool:
+            try:
+                _force_blocked = runner._omnio_quiescence_force_active()
+            except Exception:
+                _force_blocked = False
+            return not (
+                runner._draining
+                or runner._external_drain_active
+                or _force_blocked
+            )
+
+        cron_start_kwargs["can_dispatch"] = _cron_admission_open
     cron_thread = threading.Thread(
         target=cron_provider.start,
         args=(cron_stop,),

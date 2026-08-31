@@ -578,6 +578,42 @@ def active_count() -> int:
         )
 
 
+def quiescence_work_count() -> int:
+    """Return one durable count of async writer work for handover fencing.
+
+    The query deliberately combines the child lifecycle and delivery
+    lifecycle in one SQLite transaction.  A child remains counted while it is
+    running/finalizing *or* while its terminal result still needs delivery.
+    In particular, the ``running -> finalizing -> pending delivery`` handoff
+    cannot create a false zero: dispatch/finalization both synchronize their
+    in-memory lifecycle with ``_records_lock``, and this function takes that
+    lock before opening the SQLite snapshot.
+
+    ``delivery_claim`` is included as a defensive invariant for older schema
+    rows and future delivery-state values: a claimed result is writer-capable
+    until the consumer acknowledges it, even if a mixed-version writer has
+    not yet stored the literal ``claimed`` state.
+
+    Database errors intentionally propagate.  Callers that use this for
+    admission must fail closed (busy/unknown), rather than treating an
+    unavailable state store as quiescent.
+    """
+    with _records_lock:
+        with _DB_LOCK, _transaction() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) FROM async_delegations
+                   WHERE state IN ('running', 'stalling', 'finalizing')
+                      OR delivery_state IN ('pending', 'claimed')
+                      OR delivery_claim IS NOT NULL"""
+            ).fetchone()
+        return int(row[0] if row else 0)
+
+
+def durable_quiescence_work_count() -> int:
+    """Compatibility alias for the handover-facing durable count."""
+    return quiescence_work_count()
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
@@ -783,8 +819,25 @@ def dispatch_async_delegation(
                 ),
             }
         _records[delegation_id] = record
-
-    _persist_dispatch(record)
+        try:
+            # Keep durable admission under the same lock as the in-memory
+            # registration. Quiescence snapshots acquire this lock before
+            # reading SQLite, so they cannot observe a false zero between
+            # child admission and its durable row.
+            _persist_dispatch(record)
+        except Exception:
+            # No executor work has started yet; remove the reservation if the
+            # durable write fails rather than leaving a phantom active child.
+            _records.pop(delegation_id, None)
+            try:
+                _delete_durable_delegation(delegation_id)
+            except Exception:
+                logger.warning(
+                    "Could not roll back durable async delegation %s",
+                    delegation_id,
+                    exc_info=True,
+                )
+            raise
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -1104,8 +1157,21 @@ def dispatch_async_delegation_batch(
                 ),
             }
         _records[delegation_id] = record
-
-    _persist_dispatch(record)
+        try:
+            # Keep durable admission under the same lock as the in-memory
+            # registration; see the single-dispatch path above.
+            _persist_dispatch(record)
+        except Exception:
+            _records.pop(delegation_id, None)
+            try:
+                _delete_durable_delegation(delegation_id)
+            except Exception:
+                logger.warning(
+                    "Could not roll back durable async delegation batch %s",
+                    delegation_id,
+                    exc_info=True,
+                )
+            raise
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
