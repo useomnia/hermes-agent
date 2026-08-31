@@ -4837,7 +4837,17 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 and getattr(server, "_is_http", lambda: False)()
                 and is_mcp_tool_parallel_read_safe(prefixed_tool_name)
             )
-            async with server._rpc_context(parallel_read=parallel_read):
+            rpc_context = getattr(server, "_rpc_context", None)
+            # Keep compatibility with lightweight server adapters and test
+            # doubles that predate MCPServerTask._rpc_context. They cannot opt
+            # into the parallel path, so their historical lock remains the
+            # correct serial guard.
+            context = (
+                rpc_context(parallel_read=parallel_read)
+                if rpc_context is not None
+                else server._rpc_lock
+            )
+            async with context:
                 # Snapshot the agent's context so an elicitation callback
                 # triggered during this call (fired on the MCP recv loop
                 # task, which doesn't inherit our contextvars) can replay
