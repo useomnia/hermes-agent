@@ -397,19 +397,14 @@ class TestOriginTurnIdBinding:
 
 
 class TestDelegationSyncOnlyBinding:
-    """The Omnio ``delegation_sync_only`` flag bound by
-    ``_bind_api_server_session`` follows the exact same lifecycle as
-    ``chat_id``/``origin_turn_id``: set by ``set_session_vars``, readable via
-    ``get_session_env``, "" (not the os.environ fallback) once
-    ``clear_session_vars`` runs, and back to "never bound" after
-    ``reset_session_vars``."""
+    """Forbidden interaction derives the internal sync-only capability."""
 
     def test_set_and_read(self):
         tokens = set_session_vars(
             platform="api_server",
             chat_id="sess1",
             session_id="sess1",
-            delegation_sync_only=True,
+            interaction_policy="forbid",
         )
         try:
             assert get_session_env("HERMES_DELEGATION_SYNC_ONLY") == "1"
@@ -417,9 +412,7 @@ class TestDelegationSyncOnlyBinding:
             clear_session_vars(tokens)
 
     def test_defaults_empty_when_not_passed(self):
-        """Non-Omnio callers (and Omnio callers that omit the flag) never
-        pass delegation_sync_only — must read "" rather than raising or
-        falling back to a stale value."""
+        """Interactive callers do not force synchronous delegation."""
         tokens = set_session_vars(platform="telegram", chat_id="123")
         try:
             assert get_session_env("HERMES_DELEGATION_SYNC_ONLY") == ""
@@ -431,7 +424,7 @@ class TestDelegationSyncOnlyBinding:
             "HERMES_DELEGATION_SYNC_ONLY", "leaked-from-os-environ"
         )
         tokens = set_session_vars(
-            platform="api_server", chat_id="sess1", delegation_sync_only=True,
+            platform="api_server", chat_id="sess1", interaction_policy="forbid",
         )
         clear_session_vars(tokens)
         # Explicitly cleared ("") — must NOT fall back to os.environ, exactly
@@ -446,14 +439,14 @@ class TestDelegationSyncOnlyBinding:
     def test_bind_chokepoint_threads_the_flag(self):
         """``APIServerAdapter._bind_api_server_session`` is the SINGLE
         chokepoint every API-server agent-entry path uses — verify it
-        threads delegation_sync_only exactly like origin_turn_id."""
+        threads interaction policy into the internal delegation capability."""
         from gateway.platforms.api_server import APIServerAdapter
 
         tokens = APIServerAdapter._bind_api_server_session(
             chat_id="c1",
             session_key="sk1",
             session_id="sid1",
-            delegation_sync_only=True,
+            interaction_policy="forbid",
         )
         try:
             assert get_session_env("HERMES_DELEGATION_SYNC_ONLY") == "1"

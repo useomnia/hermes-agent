@@ -28,6 +28,7 @@ from gateway.turn_event_log import (
     DELTA_COALESCE_SECONDS,
     OMNIO_EXTENSION_EVENT_TYPES,
     TERMINAL_FRAME_RESERVE_BYTES,
+    TURN_EVENT_LOG_API_VERSION,
     TurnEventEmitter,
     TurnEventLogStore,
     UnknownRunError,
@@ -227,7 +228,7 @@ async def test_capabilities_stamp_turn_event_log_without_changing_legacy_boolean
         payload = await response.json()
 
     assert response.status == 200
-    assert payload["turn_event_log_api_version"] == 2
+    assert payload["turn_event_log_api_version"] == TURN_EVENT_LOG_API_VERSION
     assert payload["features"]["run_events_sse"] is True
 
 
@@ -3660,12 +3661,8 @@ async def test_runs_register_the_user_input_surface_so_questions_park_and_resolv
 
 
 @pytest.mark.asyncio
-async def test_runs_thread_delegation_sync_only_into_session_context() -> None:
-    """The Omnio proxy's ``delegation_sync_only`` on ``POST /v1/runs`` must
-    reach the running agent via ``HERMES_DELEGATION_SYNC_ONLY`` — bound by
-    ``_bind_api_server_session`` exactly like ``turn_id`` -> ``HERMES_ORIGIN_TURN_ID``
-    — so ``tools.async_delegation._current_delegation_sync_only()`` (read by
-    ``delegate_task``) sees it while the run is live."""
+async def test_runs_forbidden_interaction_forces_sync_delegation() -> None:
+    """Unattended runs must finish child delegation before returning."""
     from gateway.session_context import get_session_env
 
     adapter = _make_adapter()
@@ -3683,7 +3680,7 @@ async def test_runs_thread_delegation_sync_only_into_session_context() -> None:
             {
                 "input": "run headless",
                 "session_id": "session-sync-only",
-                "delegation_sync_only": True,
+                "interaction_policy": "forbid",
             },
         )
 
@@ -3692,10 +3689,8 @@ async def test_runs_thread_delegation_sync_only_into_session_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runs_default_delegation_sync_only_false_when_omitted() -> None:
-    """Callers that never pass ``delegation_sync_only`` (every non-Omnio and
-    most Omnio deployments) must not force delegate_task's synchronous
-    fallback."""
+async def test_runs_default_interaction_policy_allows_async_delegation() -> None:
+    """Existing callers remain interactive when the policy is omitted."""
     from gateway.session_context import get_session_env
 
     adapter = _make_adapter()

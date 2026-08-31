@@ -319,18 +319,18 @@ def test_origin_turn_id_helper_empty_when_not_bound(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# delegation_sync_only — defeats the wake-sid re-enable above, unconditionally
+# Forbidden interaction defeats the wake-sid re-enable above unconditionally.
 # ---------------------------------------------------------------------------
 
 
 def test_current_delegation_sync_only_survives_child_session_clobber(monkeypatch):
     """Same clobber-proof guarantee as _current_origin_session_id/_turn_id,
-    for the delegation_sync_only flag."""
+    for the interaction policy's derived sync-only capability."""
     from gateway.session_context import set_current_session_id
     from tools.async_delegation import _current_delegation_sync_only
 
     set_session_vars(
-        platform="api_server", chat_id="raw-origin-4", delegation_sync_only=True,
+        platform="api_server", chat_id="raw-origin-4", interaction_policy="forbid",
     )
     assert _current_delegation_sync_only() is True
 
@@ -342,7 +342,7 @@ def test_current_delegation_sync_only_false_on_push_platforms(monkeypatch):
     from tools.async_delegation import _current_delegation_sync_only
 
     set_session_vars(
-        platform="telegram", chat_id="123456789", delegation_sync_only=True,
+        platform="telegram", chat_id="123456789", interaction_policy="forbid",
     )
     assert _current_delegation_sync_only() is False
 
@@ -354,13 +354,12 @@ def test_current_delegation_sync_only_false_when_not_bound(monkeypatch):
     assert _current_delegation_sync_only() is False
 
 
-def test_delegation_sync_only_forces_sync_even_with_wake_sid_available(monkeypatch):
+def test_forbidden_interaction_forces_sync_even_with_wake_sid_available(monkeypatch):
     """The exact inverse of test_apiserver_session_with_id_dispatches_background:
     async_delivery=False + a raw session id bound (which alone would trigger
     the wake-sid re-enable and dispatch in the background) must instead stay
-    SYNCHRONOUS once delegation_sync_only is set — the flag defeats that
-    re-enable path unconditionally, because a headless surface (cron,
-    trigger.dev run) has no channel to ever consume the wake."""
+    SYNCHRONOUS once interaction is forbidden, because an unattended run has
+    no channel to consume the wake."""
     dt = _patch_delegate(monkeypatch)
     monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-9")
     set_session_vars(
@@ -369,7 +368,7 @@ def test_delegation_sync_only_forces_sync_even_with_wake_sid_available(monkeypat
         session_key="raw-sid-9",
         session_id="raw-sid-9",
         async_delivery=False,
-        delegation_sync_only=True,
+        interaction_policy="forbid",
     )
 
     out = dt.delegate_task(
@@ -384,11 +383,10 @@ def test_delegation_sync_only_forces_sync_even_with_wake_sid_available(monkeypat
     assert process_registry.completion_queue.empty()
 
 
-def test_delegation_sync_only_absent_preserves_existing_behavior(monkeypatch):
-    """Sanity check: without the flag, the exact same session state as above
+def test_allowed_interaction_preserves_existing_background_behavior(monkeypatch):
+    """Sanity check: with interaction allowed, the same session state as above
     dispatches in the background (unchanged from
-    test_apiserver_session_with_id_dispatches_background) — the new
-    parameter must not alter behavior when omitted/false."""
+    test_apiserver_session_with_id_dispatches_background)."""
     dt = _patch_delegate(monkeypatch)
     monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-10")
     set_session_vars(
@@ -397,7 +395,7 @@ def test_delegation_sync_only_absent_preserves_existing_behavior(monkeypatch):
         session_key="raw-sid-10",
         session_id="raw-sid-10",
         async_delivery=False,
-        delegation_sync_only=False,
+        interaction_policy="allow",
     )
 
     out = dt.delegate_task(

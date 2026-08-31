@@ -217,6 +217,7 @@ def test_sprites_execute_forwards_effective_cwd_when_shared_env_is_stale():
         retry_exec_predispatch=False,
         retry_deadline_seconds=None,
         cancel_event=None,
+        request_id=None,
     ):
         calls.append(payload)
         return {"output": "ok\n", "returncode": 0}

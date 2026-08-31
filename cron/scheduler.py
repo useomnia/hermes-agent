@@ -166,7 +166,9 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     ordinary agent runs (#25752 — LLM-supplied enabled_toolsets was widening
     past config.yaml's denylist).
     """
-    disabled = ["cronjob", "messaging", "clarify"]
+    from agent.unattended import UNATTENDED_DISABLED_TOOLSETS
+
+    disabled = ["cronjob", "messaging", *UNATTENDED_DISABLED_TOOLSETS]
     agent_cfg = (cfg or {}).get("agent") or {}
     user_disabled = agent_cfg.get("disabled_toolsets") or []
     for name in user_disabled:

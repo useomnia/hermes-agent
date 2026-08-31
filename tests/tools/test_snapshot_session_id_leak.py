@@ -62,6 +62,7 @@ def test_export_snippet_shape():
     assert "${!HERMES_SESSION_*}" in snippet
     assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
+    assert "HERMES_INTERACTION_POLICY" in snippet
     assert "grep -vE" not in snippet
     assert "/tmp/snap.tmp.$BASHPID" in snippet
     # The redirection must be attached to a brace group wrapping the dump,

@@ -688,7 +688,7 @@ def _current_origin_turn_id() -> str:
 
 
 def _current_delegation_sync_only() -> bool:
-    """Whether the ORIGINATING api_server request forced this run's background
+    """Whether the originating API request forces this run's background
     delegations to run SYNCHRONOUSLY, or ``False``.
 
     Mirrors ``_current_origin_turn_id`` exactly, and for the same reason: it
@@ -696,8 +696,7 @@ def _current_delegation_sync_only() -> bool:
     point as the other origin reads. The binding itself
     (``HERMES_DELEGATION_SYNC_ONLY``) is set alongside ``HERMES_SESSION_CHAT_ID``
     by ``ApiServerAdapter._bind_api_server_session`` and is request-scoped, so
-    it is ``False`` on any non-Omnio deployment (no ``delegation_sync_only``
-    on the run) or any non-api_server platform.
+    it is ``False`` for interactive runs and non-api_server platforms.
     """
     try:
         from gateway.session_context import get_session_env

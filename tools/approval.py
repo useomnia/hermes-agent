@@ -2857,6 +2857,20 @@ def _run_approval_gate(
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
+    from gateway.session_context import get_session_env
+
+    if get_session_env("HERMES_INTERACTION_POLICY", "allow") == "forbid":
+        return {
+            "approved": False,
+            "pattern_key": pattern_key,
+            "description": description,
+            "message": (
+                f"BLOCKED: approval required ({description}), but this run "
+                "forbids user interaction. Do not retry this action; continue "
+                "with work that does not require approval."
+            ),
+        }
+
     if approval_callback is None:
         try:
             from tools.terminal_tool import _get_approval_callback

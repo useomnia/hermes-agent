@@ -2880,6 +2880,7 @@ class APIServerAdapter(BasePlatformAdapter):
         prefill_before_current_user: bool = False,
         tool_gen_event_callback=None,
         tool_gen_event_aborted_callback=None,
+        disabled_toolsets: Optional[List[str]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3201,6 +3202,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "verbose_logging": False,
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
             "enabled_toolsets": enabled_toolsets,
+            "disabled_toolsets": disabled_toolsets,
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
@@ -7420,7 +7422,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: str = "",
         profile: str = "",
         origin_turn_id: str = "",
-        delegation_sync_only: bool = False,
+        interaction_policy: str = "allow",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -7435,14 +7437,9 @@ class APIServerAdapter(BasePlatformAdapter):
         event (see ``tools.async_delegation._current_origin_session_id`` and
         its turn-id sibling). Empty on non-Omnio deployments.
 
-        ``delegation_sync_only`` mirrors ``origin_turn_id``: the Omnio
-        ``delegation_sync_only`` flag from the request body (``/v1/runs``),
-        set by the proxy for headless surfaces (crons, trigger.dev runs) that
-        have no channel to ever receive a background delegation's wake. Bound
-        here so ``delegate_task(background=True)`` can force its synchronous
-        fallback for this run regardless of an otherwise-available wake
-        session id (see ``tools.async_delegation._current_delegation_sync_only``
-        and ``tools/delegate_tool.py``).
+        ``interaction_policy`` is the request's user-interaction contract.
+        ``forbid`` also forces background delegation to complete inline because
+        no later wake can reach an interactive surface.
 
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive
@@ -7457,9 +7454,9 @@ class APIServerAdapter(BasePlatformAdapter):
             session_key=session_key,
             session_id=session_id,
             profile=profile,
-            async_delivery=True,
+            async_delivery=interaction_policy != "forbid",
             origin_turn_id=origin_turn_id,
-            delegation_sync_only=delegation_sync_only,
+            interaction_policy=interaction_policy,
         )
 
     async def _run_agent(
@@ -8365,6 +8362,34 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         instructions = body.get("instructions")
+        from agent.unattended import (
+            INTERACTION_POLICIES,
+            INTERACTION_POLICY_ALLOW,
+            INTERACTION_POLICY_FORBID,
+            UNATTENDED_DISABLED_TOOLSETS,
+            with_unattended_guidance,
+        )
+
+        interaction_policy = body.get(
+            "interaction_policy", INTERACTION_POLICY_ALLOW
+        )
+        if (
+            not isinstance(interaction_policy, str)
+            or interaction_policy not in INTERACTION_POLICIES
+        ):
+            return web.json_response(
+                _openai_error(
+                    "interaction_policy must be 'allow' or 'forbid'",
+                    code="invalid_interaction_policy",
+                ),
+                status=400,
+            )
+        interaction_forbidden = interaction_policy == INTERACTION_POLICY_FORBID
+        unattended_disabled_toolsets = (
+            [*UNATTENDED_DISABLED_TOOLSETS, "omnio-interaction"]
+            if interaction_forbidden
+            else None
+        )
         previous_response_id = body.get("previous_response_id")
         explicit_session_id = body.get("session_id")
         turn_id = body.get("turn_id")
@@ -8380,12 +8405,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     _openai_error("turn_id is too long", code="invalid_turn_id"),
                     status=400,
                 )
-        # Omnio proxy flag: headless surfaces (crons, trigger.dev runs) have
-        # no channel to ever receive a background delegation's wake, so they
-        # force delegate_task(background=True) onto its synchronous fallback
-        # for this run — see _bind_api_server_session and tools/delegate_tool.py.
-        delegation_sync_only = bool(body.get("delegation_sync_only"))
-
         if explicit_session_id is not None:
             if not isinstance(explicit_session_id, str) or not explicit_session_id.strip():
                 return web.json_response(
@@ -8483,6 +8502,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             {"role": msg["role"], "content": str(content)}
                         )
 
+        if interaction_forbidden:
+            instructions = with_unattended_guidance(instructions)
+
         session_id = explicit_session_id or stored_session_id
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
@@ -8503,13 +8525,17 @@ class APIServerAdapter(BasePlatformAdapter):
         # stores only that scalar digest and the resulting run identity.
         if turn_id:
             try:
+                fingerprint_body = {
+                    key: value
+                    for key, value in body.items()
+                    if key != "turn_id"
+                }
+                fingerprint_body.setdefault(
+                    "interaction_policy", interaction_policy
+                )
                 idempotency_fingerprint = request_fingerprint(
                     {
-                        "body": {
-                            key: value
-                            for key, value in body.items()
-                            if key != "turn_id"
-                        },
+                        "body": fingerprint_body,
                         "session_id": session_id,
                         "gateway_session_key": gateway_session_key,
                         "owner_profile": request_profile,
@@ -9150,6 +9176,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             requested_provider=agent_overrides.get("requested_provider"),
                             model_options=agent_overrides.get("model_options"),
                             route=route,
+                            disabled_toolsets=unattended_disabled_toolsets,
                         )
 
                 agent = await self._run_in_executor_tracked(_build_agent)
@@ -9255,6 +9282,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_approval_surface_token = None
                     tool_approval_notify_token = None
                     user_input_token = None
+                    dangerous_approval_registered = False
                     session_tokens = []
                     with self._profile_scope(request_profile):
                         try:
@@ -9286,21 +9314,25 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_id=session_id or "",
                                 profile=request_profile or "",
                                 origin_turn_id=str(turn_id) if turn_id else "",
-                                delegation_sync_only=delegation_sync_only,
+                                interaction_policy=interaction_policy,
                             )
-                            register_gateway_notify(approval_session_key, _approval_notify)
-                            # Mark this run's session as an interactive surface so
-                            # request_user_input can PARK for an answer; without it
-                            # the blocking wait returns "no_surface" instantly and
-                            # every question degrades to no_response.
-                            user_input_token = register_user_input_session(
-                                approval_session_key
-                            )
-                            tool_approval_notify_token = register_tool_approval_notify(
-                                tool_approval_surface_key,
-                                _tool_interaction_notify,
-                                grant_session_key=tool_approval_grant_session_key,
-                            )
+                            if not interaction_forbidden:
+                                register_gateway_notify(
+                                    approval_session_key, _approval_notify
+                                )
+                                dangerous_approval_registered = True
+                                user_input_token = register_user_input_session(
+                                    approval_session_key
+                                )
+                                tool_approval_notify_token = (
+                                    register_tool_approval_notify(
+                                        tool_approval_surface_key,
+                                        _tool_interaction_notify,
+                                        grant_session_key=(
+                                            tool_approval_grant_session_key
+                                        ),
+                                    )
+                                )
                             with tool_approval_registration_lock:
                                 cancelled_before_publish = (
                                     tool_approval_registration_cancelled[0]
@@ -9351,7 +9383,10 @@ class APIServerAdapter(BasePlatformAdapter):
                                     except Exception:
                                         pass
                                 try:
-                                    unregister_gateway_notify(approval_session_key)
+                                    if dangerous_approval_registered:
+                                        unregister_gateway_notify(
+                                            approval_session_key
+                                        )
                                 finally:
                                     if approval_token is not None:
                                         try:

@@ -110,6 +110,13 @@ starting another agent. Reusing it with changed input, instructions, session,
 model, or other request fields returns HTTP 409 with error code
 `turn_id_conflict`.
 
+Turn event-log API version 3 adds the `interaction_policy` request contract.
+Set it to `forbid` for unattended runs so Hermes removes interactive tools and
+surfaces, fails new approvals closed, and waits for delegated child work before
+the parent run completes. Omitting the field preserves the interactive
+`allow` behavior. Consumers that depend on this contract should require
+`turn_event_log_api_version >= 3` from `GET /v1/capabilities` before dispatch.
+
 The relation is created additively on first open and survives gateway restart.
 If a restarted gateway receives a retry for a previously active run, it keeps
 the original identity and closes the orphaned execution as
