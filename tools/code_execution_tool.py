@@ -2286,6 +2286,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     # knows their names (from the tools array or the bridge catalog) and can read
     # their parameters off the generated stub or via tool_describe.
     mcp_tools = sorted(name for name in enabled_sandbox_tools if _is_mcp_tool(name))
+    parallel_read_guidance = ""
     if mcp_tools:
         count = (
             "the MCP tool" if len(mcp_tools) == 1 else f"all {len(mcp_tools)} MCP tools"
@@ -2300,6 +2301,10 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
             "to run one tool over many inputs: the per-call results stay in the script "
             "instead of filling your context, so you can fetch across a whole list and "
             "print only what you concluded."
+        )
+        parallel_read_guidance = (
+            " For several independent read-only MCP calls, emit normal tool calls "
+            "so the runtime can parallelize them."
         )
 
     # Build example import list from enabled tools
@@ -2366,6 +2371,9 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
 
     description = (
         "Run a Python script that can call your tools programmatically. "
+        "Use this for programmatic processing, control flow, or context reduction "
+        "across tool calls — not as a latency optimization."
+        f"{parallel_read_guidance} "
         "Use this when you need 3+ tool calls with processing logic between them, "
         "need to filter/reduce large tool outputs before they enter your context, "
         "need conditional branching (if X then Y else Z), or need to loop "

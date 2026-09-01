@@ -33,6 +33,16 @@ Example config::
         env:
           GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_..."
         supports_parallel_tool_calls: true  # tools from this server may run concurrently
+      omnia:
+        url: "https://omnia.example.com/mcp"
+        # Narrow opt-in: only tools advertising readOnlyHint: true may
+        # overlap; writes and unannotated tools remain serialized.
+        supports_parallel_read_tool_calls: true
+        parallel_read_tool_call_limit: 4  # hard-capped at 8
+        sampling:
+          enabled: false
+        elicitation:
+          enabled: false
       remote_api:
         url: "https://my-mcp-server.example.com/mcp"
         headers:
@@ -71,6 +81,10 @@ Features:
       sampling/createMessage (text and tool-use responses)
     - Parallel tool call opt-in: per-server ``supports_parallel_tool_calls``
       flag allows concurrent execution of tools from the same server
+    - Parallel read opt-in: HTTP servers may additionally set
+      ``supports_parallel_read_tool_calls`` to run explicitly read-only tools
+      concurrently, subject to ``parallel_read_tool_call_limit`` (default 4,
+      hard cap 8). Sampling and elicitation must be disabled for this opt-in.
 
 Architecture:
     A dedicated background event loop (_mcp_loop) runs in a daemon thread.
@@ -92,6 +106,7 @@ Thread safety:
 import asyncio
 import contextvars
 import concurrent.futures
+from contextlib import asynccontextmanager
 import errno
 import fnmatch
 import inspect
@@ -330,6 +345,11 @@ _MCP_LOG_LEVEL_MAP = {
 
 _DEFAULT_TOOL_TIMEOUT = 300      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
+# Read-only MCP calls are deliberately more tightly bounded than the global
+# tool executor. Four is enough to overlap independent Omnia reads without
+# turning a single MCP server into an unbounded fan-out source.
+_DEFAULT_PARALLEL_READ_LIMIT = 4
+_MAX_PARALLEL_READ_LIMIT = 8
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
@@ -343,6 +363,93 @@ _RECYCLED_RECONNECT_TIMEOUT = 15.0
 # lost the same backend retries in lockstep (thundering herd) and log lines
 # from N servers land in synchronized bursts.
 _BACKOFF_JITTER = 0.2            # +/-20%
+
+
+class _MCPReadWriteGate:
+    """Bounded-reader / exclusive-writer gate for an MCP session.
+
+    ``ClientSession`` calls from an HTTP transport can be multiplexed, but
+    writes and all transports that are not explicitly opted in must retain
+    the existing per-server serialization. The gate lets only qualified
+    HTTP reads share a bounded number of slots while making every other RPC
+    an exclusive operation. Waiting writers take priority so a stream of
+    reads cannot starve a write or a lifecycle RPC.
+
+    The semaphore is deliberately owned by this object rather than by the
+    caller. A read slot is reserved before waiting for the reader state, so
+    the configured limit applies to both active and queued reads; releasing a
+    cancelled waiter always returns its slot.
+    """
+
+    __slots__ = (
+        "_read_slots", "_condition", "_max_readers", "_active_readers",
+        "_writer_active", "_waiting_writers",
+    )
+
+    def __init__(self, max_readers: int):
+        self._max_readers = max_readers
+        self._read_slots = asyncio.BoundedSemaphore(max_readers)
+        self._condition = asyncio.Condition()
+        self._active_readers = 0
+        self._writer_active = False
+        self._waiting_writers = 0
+
+    @property
+    def read_semaphore(self):
+        """Expose the bounded semaphore for diagnostics and focused tests."""
+        return self._read_slots
+
+    @property
+    def max_readers(self) -> int:
+        return self._max_readers
+
+    async def acquire_read(self) -> None:
+        await self._read_slots.acquire()
+        try:
+            async with self._condition:
+                await self._condition.wait_for(
+                    lambda: (
+                        not self._writer_active
+                        and self._waiting_writers == 0
+                    )
+                )
+                self._active_readers += 1
+        except BaseException:
+            # A cancelled reader has not entered the active set yet.
+            self._read_slots.release()
+            raise
+
+    async def release_read(self) -> None:
+        async with self._condition:
+            if self._active_readers <= 0:
+                raise RuntimeError("MCP read gate released without an active reader")
+            self._active_readers -= 1
+            self._read_slots.release()
+            self._condition.notify_all()
+
+    async def acquire_write(self) -> None:
+        async with self._condition:
+            self._waiting_writers += 1
+            try:
+                await self._condition.wait_for(
+                    lambda: (
+                        not self._writer_active
+                        and self._active_readers == 0
+                    )
+                )
+            except BaseException:
+                self._waiting_writers -= 1
+                self._condition.notify_all()
+                raise
+            self._waiting_writers -= 1
+            self._writer_active = True
+
+    async def release_write(self) -> None:
+        async with self._condition:
+            if not self._writer_active:
+                raise RuntimeError("MCP read gate released without an active writer")
+            self._writer_active = False
+            self._condition.notify_all()
 
 
 def _jittered(seconds: float) -> float:
@@ -1829,6 +1936,8 @@ class MCPServerTask:
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
         "_pending_call_context",
+        "_parallel_read_enabled", "_parallel_read_limit",
+        "_parallel_read_gate", "_parallel_read_semaphore",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -1887,6 +1996,15 @@ class MCPServerTask:
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
         self._pending_call_context: Optional[contextvars.Context] = None
+        # Parallel reads are an additive, opt-in path. The default remains
+        # the existing exclusive ``_rpc_lock`` for every transport and tool.
+        # A read/write gate is created only after config validation succeeds;
+        # its semaphore bounds HTTP reads while its writer side keeps writes
+        # and lifecycle RPCs exclusive.
+        self._parallel_read_enabled = False
+        self._parallel_read_limit = 1
+        self._parallel_read_gate: Optional[_MCPReadWriteGate] = None
+        self._parallel_read_semaphore = None
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -1937,6 +2055,78 @@ class MCPServerTask:
     def mark_tool_call(self) -> None:
         """Record that a user-visible MCP operation is starting."""
         self._last_tool_call_at = time.monotonic()
+
+    def _configure_parallel_reads(self, config: dict) -> None:
+        """Configure the bounded HTTP read path, failing closed when unsafe.
+
+        Sampling and elicitation callbacks both need the single
+        ``_pending_call_context`` slot to attribute a server-initiated request
+        to its parent tool call. They are therefore required to be explicitly
+        disabled before any read may bypass ``_rpc_lock``. Stdio is never
+        eligible because it has one JSON-RPC stream.
+        """
+        self._parallel_read_enabled = False
+        self._parallel_read_limit = 1
+        self._parallel_read_gate = None
+        self._parallel_read_semaphore = None
+
+        eligible, limit, reasons = _parallel_read_config_eligibility(config)
+        if not _parse_boolish(
+            config.get("supports_parallel_read_tool_calls", False),
+            default=False,
+        ):
+            with _lock:
+                _parallel_read_safe_servers.discard(
+                    sanitize_mcp_name_component(self.name)
+                )
+            return
+        if not eligible or limit is None:
+            logger.warning(
+                "MCP server '%s': supports_parallel_read_tool_calls requested "
+                "but disabled (%s)",
+                self.name,
+                "; ".join(reasons) or "unsafe configuration",
+            )
+            with _lock:
+                _parallel_read_safe_servers.discard(
+                    sanitize_mcp_name_component(self.name)
+                )
+            return
+
+        self._parallel_read_limit = limit
+        self._parallel_read_gate = _MCPReadWriteGate(limit)
+        self._parallel_read_semaphore = self._parallel_read_gate.read_semaphore
+        self._parallel_read_enabled = True
+        with _lock:
+            _parallel_read_safe_servers.add(sanitize_mcp_name_component(self.name))
+
+    @asynccontextmanager
+    async def _rpc_context(self, *, parallel_read: bool = False):
+        """Acquire the appropriate MCP RPC gate for one operation.
+
+        Qualified HTTP reads use only the bounded reader side. Everything
+        else takes the exclusive writer side (when configured) and the
+        historical per-server ``_rpc_lock``. Keeping ``_rpc_lock`` in the
+        serial path preserves stdio ordering and compatibility with existing
+        tests/diagnostics that inspect it directly.
+        """
+        gate = self._parallel_read_gate
+        if parallel_read and self._parallel_read_enabled and gate is not None:
+            await gate.acquire_read()
+            try:
+                yield
+            finally:
+                await gate.release_read()
+            return
+
+        if gate is not None and self._parallel_read_enabled:
+            await gate.acquire_write()
+        try:
+            async with self._rpc_lock:
+                yield
+        finally:
+            if gate is not None and self._parallel_read_enabled:
+                await gate.release_write()
 
     def _mark_lifecycle_started(self) -> None:
         now = time.monotonic()
@@ -2093,7 +2283,7 @@ class MCPServerTask:
             old_tool_names = set(self._registered_tool_names)
 
             # 1. Fetch current tool list from server (follow nextCursor)
-            async with self._rpc_lock:
+            async with self._rpc_context():
                 new_mcp_tools = await _paginate_full_list(
                     self.session.list_tools, "tools", self.name
                 )
@@ -2156,29 +2346,34 @@ class MCPServerTask:
         Raises on a genuine connection failure so the caller triggers a
         reconnect; returns normally when the session is alive.
         """
-        if not self._ping_unsupported:
-            try:
-                await asyncio.wait_for(self.session.send_ping(), timeout=30.0)
-                return
-            except Exception as exc:
-                # Only a "method not found" means ping is unsupported. Any
-                # other error (timeout, closed transport, session expired) is
-                # a real liveness failure — propagate so we reconnect.
-                if not _is_method_not_found_error(exc):
-                    raise
-                if not self._advertises_tools():
-                    # No ping, no tools → no cheaper probe to fall back to.
-                    raise
-                self._ping_unsupported = True
-                logger.info(
-                    "MCP server '%s': does not implement the optional 'ping' "
-                    "utility (-32601); using 'list_tools' for keepalive on "
-                    "this connection.",
-                    self.name,
-                )
+        # Keep the whole probe under the exclusive side of the per-server
+        # gate. A ping may fall back to list_tools, and neither lifecycle RPC
+        # may overlap a qualified parallel read or another client RPC.
+        async with self._rpc_context():
+            if not self._ping_unsupported:
+                try:
+                    await asyncio.wait_for(self.session.send_ping(), timeout=30.0)
+                    return
+                except Exception as exc:
+                    # Only a "method not found" means ping is unsupported. Any
+                    # other error (timeout, closed transport, session expired) is
+                    # a real liveness failure — propagate so we reconnect.
+                    if not _is_method_not_found_error(exc):
+                        raise
+                    if not self._advertises_tools():
+                        # No ping, no tools → no cheaper probe to fall back to.
+                        raise
+                    self._ping_unsupported = True
+                    logger.info(
+                        "MCP server '%s': does not implement the optional 'ping' "
+                        "utility (-32601); using 'list_tools' for keepalive on "
+                        "this connection.",
+                        self.name,
+                    )
 
-        # Fallback probe for servers without ping support.
-        await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
+            # Fallback probe for servers without ping support. Keep it in the
+            # same exclusive context as the failed ping above.
+            await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
 
     def _mark_session_proven(self) -> None:
         """Record that the current session demonstrated real health.
@@ -2496,9 +2691,10 @@ class MCPServerTask:
                     connect_timeout = float(
                         config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
                     )
-                    self.initialize_result = await asyncio.wait_for(
-                        session.initialize(), timeout=connect_timeout
-                    )
+                    async with self._rpc_context():
+                        self.initialize_result = await asyncio.wait_for(
+                            session.initialize(), timeout=connect_timeout
+                        )
                     self.session = session
                     self._mark_lifecycle_started()
                     await self._discover_tools()
@@ -2839,9 +3035,10 @@ class MCPServerTask:
                         # stdio path (#59349): an endpoint that accepts the
                         # connection but never answers ``initialize`` parks this
                         # coroutine forever on the background loop.
-                        self.initialize_result = await asyncio.wait_for(
-                            session.initialize(), timeout=float(connect_timeout)
-                        )
+                        async with self._rpc_context():
+                            self.initialize_result = await asyncio.wait_for(
+                                session.initialize(), timeout=float(connect_timeout)
+                            )
                         self.session = session
                         await self._discover_tools()
                         self._ready.set()
@@ -2902,9 +3099,10 @@ class MCPServerTask:
                     ):
                         async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                             # Bound the handshake (#59349) — see stdio path.
-                            self.initialize_result = await asyncio.wait_for(
-                                session.initialize(), timeout=float(connect_timeout)
-                            )
+                            async with self._rpc_context():
+                                self.initialize_result = await asyncio.wait_for(
+                                    session.initialize(), timeout=float(connect_timeout)
+                                )
                             self.session = session
                             await self._discover_tools()
                             self._ready.set()
@@ -2940,9 +3138,10 @@ class MCPServerTask:
                 ):
                     async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                         # Bound the handshake (#59349) — see stdio path.
-                        self.initialize_result = await asyncio.wait_for(
-                            session.initialize(), timeout=float(connect_timeout)
-                        )
+                        async with self._rpc_context():
+                            self.initialize_result = await asyncio.wait_for(
+                                session.initialize(), timeout=float(connect_timeout)
+                            )
                         self.session = session
                         await self._discover_tools()
                         self._ready.set()
@@ -2989,7 +3188,7 @@ class MCPServerTask:
             self._tools = []
             self._register_discovered_tools_if_needed()
             return
-        async with self._rpc_lock:
+        async with self._rpc_context():
             self._tools = await _paginate_full_list(
                 self.session.list_tools, "tools", self.name
             )
@@ -3026,6 +3225,7 @@ class MCPServerTask:
         self._auth_type = (config.get("auth") or "").lower().strip()
         self._idle_timeout_seconds = _get_lifecycle_seconds(config, "idle_timeout_seconds")
         self._max_lifetime_seconds = _get_lifecycle_seconds(config, "max_lifetime_seconds")
+        self._configure_parallel_reads(config)
 
         # Set up sampling handler if enabled and SDK types are available
         sampling_config = config.get("sampling", {})
@@ -3471,6 +3671,10 @@ class MCPServerTask:
             registry.deregister(tool_name)
             _forget_mcp_tool_server(tool_name)
         self._registered_tool_names = []
+        with _lock:
+            _parallel_read_safe_servers.discard(
+                sanitize_mcp_name_component(self.name)
+            )
 
     async def _wait_for_lazy_reconnect(self) -> None:
         """Wait while an intentionally recycled stdio server is dormant."""
@@ -4074,6 +4278,12 @@ def _handle_session_expired_and_retry(
 # ``is_mcp_tool_parallel_safe()`` for the parallel-execution check in run_agent.
 _parallel_safe_servers: set = set()
 
+# Sanitized server names whose additive
+# ``supports_parallel_read_tool_calls`` config passed transport/callback
+# validation. Tool-level ``readOnlyHint: true`` and exact registration
+# provenance are checked separately by ``is_mcp_tool_parallel_read_safe()``.
+_parallel_read_safe_servers: set = set()
+
 # Exact MCP tool-name provenance. MCP tool names are formatted as
 # ``mcp_{sanitized_server}_{sanitized_tool}``, which is ambiguous when server
 # names contain underscores (``mcp_a_b_tool`` could be server ``a`` + tool
@@ -4093,7 +4303,8 @@ _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
 
 # Protects _mcp_loop, _mcp_thread, _servers, MCP connection status maps,
-# _parallel_safe_servers, MCP tool provenance/metadata, and _stdio_pids.
+# _parallel_safe_servers, _parallel_read_safe_servers, MCP tool
+# provenance/metadata, and _stdio_pids.
 _lock = threading.Lock()
 
 # PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
@@ -4613,16 +4824,45 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            # Only a tool that is still registered to this exact server and
+            # explicitly advertises ``readOnlyHint: true`` may bypass the
+            # historical per-server RPC lock. The server-level opt-in is
+            # checked inside ``is_mcp_tool_parallel_read_safe``; the task
+            # check below also prevents a stale registry flag from bypassing
+            # the lock after a reconnect or config validation failure.
+            prefixed_tool_name = mcp_prefixed_tool_name(server_name, tool_name)
+            parallel_read = (
+                getattr(server, "_parallel_read_enabled", False)
+                and getattr(server, "_parallel_read_gate", None) is not None
+                and getattr(server, "_is_http", lambda: False)()
+                and is_mcp_tool_parallel_read_safe(prefixed_tool_name)
+            )
+            rpc_context = getattr(server, "_rpc_context", None)
+            # Keep compatibility with lightweight server adapters and test
+            # doubles that predate MCPServerTask._rpc_context. They cannot opt
+            # into the parallel path, so their historical lock remains the
+            # correct serial guard.
+            context = (
+                rpc_context(parallel_read=parallel_read)
+                if rpc_context is not None
+                else server._rpc_lock
+            )
+            async with context:
                 # Snapshot the agent's context so an elicitation callback
                 # triggered during this call (fired on the MCP recv loop
                 # task, which doesn't inherit our contextvars) can replay
                 # it and detect the gateway platform / session for routing.
-                server._pending_call_context = contextvars.copy_context()
+                # Parallel reads have sampling and elicitation disabled by
+                # config validation, so they intentionally do not touch this
+                # singular context slot. Every serialized call retains the
+                # previous capture/replay behavior.
+                if not parallel_read:
+                    server._pending_call_context = contextvars.copy_context()
                 try:
                     result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
-                    server._pending_call_context = None
+                    if not parallel_read:
+                        server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself
             # returned isError). Clear the rapid-drop budget (#62212).
@@ -4774,7 +5014,7 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            async with server._rpc_context():
                 all_resources = await _paginate_full_list(
                     server.session.list_resources, "resources", server_name
                 )
@@ -4840,7 +5080,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            async with server._rpc_context():
                 result = await server.session.read_resource(uri)
             # read_resource returns ReadResourceResult with .contents list
             parts: List[str] = []
@@ -4901,7 +5141,7 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            async with server._rpc_context():
                 all_prompts = await _paginate_full_list(
                     server.session.list_prompts, "prompts", server_name
                 )
@@ -4973,7 +5213,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            async with server._rpc_context():
                 result = await server.session.get_prompt(name, arguments=arguments)
             # GetPromptResult has .messages list
             messages = []
@@ -5358,6 +5598,76 @@ def _parse_boolish(value: Any, default: bool = True) -> bool:
     return default
 
 
+def _parallel_read_limit_from_config(config: dict) -> tuple[Optional[int], Optional[str]]:
+    """Parse and clamp the per-server parallel-read limit.
+
+    The setting is intentionally fail-closed: an invalid value disables the
+    opt-in instead of silently turning a typo into unbounded concurrency.
+    Valid values are integers in ``[1, _MAX_PARALLEL_READ_LIMIT]``; values
+    above the hard ceiling are clamped with a warning.
+    """
+    raw = config.get(
+        "parallel_read_tool_call_limit",
+        _DEFAULT_PARALLEL_READ_LIMIT,
+    )
+    if isinstance(raw, bool):
+        return None, "parallel_read_tool_call_limit must be an integer"
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        return None, "parallel_read_tool_call_limit must be an integer"
+    # ``int(2.5)`` silently truncates; reject non-integral numeric values.
+    try:
+        if isinstance(raw, float) and not raw.is_integer():
+            return None, "parallel_read_tool_call_limit must be an integer"
+    except (AttributeError, ValueError):
+        return None, "parallel_read_tool_call_limit must be an integer"
+    if limit < 1:
+        return None, "parallel_read_tool_call_limit must be at least 1"
+    if limit > _MAX_PARALLEL_READ_LIMIT:
+        logger.warning(
+            "MCP config parallel_read_tool_call_limit=%s exceeds hard ceiling %s; clamping",
+            limit,
+            _MAX_PARALLEL_READ_LIMIT,
+        )
+        limit = _MAX_PARALLEL_READ_LIMIT
+    return limit, None
+
+
+def _parallel_read_config_eligibility(config: dict) -> tuple[bool, Optional[int], list[str]]:
+    """Return whether a server config is safe for parallel read RPCs.
+
+    ``readOnlyHint`` is checked per registered tool later. This config-level
+    gate handles the transport and callback prerequisites that must be true
+    before any read can bypass ``_rpc_lock``.
+    """
+    if not _parse_boolish(
+        config.get("supports_parallel_read_tool_calls", False),
+        default=False,
+    ):
+        return False, None, []
+
+    reasons: list[str] = []
+    if "url" not in config:
+        reasons.append("requires HTTP transport (url)")
+
+    for callback_name in ("sampling", "elicitation"):
+        callback_config = config.get(callback_name)
+        # The runtime callback setup below uses raw truthiness, so a quoted
+        # YAML value such as ``enabled: "false"`` would still enable the
+        # callback. Require the literal boolean False here instead of relying
+        # on boolish parsing that could make the safety gate disagree with the
+        # actual ClientSession configuration.
+        if not isinstance(callback_config, dict) or callback_config.get("enabled") is not False:
+            reasons.append(f"{callback_name}.enabled must be false")
+
+    limit, limit_error = _parallel_read_limit_from_config(config)
+    if limit_error:
+        reasons.append(limit_error)
+
+    return not reasons, limit, reasons
+
+
 def _get_lifecycle_seconds(config: dict, key: str) -> Optional[float]:
     """Return an optional positive lifecycle timeout from top-level/nested config."""
     raw = config.get(key)
@@ -5546,6 +5856,16 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         List of registered prefixed tool names.
     """
     from tools.registry import registry
+
+    # Re-publish the validated server capability after reconnects. A parked
+    # server removes its tools (and the planner's capability marker); the
+    # server task itself is reused when it revives, so registration is the
+    # point where the marker becomes live again.
+    with _lock:
+        if getattr(server, "_parallel_read_enabled", False):
+            _parallel_read_safe_servers.add(sanitize_mcp_name_component(name))
+        else:
+            _parallel_read_safe_servers.discard(sanitize_mcp_name_component(name))
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
@@ -5742,6 +6062,22 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 _parallel_safe_servers.add(sanitize_mcp_name_component(srv_name))
             else:
                 _parallel_safe_servers.discard(sanitize_mcp_name_component(srv_name))
+            # The additive read capability is stricter than the historical
+            # all-tool flag. Before a new server connects we can pre-record a
+            # valid config so registration/planner tests see the toggle; the
+            # task's own validation remains authoritative once connected.
+            read_eligible, _read_limit, _read_reasons = _parallel_read_config_eligibility(
+                srv_cfg
+            )
+            existing_server = _servers.get(srv_name)
+            if existing_server is not None:
+                read_eligible = bool(
+                    getattr(existing_server, "_parallel_read_enabled", False)
+                )
+            if read_eligible:
+                _parallel_read_safe_servers.add(sanitize_mcp_name_component(srv_name))
+            else:
+                _parallel_read_safe_servers.discard(sanitize_mcp_name_component(srv_name))
 
     for srv in stale_cached:
         _signal_reconnect(srv)
@@ -5885,6 +6221,32 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     with _lock:
         server_name = _mcp_tool_server_names.get(tool_name)
         return bool(server_name and server_name in _parallel_safe_servers)
+
+
+def is_mcp_tool_parallel_read_safe(tool_name: str) -> bool:
+    """Check whether a registered MCP tool is eligible for parallel reads.
+
+    This is intentionally separate from :func:`is_mcp_tool_parallel_safe`.
+    The existing flag is a server-wide opt-in and preserves its historical
+    behavior for callers that explicitly accept concurrent writes. The new
+    read-only flag is narrower: exact registration provenance must be known,
+    the tool must have advertised ``readOnlyHint: true``, and its server must
+    have passed the HTTP/callback configuration gate.
+
+    Missing or false annotations fail closed. The function is deliberately
+    metadata-only so the planner can make the same decision before dispatch;
+    the handler repeats the check against the live server task before it
+    bypasses ``_rpc_lock``.
+    """
+    if not tool_name.startswith(MCP_TOOL_NAME_PREFIX):
+        return False
+    with _lock:
+        server_name = _mcp_tool_server_names.get(tool_name)
+        return bool(
+            server_name
+            and server_name in _parallel_read_safe_servers
+            and _mcp_tool_read_only_hints.get(tool_name) is True
+        )
 
 
 def get_mcp_status() -> List[dict]:

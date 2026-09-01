@@ -34,6 +34,9 @@ mcp_servers:
     timeout: 120
     connect_timeout: 60
     supports_parallel_tool_calls: false
+    # Narrow HTTP-only read parallelism; requires both callbacks disabled.
+    supports_parallel_read_tool_calls: false
+    parallel_read_tool_call_limit: 4
     tools:
       include: []
       exclude: []
@@ -57,6 +60,8 @@ mcp_servers:
 | `timeout` | number | both | Tool call timeout in seconds (default: `300`) |
 | `connect_timeout` | number | both | Initial connection timeout in seconds (default: `60`) |
 | `supports_parallel_tool_calls` | bool | both | Allow tools from this server to run concurrently |
+| `supports_parallel_read_tool_calls` | bool | HTTP | Opt into bounded concurrency only for tools with `readOnlyHint: true` (default: `false`); requires `sampling.enabled: false` and `elicitation.enabled: false` |
+| `parallel_read_tool_call_limit` | integer | HTTP | Maximum concurrent read calls when the read-only opt-in is enabled (default: `4`, hard cap: `8`) |
 | `skip_preflight` | bool | HTTP | Bypass the fail-fast content-type probe for valid Streamable HTTP endpoints whose HEAD/GET answers a non-MCP content type (default: `false`) |
 | `tools` | mapping | both | Filtering and utility-tool policy |
 | `auth` | string | HTTP | Authentication method. Set to `oauth` to enable OAuth 2.1 with PKCE |

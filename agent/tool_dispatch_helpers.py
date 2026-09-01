@@ -93,13 +93,60 @@ def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     """Check if an MCP tool comes from a server with parallel tool calls enabled.
 
     Lazy-imports from ``tools.mcp_tool`` to avoid circular dependencies.
+    The historical server-wide opt-in remains authoritative for callers that
+    explicitly enabled concurrent execution of every tool on that server.
+    The additive read-only opt-in is checked separately and only admits tools
+    with exact registration provenance plus ``readOnlyHint: true``.
     Returns False if the MCP module is not available.
     """
     try:
-        from tools.mcp_tool import is_mcp_tool_parallel_safe
-        return is_mcp_tool_parallel_safe(tool_name)
+        from tools.mcp_tool import (
+            is_mcp_tool_parallel_read_safe,
+            is_mcp_tool_parallel_safe,
+        )
+        return (
+            is_mcp_tool_parallel_safe(tool_name)
+            or is_mcp_tool_parallel_read_safe(tool_name)
+        )
     except Exception:
         return False
+
+
+def _resolve_planner_tool_call(tool_name: str, function_args: dict):
+    """Resolve a deferred ``tool_call`` wrapper for safety planning only.
+
+    Tool-search keeps MCP schemas out of the model-facing tools array, so a
+    model batch contains the literal ``tool_call`` bridge name rather than the
+    underlying MCP name. The executor remains authoritative for session scope,
+    argument validation, hooks, and dispatch; this resolver only exposes the
+    target name/arguments to the metadata-only segment planner. Any resolver
+    error fails closed to a sequential barrier.
+    """
+    if tool_name != "tool_call":
+        return tool_name, function_args
+
+    try:
+        from tools.tool_search import resolve_underlying_call
+
+        underlying_name, underlying_args, error = resolve_underlying_call(function_args)
+    except Exception as exc:
+        logger.debug("Could not resolve tool_call for batch planning: %s", exc)
+        return None, None
+
+    if error or not isinstance(underlying_name, str) or not underlying_name:
+        logger.debug(
+            "Could not resolve tool_call for batch planning: %s",
+            error or "missing underlying tool name",
+        )
+        return None, None
+    if not isinstance(underlying_args, dict):
+        logger.debug(
+            "Could not resolve tool_call for batch planning: underlying arguments "
+            "are %s, not an object",
+            type(underlying_args).__name__,
+        )
+        return None, None
+    return underlying_name, underlying_args
 
 
 def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> List[tuple]:
@@ -121,7 +168,10 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
       path already reserved in the same run; an overlap closes the run so
       the conflicting call starts a NEW run after the first completes.
     * Anything not in ``_PARALLEL_SAFE_TOOLS`` and not an opted-in MCP
-      tool → barrier.
+      tool → barrier. MCP tools can use either the legacy server-wide
+      ``supports_parallel_tool_calls`` opt-in or the narrower
+      ``supports_parallel_read_tool_calls`` opt-in, whose metadata gate
+      admits only explicit ``readOnlyHint: true`` registrations.
 
     Parallel runs shorter than two calls are demoted to sequential (no
     concurrency win, and the sequential executor owns the richer inline
@@ -146,9 +196,9 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
             segments.append(["sequential", [tc]])
 
     for tool_call in tool_calls:
-        tool_name = tool_call.function.name
+        raw_tool_name = tool_call.function.name
 
-        if tool_name in _NEVER_PARALLEL_TOOLS:
+        if raw_tool_name in _NEVER_PARALLEL_TOOLS:
             _add_sequential(tool_call)
             continue
 
@@ -158,7 +208,7 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
             _raw = tool_call.function.arguments
             logging.debug(
                 "Could not parse args for %s — treating as sequential barrier; raw=%s",
-                tool_name,
+                raw_tool_name,
                 _raw[:200] if isinstance(_raw, str) else repr(_raw)[:200],
             )
             _add_sequential(tool_call)
@@ -166,9 +216,16 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
         if not isinstance(function_args, dict):
             logging.debug(
                 "Non-dict args for %s (%s) — treating as sequential barrier",
-                tool_name,
+                raw_tool_name,
                 type(function_args).__name__,
             )
+            _add_sequential(tool_call)
+            continue
+
+        tool_name, function_args = _resolve_planner_tool_call(
+            raw_tool_name, function_args
+        )
+        if tool_name is None or function_args is None:
             _add_sequential(tool_call)
             continue
 

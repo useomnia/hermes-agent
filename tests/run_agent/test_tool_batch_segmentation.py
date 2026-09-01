@@ -39,6 +39,18 @@ def _tc(name="web_search", arguments="{}", call_id=None):
     )
 
 
+def _tool_call(target_name, target_arguments=None, call_id=None):
+    """Build a tool-search bridge call without changing its outer shape."""
+    return _tc(
+        "tool_call",
+        json.dumps({
+            "name": target_name,
+            "arguments": {} if target_arguments is None else target_arguments,
+        }),
+        call_id=call_id,
+    )
+
+
 def _kinds(segments):
     return [kind for kind, _ in segments]
 
@@ -129,6 +141,134 @@ class TestPlanToolBatchSegments:
 
         assert _kinds(segments) == ["parallel", "sequential"]
         assert [tc.id for tc in segments[1][1]] == ["u1"]
+
+    def test_mcp_read_opt_in_requires_exact_read_only_hint(self):
+        """The additive MCP opt-in admits only explicitly read-only tools."""
+        from tools.mcp_tool import (
+            _lock,
+            _mcp_tool_read_only_hints,
+            _mcp_tool_server_names,
+            _parallel_read_safe_servers,
+        )
+
+        with _lock:
+            _parallel_read_safe_servers.add("omnia")
+            _mcp_tool_server_names["mcp__omnia__read"] = "omnia"
+            _mcp_tool_server_names["mcp__omnia__write"] = "omnia"
+            _mcp_tool_read_only_hints["mcp__omnia__read"] = True
+            _mcp_tool_read_only_hints["mcp__omnia__write"] = False
+        try:
+            reads = [_tc("mcp__omnia__read", call_id="r1"), _tc("mcp__omnia__read", call_id="r2")]
+            write = _tc("mcp__omnia__write", call_id="w1")
+            assert _kinds(_plan_tool_batch_segments(reads)) == ["parallel"]
+            assert _kinds(_plan_tool_batch_segments([write, _tc("mcp__omnia__read")])) == ["sequential"]
+        finally:
+            with _lock:
+                _parallel_read_safe_servers.discard("omnia")
+                for name in ("read", "write"):
+                    prefixed = f"mcp__omnia__{name}"
+                    _mcp_tool_server_names.pop(prefixed, None)
+                    _mcp_tool_read_only_hints.pop(prefixed, None)
+
+    def test_mcp_read_and_write_keep_ordered_barrier_segments(self):
+        from tools.mcp_tool import (
+            _lock,
+            _mcp_tool_read_only_hints,
+            _mcp_tool_server_names,
+            _parallel_read_safe_servers,
+        )
+
+        with _lock:
+            _parallel_read_safe_servers.add("omnia")
+            for name, hint in (("read", True), ("write", False)):
+                prefixed = f"mcp__omnia__{name}"
+                _mcp_tool_server_names[prefixed] = "omnia"
+                _mcp_tool_read_only_hints[prefixed] = hint
+        try:
+            calls = [
+                _tc("mcp__omnia__read", call_id="r1"),
+                _tc("mcp__omnia__read", call_id="r2"),
+                _tc("mcp__omnia__write", call_id="w1"),
+                _tc("mcp__omnia__read", call_id="r3"),
+                _tc("mcp__omnia__read", call_id="r4"),
+            ]
+            segments = _plan_tool_batch_segments(calls)
+            assert _kinds(segments) == ["parallel", "sequential", "parallel"]
+            assert _flatten_ids(segments) == ["r1", "r2", "w1", "r3", "r4"]
+        finally:
+            with _lock:
+                _parallel_read_safe_servers.discard("omnia")
+                for name in ("read", "write"):
+                    prefixed = f"mcp__omnia__{name}"
+                    _mcp_tool_server_names.pop(prefixed, None)
+                    _mcp_tool_read_only_hints.pop(prefixed, None)
+
+    def test_deferred_mcp_read_wrappers_resolve_for_parallel_planning(self):
+        """Plan the target behind tool_call while preserving bridge objects."""
+        from tools.mcp_tool import (
+            _lock,
+            _mcp_tool_read_only_hints,
+            _mcp_tool_server_names,
+            _parallel_read_safe_servers,
+        )
+        from tools.registry import registry
+
+        registered = {
+            "mcp__omnia__read": True,
+            "mcp__omnia__write": False,
+            "mcp__omnia__missing_hint": None,
+        }
+        for name in registered:
+            registry.register(
+                name=name,
+                toolset="mcp-omnia",
+                schema={
+                    "name": name,
+                    "description": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                handler=lambda *_args, **_kwargs: "{}",
+            )
+
+        with _lock:
+            _parallel_read_safe_servers.add("omnia")
+            for name, hint in registered.items():
+                _mcp_tool_server_names[name] = "omnia"
+                if hint is not None:
+                    _mcp_tool_read_only_hints[name] = hint
+
+        calls = [
+            _tool_call("mcp__omnia__read", call_id="r1"),
+            _tool_call("mcp__omnia__read", call_id="r2"),
+            _tool_call("mcp__omnia__write", call_id="write"),
+            _tool_call("mcp__omnia__missing_hint", call_id="missing"),
+            _tool_call(
+                "mcp__omnia__read",
+                target_arguments="{invalid-json",
+                call_id="invalid",
+            ),
+            _tc("tool_call", "{invalid-json", call_id="invalid-outer"),
+            _tool_call("mcp__omnia__out_of_scope", call_id="out-of-scope"),
+            _tool_call("mcp__omnia__read", call_id="r3"),
+            _tool_call("mcp__omnia__read", call_id="r4"),
+        ]
+        try:
+            segments = _plan_tool_batch_segments(calls)
+            assert _kinds(segments) == ["parallel", "sequential", "parallel"]
+            assert _flatten_ids(segments) == [
+                "r1", "r2", "write", "missing", "invalid", "invalid-outer",
+                "out-of-scope", "r3", "r4",
+            ]
+            assert segments[0][1][0] is calls[0]
+            assert all(tc.function.name == "tool_call" for _, group in segments for tc in group)
+        finally:
+            for name in registered:
+                registry.deregister(name)
+            with _lock:
+                _parallel_read_safe_servers.discard("omnia")
+                for name in registered:
+                    _mcp_tool_server_names.pop(name, None)
+                    _mcp_tool_read_only_hints.pop(name, None)
 
     def test_malformed_args_call_is_a_barrier_not_a_batch_poison(self):
         calls = [

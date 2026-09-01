@@ -191,6 +191,9 @@ class TestSchemaDescription(_WithMcpTool):
             schema = build_execute_code_schema({"terminal", *many}, mode="project")
             description = schema["description"]
             self.assertIn(f"all {len(many)} MCP tools", description)
+            self.assertIn("not as a latency optimization", description)
+            self.assertIn("independent read-only MCP calls", description)
+            self.assertIn("normal tool calls so the runtime can parallelize them", description)
             # One example name is fine; forty would be a per-turn context tax.
             listed = sum(1 for name in many if name in description)
             self.assertEqual(listed, 1)
