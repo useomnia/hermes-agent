@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 from hermes_constants import MAX_TODO_ITEMS
 
 
-TURN_EVENT_LOG_API_VERSION = 2
+TURN_EVENT_LOG_API_VERSION = 3
 DEFAULT_RUN_LOG_CAP_BYTES = 8 * 1024 * 1024
 DEFAULT_TERMINAL_RETENTION_SECONDS = 5 * 60
 DEFAULT_TOMBSTONE_LIMIT = 1000

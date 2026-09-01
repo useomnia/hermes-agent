@@ -3026,10 +3026,9 @@ def delegate_task(
     # is request-scoped and would be unreadable once a child agent binds its
     # own session context. Empty on non-Omnio deployments.
     _origin_turn_id = _current_origin_turn_id()
-    # Same rationale, same capture point: the Omnio proxy's per-run
-    # delegation_sync_only flag (bound alongside HERMES_SESSION_CHAT_ID) must
-    # be read before it becomes unreadable once a child agent binds its own
-    # session context. False on non-Omnio deployments.
+    # Same rationale, same capture point: the run's internal synchronous-
+    # delegation capability must be read before a child agent binds its own
+    # session context. It is derived from the request's interaction policy.
     _sync_only = _current_delegation_sync_only()
 
     # Build all child agents on the main thread (thread-safe construction).
@@ -3279,18 +3278,12 @@ def delegate_task(
         # not only the self-post wake fallback below.
         _wake_sid = _origin_wake_sid
         if _sync_only:
-            # The Omnio proxy set delegation_sync_only for this run: this is
-            # a headless surface (cron, trigger.dev run) with NO channel to
-            # ever consume a background wake, even though the API server
-            # always binds a raw session id and would otherwise qualify for
-            # the self-post wake re-enable below. Force the synchronous
-            # fallback unconditionally — this defeats that re-enable path
-            # entirely rather than merely skipping it, since a caller could
-            # set the flag even when async_delivery_supported() is True.
+            # This unattended run has no channel that can consume a later
+            # background wake. Force the synchronous fallback even though the
+            # API server binds a raw session id.
             logger.info(
-                "delegate_task: delegation_sync_only is set for this run — "
-                "forcing synchronous execution regardless of wake-session "
-                "availability."
+                "delegate_task: user interaction is forbidden for this run — "
+                "forcing synchronous execution."
             )
             _async_ok = False
         elif not _async_ok:

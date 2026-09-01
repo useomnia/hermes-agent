@@ -42,6 +42,7 @@ from agent.prompt_builder import (
 )
 from hermes_cli.default_soul import DEFAULT_SOUL_MD
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
+from agent.unattended import UNATTENDED_RUN_GUIDANCE
 
 
 # =========================================================================
@@ -1179,6 +1180,9 @@ class TestPromptBuilderConstants:
         assert "tui" in PLATFORM_HINTS
         assert "api_server" in PLATFORM_HINTS
         assert "webui" in PLATFORM_HINTS
+
+    def test_cron_uses_shared_unattended_guidance(self):
+        assert UNATTENDED_RUN_GUIDANCE in PLATFORM_HINTS["cron"]
 
     def test_cli_and_tui_hints_flag_local_only_cron(self):
         """#51568 — cron jobs from CLI/TUI sessions don't deliver back into

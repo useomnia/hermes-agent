@@ -399,7 +399,26 @@ Create a new agent run. Returns a `run_id` that can be used to subscribe to prog
 }
 ```
 
-Runs accept a simple `input` string and optional `session_id`, `instructions`, `conversation_history`, or `previous_response_id`. When `session_id` is provided, Hermes surfaces it in the run status so external UIs can correlate runs with their own conversation IDs.
+Runs accept a simple `input` string and optional `session_id`, `instructions`,
+`conversation_history`, `previous_response_id`, or `interaction_policy`. When
+`session_id` is provided, Hermes surfaces it in the run status so external UIs
+can correlate runs with their own conversation IDs.
+
+`interaction_policy` accepts `allow` (the default) or `forbid`. Use `forbid`
+for unattended work. Hermes then removes user-input and approval surfaces,
+disables interactive toolsets, denies actions that require a new approval,
+and completes requested background delegation synchronously before the run
+returns. Existing session or permanent approvals remain valid. The agent also
+receives general unattended-run guidance; callers can keep product-specific
+context in `instructions` without encoding these mechanics in a prompt.
+
+```json
+{
+  "input": "Run the proactive check.",
+  "interaction_policy": "forbid",
+  "turn_id": "turn_abc123"
+}
+```
 
 ### GET /v1/runs/\{run_id\}
 
@@ -439,6 +458,10 @@ running.
 ### POST /v1/runs/\{run_id\}/approval
 
 Resolve a pending approval for a run that is waiting on a human decision (for example, a tool call gated behind an approval policy). The body carries the approval decision; the run resumes once the decision is recorded. This endpoint is advertised in `/v1/capabilities` as the `run_approval` feature so external UIs can detect support before surfacing an approval prompt.
+
+Runs created with `interaction_policy: "forbid"` never enter this state. A
+newly gated action is denied inline so the agent can continue with the rest of
+the unattended task.
 
 ## Jobs API (background scheduled work)
 

@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 # placeholder; the actual content never reaches the system prompt).
 # ---------------------------------------------------------------------------
 
+from agent.unattended import UNATTENDED_RUN_GUIDANCE
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
 
 
@@ -771,9 +772,8 @@ PLATFORM_HINTS = {
         "contextually appropriate."
     ),
     "cron": (
-        "You are running as a scheduled cron job. There is no user present — you "
-        "cannot ask questions, request clarification, or wait for follow-up. Execute "
-        "the task fully and autonomously, making reasonable decisions where needed. "
+        "You are running as a scheduled cron job. "
+        f"{UNATTENDED_RUN_GUIDANCE} "
         "Your final response is automatically delivered to the job's configured "
         "destination — put the primary content directly in your response."
     ),
