@@ -150,7 +150,7 @@ class TestResolveDisplayContextLength:
     def test_without_custom_providers_returns_default_fallback(self):
         """Regression for #59314: When custom_providers is NOT passed
         (the bug pre-fix), a custom provider model falls through to
-        probe-down default (256K) instead of the configured per-model
+        generic default (1M) instead of the configured per-model
         context_length."""
         from unittest.mock import patch as _p
         from agent import model_metadata as _mm
@@ -167,9 +167,9 @@ class TestResolveDisplayContextLength:
                 api_key="k",
                 model_info=None,
             )
-        # Without custom_providers, the function falls to probe-down default
-        assert ctx == 256_000, (
-            "Without custom_providers, an un-cached model gets 256K default. "
+        # Without custom_providers, the function falls to the generic default.
+        assert ctx == 1_000_000, (
+            "Without custom_providers, an un-cached model gets 1M default. "
             "The fix ensures custom_providers is passed so per-model overrides "
             "are honored."
         )

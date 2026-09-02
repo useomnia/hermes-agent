@@ -115,7 +115,7 @@ def test_missing_auth_or_preset_api_failure_uses_exact_fallback(
             api_key=api_key,
         )
 
-    assert result == DEFAULT_FALLBACK_CONTEXT == 256_000
+    assert result == DEFAULT_FALLBACK_CONTEXT == 1_000_000
     if not api_key:
         request.assert_not_called()
 
@@ -266,9 +266,9 @@ def test_concrete_model_with_preset_suffix_uses_concrete_metadata_without_fetchi
     request.assert_not_called()
 
 
-def test_generic_unknown_model_still_uses_256k_fallback():
+def test_generic_unknown_model_uses_1m_fallback():
     with patch.object(model_metadata, "fetch_model_metadata", return_value={}):
-        assert get_model_context_length("unknown/model") == 256_000
+        assert get_model_context_length("unknown/model") == 1_000_000
 
 
 def test_turn_start_context_change_updates_engine_and_prompt_cache():
@@ -355,9 +355,9 @@ def test_turn_start_resolution_failure_drops_previous_context_to_fallback():
     agent.context_compressor.update_model.assert_called_once()
     assert (
         agent.context_compressor.update_model.call_args.kwargs["context_length"]
-        == 256_000
+        == 1_000_000
     )
-    assert agent._openrouter_preset_context_length == 256_000
+    assert agent._openrouter_preset_context_length == 1_000_000
 
 
 def test_turn_start_refresh_runs_before_prompt_assembly():

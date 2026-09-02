@@ -59,7 +59,7 @@ def _refresh_openrouter_preset_context(agent: Any) -> None:
     A preset can change its designated model without changing Hermes' model
     string, so startup-time context detection is not sufficient. This hook is
     deliberately fail-open: a missing credential, provider outage, malformed
-    preset, or metadata miss selects the existing 256K fallback and never
+    preset, or metadata miss selects the configured 1M fallback and never
     prevents the turn from running.
 
     The normal ``ContextEngine.update_model`` contract is used when the

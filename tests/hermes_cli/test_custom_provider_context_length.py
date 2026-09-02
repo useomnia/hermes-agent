@@ -222,7 +222,7 @@ class TestGetModelContextLengthHonorsOverride:
 
     def test_no_override_falls_through_to_default(self):
         """With custom_providers=None and all probes disabled, resolver
-        returns DEFAULT_FALLBACK_CONTEXT (256K after the stepdown bump).
+        returns DEFAULT_FALLBACK_CONTEXT (1M).
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
         patches = self._mock_all_probes()
@@ -242,12 +242,12 @@ class TestGetModelContextLengthHonorsOverride:
 
 
 class TestContextProbeTiers:
-    def test_256k_is_top_tier_and_default(self):
-        """The stepdown probe starts at 256K and 256K is the new default."""
+    def test_256k_is_top_probe_tier_and_1m_is_default(self):
+        """Probe-down starts at 256K while non-probing fallback uses 1M."""
         from agent.model_metadata import CONTEXT_PROBE_TIERS, DEFAULT_FALLBACK_CONTEXT
 
         assert CONTEXT_PROBE_TIERS[0] == 256_000
-        assert DEFAULT_FALLBACK_CONTEXT == 256_000
+        assert DEFAULT_FALLBACK_CONTEXT == 1_000_000
         # Tiers still descend monotonically
         for a, b in zip(CONTEXT_PROBE_TIERS, CONTEXT_PROBE_TIERS[1:]):
             assert a > b, f"tiers must strictly descend, got {a} then {b}"
