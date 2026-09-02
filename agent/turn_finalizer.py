@@ -95,11 +95,23 @@ def finalize_turn(
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
     )
-    # A per-turn COST budget exit (``cost_budget_exhausted``) is deliberately
-    # absent from this set, and is also excluded by ``budget_exhausted`` above
-    # because it breaks with iterations still remaining. Both exclusions
-    # matter: the fallback below spends one more toolless full-context call,
-    # which is precisely what a spend ceiling exists to prevent. Do not add it.
+    # Do NOT add ``cost_budget_exhausted`` (agent/cost_budget.py) to this set.
+    # The fallback below spends one more toolless full-context call — the most
+    # expensive single call in a run — on precisely the turn whose spend
+    # ceiling just tripped. This reason set is the only thing keeping it out.
+    #
+    # ``budget_exhausted`` above is also False on that path, because the cost
+    # guard breaks with iterations still remaining. Do not read that as a
+    # second safeguard. It holds only because the loop's ``or
+    # agent._budget_grace_call`` disjunct can never be True: upstream
+    # 934318ba3a removed the sole assignment when it replaced the grace
+    # mechanism with ``_handle_max_iterations`` (the grace block set the flag
+    # after the loop had already exited, so it could never re-enter, and the
+    # flag then blocked the fallback). What survives is residue — the init in
+    # agent_init.py, the disjunct, and the consume block. Restore a grace path
+    # and a grace iteration could be entered with
+    # ``api_call_count >= max_iterations``, with the cost guard breaking before
+    # the flag is consumed; this set would then be the only exclusion left.
     budget_fallback_eligible = (
         budget_exhausted
         and not interrupted
