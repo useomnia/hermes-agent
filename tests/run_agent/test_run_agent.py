@@ -7293,12 +7293,26 @@ class TestSystemPromptStability:
         assert "Hermes Agent" in agent._cached_system_prompt
 
 class TestBudgetPressure:
-    """Budget exhaustion grace call system."""
+    """Iteration budget exhaustion."""
 
-    def test_grace_call_flags_initialized(self, agent):
-        """Agent should have budget grace call flags."""
-        assert agent._budget_exhausted_injected is False
-        assert agent._budget_grace_call is False
+    def test_loop_runs_until_the_iteration_budget_is_gone(self, agent):
+        """No grace iteration: the budget is the only thing gating the loop.
+
+        Replaces a test that asserted two flags initialize to False. Those
+        flags (``_budget_exhausted_injected``, ``_budget_grace_call``) were
+        removed — upstream 934318ba3a deleted the only writer in 2026 and left
+        the readers behind. What matters now is that the budget itself stops
+        the loop, with no extra iteration granted past it.
+        """
+        assert not hasattr(agent, "_budget_grace_call")
+        assert not hasattr(agent, "_budget_exhausted_injected")
+
+        budget = agent.iteration_budget
+        allowed = budget.max_total
+        for _ in range(allowed):
+            assert budget.consume() is True
+        assert budget.consume() is False
+        assert budget.remaining == 0
 
 
 class TestSafeWriter:

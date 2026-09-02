@@ -1221,7 +1221,7 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -1263,12 +1263,7 @@ def run_conversation(
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
 
-        # Grace call: the budget is exhausted but we gave the model one
-        # more chance.  Consume the grace flag so the loop exits after
-        # this iteration regardless of outcome.
-        if agent._budget_grace_call:
-            agent._budget_grace_call = False
-        elif not agent.iteration_budget.consume():
+        if not agent.iteration_budget.consume():
             _turn_exit_reason = "budget_exhausted"
             if not agent.quiet_mode:
                 agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")

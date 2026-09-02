@@ -100,18 +100,9 @@ def finalize_turn(
     # expensive single call in a run — on precisely the turn whose spend
     # ceiling just tripped. This reason set is the only thing keeping it out.
     #
-    # ``budget_exhausted`` above is also False on that path, because the cost
-    # guard breaks with iterations still remaining. Do not read that as a
-    # second safeguard. It holds only because the loop's ``or
-    # agent._budget_grace_call`` disjunct can never be True: upstream
-    # 934318ba3a removed the sole assignment when it replaced the grace
-    # mechanism with ``_handle_max_iterations`` (the grace block set the flag
-    # after the loop had already exited, so it could never re-enter, and the
-    # flag then blocked the fallback). What survives is residue — the init in
-    # agent_init.py, the disjunct, and the consume block. Restore a grace path
-    # and a grace iteration could be entered with
-    # ``api_call_count >= max_iterations``, with the cost guard breaking before
-    # the flag is consumed; this set would then be the only exclusion left.
+    # ``budget_exhausted`` above is False on that path too, since the cost
+    # guard breaks with iterations still remaining — but that is a side effect
+    # of where the guard sits, not a guarantee. This set is the one to keep.
     budget_fallback_eligible = (
         budget_exhausted
         and not interrupted

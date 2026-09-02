@@ -578,7 +578,10 @@ def init_agent(
     agent.model = model
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
-    # Consumed by every LLM turn across parent + all subagents.
+    # Consumed by every LLM turn across parent + all subagents. The model is
+    # told only once the budget is actually gone (via _handle_max_iterations);
+    # warning it as the budget got tight made models "give up" early on
+    # complex tasks (#7915), so there are no intermediate pressure warnings.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
     # Per-turn estimated-USD ceiling. None = uncapped, which is every path
     # except a /v1/runs request that asked for one. Unlike the iteration
@@ -858,15 +861,6 @@ def init_agent(
             agent._cache_ttl = _ttl
     except Exception:
         pass
-
-    # Iteration budget: the LLM is only notified when it actually exhausts
-    # the iteration budget (api_call_count >= max_iterations).  At that
-    # point we inject ONE message, allow one final API call, and if the
-    # model doesn't produce a text response, force a user-message asking
-    # it to summarise.  No intermediate pressure warnings — they caused
-    # models to "give up" prematurely on complex tasks (#7915).
-    agent._budget_exhausted_injected = False
-    agent._budget_grace_call = False
 
     # Activity tracking — updated on each API call, tool execution, and
     # stream chunk.  Used by the gateway timeout handler to report what the
