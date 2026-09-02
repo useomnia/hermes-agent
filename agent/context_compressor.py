@@ -170,6 +170,50 @@ def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
     return fresh
 
 
+def _template_visible_role(message: Any) -> Optional[str]:
+    """Role as counted by strict chat-template alternation checks.
+
+    Mistral-family templates (Devstral, Mistral Small 3.x, Magistral)
+    enforce user/assistant alternation at render time but EXEMPT the tool
+    flow from the check: ``tool`` results and assistant messages carrying
+    ``tool_calls`` are skipped. A summary role chosen against the *literal*
+    neighbouring roles can therefore still violate alternation as the
+    template sees it. The canonical failure: the protected head ends
+    ``[user, assistant(tool_calls), tool]``, so the literal last role is
+    ``tool`` and the summary is pinned to ``role="user"`` -- but the last
+    role the template counts is ``user``, the template sees user -> user,
+    and llama.cpp / Mistral-hosted backends reject the ENTIRE request with
+    a Jinja alternation error (HTTP 500). Because the summary persists in
+    the stored conversation, every retry replays the same poisoned history
+    and the session is unrecoverable.
+
+    Returns ``None`` for messages the alternation check skips.
+    """
+    if not isinstance(message, dict):
+        return None
+    role = message.get("role")
+    if role == "tool":
+        return None
+    if role == "assistant" and message.get("tool_calls"):
+        return None
+    return role
+
+
+def _last_template_visible_role(messages: List[Dict[str, Any]]) -> Optional[str]:
+    """Last role a strict alternation template would count in *messages*.
+
+    ``None`` when every row is template-exempt (tool flow only).
+    """
+    return next(
+        (
+            role
+            for role in (_template_visible_role(m) for m in reversed(messages))
+            if role is not None
+        ),
+        None,
+    )
+
+
 def _strip_persistence_markers(messages: List[Dict[str, Any]]) -> None:
     """Enforce the compaction invariant: no assembled message carries a
     session-store persistence marker.
@@ -4754,20 +4798,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "handoff so it stays actionable (#100818)"
             )
 
-        # Alternation is judged on template-visible rows only: a tail of
-        # tool_calls/tool pairs is exempt, so a user-pinned summary followed by
-        # such a tail still "ends on user" for the Mistral-style pre-flight
-        # check (#58753). Look through the exempt tail, not just at [-1].
-        last_visible_role = next(
-            (
-                role
-                for role in (
-                    _template_visible_role(msg) for msg in reversed(compressed)
-                )
-                if role is not None
-            ),
-            None,
-        )
+        last_visible_role = _last_template_visible_role(compressed)
         if inflight.get(_INFLIGHT_REPLAY_MERGED_KEY):
             # Never copy a summary carrier (metadata would mark the replay
             # synthetic): restate as a plain user row.
