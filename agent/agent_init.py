@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
+from agent.cost_budget import CostBudget
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.model_metadata import (
@@ -510,6 +511,7 @@ def init_agent(
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
+    cost_budget: "CostBudget" = None,
     fallback_model: Dict[str, Any] = None,
     credential_pool=None,
     checkpoints_enabled: bool = False,
@@ -578,6 +580,14 @@ def init_agent(
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
+    # Per-turn estimated-USD ceiling. None = uncapped, which is every path
+    # except a /v1/runs request that asked for one. Unlike the iteration
+    # budget this is NOT shared with subagents: they run as separate agents
+    # with their own cost counters (see agent/cost_budget.py).
+    agent.cost_budget = cost_budget
+    # Session-cumulative cost latched at each turn's start, so a turn's budget
+    # measures only that turn. Re-latched in run_conversation.
+    agent._cost_budget_turn_start_usd = 0.0
     agent.tool_delay = tool_delay
     agent.save_trajectories = save_trajectories
     agent.verbose_logging = verbose_logging

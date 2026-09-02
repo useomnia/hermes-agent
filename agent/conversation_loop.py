@@ -43,6 +43,7 @@ from agent.display import (
     build_tool_preview,
     redact_tool_args_for_display,
 )
+from agent import cost_budget as cost_budget_module
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
@@ -1145,6 +1146,17 @@ def run_conversation(
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
 
+    # Latch the session-cumulative spend so a per-turn cost budget measures
+    # only this turn. Done before the first API call of the turn, so a
+    # long-running session's earlier turns never consume this turn's cap.
+    if getattr(agent, "cost_budget", None) is not None:
+        try:
+            agent._cost_budget_turn_start_usd = float(
+                getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            agent._cost_budget_turn_start_usd = 0.0
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
@@ -1231,6 +1243,22 @@ def run_conversation(
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
         
+        # Per-turn cost ceiling. Checked BEFORE the call is counted or the
+        # iteration consumed, so the turn ends without spending anything more.
+        # Fails open by construction: `turn_spend_usd` returns 0.0 when either
+        # figure is unreadable, and an absent budget skips the block entirely.
+        _cost_budget = getattr(agent, "cost_budget", None)
+        if _cost_budget is not None:
+            _turn_spend = cost_budget_module.turn_spend_usd(agent)
+            if _cost_budget.exceeded(_turn_spend):
+                _turn_exit_reason = cost_budget_module.COST_BUDGET_EXIT_REASON
+                if not agent.quiet_mode:
+                    agent._safe_print(
+                        f"\n⚠️  Turn cost budget exhausted "
+                        f"(${_turn_spend:.4f} of ${_cost_budget.max_cost_usd:.4f} estimated)"
+                    )
+                break
+
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")

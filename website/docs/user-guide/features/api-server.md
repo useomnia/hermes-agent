@@ -400,9 +400,9 @@ Create a new agent run. Returns a `run_id` that can be used to subscribe to prog
 ```
 
 Runs accept a simple `input` string and optional `session_id`, `instructions`,
-`conversation_history`, `previous_response_id`, or `interaction_policy`. When
-`session_id` is provided, Hermes surfaces it in the run status so external UIs
-can correlate runs with their own conversation IDs.
+`conversation_history`, `previous_response_id`, `interaction_policy`, or
+`budget`. When `session_id` is provided, Hermes surfaces it in the run status
+so external UIs can correlate runs with their own conversation IDs.
 
 `interaction_policy` accepts `allow` (the default) or `forbid`. Use `forbid`
 for unattended work. Hermes then removes user-input and approval surfaces,
@@ -419,6 +419,47 @@ context in `instructions` without encoding these mechanics in a prompt.
   "turn_id": "turn_abc123"
 }
 ```
+
+#### Bounding what one run may spend
+
+`budget` puts a per-run ceiling on cost, iterations, or both. It only ever
+tightens: `max_iterations` above the gateway's configured limit is clamped down
+to it, so a caller can ask for less headroom but never more.
+
+```json
+{
+  "input": "Run the proactive check.",
+  "interaction_policy": "forbid",
+  "budget": { "max_cost_usd": 2.50, "max_iterations": 40 }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `max_cost_usd` | Positive number. The run ends before the API call that would take its **estimated** spend to or past this figure. |
+| `max_iterations` | Positive integer. Tightens the per-turn tool-iteration limit for this run only. |
+
+Both fields are optional; omitting `budget` leaves a run uncapped, exactly as
+before. A malformed policy is rejected with `400 invalid_budget` rather than
+silently ignored — an unrecognised field (`maxCostUsd`, say) would otherwise
+read as a cap and mean no cap at all.
+
+When a run reaches `max_cost_usd` it terminates as `failed` with
+`failure_reason: "budget_exceeded"`, and the event stream closes with error code
+`budget_exceeded`. The run deliberately does **not** make a final
+summary call first: that call would carry the whole context and is the single
+most expensive call of the run — precisely what the ceiling exists to prevent.
+Expect no assistant answer from a run that ends this way.
+
+Costs are the same estimates Hermes accumulates per API call, reported on the
+terminal run as `usage.estimated_cost_usd`, so a caller can reconcile a breach
+without a second lookup. Two consequences worth planning for:
+
+- Estimates need pricing metadata for the model in play. An unpriced model
+  reports `0`, and a cost ceiling against it never trips.
+- The figure covers the run's **own** agent. A `delegate` subagent runs as a
+  separate agent with its own cost counter, so its spend is not counted here.
+  Bounding a whole delegation tree requires measuring outside the process.
 
 ### GET /v1/runs/\{run_id\}
 

@@ -95,6 +95,11 @@ def finalize_turn(
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
     )
+    # A per-turn COST budget exit (``cost_budget_exhausted``) is deliberately
+    # absent from this set, and is also excluded by ``budget_exhausted`` above
+    # because it breaks with iterations still remaining. Both exclusions
+    # matter: the fallback below spends one more toolless full-context call,
+    # which is precisely what a spend ceiling exists to prevent. Do not add it.
     budget_fallback_eligible = (
         budget_exhausted
         and not interrupted

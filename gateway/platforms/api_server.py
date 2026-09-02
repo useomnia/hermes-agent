@@ -74,6 +74,21 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
 
+
+def _cost_budget_exit(result: Any) -> bool:
+    """True when a turn result ended on its per-turn cost ceiling.
+
+    Reads the ``turn_exit_reason`` the turn finalizer puts on every result, so
+    the terminal state is derived from what the loop actually did rather than
+    from a second cost comparison that could disagree with it.
+    """
+    if not isinstance(result, dict):
+        return False
+    from agent.cost_budget import COST_BUDGET_EXIT_REASON
+
+    return str(result.get("turn_exit_reason") or "") == COST_BUDGET_EXIT_REASON
+
+
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
         return ["once", "deny"]
@@ -2881,6 +2896,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_gen_event_callback=None,
         tool_gen_event_aborted_callback=None,
         disabled_toolsets: Optional[List[str]] = None,
+        cost_budget: Optional["CostBudget"] = None,
+        max_iterations_override: Optional[int] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3173,7 +3190,14 @@ class APIServerAdapter(BasePlatformAdapter):
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
-        max_iterations = _current_max_iterations()
+        # The operator's configured ceiling. A request may tighten it via
+        # ``budget.max_iterations`` but never raise it — clamp, don't reject,
+        # because the operator's number is the authority on available headroom.
+        from agent.cost_budget import clamp_max_iterations
+
+        max_iterations = clamp_max_iterations(
+            max_iterations_override, _current_max_iterations()
+        )
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -3198,6 +3222,7 @@ class APIServerAdapter(BasePlatformAdapter):
             **runtime_kwargs,
             **_checkpoint_agent_kwargs(user_config),
             "max_iterations": max_iterations,
+            "cost_budget": cost_budget,
             "quiet_mode": True,
             "verbose_logging": False,
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
@@ -8390,6 +8415,25 @@ class APIServerAdapter(BasePlatformAdapter):
             if interaction_forbidden
             else None
         )
+
+        # Per-turn budget. Validation is fail-closed (a malformed policy is a
+        # 400, never a silently uncapped run); enforcement at runtime fails
+        # open. See agent/cost_budget.py for why those differ.
+        from agent.cost_budget import cost_budget_from_request, parse_budget_request
+
+        request_budget, budget_error = parse_budget_request(body.get("budget"))
+        if budget_error is not None:
+            return web.json_response(
+                _openai_error(
+                    budget_error,
+                    param="budget",
+                    code="invalid_budget",
+                ),
+                status=400,
+            )
+        request_cost_budget = cost_budget_from_request(request_budget)
+        request_max_iterations = request_budget.get("max_iterations")
+
         previous_response_id = body.get("previous_response_id")
         explicit_session_id = body.get("session_id")
         turn_id = body.get("turn_id")
@@ -9177,6 +9221,8 @@ class APIServerAdapter(BasePlatformAdapter):
                             model_options=agent_overrides.get("model_options"),
                             route=route,
                             disabled_toolsets=unattended_disabled_toolsets,
+                            cost_budget=request_cost_budget,
+                            max_iterations_override=request_max_iterations,
                         )
 
                 agent = await self._run_in_executor_tracked(_build_agent)
@@ -9416,6 +9462,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                             "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                             "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                            # Estimated, not provider-reported — the same figure
+                            # a per-turn cost budget is enforced against, so a
+                            # caller can reconcile a breach from the run alone.
+                            "estimated_cost_usd": float(
+                                getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0
+                            ),
                         }
                         return r, u
 
@@ -9491,6 +9543,33 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     _legacy_terminal("run.failed", error=error_msg)
 
+                def _close_budget_exceeded() -> None:
+                    spent = 0.0
+                    if agent is not None:
+                        try:
+                            from agent.cost_budget import turn_spend_usd
+
+                            spent = turn_spend_usd(agent)
+                        except Exception:
+                            spent = 0.0
+                    error_msg = (
+                        "Turn reached its cost budget "
+                        f"(${spent:.4f} estimated) before producing an answer"
+                    )
+                    self._set_run_status(
+                        run_id,
+                        "failed",
+                        error=error_msg,
+                        failure_reason="budget_exceeded",
+                        last_event="run.failed",
+                        completed_at=time.time(),
+                    )
+                    emitter.response_failed(
+                        error_msg,
+                        code="budget_exceeded",
+                    )
+                    _legacy_terminal("run.failed", error=error_msg)
+
                 def _close_cancelled() -> None:
                     emitter.omnio_event(
                         "response.omnio.interrupted_history",
@@ -9543,6 +9622,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         _close_log_cap_exceeded()
                     elif run_id in self._stopping_run_ids:
                         _close_cancelled()
+                    # The turn ended on its own spend ceiling. Read after the
+                    # stop checks (an explicit cancel stays authoritative) but
+                    # before "completed": the loop broke before producing an
+                    # answer, so reporting success would strand the caller with
+                    # an empty output and no reason.
+                    elif _cost_budget_exit(result):
+                        _close_budget_exceeded()
                     else:
                         self._set_run_status(
                             run_id,
