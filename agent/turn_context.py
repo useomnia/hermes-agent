@@ -42,11 +42,134 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.model_metadata import (
+    DEFAULT_FALLBACK_CONTEXT,
+    _is_openrouter_route,
+    _pure_openrouter_preset_slug,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
+    resolve_openrouter_preset_context,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _refresh_openrouter_preset_context(agent: Any) -> None:
+    """Refresh a pure OpenRouter preset before assembling this turn's prompt.
+
+    A preset can change its designated model without changing Hermes' model
+    string, so startup-time context detection is not sufficient. This hook is
+    deliberately fail-open: a missing credential, provider outage, malformed
+    preset, or metadata miss selects the configured 1M fallback and never
+    prevents the turn from running.
+
+    The normal ``ContextEngine.update_model`` contract is used when the
+    resolved window changes. Prompt invalidation is paired with that update so
+    context-file sizing is rebuilt on the next prompt assembly, while the
+    conversation and compression history remain untouched.
+    """
+    model = getattr(agent, "model", "") or ""
+    provider = getattr(agent, "provider", "") or ""
+    base_url = getattr(agent, "base_url", "") or ""
+    slug = _pure_openrouter_preset_slug(model)
+    if slug is None or not _is_openrouter_route(base_url, provider):
+        return
+
+    resolution = None
+    try:
+        resolution = resolve_openrouter_preset_context(
+            model,
+            base_url=base_url,
+            provider=provider,
+            api_key=getattr(agent, "api_key", "") or "",
+        )
+    except Exception:
+        # The resolver itself is defensive, but a plugin/test replacement or a
+        # future change must not make a provider outage fatal to turn setup.
+        logger.info(
+            "openrouter preset context refresh: slug=%s designated_version=%s "
+            "candidate_count=%d context=%d source=%s outcome=%s",
+            slug, "", 0, DEFAULT_FALLBACK_CONTEXT, "fallback", "resolver_failed",
+        )
+
+    desired_context = (
+        resolution.context_length
+        if resolution is not None
+        else DEFAULT_FALLBACK_CONTEXT
+    )
+    designated_version_id = (
+        resolution.designated_version_id if resolution is not None else ""
+    )
+    candidate_count = resolution.candidate_count if resolution is not None else 0
+    source = resolution.source if resolution is not None else "fallback"
+    outcome = resolution.outcome if resolution is not None else "resolution_failed"
+
+    compressor = getattr(agent, "context_compressor", None)
+    current_context = getattr(compressor, "context_length", None)
+    previous_context = getattr(agent, "_openrouter_preset_context_length", None)
+    if not isinstance(previous_context, int) or previous_context <= 0:
+        previous_context = (
+            current_context
+            if isinstance(current_context, int) and current_context > 0
+            else DEFAULT_FALLBACK_CONTEXT
+        )
+
+    context_changed = previous_context != desired_context
+    if not context_changed:
+        # An engine may have been replaced or manually updated between turns;
+        # keep its actual state aligned even when the per-agent tracker is
+        # already current. This is still a no-op for the normal unchanged path.
+        context_changed = current_context != desired_context
+
+    if context_changed and compressor is not None:
+        update_model = getattr(compressor, "update_model", None)
+        if callable(update_model):
+            try:
+                update_model(
+                    model=model,
+                    context_length=desired_context,
+                    base_url=base_url,
+                    api_key=getattr(agent, "api_key", "") or "",
+                    provider=provider,
+                    api_mode=getattr(agent, "api_mode", "") or "",
+                )
+            except Exception:
+                # Leave the tracker unchanged so a later turn can retry the
+                # normal update contract after a transient engine failure.
+                logger.info(
+                    "openrouter preset context refresh: slug=%s designated_version=%s "
+                    "candidate_count=%d context=%d source=%s outcome=%s",
+                    slug, designated_version_id, candidate_count, desired_context,
+                    source, "update_failed",
+                )
+                return
+
+            invalidate = getattr(agent, "_invalidate_system_prompt", None)
+            try:
+                if callable(invalidate):
+                    invalidate()
+                else:
+                    agent._cached_system_prompt = None
+                    agent._cached_system_prompt_static = None
+            except Exception:
+                logger.info(
+                    "openrouter preset context refresh: slug=%s designated_version=%s "
+                    "candidate_count=%d context=%d source=%s outcome=%s",
+                    slug, designated_version_id, candidate_count, desired_context,
+                    source, "prompt_invalidation_failed",
+                )
+                return
+
+            logger.info(
+                "openrouter preset context change: slug=%s designated_version=%s "
+                "candidate_count=%d context=%d source=%s outcome=%s",
+                slug, designated_version_id, candidate_count, desired_context,
+                source, "changed",
+            )
+
+    # Store only safe scalar metadata on the agent. The preset config and
+    # bearer token remain confined to the resolver request/cache boundary.
+    agent._openrouter_preset_context_length = desired_context
+    agent._openrouter_preset_context_version = designated_version_id
 
 
 def compose_user_api_content(
@@ -377,6 +500,11 @@ def build_turn_context(
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
+
+    # Presets can change independently of the Hermes model string. Refresh the
+    # pure OpenRouter alias after runtime restoration and before any system
+    # prompt or preflight token work for this turn.
+    _refresh_openrouter_preset_context(agent)
 
     # Tell auxiliary_client what the live main provider/model are for this turn
     # after primary restoration has settled the runtime.

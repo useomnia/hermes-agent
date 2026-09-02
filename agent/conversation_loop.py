@@ -631,6 +631,23 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     if stored_provider and current_provider and stored_provider != current_provider:
         return False
 
+    # The resolved context window is part of the prompt's runtime identity.
+    # This is especially important for OpenRouter aliases: a gateway may build
+    # a fresh AIAgent after the preset changes, so its in-memory compressor is
+    # already current while SQLite still contains a prompt sized for the old
+    # designated model. The volatile marker is emitted after project context,
+    # which makes the last-match parser safe from AGENTS.md shadowing.
+    stored_context_window = line_value("Context window")
+    compressor = getattr(agent, "context_compressor", None)
+    current_context_window = getattr(compressor, "context_length", None)
+    if (
+        stored_context_window
+        and isinstance(current_context_window, int)
+        and current_context_window > 0
+        and stored_context_window != str(current_context_window)
+    ):
+        return False
+
     # Detect cwd drift: if the stored prompt was built in a different working
     # directory, reuse would silently inject a stale path into the prefix cache.
     # Compare against resolve_agent_cwd() — the SAME resolver used to build the

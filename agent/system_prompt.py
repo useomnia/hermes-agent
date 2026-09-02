@@ -538,6 +538,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             timestamp_line += f"\nModel: {agent.model}"
         if agent.provider:
             timestamp_line += f"\nProvider: {agent.provider}"
+    context_compressor = getattr(agent, "context_compressor", None)
+    context_window = getattr(context_compressor, "context_length", None)
+    if isinstance(context_window, int) and context_window > 0:
+        timestamp_line += f"\nContext window: {context_window}"
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)

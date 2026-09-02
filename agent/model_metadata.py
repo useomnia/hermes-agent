@@ -12,9 +12,10 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 import yaml
@@ -175,9 +176,8 @@ def _save_model_metadata_disk_cache(data: Dict[str, Dict[str, Any]]) -> None:
         logger.debug("Failed to save OpenRouter model metadata disk cache: %s", e)
 
 # Descending tiers for context length probing when the model is unknown.
-# We start at 256K (covers GPT-5.x, many current large-context models) and
-# step down on context-length errors until one works.  Tier[0] is also the
-# default fallback when no detection method succeeds.
+# Probe-down starts at 256K because sending a speculative one-million-token
+# request is prohibitively expensive. The non-probing fallback is independent.
 CONTEXT_PROBE_TIERS = [
     256_000,
     128_000,
@@ -188,7 +188,346 @@ CONTEXT_PROBE_TIERS = [
 ]
 
 # Default context length when no detection method succeeds.
-DEFAULT_FALLBACK_CONTEXT = CONTEXT_PROBE_TIERS[0]
+DEFAULT_FALLBACK_CONTEXT = 1_000_000
+
+# OpenRouter presets are user-owned configuration, not model metadata. Keep
+# their context resolution separate from the persistent model cache: a preset
+# may change without the Hermes model string changing, and its authenticated
+# response must never be written to disk.  The short TTL bounds both staleness
+# and the authenticated request rate while allowing a dashboard edit to take
+# effect on a subsequent turn.
+OPENROUTER_PRESET_CONTEXT_CACHE_TTL = 60.0
+OPENROUTER_PRESET_CONTEXT_CACHE_MAX_ENTRIES = 128
+OPENROUTER_PRESETS_URL = "https://openrouter.ai/api/v1/presets"
+
+
+@dataclass(frozen=True)
+class OpenRouterPresetContextResolution:
+    """Safe, content-free result of resolving an OpenRouter preset.
+
+    Only metadata needed by the context engine is retained.  In particular,
+    the preset's private ``config`` body and bearer token are never included in
+    this object or any cache entry.
+    """
+
+    slug: str
+    context_length: int
+    designated_version_id: str
+    candidate_count: int
+    source: str = "live"
+    outcome: str = "resolved"
+
+
+_openrouter_preset_context_cache: Dict[
+    tuple[str, str], tuple[OpenRouterPresetContextResolution, float]
+] = {}
+
+
+def _openrouter_api_key_fingerprint(api_key: Any) -> Optional[str]:
+    """Return an irreversible fingerprint for a usable bearer token."""
+    if not isinstance(api_key, str):
+        return None
+    token = api_key.strip()
+    if not token:
+        return None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _pure_openrouter_preset_slug(model: Any) -> Optional[str]:
+    """Return the slug for an exact ``@preset/<slug>`` model alias.
+
+    OpenRouter also accepts ``concrete-model@preset/foo``.  That form has an
+    ordinary concrete model and must continue through the existing inference
+    and model-normalization paths, so it is deliberately not recognized here.
+    """
+    if not isinstance(model, str):
+        return None
+    value = model.strip()
+    prefix = "@preset/"
+    if not value.startswith(prefix):
+        return None
+    slug = value[len(prefix):].strip()
+    # Preset slugs are URL-safe path segments.  Reject an empty or nested
+    # segment rather than accidentally turning an arbitrary model string into
+    # an authenticated request to a different path.
+    if not slug or "/" in slug or "\\" in slug:
+        return None
+    return slug
+
+
+def _openrouter_concrete_model(model: str) -> str:
+    """Return the concrete portion of ``model@preset/slug`` for metadata only.
+
+    OpenRouter applies the preset to the concrete model at inference time, but
+    its public model catalogue naturally contains only the concrete id. Keep
+    the request model untouched and strip the suffix solely inside context
+    resolution.
+    """
+    marker = "@preset/"
+    if model.startswith(marker) or marker not in model:
+        return model
+    concrete, _separator, slug = model.partition(marker)
+    return concrete if concrete.strip() and slug.strip() else model
+
+
+def _is_openrouter_route(base_url: str = "", provider: str = "") -> bool:
+    """Return whether the effective route is OpenRouter.
+
+    An explicit non-OpenRouter base URL wins over a provider label.  When the
+    URL is omitted, ``provider=openrouter`` still identifies the built-in
+    OpenRouter route whose default URL is supplied by the caller/runtime.
+    """
+    normalized_base_url = _normalize_base_url(base_url)
+    if normalized_base_url:
+        try:
+            return _is_openrouter_base_url(normalized_base_url)
+        except ValueError:
+            return False
+    return str(provider or "").strip().lower() == "openrouter"
+
+
+def _preset_config_candidates(config: Any) -> tuple[Optional[list[str]], str]:
+    """Extract valid model candidates from a designated preset config.
+
+    OpenRouter's preset schema uses either ``model`` or ``models``.  A config
+    containing both is treated conservatively as a selection set: any of the
+    listed models may receive a request, so the smallest known window wins.
+    The second return value is a low-cardinality failure reason when the config
+    cannot produce a candidate list.
+    """
+    if not isinstance(config, dict):
+        return None, "missing_config"
+
+    candidates: list[str] = []
+    saw_model = "model" in config
+    saw_models = "models" in config
+
+    if saw_model:
+        model = config.get("model")
+        if not isinstance(model, str) or not model.strip():
+            return None, "invalid_model"
+        candidates.append(model.strip())
+
+    if saw_models:
+        models = config.get("models")
+        if not isinstance(models, list) or not models:
+            return None, "invalid_models"
+        for model in models:
+            if not isinstance(model, str) or not model.strip():
+                return None, "invalid_candidate"
+            candidates.append(model.strip())
+
+    if not candidates:
+        return None, "missing_candidates"
+    return candidates, "resolved"
+
+
+def _metadata_entry_for_preset_candidate(
+    metadata: Dict[str, Dict[str, Any]], candidate: str,
+) -> Optional[Dict[str, Any]]:
+    """Find public OpenRouter metadata for one preset model candidate."""
+    # ``~`` is OpenRouter's optional model-routing marker in a models array,
+    # not part of the public model catalogue id.
+    lookup = candidate[1:] if candidate.startswith("~") else candidate
+    entry = metadata.get(lookup)
+    if entry is None:
+        entry = metadata.get(lookup.lower())
+    return entry if isinstance(entry, dict) else None
+
+
+def _preset_candidate_contexts(
+    candidates: list[str], metadata: Dict[str, Dict[str, Any]],
+) -> Optional[list[int]]:
+    """Return all candidate windows, or ``None`` when any candidate is unknown."""
+    contexts: list[int] = []
+    for candidate in candidates:
+        entry = _metadata_entry_for_preset_candidate(metadata, candidate)
+        context_length = entry.get("context_length") if entry else None
+        if (
+            isinstance(context_length, bool)
+            or not isinstance(context_length, int)
+            or context_length <= 0
+        ):
+            return None
+        contexts.append(context_length)
+    return contexts
+
+
+def resolve_openrouter_preset_context(
+    model: Any,
+    *,
+    base_url: str = "",
+    provider: str = "",
+    api_key: Any = "",
+    force_refresh: bool = False,
+) -> Optional[OpenRouterPresetContextResolution]:
+    """Resolve a pure OpenRouter preset alias to a conservative context size.
+
+    The preset body is fetched with the active OpenRouter bearer and retained
+    only for the duration of this call.  Public ``/models`` metadata supplies
+    each candidate's context window; if any candidate is missing, one forced
+    metadata refresh is attempted before the whole preset is rejected.
+    """
+    slug = _pure_openrouter_preset_slug(model)
+    if slug is None or not _is_openrouter_route(base_url, provider):
+        return None
+
+    key_fingerprint = _openrouter_api_key_fingerprint(api_key)
+    if key_fingerprint is None:
+        logger.info(
+            "openrouter preset context resolution: slug=%s designated_version=%s "
+            "candidate_count=%d context=%s source=%s outcome=%s",
+            slug, "", 0, "", "none", "missing_auth",
+        )
+        return None
+
+    cache_key = (slug, key_fingerprint)
+    now = time.time()
+    if not force_refresh:
+        cached = _openrouter_preset_context_cache.get(cache_key)
+        if cached is not None:
+            result, cached_at = cached
+            if now - cached_at < OPENROUTER_PRESET_CONTEXT_CACHE_TTL:
+                cached_result = replace(result, source="cache", outcome="cache_hit")
+                logger.debug(
+                    "openrouter preset context resolution: slug=%s designated_version=%s "
+                    "candidate_count=%d context=%d source=%s outcome=%s",
+                    cached_result.slug,
+                    cached_result.designated_version_id,
+                    cached_result.candidate_count,
+                    cached_result.context_length,
+                    cached_result.source,
+                    cached_result.outcome,
+                )
+                return cached_result
+            _openrouter_preset_context_cache.pop(cache_key, None)
+
+    encoded_slug = quote(slug, safe="._~-")
+    try:
+        response = requests.get(
+            f"{OPENROUTER_PRESETS_URL}/{encoded_slug}",
+            headers={"Authorization": f"Bearer {str(api_key).strip()}"},
+            timeout=(5, 10),
+            verify=_resolve_requests_verify(),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException:
+        logger.info(
+            "openrouter preset context resolution: slug=%s designated_version=%s "
+            "candidate_count=%d context=%s source=%s outcome=%s",
+            slug, "", 0, "", "live", "request_failed",
+        )
+        return None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        logger.info(
+            "openrouter preset context resolution: slug=%s designated_version=%s "
+            "candidate_count=%d context=%s source=%s outcome=%s",
+            slug, "", 0, "", "live", "invalid_response",
+        )
+        return None
+    except Exception:
+        # Resolver failures are deliberately fail-open for the turn.  Do not
+        # include an exception string because a provider may echo private body
+        # content in an error message.
+        logger.info(
+            "openrouter preset context resolution: slug=%s designated_version=%s "
+            "candidate_count=%d context=%s source=%s outcome=%s",
+            slug, "", 0, "", "live", "request_failed",
+        )
+        return None
+
+    if not isinstance(payload, dict):
+        logger.info(
+            "openrouter preset context resolution: slug=%s designated_version=%s "
+            "candidate_count=%d context=%s source=%s outcome=%s",
+            slug, "", 0, "", "live", "invalid_response",
+        )
+        return None
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        logger.info(
+            "openrouter preset context resolution: slug=%s designated_version=%s "
+            "candidate_count=%d context=%s source=%s outcome=%s",
+            slug, "", 0, "", "live", "invalid_response",
+        )
+        return None
+
+    designated_version = data.get("designated_version")
+    if not isinstance(designated_version, dict):
+        logger.info(
+            "openrouter preset context resolution: slug=%s designated_version=%s "
+            "candidate_count=%d context=%s source=%s outcome=%s",
+            slug, "", 0, "", "live", "missing_designated_version",
+        )
+        return None
+    designated_version_id = str(
+        data.get("designated_version_id")
+        or designated_version.get("id")
+        or ""
+    ).strip()
+    config = designated_version.get("config")
+    candidates, config_outcome = _preset_config_candidates(config)
+    if candidates is None:
+        logger.info(
+            "openrouter preset context resolution: slug=%s designated_version=%s "
+            "candidate_count=%d context=%s source=%s outcome=%s",
+            slug, designated_version_id, 0, "", "live", config_outcome,
+        )
+        return None
+
+    try:
+        metadata = fetch_model_metadata()
+    except Exception:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    contexts = _preset_candidate_contexts(candidates, metadata)
+    metadata_source = "cached_public_metadata"
+    if contexts is None:
+        # A single forced refresh is enough to pick up a newly published model
+        # while bounding latency and avoiding a refresh per candidate.
+        try:
+            metadata = fetch_model_metadata(force_refresh=True)
+        except Exception:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata_source = "forced_public_metadata"
+        contexts = _preset_candidate_contexts(candidates, metadata)
+    if contexts is None:
+        logger.info(
+            "openrouter preset context resolution: slug=%s designated_version=%s "
+            "candidate_count=%d context=%s source=%s outcome=%s",
+            slug, designated_version_id, len(candidates), "", metadata_source,
+            "unknown_candidate",
+        )
+        return None
+
+    result = OpenRouterPresetContextResolution(
+        slug=slug,
+        context_length=min(contexts),
+        designated_version_id=designated_version_id,
+        candidate_count=len(candidates),
+        source="live",
+        outcome="resolved",
+    )
+    _openrouter_preset_context_cache[cache_key] = (result, now)
+    while len(_openrouter_preset_context_cache) > OPENROUTER_PRESET_CONTEXT_CACHE_MAX_ENTRIES:
+        oldest_key = next(iter(_openrouter_preset_context_cache))
+        _openrouter_preset_context_cache.pop(oldest_key, None)
+    logger.info(
+        "openrouter preset context resolution: slug=%s designated_version=%s "
+        "candidate_count=%d context=%d source=%s outcome=%s",
+        result.slug,
+        result.designated_version_id,
+        result.candidate_count,
+        result.context_length,
+        metadata_source,
+        result.outcome,
+    )
+    return result
 
 # Minimum context length required to run Hermes Agent.  Models with fewer
 # tokens cannot maintain enough working memory for tool-calling workflows.
@@ -2189,14 +2528,14 @@ def get_model_context_length(
     6. OpenRouter live API metadata (Kimi-family 32k guard)
     7. Local server query (before hardcoded defaults for local endpoints)
     8. Hardcoded defaults (broad family patterns, longest-key-first)
-    9. Default fallback (256K)"""
+    9. Default fallback (1M)"""
     # 0. Explicit config override — user knows best
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length
 
     # 0a. MoA virtual provider — ``model`` is a preset name, not a real model,
     # and ``base_url`` is the local virtual endpoint, so every probe below would
-    # miss and fall through to the 256K default. The aggregator is the acting
+    # miss and fall through to the generic default. The aggregator is the acting
     # model, so resolve the context window from the aggregator slot's real
     # provider+model instead. References are advisory-only and never bound the
     # acting context, so they're ignored here.
@@ -2246,6 +2585,34 @@ def get_model_context_length(
                 return cp_ctx
         except Exception:
             pass  # fall through to probing
+
+    # 0c. Pure OpenRouter preset aliases have no concrete model metadata of
+    # their own. Resolve the designated version before provider/model
+    # normalization so the alias remains untouched on the wire and the
+    # existing ``concrete-model@preset/foo`` path is unaffected.
+    if (
+        _pure_openrouter_preset_slug(model) is not None
+        and _is_openrouter_route(base_url, provider)
+    ):
+        try:
+            preset_resolution = resolve_openrouter_preset_context(
+                model,
+                base_url=base_url,
+                provider=provider,
+                api_key=api_key,
+            )
+        except Exception:
+            # Context detection must never make agent initialization fail when
+            # a provider/plugin resolver has an unexpected runtime error.
+            preset_resolution = None
+        return (
+            preset_resolution.context_length
+            if preset_resolution is not None
+            else DEFAULT_FALLBACK_CONTEXT
+        )
+
+    if _is_openrouter_route(base_url, provider):
+        model = _openrouter_concrete_model(model)
 
     # Malformed user-provided URLs (for example an unmatched IPv6 bracket)
     # make urllib.parse raise. Context resolution should treat those as an
@@ -2450,13 +2817,13 @@ def get_model_context_length(
                 "in config.yaml to override.",
                 model, base_url, f"{DEFAULT_FALLBACK_CONTEXT:,}",
             )
-            # 3b. Before falling back to the hard 256K default, consult the
+            # 3b. Before falling back to the generic default, consult the
             # hardcoded catalog as a last resort.  A proxied/custom Anthropic
             # gateway (e.g. corporate proxy) fails the Ollama/local probes
             # above, but the model name may still match an entry in
             # DEFAULT_CONTEXT_LENGTHS (e.g. "claude-opus-4-8" → 1M).
             # Without this, the early return here short-circuits the catalog
-            # lookup at step 8 and silently caps context at 256K.
+            # lookup at step 8 and can assign the wrong context budget.
             model_lower = model.lower()
             for default_model, length in sorted(
                 DEFAULT_CONTEXT_LENGTHS.items(),
@@ -2642,7 +3009,7 @@ def get_model_context_length(
         if default_model in model_lower:
             return length
 
-    # 9. Default fallback — 256K
+    # 9. Default fallback — 1M
     return DEFAULT_FALLBACK_CONTEXT
 
 
