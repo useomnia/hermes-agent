@@ -2524,3 +2524,101 @@ class TestDispatchToolWithoutCliRef:
             assert calls[0][1].get("parent_agent") is None
         finally:
             registry.deregister("_test_dispatch_probe")
+
+
+class TestPreToolProjectionHook:
+    """``pre_tool_projection`` lets a tool's plugin keep rejected arguments off the client."""
+
+    def _manager_with_hooks(self, monkeypatch, *callbacks):
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_projection"] = list(callbacks)
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: mgr)
+        return mgr
+
+    def test_pre_tool_projection_is_a_valid_hook(self):
+        from hermes_cli.plugins import VALID_HOOKS
+
+        assert "pre_tool_projection" in VALID_HOOKS
+
+    def test_withhold_directive_returns_its_message(self, monkeypatch):
+        from hermes_cli.plugins import resolve_tool_projection_withhold
+
+        self._manager_with_hooks(
+            monkeypatch,
+            lambda **_: {"action": "withhold", "message": "render is only valid for approval_gate"},
+        )
+
+        assert (
+            resolve_tool_projection_withhold("request_user_input", {"kind": "choice"})
+            == "render is only valid for approval_gate"
+        )
+
+    def test_returns_none_when_no_hook_is_registered(self, monkeypatch):
+        from hermes_cli.plugins import resolve_tool_projection_withhold
+
+        self._manager_with_hooks(monkeypatch)
+
+        assert resolve_tool_projection_withhold("request_user_input", {"kind": "choice"}) is None
+
+    def test_withhold_without_a_message_is_ignored(self, monkeypatch):
+        from hermes_cli.plugins import resolve_tool_projection_withhold
+
+        self._manager_with_hooks(
+            monkeypatch,
+            lambda **_: {"action": "withhold"},
+            lambda **_: {"action": "withhold", "message": ""},
+        )
+
+        assert resolve_tool_projection_withhold("request_user_input", {"kind": "choice"}) is None
+
+    def test_results_that_are_not_withhold_directives_are_ignored(self, monkeypatch):
+        from hermes_cli.plugins import resolve_tool_projection_withhold
+
+        self._manager_with_hooks(
+            monkeypatch,
+            lambda **_: "withhold",
+            lambda **_: {"action": "block", "message": "blocked"},
+            lambda **_: {"telemetry": True},
+        )
+
+        assert resolve_tool_projection_withhold("request_user_input", {"kind": "choice"}) is None
+
+    def test_first_valid_withhold_directive_wins(self, monkeypatch):
+        from hermes_cli.plugins import resolve_tool_projection_withhold
+
+        self._manager_with_hooks(
+            monkeypatch,
+            lambda **_: None,
+            lambda **_: {"action": "withhold", "message": "first"},
+            lambda **_: {"action": "withhold", "message": "second"},
+        )
+
+        assert resolve_tool_projection_withhold("render_component", {"component": ""}) == "first"
+
+    def test_hook_receives_tool_name_and_dict_args(self, monkeypatch):
+        from hermes_cli.plugins import resolve_tool_projection_withhold
+
+        seen: list = []
+
+        def _record(**kwargs):
+            seen.append(kwargs)
+            return None
+
+        self._manager_with_hooks(monkeypatch, _record)
+
+        resolve_tool_projection_withhold("emit_client_event", {"version": 1, "name": "x"})
+        resolve_tool_projection_withhold("emit_client_event", "not-a-dict")
+
+        assert seen[0]["tool_name"] == "emit_client_event"
+        assert seen[0]["args"] == {"version": 1, "name": "x"}
+        assert seen[1]["args"] == {}
+
+    def test_a_raising_hook_does_not_withhold(self, monkeypatch):
+        from hermes_cli.plugins import resolve_tool_projection_withhold
+
+        def _boom(**_):
+            raise RuntimeError("plugin bug")
+
+        self._manager_with_hooks(monkeypatch, _boom)
+
+        assert resolve_tool_projection_withhold("request_user_input", {"kind": "choice"}) is None

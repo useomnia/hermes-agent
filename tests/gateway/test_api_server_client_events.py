@@ -84,6 +84,25 @@ class TestCustomToolInputProjection:
     def test_non_allowlisted_tool_projects_nothing(self):
         assert _project_custom_tool_inputs("terminal", {"command": "ls"}) == {}
 
+    def test_withheld_projection_yields_nothing_for_the_client(self):
+        args = {"kind": "choice", "question": "Which?", "render": {"component": ""}}
+
+        with patch(
+            "hermes_cli.plugins.resolve_tool_projection_withhold",
+            return_value="request_user_input 'render' is valid only for 'approval_gate'.",
+        ):
+            assert _project_custom_tool_inputs("request_user_input", args) == {}
+
+    def test_projection_passes_through_when_no_hook_withholds(self):
+        args = {"kind": "choice", "question": "Which?", "options": ["a"]}
+
+        with patch(
+            "hermes_cli.plugins.resolve_tool_projection_withhold", return_value=None
+        ):
+            assert _project_custom_tool_inputs("request_user_input", args) == {
+                "interaction": args
+            }
+
 
 class TestAgUiStateForwarding:
     """Verify typed shared state stays ephemeral and untrusted."""

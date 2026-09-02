@@ -52,6 +52,7 @@ behavior-affecting hooks:
 | --- | --- |
 | `pre_llm_call` | May return a string or `{"context": "..."}` to inject ephemeral context into the current user message. |
 | `pre_tool_call` | May return `{"action": "block", "message": "..."}` to block a tool before execution. |
+| `pre_tool_projection` | May return `{"action": "withhold", "message": "..."}` to keep a client-rendered tool's arguments off the client-visible event; the call still streams and is recorded. |
 | `transform_tool_result` | May return a replacement tool result string after `post_tool_call`. |
 | `transform_llm_output` | May return a replacement final assistant text string. |
 
@@ -163,11 +164,16 @@ Tool hooks describe individual tool calls:
 | Hook | When it fires |
 | --- | --- |
 | `pre_tool_call` | Before guardrail-approved tool dispatch. |
+| `pre_tool_projection` | Before a client-rendered tool's arguments are copied onto a client-visible event (Omnio interaction, GenUI, client event). |
 | `post_tool_call` | After tool dispatch, cancellation, block, or error completion. |
 | `transform_tool_result` | After `post_tool_call`, before the result is appended to model context. |
 
 `pre_tool_call` includes `tool_name`, `args`, `task_id`, `session_id`,
 `tool_call_id`, `turn_id`, and `api_request_id`.
+
+`pre_tool_projection` includes `tool_name` and `args` only. It fires for the
+allowlisted client-rendered tools, on both the Responses turn log and the
+chat-completions progress event, and is fail-open.
 
 `post_tool_call` includes the same identity fields plus `result`,
 `duration_ms`, `status`, `error_type`, and `error_message`.

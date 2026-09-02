@@ -3710,3 +3710,89 @@ async def test_runs_default_interaction_policy_allows_async_delegation() -> None
 
     assert started.status == 202
     assert captured["delegation_sync_only"] == ""
+
+
+def _projection_events(run_id: str, store: TurnEventLogStore) -> List[Dict[str, Any]]:
+    log = store.get_log(run_id)
+    assert log is not None
+    return [
+        json.loads(stored.frame.removeprefix(b"data: ").strip())
+        for stored in log.events
+    ]
+
+
+def _emit_request_user_input_call(
+    run_id: str, arguments: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    store = TurnEventLogStore()
+    store.create_run(run_id, f"session-{run_id}")
+    emitter = TurnEventEmitter(store, run_id, f"session-{run_id}")
+    emitter.response_started()
+    emitter.function_call_start("call-1", "request_user_input")
+    emitter.function_call_arguments("call-1", "request_user_input", arguments)
+    emitter.function_call_done("call-1")
+    emitter.response_completed()
+    return _projection_events(run_id, store)
+
+
+def test_function_call_arguments_projects_the_card_when_no_hook_withholds() -> None:
+    arguments = {"kind": "choice", "question": "Which?", "options": ["a", "b"]}
+
+    with patch(
+        "hermes_cli.plugins.resolve_tool_projection_withhold", return_value=None
+    ):
+        events = _emit_request_user_input_call("run_projection_allowed", arguments)
+
+    types = [event["type"] for event in events]
+    assert "response.function_call_arguments.delta" in types
+    card = next(event for event in events if event["type"] == "response.omnio.interaction")
+    assert card["interaction"] == arguments
+
+
+def test_function_call_arguments_keeps_the_transcript_but_withholds_the_card() -> None:
+    arguments = {"kind": "choice", "question": "Which?", "render": {"component": ""}}
+
+    with patch(
+        "hermes_cli.plugins.resolve_tool_projection_withhold",
+        return_value="request_user_input 'render' is valid only for 'approval_gate'.",
+    ):
+        events = _emit_request_user_input_call("run_projection_withheld", arguments)
+
+    types = [event["type"] for event in events]
+    assert "response.omnio.interaction" not in types
+    delta = next(
+        event for event in events if event["type"] == "response.function_call_arguments.delta"
+    )
+    assert json.loads(delta["delta"]) == arguments
+    done_item = next(
+        event["item"]
+        for event in events
+        if event["type"] == "response.output_item.done"
+        and event["item"].get("type") == "function_call"
+    )
+    assert done_item["status"] == "completed"
+    assert json.loads(done_item["arguments"]) == arguments
+
+
+def test_function_call_arguments_projects_the_card_when_the_projection_hook_raises() -> None:
+    arguments = {"kind": "confirm", "question": "Proceed?"}
+
+    with patch(
+        "hermes_cli.plugins.resolve_tool_projection_withhold",
+        side_effect=RuntimeError("plugin bug"),
+    ):
+        events = _emit_request_user_input_call("run_projection_failopen", arguments)
+
+    assert any(event["type"] == "response.omnio.interaction" for event in events)
+
+
+def test_client_projection_withheld_skips_hooks_for_non_allowlisted_tools() -> None:
+    from gateway.turn_event_log import client_projection_withheld
+
+    with patch(
+        "hermes_cli.plugins.resolve_tool_projection_withhold",
+        return_value="never consulted",
+    ) as resolve:
+        assert client_projection_withheld("terminal", {"command": "ls"}) is False
+
+    resolve.assert_not_called()
