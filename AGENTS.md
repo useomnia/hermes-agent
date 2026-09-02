@@ -4,6 +4,26 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## This Is A Fork — Read The Patch Register First
+
+`useomnia/hermes-agent` forks `NousResearch/hermes-agent` and carries patches
+upstream does not have, mostly on the `/v1/runs` API that the Omnia sprite proxy
+drives.
+
+**Before you merge upstream, or write a patch that touches a surface upstream
+also owns, read [`docs/fork-patches.md`](docs/fork-patches.md)** — it records what
+we carry, which upstream proposals are in flight over the same seams, and what
+silently drifts on a merge. Update it in the same change as the patch.
+
+Two things that will bite immediately:
+
+- **`upstream/main` is ambiguous here.** A stale local branch shadows the
+  remote-tracking ref, so `git log upstream/main..main` reads the wrong thing
+  without erroring. Use `refs/remotes/upstream/main`.
+- **Upstream refactored the runs handlers** out of `gateway/platforms/api_server.py`
+  into `api_server_runs.py` and friends. Ours are still inline, so runs-API
+  patches conflict structurally, not textually.
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a
