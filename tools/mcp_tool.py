@@ -4755,6 +4755,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        from gateway.session_context import get_session_env
+
+        origin_turn_id = get_session_env("HERMES_ORIGIN_TURN_ID", "") or ""
+
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -4859,7 +4863,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 if not parallel_read:
                     server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    call_kwargs = {"arguments": args}
+                    if origin_turn_id:
+                        call_kwargs["meta"] = {
+                            "omnia/originTurnId": origin_turn_id,
+                        }
+                    result = await server.session.call_tool(tool_name, **call_kwargs)
                 finally:
                     if not parallel_read:
                         server._pending_call_context = None
