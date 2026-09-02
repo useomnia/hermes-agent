@@ -1191,6 +1191,15 @@ def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) 
     """Preserve human intent, not merely a synthetic user-role placeholder."""
     if any(_is_real_user_message(message) for message in compressed):
         return
+    from agent.context_compressor import _INFLIGHT_REPLAY_MERGED_KEY
+
+    if any(
+        isinstance(message, dict) and message.get(_INFLIGHT_REPLAY_MERGED_KEY)
+        for message in compressed
+    ):
+        # The in-flight request was restated onto the summary carrier
+        # (#100818); inserting an anchor would duplicate it.
+        return
     from agent.context_compressor import (
         COMPRESSION_CONTINUATION_USER_CONTENT,
         _fresh_compaction_message_copy,
