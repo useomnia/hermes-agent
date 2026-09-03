@@ -8988,7 +8988,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             consume_user_input_completion_reason,
                         )
 
-                        reason = consume_user_input_completion_reason(session_id)
+                        reason = consume_user_input_completion_reason(
+                            approval_session_key
+                        )
                     except Exception:
                         reason = None
                     # Only an expired wait closes the card; a stop or disconnect
