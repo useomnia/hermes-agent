@@ -906,6 +906,10 @@ async def test_same_continuation_id_reclaims_after_adapter_restart(
                 },
             )
             first_payload = await first.json()
+            for _ in range(50):
+                if first_agent.run_conversation.call_count:
+                    break
+                await asyncio.sleep(0.01)
 
     restarted = APIServerAdapter(
         PlatformConfig(enabled=True, extra={"key": "test-key"})
@@ -1011,12 +1015,12 @@ async def test_durable_once_approval_survives_fresh_adapter_and_executes(
                     "turn_id": "approval-restart-turn",
                 },
             )
+            for _ in range(50):
+                if len(db.get_messages("approval-restart")) == 2:
+                    break
+                await asyncio.sleep(0.01)
 
     assert continued.status == 202
-    for _ in range(50):
-        if len(db.get_messages("approval-restart")) == 2:
-            break
-        await asyncio.sleep(0.01)
     rows = db.get_messages("approval-restart")
     assert [row["role"] for row in rows] == ["assistant", "tool"]
     assert rows[-1]["content"] == '{"ok":true}'
