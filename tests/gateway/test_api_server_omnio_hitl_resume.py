@@ -844,6 +844,10 @@ async def test_concurrent_duplicate_continuations_enqueue_only_one_run(
                 for _ in range(2)
             ])
             payloads = [await first.json(), await second.json()]
+            for _ in range(50):
+                if agent.run_conversation.call_count:
+                    break
+                await asyncio.sleep(0.01)
 
     assert sorted((first.status, second.status)) in ([202, 202], [202, 409])
     accepted_run_ids = {
@@ -852,10 +856,6 @@ async def test_concurrent_duplicate_continuations_enqueue_only_one_run(
         if response.status == 202
     }
     assert len(accepted_run_ids) == 1
-    for _ in range(50):
-        if agent.run_conversation.call_count:
-            break
-        await asyncio.sleep(0.01)
     assert agent.run_conversation.call_count == 1
     tail = db.get_messages("continuation-race")[-1]
     assert tail["display_metadata"]["_omnio_continuation_claim"] == {
