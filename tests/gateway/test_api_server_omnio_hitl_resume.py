@@ -176,6 +176,62 @@ async def test_prepared_resume_keeps_interaction_unresolved_until_admission_and_
 
 
 @pytest.mark.asyncio
+async def test_concurrent_rejected_prepared_starts_never_report_false_acceptance(
+    adapter: APIServerAdapter, db: SessionDB,
+) -> None:
+    await _seed_dangling(db, "rejected-start-race", _tool_call("call-rejected"))
+    continuation_id = "interaction-resume:call-rejected"
+    claim_status, prepared_run_id = db.claim_pending_continuation(
+        "rejected-start-race",
+        continuation_id,
+        "run_rejected",
+        phase="prepared",
+        tool_call_id="call-rejected",
+    )
+    assert claim_status == "claimed"
+    resolve_status, _ = db.resolve_pending_interaction(
+        "rejected-start-race",
+        "call-rejected",
+        expected_tool_name="request_user_input",
+        tool_result_content='{"status":"answered","response":"A"}',
+        resolution_id=continuation_id,
+    )
+    assert resolve_status == "resolved"
+
+    calls = 0
+    calls_lock = threading.Lock()
+    both_entered = threading.Event()
+
+    def reject_start(*_args, **_kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            if calls == 2:
+                both_entered.set()
+        both_entered.wait(timeout=1)
+        return "invalid", None
+
+    with patch.object(db, "start_pending_continuation", side_effect=reject_start):
+        async with TestClient(TestServer(_app(adapter))) as client:
+            first, second = await asyncio.gather(*[
+                client.post(
+                    "/v1/runs",
+                    headers=AUTH,
+                    json={
+                        "session_id": "rejected-start-race",
+                        "input": None,
+                        "turn_id": continuation_id,
+                        "start_prepared": prepared_run_id,
+                    },
+                )
+                for _ in range(2)
+            ])
+
+    assert calls == 2
+    assert first.status == second.status == 409
+
+
+@pytest.mark.asyncio
 async def test_legacy_resume_takes_over_prepared_claim_after_legacy_resolve(
     adapter: APIServerAdapter, db: SessionDB,
 ) -> None:
@@ -870,11 +926,13 @@ async def test_same_continuation_id_reclaims_after_adapter_restart(
             second_payload = await second.json()
 
     assert first.status == second.status == 202
-    assert first_payload["run_id"] != second_payload["run_id"]
+    assert first_payload["run_id"] == second_payload["run_id"]
+    assert first_agent.run_conversation.call_count == 1
+    assert second_agent.run_conversation.call_count == 0
     tail = db.get_messages("restart-claim")[-1]
     assert tail["display_metadata"]["_omnio_continuation_claim"] == {
         "continuation_id": "stable-retry-id",
-        "run_id": second_payload["run_id"],
+        "run_id": first_payload["run_id"],
     }
 
 

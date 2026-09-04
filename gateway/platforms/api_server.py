@@ -1566,11 +1566,16 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
-        # In-process half of durable continuation idempotency. Install before
-        # awaiting SessionDB so concurrent retries cannot both interpret a
-        # claim from this live adapter as restart residue.
+        # In-process half of durable continuation idempotency. It is installed
+        # only after SessionDB accepts the claim, then before any run-local
+        # state is created. Concurrent accepted claims race through one
+        # event-loop atomic check/set, while a rejected claim can never make a
+        # peer observe a false `started` response.
         self._continuation_reservations: Dict[
             tuple[Optional[str], str, str], str
+        ] = {}
+        self._continuation_admission_locks: Dict[
+            tuple[Optional[str], str, str], asyncio.Lock
         ] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
@@ -8894,6 +8899,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         request_profile = self._effective_request_profile()
+        continuation_admission_lock: asyncio.Lock | None = None
         run_id = start_prepared_run_id or f"run_{uuid.uuid4().hex}"
         # Do not include turn_id itself in the fingerprint. The caller's
         # immutable request semantics are hashed in memory; the durable row
@@ -8948,6 +8954,31 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=409,
                 )
             if not is_new:
+                reservation_key = (
+                    request_profile,
+                    record.session_id,
+                    turn_id or record.run_id,
+                )
+                admission_lock = self._continuation_admission_locks.get(reservation_key)
+                retry_local_continuation_admission = continuation and admission_lock is not None
+                if retry_local_continuation_admission and admission_lock.locked():
+                    await admission_lock.acquire()
+                    admission_lock.release()
+                reserved_run_id = self._continuation_reservations.get(reservation_key)
+                if continuation and reserved_run_id == record.run_id:
+                    return web.json_response(
+                        {
+                            "run_id": record.run_id,
+                            "status": "started",
+                            "reused": True,
+                        },
+                        status=202,
+                        headers=(
+                            {"X-Hermes-Session-Key": gateway_session_key}
+                            if gateway_session_key
+                            else {}
+                        ),
+                    )
                 # A prepared continuation can survive a gateway restart after
                 # durable run-id admission but before its SessionDB claim is
                 # advanced to `started`. Replay that exact request instead of
@@ -8961,7 +8992,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     and record.run_id not in self._run_statuses
                     and record.status in {"queued", "running", "waiting_for_approval", "stopping"}
                 )
-                if not replay_prepared:
+                if not replay_prepared and not retry_local_continuation_admission:
                     status = self._restore_idempotent_run(record)
                     response_headers = (
                         {"X-Hermes-Session-Key": gateway_session_key}
@@ -9008,16 +9039,36 @@ class APIServerAdapter(BasePlatformAdapter):
                     },
                     status=202,
                 )
-            self._continuation_reservations[reservation_key] = run_id
-            try:
-                if start_prepared_run_id is not None:
+            continuation_admission_lock = self._continuation_admission_locks.setdefault(
+                reservation_key, asyncio.Lock()
+            )
+            await continuation_admission_lock.acquire()
+            reserved_run_id = self._continuation_reservations.get(reservation_key)
+            if reserved_run_id is not None:
+                continuation_admission_lock.release()
+                continuation_admission_lock = None
+                return web.json_response(
+                    {
+                        "run_id": reserved_run_id,
+                        "status": "started",
+                        "reused": True,
+                    },
+                    status=202,
+                )
+            if start_prepared_run_id is not None:
+                try:
                     claim_status, _claimed_run_id = await asyncio.to_thread(
                         db.start_pending_continuation,
                         session_id,
                         continuation_id,
                         start_prepared_run_id,
                     )
-                else:
+                except Exception:
+                    continuation_admission_lock.release()
+                    continuation_admission_lock = None
+                    raise
+            else:
+                try:
                     claim_status, _claimed_run_id = await asyncio.to_thread(
                         db.claim_pending_continuation,
                         session_id,
@@ -9025,16 +9076,16 @@ class APIServerAdapter(BasePlatformAdapter):
                         run_id,
                         reclaim_existing=True,
                     )
-            except Exception:
-                if self._continuation_reservations.get(reservation_key) == run_id:
-                    self._continuation_reservations.pop(reservation_key, None)
-                raise
+                except Exception:
+                    continuation_admission_lock.release()
+                    continuation_admission_lock = None
+                    raise
             if (
                 claim_status not in {"claimed", "reclaimed", "started"}
                 or (start_prepared_run_id is not None and _claimed_run_id != run_id)
             ):
-                if self._continuation_reservations.get(reservation_key) == run_id:
-                    self._continuation_reservations.pop(reservation_key, None)
+                continuation_admission_lock.release()
+                continuation_admission_lock = None
                 return web.json_response(
                     _openai_error(
                         "Session tail cannot be continued again",
@@ -9042,6 +9093,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=409,
                 )
+            self._continuation_reservations[reservation_key] = run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -9080,6 +9132,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 failure_reason="run_initialization_failed",
                 completed_at=time.time(),
             )
+            if continuation:
+                reservation_key = (
+                    self._effective_request_profile(),
+                    session_id,
+                    turn_id or run_id,
+                )
+                if self._continuation_reservations.get(reservation_key) == run_id:
+                    self._continuation_reservations.pop(reservation_key, None)
+            if continuation_admission_lock is not None:
+                continuation_admission_lock.release()
+                continuation_admission_lock = None
             return web.json_response(
                 _openai_error(
                     "Unable to initialize run",
@@ -9585,6 +9648,9 @@ class APIServerAdapter(BasePlatformAdapter):
             owner_profile=request_profile,
             **({"turn_id": turn_id} if turn_id else {}),
         )
+        if continuation_admission_lock is not None:
+            continuation_admission_lock.release()
+            continuation_admission_lock = None
         self._run_lifecycles[run_id] = {
             "accepting": True,
             "agent": None,
