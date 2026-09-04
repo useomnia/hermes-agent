@@ -1,9 +1,10 @@
 """Structured-output constraints across backend wire protocols.
 
-The gateway accepts an OpenAI-shaped structured-output request on two surfaces:
-Chat Completions ``response_format`` and Responses ``text.format``.  Both are
-normalized here into one canonical OpenAI-shaped constraint, and then mapped to
-the per-``api_mode`` wire field the active backend actually honours:
+The gateway accepts an OpenAI-shaped structured-output request on Chat
+Completions ``response_format``, Responses ``text.format``, and both dialects on
+the Hermes Runs API. All are normalized here into one canonical OpenAI-shaped
+constraint, and then mapped to the per-``api_mode`` wire field the active
+backend actually honours:
 
     chat_completions    -> top-level ``response_format`` (OpenAI shape, verbatim)
     anthropic_messages  -> ``output_config.format`` (Anthropic Messages structured outputs)
@@ -74,11 +75,15 @@ def normalize_responses_text_format(text: Any) -> Tuple[Optional[Dict[str, Any]]
     Unlike Chat Completions, the Responses API nests ``name``/``schema``/
     ``strict`` directly under ``format`` (not under a ``json_schema`` key).
     """
+    if text is None:
+        return None, None
     if not isinstance(text, dict):
+        return None, "'text' must be an object"
+    if "format" not in text or text.get("format") is None:
         return None, None
     fmt = text.get("format")
     if not isinstance(fmt, dict):
-        return None, None
+        return None, "'text.format' must be an object"
 
     fmt_type = fmt.get("type")
     if fmt_type in (None, "text"):

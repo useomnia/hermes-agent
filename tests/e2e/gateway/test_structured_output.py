@@ -4,7 +4,8 @@ Direct descendant of the hand-run ``probe_structured_output.py``:
 
   1. /v1/chat/completions  — response_format json_schema  (must be enforced)
   2. /v1/responses         — text.format json_schema       (must be enforced)
-  3. /v1/chat/completions  — response_format json_object   (backend-dependent)
+  3. /v1/runs              — text.format json_schema       (must be enforced)
+  4. /v1/chat/completions  — response_format json_object   (backend-dependent)
 
 json_schema enforcement is a hard requirement on every backend. json_object
 has no native Anthropic mapping, so its expected outcome is read from the
@@ -14,6 +15,7 @@ provider spec: "reject" → 400 up-front, "accept" → 200, "any" → informatio
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -72,6 +74,40 @@ def test_responses_json_schema(gateway):
         },
     )
     _assert_conforms(responses_content(resp.json()), resp.status, resp.text, ["word"])
+
+
+def test_runs_json_schema(gateway):
+    """Runs must carry the constraint through tool loops and status polling."""
+    resp = gateway.post(
+        "/v1/runs",
+        {
+            "model": MODEL,
+            "instructions": STEER,
+            "input": "Reply with the word PONG.",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "Probe",
+                    "schema": WORD_SCHEMA,
+                    "strict": True,
+                }
+            },
+        },
+    )
+    assert resp.status == 202, f"HTTP {resp.status}: {resp.text[:300]}"
+    run_id = resp.json()["run_id"]
+    deadline = time.monotonic() + gateway.timeout
+    status = None
+    while time.monotonic() < deadline:
+        polled = gateway.get(f"/v1/runs/{run_id}")
+        assert polled.status == 200, f"HTTP {polled.status}: {polled.text[:300]}"
+        status = polled.json()
+        if status.get("status") in {"completed", "failed", "cancelled"}:
+            break
+        time.sleep(0.25)
+
+    assert status is not None and status.get("status") == "completed", status
+    _assert_conforms(status.get("output"), 200, json.dumps(status), ["word"])
 
 
 def test_chat_json_object(gateway):
