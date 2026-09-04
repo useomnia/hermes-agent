@@ -107,6 +107,7 @@ from agent.structured_output import (
 from gateway.readiness import collect_runtime_readiness
 from gateway.turn_event_log import (
     CUSTOM_TOOL_INPUT_KEYS as _CUSTOM_TOOL_INPUT_KEYS,
+    client_projection_withheld,
     CursorExpiredError,
     InvalidCursorError,
     RunTombstone,
@@ -265,6 +266,8 @@ def _project_custom_tool_inputs(function_name: str, function_args: Any) -> dict[
     """Copy allowlisted tool inputs onto client-visible progress events."""
     output_key = _CUSTOM_TOOL_INPUT_KEYS.get(function_name)
     if output_key is None or not isinstance(function_args, dict):
+        return {}
+    if client_projection_withheld(function_name, function_args):
         return {}
     return {output_key: copy.deepcopy(function_args)}
 

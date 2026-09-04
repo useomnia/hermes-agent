@@ -74,6 +74,25 @@ _TOOL_EXTENSION_EVENTS = {
 }
 
 
+def client_projection_withheld(name: str, arguments: Dict[str, Any]) -> bool:
+    """Whether a plugin keeps this call's arguments off client-visible events.
+
+    Both projectors ask this before copying an allowlisted tool's inputs to a
+    client, so an argument set the owning tool will reject never renders as a
+    card or component. The function-call item is unaffected: the call and its
+    result stay in the transcript. Fail-open — a hook fault projects as before,
+    since a missing card is a worse failure than a stray one.
+    """
+    if name not in CUSTOM_TOOL_INPUT_KEYS:
+        return False
+    try:
+        from hermes_cli.plugins import resolve_tool_projection_withhold
+
+        return resolve_tool_projection_withhold(name, arguments) is not None
+    except Exception:
+        return False
+
+
 def response_id_for_run_id(run_id: str) -> str:
     """Map one Hermes Turn identity to its Responses wire identity."""
     suffix = run_id[4:] if run_id.startswith("run_") else run_id
@@ -777,6 +796,8 @@ class TurnEventEmitter:
             output_index=state["output_index"],
             delta=serialized,
         )
+        if client_projection_withheld(name, arguments):
+            return
         extension_type, payload_key = _TOOL_EXTENSION_EVENTS[name]
         self.omnio_event(extension_type, **{payload_key: arguments})
 
@@ -929,6 +950,7 @@ class TurnEventEmitter:
 
 
 __all__ = [
+    "client_projection_withheld",
     "CursorExpiredError",
     "CUSTOM_TOOL_INPUT_KEYS",
     "DEFAULT_RUN_LOG_CAP_BYTES",

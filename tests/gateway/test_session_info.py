@@ -57,7 +57,7 @@ class TestFormatSessionInfo:
                                   {"provider": "", "base_url": "", "api_key": ""})
         with p1, p2, p3:
             info = runner._format_session_info()
-        assert "256K" in info
+        assert "1.0M" in info
         assert "model.context_length" in info
 
     def test_local_endpoint_shown(self, runner, tmp_path):
@@ -97,7 +97,7 @@ custom_providers:
     base_url: https://example.com/v1//
     models:
       shared-model:
-        context_length: 1048576
+        context_length: 524288
 """
         p1, p2, p3 = _patch_info(
             tmp_path,
@@ -113,7 +113,8 @@ custom_providers:
         with p1, p2, p3:
             info = runner._format_session_info()
 
-        assert "1.0M" not in info
+        assert "512K" not in info
+        assert "1.0M" in info
         assert "(config)" not in info
 
     def test_global_context_is_scoped_to_active_runtime_route(self, runner, tmp_path):
@@ -122,7 +123,7 @@ model:
   default: shared-model
   provider: custom
   base_url: https://large.example/v1
-  context_length: 1048576
+  context_length: 524288
 """
         p1, p2, p3 = _patch_info(
             tmp_path,
@@ -138,7 +139,8 @@ model:
         with p1, p2, p3:
             info = runner._format_session_info()
 
-        assert "1.0M" not in info
+        assert "512K" not in info
+        assert "1.0M" in info
         assert "(config)" not in info
 
     def test_missing_config(self, runner, tmp_path):
