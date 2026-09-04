@@ -449,6 +449,60 @@ class TestBrowserVisionAnnotate:
         )
 
 
+class TestBrowserVisionFileDeliveryGuidance:
+    """browser_vision keeps file delivery guidance platform-neutral."""
+
+    def test_schema_preserves_screenshot_path_and_active_interface_guidance(self):
+        from tools.browser_tool import (
+            BROWSER_TOOL_SCHEMAS,
+            _BROWSER_VISION_FILE_DELIVERY_GUIDANCE,
+        )
+
+        schema = next(s for s in BROWSER_TOOL_SCHEMAS if s["name"] == "browser_vision")
+        description = schema["description"]
+
+        assert "screenshot_path" in description
+        assert "MEDIA" not in description
+        assert _BROWSER_VISION_FILE_DELIVERY_GUIDANCE in description
+        assert "active interface" in description.lower()
+
+    def test_analysis_failure_result_uses_same_active_interface_guidance(self, tmp_path):
+        from tools.browser_tool import (
+            _BROWSER_VISION_FILE_DELIVERY_GUIDANCE,
+            browser_vision,
+        )
+
+        shots_dir = tmp_path / "browser_screenshots"
+        shots_dir.mkdir()
+        screenshot = shots_dir / "captured.png"
+        screenshot.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+
+        with (
+            patch("hermes_constants.get_hermes_dir", return_value=shots_dir),
+            patch("tools.browser_tool._cleanup_old_screenshots"),
+            patch(
+                "tools.browser_tool._run_browser_command",
+                return_value={"success": True, "data": {"path": str(screenshot)}},
+            ),
+            patch("tools.browser_tool._get_vision_model", return_value="test-model"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"auxiliary": {"vision": {}}},
+            ),
+            patch(
+                "tools.browser_tool.call_llm",
+                side_effect=RuntimeError("vision backend unavailable"),
+            ),
+        ):
+            result = json.loads(browser_vision("what is on the page?", task_id="test"))
+
+        assert result["success"] is False
+        assert result["screenshot_path"] == str(screenshot)
+        assert "MEDIA" not in result["note"]
+        assert _BROWSER_VISION_FILE_DELIVERY_GUIDANCE in result["note"]
+        assert "active interface" in result["note"].lower()
+
+
 class TestBrowserVisionConfig:
     def _setup_screenshot(self, tmp_path):
         shots_dir = tmp_path / "browser_screenshots"
