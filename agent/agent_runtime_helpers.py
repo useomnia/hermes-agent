@@ -2899,7 +2899,11 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             len(orphaned_results),
         )
 
-    # 2. Inject stub results for calls whose result was dropped
+    # 2. Inject a result for each unresolved call. Omnio HITL calls remain
+    # explicitly pending in the request copy because their durable dangling
+    # tail can still be resolved later. Ordinary missing results retain the
+    # long-standing generic unavailable stub; treating an arbitrary failed
+    # tool as an open human interaction would mislead the model.
     missing_results = surviving_call_ids - result_call_ids
     if missing_results:
         patched: List[Dict[str, Any]] = []
@@ -2909,10 +2913,30 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 for tc in msg.get("tool_calls") or []:
                     cid = _ra().AIAgent._get_tool_call_id_static(tc)
                     if cid in missing_results:
+                        tool_name = _ra().AIAgent._get_tool_call_name_static(tc)
+                        is_hitl = tool_name == "request_user_input"
+                        if not is_hitl:
+                            try:
+                                from tools.tool_approval import is_gated_tool
+
+                                is_hitl = is_gated_tool(tool_name)
+                            except Exception:
+                                is_hitl = False
+                        content = (
+                            json.dumps({
+                                "status": "pending",
+                                "note": (
+                                    "The user has not answered this request yet; "
+                                    "it is still open. Do not assume an answer."
+                                ),
+                            }, ensure_ascii=False)
+                            if is_hitl
+                            else "[Result unavailable — see context summary above]"
+                        )
                         patched.append({
                             "role": "tool",
-                            "name": _ra().AIAgent._get_tool_call_name_static(tc),
-                            "content": "[Result unavailable — see context summary above]",
+                            "name": tool_name,
+                            "content": content,
                             "tool_call_id": cid,
                         })
         messages = patched

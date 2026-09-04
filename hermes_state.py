@@ -6681,6 +6681,625 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def resolve_pending_interaction(
+        self,
+        session_id: str,
+        tool_call_id: str,
+        *,
+        tool_result_content: Optional[str] = None,
+        expected_tool_name: Optional[str] = None,
+        excluded_tool_name: Optional[str] = None,
+        claim_approval: bool = False,
+        approval_scope: Optional[str] = None,
+        resolution_id: Optional[str] = None,
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        """Atomically validate and optionally resolve a dangling tool call.
+
+        The latest assistant tool-call block must contain ``tool_call_id`` and
+        anything after it must be a contiguous suffix of tool results belonging
+        to sibling calls from that same block. The target itself must remain
+        unresolved. When ``tool_result_content`` is provided, the matching tool
+        row is appended in the same ``BEGIN IMMEDIATE`` transaction as those
+        checks. Accepted approvals instead merge a durable claim keyed by
+        tool-call id into the assistant row's existing display metadata.
+        Concurrent deliveries therefore cannot both observe and resolve the
+        same dangling interaction.
+
+        Returns ``("resolved", call)``, ``("not_found", None)``, or
+        ``("not_resumable", call)``.  Approval grants use the validation-only
+        form because their grant stores deliberately share the gateway's
+        existing process-local lifecycle.
+        """
+        stored_content = self._encode_content(tool_result_content)
+
+        def _calls(raw: Any) -> List[Dict[str, Any]]:
+            if not raw:
+                return []
+            try:
+                value = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError):
+                return []
+            return [call for call in value if isinstance(call, dict)] if isinstance(value, list) else []
+
+        def _do(conn):
+            rows = conn.execute(
+                "SELECT id, role, tool_call_id, tool_calls, display_metadata "
+                "FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            matching_call = None
+            for row in rows:
+                if row["role"] != "assistant":
+                    continue
+                matching_call = next(
+                    (
+                        call
+                        for call in _calls(row["tool_calls"])
+                        if call.get("id") == tool_call_id
+                    ),
+                    matching_call,
+                )
+            if matching_call is None:
+                return "not_found", None
+
+            # Validate the requested interaction kind before any idempotent
+            # replay short-circuit below.  Otherwise a resolved input claim
+            # could be replayed through the approval endpoint (or vice versa)
+            # and reach grant logic with the wrong payload kind.
+            matching_function = matching_call.get("function")
+            matching_tool_name = (
+                matching_function.get("name")
+                if isinstance(matching_function, dict)
+                else None
+            )
+            if not isinstance(matching_tool_name, str) or not matching_tool_name:
+                return "not_found", None
+            if expected_tool_name is not None and matching_tool_name != expected_tool_name:
+                return "not_found", None
+            if excluded_tool_name is not None and matching_tool_name == excluded_tool_name:
+                return "not_found", None
+
+            continuation_claim = None
+            continuation_claim_row_id = None
+
+            # A legacy Omnia caller does not send ``resolution_id``.  If a
+            # newer proxy already prepared this same interaction, remember its
+            # claim so that the legacy resolve can either replay a completed
+            # transition or advance ``prepared`` to ``resolved``.  This keeps
+            # an in-flight prepared reservation take-over-safe during rollback
+            # (old Omnia + new Hermes) without allowing an unrelated claim to be
+            # replaced before the answer is actually durable.
+            if resolution_id is None:
+                for candidate in reversed(rows):
+                    if candidate["role"] != "assistant":
+                        continue
+                    candidate_calls = _calls(candidate["tool_calls"])
+                    if not any(
+                        call.get("id") == tool_call_id for call in candidate_calls
+                    ):
+                        continue
+                    candidate_metadata = self._decode_display_metadata(
+                        candidate["display_metadata"]
+                    ) or {}
+                    candidate_claim = candidate_metadata.get("_omnio_continuation_claim")
+                    candidate_phase = (
+                        candidate_claim.get("phase")
+                        if isinstance(candidate_claim, dict)
+                        else None
+                    )
+                    candidate_id = (
+                        candidate_claim.get("continuation_id")
+                        if isinstance(candidate_claim, dict)
+                        else None
+                    )
+                    claim_tool_call_id = (
+                        candidate_claim.get("tool_call_id")
+                        if isinstance(candidate_claim, dict)
+                        else None
+                    )
+                    if (
+                        isinstance(candidate_claim, dict)
+                        and (
+                            candidate_phase in {"prepared", "resolved", "started"}
+                            or (
+                                isinstance(candidate_id, str)
+                                and candidate_id.startswith("interaction-resume:")
+                            )
+                        )
+                        and (
+                            claim_tool_call_id == tool_call_id
+                            or (
+                                claim_tool_call_id is None
+                                and candidate_id
+                                == f"interaction-resume:{tool_call_id}"
+                            )
+                        )
+                    ):
+                        continuation_claim = candidate_claim
+                        continuation_claim_row_id = candidate["id"]
+                    break
+
+                if continuation_claim is not None:
+                    claim_phase = continuation_claim.get("phase")
+                    if claim_phase in {"resolved", "started"}:
+                        return "resolved", matching_call
+                    if claim_phase != "prepared":
+                        return "not_resumable", matching_call
+
+            # A prepared continuation owns the answer's durable identity.  A
+            # retry after the tool row/grant was already written replays the
+            # same resolution instead of turning the answer into a stale 409.
+            if resolution_id is not None:
+                for candidate in reversed(rows):
+                    metadata = self._decode_display_metadata(
+                        candidate["display_metadata"]
+                    ) or {}
+                    claim = metadata.get("_omnio_continuation_claim")
+                    if (
+                        isinstance(claim, dict)
+                        and claim.get("continuation_id") == resolution_id
+                        and (
+                            claim.get("tool_call_id") == tool_call_id
+                            or (
+                                claim.get("tool_call_id") is None
+                                and resolution_id
+                                == f"interaction-resume:{tool_call_id}"
+                            )
+                        )
+                    ):
+                        continuation_claim = claim
+                        continuation_claim_row_id = candidate["id"]
+                        break
+                if continuation_claim is None:
+                    return "not_resumable", matching_call
+                claim_phase = continuation_claim.get("phase")
+                if claim_phase in {"resolved", "started"}:
+                    return "resolved", matching_call
+                if claim_phase != "prepared":
+                    return "not_resumable", matching_call
+
+            assistant_idx = next(
+                (
+                    idx
+                    for idx in range(len(rows) - 1, -1, -1)
+                    if rows[idx]["role"] == "assistant"
+                ),
+                None,
+            )
+            assistant_row = rows[assistant_idx] if assistant_idx is not None else None
+            assistant_calls = _calls(
+                assistant_row["tool_calls"] if assistant_row is not None else None
+            )
+            tail_call = next(
+                (
+                    call
+                    for call in assistant_calls
+                    if call.get("id") == tool_call_id
+                ),
+                None,
+            )
+            if tail_call is None:
+                return "not_resumable", matching_call
+            assistant_call_ids = {
+                call.get("id")
+                for call in assistant_calls
+                if isinstance(call.get("id"), str)
+            }
+            trailing_rows = rows[assistant_idx + 1:]
+            if any(
+                row["role"] != "tool"
+                or row["tool_call_id"] not in assistant_call_ids
+                for row in trailing_rows
+            ):
+                return "not_resumable", tail_call
+            if any(
+                row["tool_call_id"] == tool_call_id for row in trailing_rows
+            ):
+                return "not_resumable", tail_call
+
+            function = tail_call.get("function")
+            tool_name = function.get("name") if isinstance(function, dict) else None
+            if not isinstance(tool_name, str) or not tool_name:
+                return "not_found", None
+            if expected_tool_name is not None and tool_name != expected_tool_name:
+                return "not_found", None
+            if excluded_tool_name is not None and tool_name == excluded_tool_name:
+                return "not_found", None
+
+            metadata = self._decode_display_metadata(
+                assistant_row["display_metadata"]
+            ) or {}
+            claim_key = "_omnio_resolved_approvals"
+            claims = metadata.get(claim_key, {})
+            if not isinstance(claims, dict):
+                claims = {}
+            if tool_call_id in claims:
+                if continuation_claim is not None:
+                    return "resolved", tail_call
+                return "not_resumable", tail_call
+            if claim_approval:
+                raw_arguments = function.get("arguments")
+                metadata[claim_key] = {
+                    **claims,
+                    tool_call_id: {
+                        "scope": approval_scope or "once",
+                        "tool_name": tool_name,
+                        "arguments": (
+                            raw_arguments
+                            if isinstance(raw_arguments, str)
+                            else "{}"
+                        ),
+                    },
+                }
+                conn.execute(
+                    "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                    (
+                        self._encode_display_metadata(metadata),
+                        assistant_row["id"],
+                    ),
+                )
+            elif continuation_claim is not None and resolution_id is not None:
+                # Denials are decisions too.  Persist a deny marker so a
+                # replay carrying ``scope=always`` cannot escalate the first
+                # response after a process restart.
+                raw_arguments = function.get("arguments")
+                metadata[claim_key] = {
+                    **claims,
+                    tool_call_id: {
+                        "scope": "deny",
+                        "tool_name": tool_name,
+                        "arguments": (
+                            raw_arguments
+                            if isinstance(raw_arguments, str)
+                            else "{}"
+                        ),
+                    },
+                }
+                conn.execute(
+                    "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                    (
+                        self._encode_display_metadata(metadata),
+                        assistant_row["id"],
+                    ),
+                )
+
+            if tool_result_content is not None:
+                conn.execute(
+                    "INSERT INTO messages "
+                    "(session_id, role, content, tool_call_id, tool_name, "
+                    "timestamp, observed, active) VALUES (?, 'tool', ?, ?, ?, ?, 0, 1)",
+                    (
+                        session_id,
+                        stored_content,
+                        tool_call_id,
+                        _scrub_surrogates(tool_name),
+                        time.time(),
+                    ),
+                )
+                conn.execute(
+                    "UPDATE sessions SET message_count = message_count + 1 "
+                    "WHERE id = ?",
+                    (session_id,),
+                )
+            if continuation_claim is not None and continuation_claim_row_id is not None:
+                continuation_claim["phase"] = "resolved"
+                conn.execute(
+                    "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                    (
+                        self._encode_display_metadata(
+                            {
+                                **(
+                                    self._decode_display_metadata(
+                                        conn.execute(
+                                            "SELECT display_metadata FROM messages WHERE id = ?",
+                                            (continuation_claim_row_id,),
+                                        ).fetchone()["display_metadata"]
+                                    )
+                                    or {}
+                                ),
+                                "_omnio_continuation_claim": continuation_claim,
+                            }
+                        ),
+                        continuation_claim_row_id,
+                    ),
+                )
+            return "resolved", tail_call
+
+        return self._execute_write(_do)
+
+    def claim_pending_continuation(
+        self,
+        session_id: str,
+        continuation_id: str,
+        run_id: str,
+        *,
+        reclaim_existing: bool = False,
+        phase: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
+    ) -> tuple[str, Optional[str]]:
+        """Atomically claim the current resumable tail for one API run.
+
+        The claim is merged into the existing tail row's display metadata so
+        it shares SessionDB's durable, serialized lifecycle rather than adding
+        a process-local continuation lock. A retry with the same client
+        identity can reuse the recorded run while a distinct second delivery
+        is rejected. The claim itself never becomes provider-visible.
+        """
+        claim_key = "_omnio_continuation_claim"
+
+        def _do(conn):
+            if (
+                tool_call_id is not None
+                and continuation_id != f"interaction-resume:{tool_call_id}"
+            ):
+                return "not_resumable", None
+            rows = conn.execute(
+                "SELECT id, role, tool_call_id, tool_calls, display_metadata FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id DESC",
+                (session_id,),
+            ).fetchall()
+            if not rows:
+                return "not_resumable", None
+            row = rows[0]
+            resumable = row["role"] == "tool"
+            if row["role"] == "assistant":
+                try:
+                    calls = json.loads(row["tool_calls"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    calls = []
+                resumable = isinstance(calls, list) and bool(calls)
+            if not resumable:
+                return "not_resumable", None
+            # Resolution appends tool rows after the assistant row that owns
+            # the claim. Keep the contiguous tail as the only eligible owner;
+            # an older assistant's call must not mint a new reservation.
+            claim_rows = [row]
+            if row["role"] == "tool":
+                claim_rows = []
+                for candidate in rows:
+                    if candidate["role"] == "tool":
+                        claim_rows.append(candidate)
+                        continue
+                    if candidate["role"] == "assistant":
+                        claim_rows.append(candidate)
+                    break
+            owner_row = None
+            if tool_call_id is not None:
+                for candidate in rows:
+                    if candidate["role"] != "assistant":
+                        continue
+                    try:
+                        calls = json.loads(candidate["tool_calls"] or "[]")
+                    except (json.JSONDecodeError, TypeError):
+                        calls = []
+                    if any(
+                        isinstance(call, dict) and call.get("id") == tool_call_id
+                        for call in calls
+                    ):
+                        owner_row = candidate
+                        break
+                if owner_row is None:
+                    return "not_resumable", None
+                if owner_row["id"] not in {candidate["id"] for candidate in claim_rows}:
+                    return "not_resumable", None
+                target_has_tool_result = any(
+                    candidate["role"] == "tool"
+                    and candidate["tool_call_id"] == tool_call_id
+                    for candidate in claim_rows
+                )
+            else:
+                target_has_tool_result = False
+            # A retry after resolution reuses the original reservation rather
+            # than minting a second run identity on the new tool row.
+            for candidate in claim_rows:
+                if owner_row is not None and candidate["id"] != owner_row["id"]:
+                    continue
+                candidate_metadata = self._decode_display_metadata(
+                    candidate["display_metadata"]
+                ) or {}
+                candidate_claim = candidate_metadata.get(claim_key)
+                if not isinstance(candidate_claim, dict):
+                    continue
+                candidate_id = candidate_claim.get("continuation_id")
+                candidate_run_id = candidate_claim.get("run_id")
+                candidate_tool_call_id = candidate_claim.get("tool_call_id")
+                if (
+                    tool_call_id is not None
+                    and candidate_tool_call_id is not None
+                    and candidate_tool_call_id != tool_call_id
+                ):
+                    return "not_resumable", (
+                        candidate_run_id if isinstance(candidate_run_id, str) else None
+                    )
+                if candidate_id == continuation_id and isinstance(candidate_run_id, str):
+                    existing_phase = candidate_claim.get("phase")
+                    if phase == "prepared" and existing_phase in {
+                        "prepared", "resolved", "started",
+                    }:
+                        return "existing", candidate_run_id
+                    # A legacy continuation request must not replace a
+                    # two-phase reservation that is waiting for its answer;
+                    # doing so would strand the new Omnia Turn's deterministic
+                    # run identity. The legacy caller can retry after the
+                    # prepared flow commits or report its normal 409.
+                    if phase is None and existing_phase in {"prepared", "resolved"}:
+                        return "existing", candidate_run_id
+                    if reclaim_existing:
+                        replacement = {
+                            "continuation_id": continuation_id,
+                            "run_id": run_id,
+                        }
+                        if tool_call_id is not None:
+                            replacement["tool_call_id"] = tool_call_id
+                        if phase is not None:
+                            replacement["phase"] = phase
+                        candidate_metadata[claim_key] = replacement
+                        conn.execute(
+                            "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                            (
+                                self._encode_display_metadata(candidate_metadata),
+                                candidate["id"],
+                            ),
+                        )
+                        return "reclaimed", run_id
+                    return "existing", candidate_run_id
+                # During a mixed-version rollback, old Omnia resolves the
+                # interaction without ``resolutionId`` and then starts a
+                # continuation using its UUID5 Turn id.  A new Hermes may
+                # already have a prepared claim keyed by
+                # ``interaction-resume:<tool>``; after the legacy resolve above
+                # advances it to ``resolved``, let that legacy start take over
+                # the same durable tail.  Never permit this while the claim is
+                # still merely prepared, or before a response was consumed.
+                if (
+                    candidate_id != continuation_id
+                    and reclaim_existing
+                    and candidate_claim.get("phase") == "resolved"
+                    and isinstance(candidate_run_id, str)
+                ):
+                    replacement = {
+                        "continuation_id": continuation_id,
+                        "run_id": run_id,
+                    }
+                    if tool_call_id is not None:
+                        replacement["tool_call_id"] = tool_call_id
+                    candidate_metadata[claim_key] = replacement
+                    conn.execute(
+                        "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                        (
+                            self._encode_display_metadata(candidate_metadata),
+                            candidate["id"],
+                        ),
+                    )
+                    return "reclaimed", run_id
+                return "not_resumable", (
+                    candidate_run_id if isinstance(candidate_run_id, str) else None
+                )
+
+            if tool_call_id is not None and target_has_tool_result:
+                return "not_resumable", None
+
+            metadata = self._decode_display_metadata(row["display_metadata"]) or {}
+            claim = {
+                "continuation_id": continuation_id,
+                "run_id": run_id,
+            }
+            if tool_call_id is not None:
+                claim["tool_call_id"] = tool_call_id
+            if phase is not None:
+                claim["phase"] = phase
+            metadata[claim_key] = claim
+            conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                (self._encode_display_metadata(metadata), row["id"]),
+            )
+            return "claimed", run_id
+
+        return self._execute_write(_do)
+
+    def get_pending_continuation_claim(
+        self,
+        session_id: str,
+        continuation_id: str,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Read the durable run and phase for a continuation claim.
+
+        ``claim_pending_continuation`` deliberately keeps its historical
+        two-value return contract for callers that only need admission.  The
+        additive Omnia prepare endpoint uses this read to expose Hermes's
+        authoritative phase after an idempotent claim replay.  Claims live on
+        the assistant tail (and remain there after resolution appends a tool
+        row), so scan the active tail rather than assuming the newest row owns
+        the metadata.
+        """
+        claim_key = "_omnio_continuation_claim"
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT display_metadata FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id DESC",
+                (session_id,),
+            ).fetchall()
+        for row in rows:
+            metadata = self._decode_display_metadata(row["display_metadata"]) or {}
+            claim = metadata.get(claim_key)
+            if not isinstance(claim, dict):
+                continue
+            if claim.get("continuation_id") != continuation_id:
+                continue
+            run_id = claim.get("run_id")
+            phase = claim.get("phase")
+            return (
+                run_id if isinstance(run_id, str) else None,
+                phase if isinstance(phase, str) else None,
+            )
+        return None, None
+
+    def start_pending_continuation(
+        self,
+        session_id: str,
+        continuation_id: str,
+        run_id: str,
+    ) -> tuple[str, Optional[str]]:
+        """Atomically commit a prepared continuation and retain its run id."""
+        claim_key = "_omnio_continuation_claim"
+
+        def _do(conn):
+            rows = conn.execute(
+                "SELECT id, display_metadata FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id DESC",
+                (session_id,),
+            ).fetchall()
+            for row in rows:
+                metadata = self._decode_display_metadata(row["display_metadata"]) or {}
+                claim = metadata.get(claim_key)
+                if not isinstance(claim, dict) or claim.get("continuation_id") != continuation_id:
+                    continue
+                claimed_run_id = claim.get("run_id")
+                if claimed_run_id != run_id:
+                    return "not_resumable", claimed_run_id
+                phase = claim.get("phase")
+                if phase == "started":
+                    return "started", run_id
+                # Starting is a commit after the interaction transaction.  A
+                # prepared claim alone is not enough: admission may have been
+                # accepted while credits/turn fences still refuse the answer.
+                if phase != "resolved":
+                    return "not_resumable", run_id
+                claim["phase"] = "started"
+                metadata[claim_key] = claim
+                conn.execute(
+                    "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                    (self._encode_display_metadata(metadata), row["id"]),
+                )
+                return "started", run_id
+            return "not_resumable", None
+
+        return self._execute_write(_do)
+
+    def get_resolved_approval(
+        self,
+        session_id: str,
+        tool_call_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the durable approval decision for an already-resolved call."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT display_metadata FROM messages "
+                "WHERE session_id = ? AND role = 'assistant' AND active = 1 "
+                "ORDER BY id DESC",
+                (session_id,),
+            ).fetchall()
+        for row in rows:
+            metadata = self._decode_display_metadata(row["display_metadata"]) or {}
+            claims = metadata.get("_omnio_resolved_approvals")
+            if not isinstance(claims, dict):
+                continue
+            decision = claims.get(tool_call_id)
+            if isinstance(decision, dict):
+                return decision
+        return None
+
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
         display_metadata: Optional[Dict[str, Any]] = None,

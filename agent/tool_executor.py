@@ -155,6 +155,14 @@ def _flush_session_db_after_tool_progress(
         logger.warning("Incremental tool-call persistence failed after %s: %s", stage, exc)
 
 
+def _mark_omnio_timeout_tool_result(agent, tool_message: dict, tool_call_id: str) -> None:
+    """Keep expired Omnio HITL sentinels in-memory but out of SessionDB."""
+    pending = getattr(agent, "_omnio_skip_persist_tool_call_ids", None)
+    if isinstance(pending, set) and tool_call_id in pending:
+        tool_message["_omnio_skip_persist"] = True
+        pending.discard(tool_call_id)
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so patches like ``run_agent._set_interrupt`` work."""
     import run_agent
@@ -1016,6 +1024,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tc.id,
             effect_disposition=effect_disposition,
         )
+        _mark_omnio_timeout_tool_result(agent, tool_message, tc.id)
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if (
@@ -1727,6 +1736,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_call.id,
             effect_disposition=effect_disposition,
         )
+        _mark_omnio_timeout_tool_result(agent, tool_message, tool_call.id)
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if (

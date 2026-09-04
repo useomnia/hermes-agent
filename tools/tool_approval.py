@@ -33,6 +33,7 @@ replace or release each other, while session grants remain conversation-scoped.
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -98,6 +99,11 @@ class ToolApprovalDenial(str):
 _lock = threading.Lock()
 # session_key -> tool names approved for the whole conversation.
 _session_approved: dict[str, set[str]] = {}
+# (session_key, tool_call_id, tool_name, canonical args) grants consumed by
+# exactly one re-dispatch. Kept process-local like the existing session grant
+# store: the durable interaction is the dangling SessionDB tool call, not a
+# second grant record with a separate lifecycle.
+_once_approved: set[tuple[str, str, str, str]] = set()
 # Mechanical surface/wait state stays isolated from the user-input gate by this
 # module's own registry instance. The waiter payload is the gated tool name.
 _wait_registry: BlockingWaitRegistry[
@@ -213,6 +219,134 @@ def record_session_approval(session_key: str, function_name: str) -> None:
     """Grant a tool for the rest of the session (the `session` scope)."""
     with _lock:
         _session_approved.setdefault(session_key, set()).add(function_name)
+
+
+def _canonical_args(function_args: Optional[dict]) -> str:
+    """Stable, non-secret-bearing key material for an exact tool call."""
+    try:
+        canonical = json.dumps(
+            function_args if isinstance(function_args, dict) else {},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    except (TypeError, ValueError):
+        return hashlib.sha256(b"{}").hexdigest()
+
+
+def record_once_approval(
+    session_key: str,
+    tool_call_id: str,
+    function_name: str,
+    function_args: Optional[dict],
+) -> None:
+    """Grant exactly one matching resumed tool-call identity."""
+    with _lock:
+        _once_approved.add(
+            (session_key, tool_call_id, function_name, _canonical_args(function_args))
+        )
+
+
+def consume_once_approval(
+    session_key: str,
+    tool_call_id: str,
+    function_name: str,
+    function_args: Optional[dict],
+) -> bool:
+    """Atomically consume the exact one-shot tool-call grant, if present."""
+    key = (session_key, tool_call_id, function_name, _canonical_args(function_args))
+    with _lock:
+        if key not in _once_approved:
+            return False
+        _once_approved.remove(key)
+        return True
+
+
+def resolve_approval_target(
+    function_name: str,
+    function_args: Optional[dict],
+) -> tuple[str, dict]:
+    """Return the tool identity that the approval gate actually protects.
+
+    Progressive disclosure presents deferred MCP tools to the model through
+    the ``tool_call`` bridge.  The persisted assistant call therefore names
+    the bridge even though ``model_tools.handle_function_call`` unwraps it
+    before applying this approval gate.  Durable grants must follow that same
+    unwrapping or they approve the inert bridge and the resumed underlying
+    call asks the user a second time.
+
+    Resolution is deliberately fail-closed: malformed or unavailable bridge
+    calls keep their outer identity, which cannot approve an underlying write.
+    """
+    args = function_args if isinstance(function_args, dict) else {}
+    if function_name != "tool_call":
+        return function_name, args
+    try:
+        from tools.tool_search import resolve_underlying_call
+
+        underlying_name, underlying_args, error = resolve_underlying_call(args)
+    except Exception:
+        return function_name, args
+    if (
+        error
+        or not isinstance(underlying_name, str)
+        or not underlying_name
+        or not isinstance(underlying_args, dict)
+    ):
+        return function_name, args
+    return underlying_name, underlying_args
+
+
+def rehydrate_resolved_approval(
+    session_key: str,
+    tool_call_id: str,
+    function_name: str,
+    raw_arguments: str,
+    durable_grant: object,
+) -> bool:
+    """Restore one accepted durable approval after a gateway restart.
+
+    The assistant message remains the canonical record. Its tool-call identity
+    must exactly match the metadata captured by SessionDB before any transient
+    grant is restored. Credit-spend tools deliberately demote standing scopes
+    to one exact call, matching the live approval resolver.
+    """
+    if not isinstance(durable_grant, dict):
+        return False
+    scope = durable_grant.get("scope")
+    if scope not in {"once", "session", "always"}:
+        return False
+    if durable_grant.get("tool_name") != function_name:
+        return False
+    if durable_grant.get("arguments") != raw_arguments:
+        return False
+    try:
+        function_args = json.loads(raw_arguments or "{}")
+    except (TypeError, ValueError):
+        function_args = {}
+    if not isinstance(function_args, dict):
+        function_args = {}
+    approval_name, approval_args = resolve_approval_target(
+        function_name,
+        function_args,
+    )
+    try:
+        credit_gated = is_credit_gated_tool(approval_name)
+    except Exception:
+        credit_gated = True
+    if scope == "once" or credit_gated:
+        record_once_approval(
+            session_key,
+            tool_call_id,
+            approval_name,
+            approval_args,
+        )
+    elif scope == "session":
+        record_session_approval(session_key, approval_name)
+    else:
+        record_always_approval(approval_name)
+    return True
 
 
 def register_always_approval_authority(
@@ -472,6 +606,8 @@ def clear_session(session_key: str) -> None:
         return
     with _lock:
         _session_approved.pop(session_key, None)
+        for key in [key for key in _once_approved if key[0] == session_key]:
+            _once_approved.discard(key)
         surface_keys = {
             surface_key
             for surface_key, (_, grant_session_key) in _surface_grant_sessions.items()
@@ -682,6 +818,10 @@ def maybe_require_tool_approval(
     credits_descriptor = mcp_tool_credits_meta(function_name)
     grant_session_key = get_current_tool_approval_session_key()
     surface_key = get_current_tool_approval_surface_key()
+    if consume_once_approval(
+        grant_session_key, tool_call_id, function_name, function_args
+    ):
+        return None
     if credits_descriptor is None:
         if is_always_approved(function_name):
             return None  # granted for every conversation on this gateway

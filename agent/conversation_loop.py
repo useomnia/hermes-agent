@@ -1076,6 +1076,7 @@ def run_conversation(
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    continuation: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1098,7 +1099,7 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
-    if moa_config is None:
+    if moa_config is None and not continuation:
         try:
             from hermes_cli.moa_config import decode_moa_turn
 
@@ -1110,6 +1111,11 @@ def run_conversation(
                     persist_user_message = _decoded_message
         except Exception:
             pass
+
+    if continuation:
+        # Continuations deliberately have no user turn. Keep downstream
+        # helpers that expect text on their established empty-string path.
+        user_message = ""
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
@@ -1145,6 +1151,7 @@ def run_conversation(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
+        continuation=continuation,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -1157,6 +1164,92 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+
+    # A continuation can begin at a durable assistant(tool_calls) block after a
+    # late approval, optionally followed by results from sibling calls in that
+    # same block. Re-dispatch only its still-unresolved calls before the first
+    # provider request; the one-shot approval grant is consumed by the normal
+    # gate.
+    _continuation_boundary_tool_call_ids = set()
+    if continuation and messages:
+        _assistant_idx = next(
+            (
+                _idx
+                for _idx in range(len(messages) - 1, -1, -1)
+                if isinstance(messages[_idx], dict)
+                and messages[_idx].get("role") == "assistant"
+                and messages[_idx].get("tool_calls")
+            ),
+            None,
+        )
+        if _assistant_idx is not None and all(
+            isinstance(_message, dict) and _message.get("role") == "tool"
+            for _message in messages[_assistant_idx + 1:]
+        ):
+            from types import SimpleNamespace
+
+            _assistant = messages[_assistant_idx]
+            _continuation_boundary_tool_call_ids = {
+                _call.get("id")
+                for _call in _assistant["tool_calls"]
+                if isinstance(_call, dict) and isinstance(_call.get("id"), str)
+            }
+            _resolved_call_ids = {
+                _message.get("tool_call_id")
+                for _message in messages[_assistant_idx + 1:]
+                if isinstance(_message.get("tool_call_id"), str)
+            }
+            _metadata = _assistant.get("display_metadata")
+            _durable_grants = (
+                _metadata.get("_omnio_resolved_approvals", {})
+                if isinstance(_metadata, dict)
+                else {}
+            )
+            pending_calls = []
+            for _call in _assistant["tool_calls"]:
+                if not isinstance(_call, dict):
+                    continue
+                _function = _call.get("function") or {}
+                _name = _function.get("name") if isinstance(_function, dict) else None
+                _arguments = _function.get("arguments") if isinstance(_function, dict) else None
+                _call_id = _call.get("id")
+                if (
+                    not isinstance(_name, str)
+                    or not isinstance(_call_id, str)
+                    or _call_id in _resolved_call_ids
+                ):
+                    continue
+                _durable_grant = (
+                    _durable_grants.get(_call_id)
+                    if isinstance(_durable_grants, dict)
+                    else None
+                )
+                if _durable_grant is not None:
+                    from tools.tool_approval import (
+                        get_current_tool_approval_session_key,
+                        rehydrate_resolved_approval,
+                    )
+
+                    rehydrate_resolved_approval(
+                        get_current_tool_approval_session_key(),
+                        _call_id,
+                        _name,
+                        _arguments if isinstance(_arguments, str) else "{}",
+                        _durable_grant,
+                    )
+                pending_calls.append(
+                    SimpleNamespace(
+                        id=_call_id,
+                        function=SimpleNamespace(
+                            name=_name,
+                            arguments=_arguments if isinstance(_arguments, str) else "{}",
+                        ),
+                    )
+                )
+            if pending_calls:
+                agent._execute_tool_calls(
+                    SimpleNamespace(tool_calls=pending_calls), messages, effective_task_id
+                )
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -5303,10 +5396,11 @@ def run_conversation(
             # lands on a historical user message would make the live-compose
             # fallback inject this turn's prefetch into that message on the
             # wire only, diverging the next turn's replayed prefix there.
-            current_turn_user_idx = reanchor_current_turn_user_idx(
-                messages, user_message
-            )
-            agent._persist_user_message_idx = current_turn_user_idx
+            if not continuation:
+                current_turn_user_idx = reanchor_current_turn_user_idx(
+                    messages, user_message
+                )
+                agent._persist_user_message_idx = current_turn_user_idx
             continue
 
         if _retry.restart_with_rebuilt_messages:
@@ -6907,6 +7001,10 @@ def run_conversation(
         original_user_message=original_user_message,
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
+        continuation=continuation,
+        continuation_boundary_tool_call_ids=(
+            _continuation_boundary_tool_call_ids
+        ),
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )

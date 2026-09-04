@@ -799,7 +799,11 @@ class TurnEventEmitter:
         if client_projection_withheld(name, arguments):
             return
         extension_type, payload_key = _TOOL_EXTENSION_EVENTS[name]
-        self.omnio_event(extension_type, **{payload_key: arguments})
+        self.omnio_event(
+            extension_type,
+            tool_call_id=call_id,
+            **{payload_key: arguments},
+        )
 
     def function_call_done(self, call_id: str) -> None:
         state = self._function_calls.pop(call_id, None)

@@ -339,10 +339,17 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     if not isinstance(last, dict) or last.get("role") != "tool":
         return False
     text = final_response if isinstance(final_response, str) else ""
-    messages.append({
+    closer = {
         "role": "assistant",
         "content": text.strip() or "Operation interrupted.",
-    })
+    }
+    # The Omnio timeout path intentionally leaves the durable transcript at
+    # the preceding assistant(tool_calls) row.  Keep the in-memory closer so
+    # this turn unwinds exactly like every other interrupt, but let the
+    # persistence funnel omit it together with its sentinel tool result.
+    if last.get("_omnio_skip_persist"):
+        closer["_omnio_skip_persist"] = True
+    messages.append(closer)
     return True
 
 
