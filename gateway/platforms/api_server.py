@@ -9135,17 +9135,19 @@ class APIServerAdapter(BasePlatformAdapter):
                             consume_user_input_completion_reason,
                         )
 
-                        reason = consume_user_input_completion_reason(session_id)
+                        reason = consume_user_input_completion_reason(
+                            approval_session_key
+                        )
                     except Exception:
                         reason = None
                     # Only an expired wait closes the card; a stop or disconnect
                     # leaves it open and answerable.
                     if reason == "expired":
                         completion_fields = {"timed_out": True}
-                # The question is now waiting on the chat, not on this run: the
-                # card stays answerable and a late answer arrives as the next
-                # Turn's user message, so the run must end instead of letting
-                # the agent keep working without the answer.
+                # A presented question is now waiting on the chat rather than
+                # this run; an expired wait is terminal and emits the completion
+                # above. Either way, the run must end instead of letting the
+                # agent continue without an answer.
                 user_input_turn_ending = status in {"presented", "no_response"}
                 if completion_fields is not None:
                     fields = {

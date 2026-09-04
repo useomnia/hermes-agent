@@ -2548,12 +2548,22 @@ async def test_tool_approval_timeout_interrupts_the_turn_before_another_iteratio
 
 
 @pytest.mark.asyncio
-async def test_user_input_timeout_interrupts_the_run_and_stamps_timed_out() -> None:
+@pytest.mark.parametrize("completion_count", [1, 2])
+async def test_user_input_timeout_interrupts_the_run_and_stamps_timed_out(
+    monkeypatch: pytest.MonkeyPatch, completion_count: int
+) -> None:
+    import tools.user_input as user_input
+    from tools.approval import get_current_session_key
+
+    # Exercise the real registry expiry under the worker's ContextVar identity.
+    # Mocking the consumed reason hides a conversation/run namespace mismatch.
+    monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "0")
     adapter = _make_adapter()
     session_id = "conversation-user-input-timeout"
     continued_after_timeout = False
     interrupted = threading.Event()
     built_agent: Optional[MagicMock] = None
+    captured: Dict[str, Any] = {}
 
     def build_agent(**callbacks: Any) -> MagicMock:
         nonlocal built_agent, continued_after_timeout
@@ -2568,11 +2578,20 @@ async def test_user_input_timeout_interrupts_the_run_and_stamps_timed_out() -> N
                 status="running",
                 interaction={"kind": "choice", "question": "Which one?", "options": []},
             )
-            callbacks["tool_complete_callback"](
-                "call-ask",
-                "request_user_input",
-                {},
-                json.dumps({"status": "no_response"}),
+            run_key = get_current_session_key()
+            captured["run_key"] = run_key
+            assert run_key != session_id
+            assert user_input._wait_registry.has_surface(run_key)
+            assert user_input.await_user_input(run_key) is None
+            for _ in range(completion_count):
+                callbacks["tool_complete_callback"](
+                    "call-ask",
+                    "request_user_input",
+                    {},
+                    json.dumps({"status": "no_response"}),
+                )
+            captured["unconsumed_reason"] = (
+                user_input.consume_user_input_completion_reason(run_key)
             )
             continued_after_timeout = not interrupted.is_set()
             return {
@@ -2584,31 +2603,105 @@ async def test_user_input_timeout_interrupts_the_run_and_stamps_timed_out() -> N
         built_agent = _agent(run, interrupt=lambda _message=None: interrupted.set())
         return built_agent
 
-    with (
-        patch.object(adapter, "_create_agent", side_effect=build_agent),
-        patch(
-            "tools.user_input.consume_user_input_completion_reason",
-            return_value="expired",
-        ),
-    ):
-        _, events = await _run_without_http_server(
+    with patch.object(adapter, "_create_agent", side_effect=build_agent):
+        started, events = await _run_without_http_server(
             adapter,
             {"input": "ask the user", "session_id": session_id},
         )
 
     assert built_agent is not None
-    built_agent.interrupt.assert_called_once_with(
-        "awaiting user interaction (request_user_input)"
-    )
+    assert built_agent.interrupt.call_count == completion_count
+    for call in built_agent.interrupt.call_args_list:
+        assert call.args == ("awaiting user interaction (request_user_input)",)
     assert continued_after_timeout is False
-    completed = next(
+    assert captured["run_key"] == json.loads(started.text)["run_id"]
+    completed = [
         event
         for event in events
         if event["type"] == "response.omnio.interaction_completed"
         and event.get("tool_call_id") == "call-ask"
-    )
-    assert completed["timed_out"] is True
+    ]
+    assert len(completed) == 1
+    assert completed[0] == {
+        "type": "response.omnio.interaction_completed",
+        "tool_call_id": "call-ask",
+        "timed_out": True,
+        "sequence_number": completed[0]["sequence_number"],
+    }
+    assert captured["unconsumed_reason"] is None
     assert events[-1]["type"] == "response.incomplete"
+    assert completed[0]["sequence_number"] < events[-1]["sequence_number"]
+    assert user_input.resolve_user_input(captured["run_key"], "late answer") is False
+
+    # A fresh Turn in the same conversation has an independent wait identity.
+    recovery_agent = _agent(
+        lambda **_kwargs: {"final_response": "recovered", "messages": []}
+    )
+    with patch.object(adapter, "_create_agent", return_value=recovery_agent):
+        recovery, recovery_events = await _run_without_http_server(
+            adapter, {"input": "continue", "session_id": session_id}
+        )
+    assert json.loads(recovery.text)["run_id"] != captured["run_key"]
+    assert recovery_events[-1]["type"] == "response.completed"
+    assert not any(
+        event["type"] == "response.omnio.interaction_completed"
+        for event in recovery_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_user_input_does_not_consume_conversation_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.user_input as user_input
+    from tools.approval import get_current_session_key
+    from tools.interrupt import set_interrupt
+
+    adapter = _make_adapter()
+    session_id = "conversation-user-input-cancelled"
+    # A legacy conversation-scoped wait must not be consumed by this run.
+    token = user_input.register_user_input_session(session_id)
+    monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "0")
+    assert user_input.await_user_input(session_id) is None
+    monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "30")
+    captured: Dict[str, Any] = {}
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            run_key = get_current_session_key()
+            callbacks["tool_start_callback"]("call-ask", "request_user_input", {})
+            set_interrupt(True)
+            try:
+                assert user_input.await_user_input(run_key) is None
+            finally:
+                set_interrupt(False)
+            callbacks["tool_complete_callback"](
+                "call-ask",
+                "request_user_input",
+                {},
+                json.dumps({"status": "no_response"}),
+            )
+            captured["unconsumed_reason"] = (
+                user_input.consume_user_input_completion_reason(run_key)
+            )
+            return {"final_response": "", "messages": [], "interrupted": True}
+
+        return _agent(run)
+
+    try:
+        with patch.object(adapter, "_create_agent", side_effect=build_agent):
+            _, events = await _run_without_http_server(
+                adapter, {"input": "ask the user", "session_id": session_id}
+            )
+        assert events[-1]["type"] == "response.incomplete"
+        assert not any(
+            event["type"] == "response.omnio.interaction_completed"
+            for event in events
+        )
+        assert captured["unconsumed_reason"] is None
+        assert user_input.consume_user_input_completion_reason(session_id) == "expired"
+    finally:
+        user_input.unregister_user_input_session(session_id, token)
 
 
 @pytest.mark.asyncio
