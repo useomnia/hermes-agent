@@ -15,6 +15,8 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
+- POST /v1/runs/managed/reconcile  — read an exact Omnio-managed run mapping
+- POST /v1/runs/managed/cancel     — durably cancel an Omnio-managed run identity
 - GET  /v1/runs?recoverable=1      — enumerate active and retained terminal runs
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
@@ -116,6 +118,7 @@ from gateway.turn_event_log import (
     UnknownRunError,
 )
 from gateway.run_idempotency import (
+    ManagedRunIdentity,
     RunIdempotencyMismatch,
     RunIdempotencyRecord,
     RunIdempotencyStore,
@@ -137,6 +140,44 @@ _OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS = 30.0
 _OMNIO_QUIESCENCE_DEFAULT_FORCE_TIMEOUT_SECONDS = 30.0
 _OMNIO_QUIESCENCE_MAX_FORCE_TIMEOUT_SECONDS = 120.0
 _OMNIO_QUIESCENCE_OBJECT = "hermes.gateway.quiescence"
+_MANAGED_RUN_IDENTITY_KEYS = {
+    "version",
+    "submission_id",
+    "execution_fingerprint",
+}
+_MANAGED_EXECUTION_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _parse_managed_run_identity(value: Any) -> ManagedRunIdentity:
+    """Parse the strict v1 managed identity shared by all managed run routes."""
+    if not isinstance(value, dict) or set(value) != _MANAGED_RUN_IDENTITY_KEYS:
+        raise ValueError("omnio_managed must contain exactly the v1 identity fields")
+    version = value["version"]
+    if type(version) is not int or version != 1:
+        raise ValueError("omnio_managed.version must be integer 1")
+    submission_id = value["submission_id"]
+    if not isinstance(submission_id, str):
+        raise ValueError("omnio_managed.submission_id must be a canonical UUID")
+    try:
+        parsed_submission_id = uuid.UUID(submission_id)
+    except (ValueError, AttributeError):
+        raise ValueError(
+            "omnio_managed.submission_id must be a canonical UUID"
+        ) from None
+    if str(parsed_submission_id) != submission_id:
+        raise ValueError("omnio_managed.submission_id must be a canonical UUID")
+    execution_fingerprint = value["execution_fingerprint"]
+    if (
+        not isinstance(execution_fingerprint, str)
+        or _MANAGED_EXECUTION_FINGERPRINT_RE.fullmatch(execution_fingerprint) is None
+    ):
+        raise ValueError(
+            "omnio_managed.execution_fingerprint must be 64 lowercase hex characters"
+        )
+    return ManagedRunIdentity(
+        submission_id=submission_id,
+        execution_fingerprint=execution_fingerprint,
+    )
 
 
 def _boot_mark(name: str) -> None:
@@ -2341,6 +2382,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
+            ("POST", "/v1/runs/managed/reconcile", self._handle_reconcile_managed_run),
+            ("POST", "/v1/runs/managed/cancel", self._handle_cancel_managed_run),
             ("GET", "/v1/runs", self._handle_recoverable_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -4036,6 +4079,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_streaming": True,
                 "run_submission": True,
                 "run_turn_idempotency": {"apiVersion": 1},
+                "managed_run_identity": {
+                    "apiVersion": 1,
+                    "nonCreatingReconcile": True,
+                    "durableCancelFence": True,
+                },
                 # Omnia's handover controller uses this as a feature gate.  It
                 # is intentionally an explicit runtime capability rather than
                 # a version stamp: the endpoint accounts for all durable and
@@ -4080,6 +4128,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
+                "managed_run_reconcile": {
+                    "method": "POST",
+                    "path": "/v1/runs/managed/reconcile",
+                },
+                "managed_run_cancel": {
+                    "method": "POST",
+                    "path": "/v1/runs/managed/cancel",
+                },
                 "recoverable_runs": {
                     "method": "GET",
                     "path": "/v1/runs?recoverable=1",
@@ -7788,6 +7844,192 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
+    def _parse_managed_control_body(
+        self, body: Any
+    ) -> tuple[str, str, ManagedRunIdentity]:
+        if not isinstance(body, dict) or set(body) != {
+            "turn_id",
+            "session_id",
+            "omnio_managed",
+        }:
+            raise ValueError(
+                "request must contain exactly turn_id, session_id, and omnio_managed"
+            )
+        turn_id = body["turn_id"]
+        if (
+            not isinstance(turn_id, str)
+            or not turn_id.strip()
+            or len(turn_id.strip()) > 255
+        ):
+            raise ValueError("turn_id must be a non-empty string up to 255 characters")
+        session_id = body["session_id"]
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        session_id = session_id.strip()
+        from gateway.session import _is_path_unsafe
+
+        if (
+            re.search(r"[\r\n\x00]", session_id)
+            or _is_path_unsafe(session_id)
+            or len(session_id) > self._MAX_SESSION_HEADER_LEN
+        ):
+            raise ValueError("session_id is invalid")
+        return (
+            turn_id.strip(),
+            session_id,
+            _parse_managed_run_identity(body["omnio_managed"]),
+        )
+
+    @staticmethod
+    def _managed_run_payload(
+        record: RunIdempotencyRecord,
+        *,
+        status: str | None = None,
+    ) -> Dict[str, Any]:
+        return {
+            "object": "hermes.managed_run",
+            "turn_id": record.turn_id,
+            "run_id": record.run_id,
+            "session_id": record.session_id,
+            "status": status or record.status,
+            "submission_id": record.managed_submission_id,
+            "execution_fingerprint": record.managed_execution_fingerprint,
+            "cancel_requested": record.cancel_requested,
+        }
+
+    def _managed_cancelled_replay_at_limit(
+        self,
+        body: Any,
+        *,
+        owner_profile: str | None,
+    ) -> RunIdempotencyRecord | None:
+        """Recognize an exact no-agent tombstone before rejecting new work."""
+        try:
+            turn_id, session_id, identity = self._parse_managed_control_body(
+                {
+                    "turn_id": body["turn_id"],
+                    "session_id": body["session_id"],
+                    "omnio_managed": body["omnio_managed"],
+                }
+            )
+            record = self._run_idempotency_store_for_profile(
+                owner_profile
+            ).reconcile_managed(
+                turn_id=turn_id,
+                session_id=session_id,
+                owner_profile=owner_profile,
+                identity=identity,
+            )
+        except (KeyError, TypeError, ValueError, RunIdempotencyMismatch):
+            return None
+        return record if record is not None and record.is_cancel_tombstone else None
+
+    async def _handle_reconcile_managed_run(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Return an exact managed run mapping without creating a row."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+            turn_id, session_id, identity = self._parse_managed_control_body(body)
+        except Exception as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_managed_run_identity"),
+                status=400,
+            )
+        owner_profile = self._effective_request_profile()
+        try:
+            record = self._run_idempotency_store_for_profile(
+                owner_profile
+            ).reconcile_managed(
+                turn_id=turn_id,
+                session_id=session_id,
+                owner_profile=owner_profile,
+                identity=identity,
+            )
+        except RunIdempotencyMismatch:
+            return web.json_response(
+                _openai_error(
+                    "managed run identity does not match the reserved turn",
+                    code="managed_run_identity_conflict",
+                ),
+                status=409,
+            )
+        if record is None:
+            return web.json_response(
+                _openai_error(
+                    "managed run identity was not found",
+                    code="managed_run_not_found",
+                ),
+                status=404,
+            )
+        current = self._restore_idempotent_run(record)
+        return web.json_response(
+            self._managed_run_payload(
+                record,
+                status=current.get("status", record.status),
+            )
+        )
+
+    async def _handle_cancel_managed_run(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Atomically cancel an exact managed run, including before launch."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+            turn_id, session_id, identity = self._parse_managed_control_body(body)
+        except Exception as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_managed_run_identity"),
+                status=400,
+            )
+        owner_profile = self._effective_request_profile()
+        try:
+            record, _ = self._run_idempotency_store_for_profile(
+                owner_profile
+            ).cancel_managed(
+                turn_id=turn_id,
+                run_id=f"run_{uuid.uuid4().hex}",
+                session_id=session_id,
+                owner_profile=owner_profile,
+                identity=identity,
+            )
+        except RunIdempotencyMismatch:
+            return web.json_response(
+                _openai_error(
+                    "managed run identity does not match the reserved turn",
+                    code="managed_run_identity_conflict",
+                ),
+                status=409,
+            )
+
+        local_execution_exists = (
+            record.run_id in self._run_lifecycles
+            or record.run_id in self._active_run_tasks
+            or record.run_id in self._active_run_agents
+        )
+        if record.cancel_requested and local_execution_exists:
+            self._stopping_run_ids.add(record.run_id)
+            interrupted = self._interrupt_run(record.run_id, "Managed run cancelled")
+            current = (
+                self._run_statuses.get(record.run_id, {})
+                if interrupted
+                else self._restore_idempotent_run(record)
+            )
+        else:
+            current = self._restore_idempotent_run(record)
+        return web.json_response(
+            self._managed_run_payload(
+                record,
+                status=current.get("status", record.status),
+            )
+        )
+
     def _restore_idempotent_run(self, record: RunIdempotencyRecord) -> Dict[str, Any]:
         """Restore scalar status for a run admitted by an earlier process.
 
@@ -7798,10 +8040,26 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         current = self._run_statuses.get(record.run_id)
         if current is not None:
+            if record.cancel_requested and current.get("status") not in {
+                "cancelled",
+                "stopping",
+            }:
+                return self._set_run_status(
+                    record.run_id,
+                    record.status,
+                    failure_reason=record.failure_reason,
+                )
             return current
         status = record.status
         failure_reason = record.failure_reason
-        if status in {"queued", "running", "waiting_for_approval", "stopping"}:
+        if record.cancel_requested and status in {
+            "queued",
+            "running",
+            "waiting_for_approval",
+            "stopping",
+        }:
+            status = "cancelled"
+        elif status in {"queued", "running", "waiting_for_approval", "stopping"}:
             # The old process cannot still own this event loop after a gateway
             # restart. Preserve the run identity, but close the orphaned
             # execution instead of presenting a never-ending active stream.
@@ -7846,16 +8104,10 @@ class APIServerAdapter(BasePlatformAdapter):
         })
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
-        self._run_statuses[run_id] = current
-        self._turn_event_logs.set_status(
-            run_id,
-            status,
-            failure_reason=current.get("failure_reason"),
-        )
         turn_id = current.get("turn_id")
         if isinstance(turn_id, str) and turn_id:
             try:
-                self._run_idempotency_store_for_profile(
+                persisted = self._run_idempotency_store_for_profile(
                     current.get("owner_profile")
                 ).update_status(
                     turn_id=turn_id,
@@ -7863,8 +8115,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     failure_reason=current.get("failure_reason"),
                     updated_at=now,
                 )
+                if persisted is not None and (
+                    persisted.status != status or persisted.is_cancel_tombstone
+                ):
+                    current["status"] = persisted.status
+                    if persisted.failure_reason is None:
+                        current.pop("failure_reason", None)
+                    else:
+                        current["failure_reason"] = persisted.failure_reason
             except Exception:  # noqa: BLE001 - execution must finish; log durability is observable
                 logger.exception("Failed to persist /v1/runs status for turn_id=%s", turn_id)
+        self._run_statuses[run_id] = current
+        self._turn_event_logs.set_status(
+            run_id,
+            current["status"],
+            failure_reason=current.get("failure_reason"),
+        )
         return current
 
     @staticmethod
@@ -8333,17 +8599,42 @@ class APIServerAdapter(BasePlatformAdapter):
         # Enforce concurrency limit (shared across all agent-serving
         # endpoints; configurable via gateway.api_server.max_concurrent_runs).
         limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
 
         try:
             body = await request.json()
         except Exception:
+            if limited is not None:
+                return limited
             return web.json_response(_openai_error("Invalid JSON"), status=400)
         if not isinstance(body, dict):
+            if limited is not None:
+                return limited
             return web.json_response(
                 _openai_error("Request body must be an object"),
                 status=400,
+            )
+
+        if limited is not None:
+            request_profile = self._effective_request_profile()
+            tombstone = self._managed_cancelled_replay_at_limit(
+                body,
+                owner_profile=request_profile,
+            )
+            if tombstone is None:
+                return limited
+            current = self._restore_idempotent_run(tombstone)
+            return web.json_response(
+                {
+                    "run_id": tombstone.run_id,
+                    "status": current.get("status", tombstone.status),
+                    "idempotent": True,
+                },
+                status=202,
+                headers=(
+                    {"X-Hermes-Session-Key": gateway_session_key}
+                    if gateway_session_key
+                    else {}
+                ),
             )
 
         raw_input = body.get("input")
@@ -8406,6 +8697,26 @@ class APIServerAdapter(BasePlatformAdapter):
             if len(explicit_session_id) > self._MAX_SESSION_HEADER_LEN:
                 return web.json_response(
                     _openai_error("Session ID too long", code="invalid_session_id"),
+                    status=400,
+                )
+
+        managed_identity: ManagedRunIdentity | None = None
+        if "omnio_managed" in body:
+            try:
+                managed_identity = _parse_managed_run_identity(
+                    body["omnio_managed"]
+                )
+            except ValueError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code="invalid_managed_run_identity"),
+                    status=400,
+                )
+            if turn_id is None or explicit_session_id is None:
+                return web.json_response(
+                    _openai_error(
+                        "managed runs require explicit turn_id and session_id",
+                        code="invalid_managed_run_identity",
+                    ),
                     status=400,
                 )
 
@@ -8498,6 +8809,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         request_profile = self._effective_request_profile()
         run_id = f"run_{uuid.uuid4().hex}"
+        idempotency_store: RunIdempotencyStore | None = None
         # Do not include turn_id itself in the fingerprint. The caller's
         # immutable request semantics are hashed in memory; the durable row
         # stores only that scalar digest and the resulting run identity.
@@ -8537,12 +8849,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     request_fingerprint=idempotency_fingerprint,
                     session_id=session_id or run_id,
                     owner_profile=request_profile,
+                    managed_identity=managed_identity,
                 )
             except RunIdempotencyMismatch:
+                conflict_code = (
+                    "managed_run_identity_conflict"
+                    if managed_identity is not None
+                    else "turn_id_conflict"
+                )
                 return web.json_response(
                     _openai_error(
                         "turn_id was already used with different request semantics",
-                        code="turn_id_conflict",
+                        code=conflict_code,
                     ),
                     status=409,
                 )
@@ -9102,9 +9420,12 @@ class APIServerAdapter(BasePlatformAdapter):
             result: Any = None
             agent: Any = None
             try:
-                self._set_run_status(run_id, "running")
+                admitted_status = self._set_run_status(run_id, "running")
                 emitter.response_started()
-                if run_id in self._stopping_run_ids:
+                if (
+                    run_id in self._stopping_run_ids
+                    or admitted_status.get("status") in {"cancelled", "stopping"}
+                ):
                     missed_steer = await self._close_run_steering(run_id)
                     if missed_steer:
                         emitter.omnio_event(
@@ -9640,6 +9961,39 @@ class APIServerAdapter(BasePlatformAdapter):
                 await self._discard_run_lifecycle(run_id)
 
         run_coro = _run_and_close()
+        if managed_identity is not None and turn_id and idempotency_store is not None:
+            # The supported API-server topology has one event loop per profile.
+            # Keep this SQLite read and task publication in one non-awaiting
+            # block so a same-process cancel either precedes this check or sees
+            # the published task and interrupts it.
+            latest = idempotency_store.get(turn_id)
+            if latest is not None and latest.cancel_requested:
+                run_coro.close()
+                self._set_run_status(
+                    run_id,
+                    "cancelled",
+                    last_event="run.cancelled",
+                    completed_at=time.time(),
+                )
+                emitter.response_incomplete()
+                _legacy_terminal("run.cancelled")
+                try:
+                    q.put_nowait(None)
+                except Exception:
+                    pass
+                self._run_streams.pop(run_id, None)
+                self._run_streams_created.pop(run_id, None)
+                self._run_approval_sessions.pop(run_id, None)
+                self._stopping_run_ids.discard(run_id)
+                await self._discard_run_lifecycle(run_id)
+                return web.json_response(
+                    {
+                        "run_id": run_id,
+                        "status": "cancelled",
+                        "idempotent": True,
+                    },
+                    status=202,
+                )
         try:
             self._activate_admitted_request()
             task = asyncio.create_task(run_coro)
