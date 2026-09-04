@@ -3252,20 +3252,106 @@ class APIServerAdapter(BasePlatformAdapter):
         return agent
 
     def _structured_output_error(
-        self, response_format: Optional[Dict[str, Any]]
+        self,
+        response_format: Optional[Dict[str, Any]],
+        *,
+        param: str = "response_format",
+        session_id: Optional[str] = None,
+        gateway_session_key: Optional[str] = None,
+        requested_model: Optional[str] = None,
+        requested_provider: Optional[str] = None,
+        route: Optional[Dict[str, Any]] = None,
     ) -> Optional["web.Response"]:
         if not response_format:
             return None
         try:
-            from gateway.run import _resolve_runtime_agent_kwargs
+            from gateway.run import (
+                _resolve_gateway_model,
+                _resolve_runtime_agent_kwargs,
+                _resolve_runtime_agent_kwargs_for_provider,
+            )
 
-            api_mode = (_resolve_runtime_agent_kwargs() or {}).get("api_mode")
+            runtime_kwargs = _resolve_runtime_agent_kwargs() or {}
+            api_mode = runtime_kwargs.get("api_mode")
+            model = runtime_kwargs.get("model") or _resolve_gateway_model()
+
+            def _provider_api_mode(
+                provider: Optional[str],
+                target_model: Optional[str],
+                *,
+                required: bool,
+            ) -> Optional[str]:
+                provider_name = _clean_request_string(provider)
+                if not provider_name:
+                    return None
+                try:
+                    provider_runtime = _resolve_request_runtime_agent_kwargs(
+                        provider_name,
+                        target_model=target_model or None,
+                    )
+                except Exception as exc:
+                    try:
+                        provider_runtime = _resolve_runtime_agent_kwargs_for_provider(
+                            provider_name
+                        )
+                    except Exception:
+                        if required:
+                            raise exc
+                        return None
+                return provider_runtime.get("api_mode")
+
+            request_model = _clean_request_string(requested_model)
+            request_provider = _clean_request_string(requested_provider)
+            route_model = (
+                _clean_request_string(route.get("model"))
+                if isinstance(route, dict)
+                else None
+            )
+            route_provider = (
+                _clean_request_string(route.get("provider"))
+                if isinstance(route, dict)
+                else None
+            )
+            current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+
+            session_key = gateway_session_key or session_id
+            session_override = self._session_model_override_for(session_key)
+            if session_override:
+                override_model = (
+                    _clean_request_string(session_override.get("model")) or model
+                )
+                override_provider = (
+                    _clean_request_string(session_override.get("provider"))
+                    or current_provider
+                )
+                resolved_mode = _provider_api_mode(
+                    override_provider, override_model, required=False
+                )
+                if resolved_mode is not None:
+                    api_mode = resolved_mode
+                if session_override.get("api_mode") is not None:
+                    api_mode = session_override.get("api_mode")
+            else:
+                effective_model = (
+                    route_model or model if route is not None else request_model or model
+                )
+                effective_provider = request_provider or route_provider or current_provider
+                if effective_provider and (
+                    request_provider or route_provider or effective_model != model
+                ):
+                    resolved_mode = _provider_api_mode(
+                        effective_provider,
+                        effective_model,
+                        required=bool(request_provider),
+                    )
+                    if resolved_mode is not None:
+                        api_mode = resolved_mode
         except Exception:
             return None
         reason = _structured_output_unsupported_reason(response_format, api_mode)
         if reason:
             return web.json_response(
-                _openai_error(reason, param="response_format"), status=400
+                _openai_error(reason, param=param), status=400
             )
         return None
 
@@ -4040,6 +4126,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "run_structured_output": True,
                 "run_turn_idempotency": {"apiVersion": 1},
                 # Omnia's handover controller uses this as a feature gate.  It
                 # is intentionally an explicit runtime capability rather than
@@ -5195,10 +5282,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error(response_format_error, param="response_format"),
                 status=400,
             )
-        unsupported = self._structured_output_error(response_format)
-        if unsupported is not None:
-            return unsupported
-
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
@@ -5328,6 +5411,16 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+        unsupported = self._structured_output_error(
+            response_format,
+            session_id=session_id,
+            gateway_session_key=gateway_session_key,
+            requested_model=agent_overrides.get("requested_model"),
+            requested_provider=agent_overrides.get("requested_provider"),
+            route=route,
+        )
+        if unsupported is not None:
+            return unsupported
 
         if stream:
             import queue as _q
@@ -6555,10 +6648,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error(response_format_error, param="text.format"),
                 status=400,
             )
-        unsupported = self._structured_output_error(response_format)
-        if unsupported is not None:
-            return unsupported
-
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
             return web.json_response(_openai_error("Cannot use both 'conversation' and 'previous_response_id'"), status=400)
@@ -6656,6 +6745,17 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+        unsupported = self._structured_output_error(
+            response_format,
+            param="text.format",
+            session_id=session_id,
+            gateway_session_key=gateway_session_key,
+            requested_model=agent_overrides.get("requested_model"),
+            requested_provider=agent_overrides.get("requested_provider"),
+            route=route,
+        )
+        if unsupported is not None:
+            return unsupported
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
             # agent runs so frontends can render text deltas and tool
@@ -8364,6 +8464,37 @@ class APIServerAdapter(BasePlatformAdapter):
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
+        text_format, text_format_error = _response_format_from_text_format(
+            body.get("text")
+        )
+        if text_format_error:
+            return web.json_response(
+                _openai_error(text_format_error, param="text.format"),
+                status=400,
+            )
+        chat_response_format, response_format_error = _normalize_response_format(
+            body.get("response_format")
+        )
+        if response_format_error:
+            return web.json_response(
+                _openai_error(response_format_error, param="response_format"),
+                status=400,
+            )
+        text_declares_format = (
+            isinstance(body.get("text"), dict)
+            and body["text"].get("format") is not None
+        )
+        response_format_declared = body.get("response_format") is not None
+        if text_declares_format and response_format_declared:
+            return web.json_response(
+                _openai_error(
+                    "Cannot use both 'text.format' and 'response_format'",
+                    param="response_format",
+                    code="conflicting_output_format",
+                ),
+                status=400,
+            )
+        response_format = text_format or chat_response_format
         instructions = body.get("instructions")
         from agent.unattended import (
             INTERACTION_POLICIES,
@@ -8520,6 +8651,17 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+        unsupported = self._structured_output_error(
+            response_format,
+            param="text.format" if text_declares_format else "response_format",
+            session_id=session_id,
+            gateway_session_key=gateway_session_key,
+            requested_model=agent_overrides.get("requested_model"),
+            requested_provider=agent_overrides.get("requested_provider"),
+            route=route,
+        )
+        if unsupported is not None:
+            return unsupported
 
         request_profile = self._effective_request_profile()
         run_id = f"run_{uuid.uuid4().hex}"
@@ -8531,11 +8673,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 fingerprint_body = {
                     key: value
                     for key, value in body.items()
-                    if key != "turn_id"
+                    if key not in {"turn_id", "text", "response_format"}
                 }
                 fingerprint_body.setdefault(
                     "interaction_policy", interaction_policy
                 )
+                if response_format is not None:
+                    fingerprint_body["structured_output"] = response_format
                 idempotency_fingerprint = request_fingerprint(
                     {
                         "body": fingerprint_body,
@@ -9179,6 +9323,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             requested_provider=agent_overrides.get("requested_provider"),
                             model_options=agent_overrides.get("model_options"),
                             route=route,
+                            response_format=response_format,
                             disabled_toolsets=unattended_disabled_toolsets,
                         )
 

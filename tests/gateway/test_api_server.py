@@ -1386,6 +1386,7 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["run_structured_output"] is True
             assert data["features"]["run_turn_idempotency"] == {"apiVersion": 1}
             assert data["features"]["omnio_quiescence"] == {
                 "apiVersion": 1,

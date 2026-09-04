@@ -128,7 +128,12 @@ Uploaded files (`file` / `input_file` / `file_id`) and non-image `data:` URLs re
 }
 ```
 
-Structured output is forwarded only when the configured backend uses an OpenAI-compatible chat-completions API. On other backends (e.g. native Anthropic Messages or Bedrock Converse) the request returns `400` with a clear message rather than silently returning plain text. A malformed `response_format` returns `400` with `param: "response_format"`.
+Structured output is forwarded to OpenAI-compatible chat-completions backends.
+Native Anthropic Messages backends also support `json_schema` through
+`output_config.format`, but not the schema-less `json_object` mode. Backends
+without a structured-output mapping (for example Bedrock Converse) return
+`400` rather than silently returning plain text. A malformed
+`response_format` returns `400` with `param: "response_format"`.
 
 **Streaming** (`"stream": true`): Returns Server-Sent Events (SSE) with token-by-token response chunks. For **Chat Completions**, the stream uses standard `chat.completion.chunk` events plus Hermes' custom `hermes.tool.progress` event for tool-start UX. For **Responses**, the stream uses OpenAI Responses event types such as `response.created`, `response.output_text.delta`, `response.output_item.added`, `response.output_item.done`, and `response.completed`.
 
@@ -207,7 +212,11 @@ Uploaded files (`input_file` / `file_id`) and non-image `data:` URLs return `400
 }
 ```
 
-As with Chat Completions, this is honoured on chat-completions backends and returns `400` on backends that cannot enforce it.
+As with Chat Completions, this is honoured on chat-completions backends and for
+`json_schema` on native Anthropic Messages. It returns `400` on backends that
+cannot enforce the requested constraint. If `text` or `text.format` is present
+with the wrong JSON type, the request also returns `400` with
+`param: "text.format"`.
 
 #### Multi-turn with previous_response_id
 
@@ -296,6 +305,8 @@ Returns a machine-readable description of the API server's stable surface for ex
     "chat_completions": true,
     "responses_api": true,
     "run_submission": true,
+    "run_structured_output": true,
+    "structured_output": true,
     "run_status": true,
     "run_events_sse": true,
     "run_stop": true
@@ -404,6 +415,65 @@ Runs accept a simple `input` string and optional `session_id`, `instructions`,
 `session_id` is provided, Hermes surfaces it in the run status so external UIs
 can correlate runs with their own conversation IDs.
 
+For structured output, use the Responses-style `text.format` contract:
+
+```json
+{
+  "input": "Extract the city and country.",
+  "text": {
+    "format": {
+      "type": "json_schema",
+      "name": "Location",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "city": {"type": "string"},
+          "country": {"type": "string"}
+        },
+        "required": ["city", "country"],
+        "additionalProperties": false
+      },
+      "strict": true
+    }
+  }
+}
+```
+
+For clients that already use Chat Completions, runs also accept the equivalent
+`response_format` shape:
+
+```json
+{
+  "input": "Extract the city and country.",
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "Location",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "city": {"type": "string"},
+          "country": {"type": "string"}
+        },
+        "required": ["city", "country"],
+        "additionalProperties": false
+      },
+      "strict": true
+    }
+  }
+}
+```
+
+Send only one format dialect per request. Supplying both `text.format` and
+`response_format` returns `400` with code `conflicting_output_format`.
+Malformed shapes return `400` with the offending field in `error.param`, and
+constraints unsupported by the configured backend use the same support matrix
+as `/v1/responses` and `/v1/chat/completions`. The normalized constraint is
+part of `turn_id` idempotency semantics, so reusing a `turn_id` with a different
+schema returns `409 turn_id_conflict`. Clients should feature-detect this
+contract with `features.run_structured_output` rather than inferring it from
+the global `features.structured_output` flag.
+
 `interaction_policy` accepts `allow` (the default) or `forbid`. Use `forbid`
 for unattended work. Hermes then removes user-input and approval surfaces,
 disables interactive toolsets, denies actions that require a new approval,
@@ -436,7 +506,10 @@ Poll the current run state. This is useful for dashboards that need status witho
 }
 ```
 
-Statuses are retained briefly after terminal states (`completed`, `failed`, or `cancelled`) for polling and UI reconciliation.
+For completed runs, `output` is the exact final response stored when the run
+settled, including schema-constrained JSON. Statuses are retained briefly after
+terminal states (`completed`, `failed`, or `cancelled`) for polling and UI
+reconciliation.
 
 ### GET /v1/runs/\{run_id\}/events
 
