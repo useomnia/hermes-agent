@@ -4837,6 +4837,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 record_always_approval,
                 record_once_approval,
                 record_session_approval,
+                resolve_approval_target,
             )
             denial_result = _denial_result("deny") if scope == "deny" else None
             resolution, call = await asyncio.to_thread(
@@ -4875,7 +4876,11 @@ class APIServerAdapter(BasePlatformAdapter):
             approval_session_key = self._scoped_tool_approval_session_key(
                 resolved_session_id, self._effective_request_profile()
             )
-            credit_gated = is_credit_gated_tool(function_name)
+            approval_name, approval_args = resolve_approval_target(
+                function_name,
+                function_args,
+            )
+            credit_gated = is_credit_gated_tool(approval_name)
             effective_scope = scope
             if resolution_id is not None and durable_approval is not None:
                 stored_scope = durable_approval.get("scope")
@@ -4892,13 +4897,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 record_once_approval(
                     approval_session_key,
                     tool_call_id,
-                    function_name,
-                    function_args,
+                    approval_name,
+                    approval_args,
                 )
             elif effective_scope == "session":
-                record_session_approval(approval_session_key, function_name)
+                record_session_approval(approval_session_key, approval_name)
             elif effective_scope == "always":
-                record_always_approval(function_name)
+                record_always_approval(approval_name)
         return web.json_response({"resolved": True})
 
     @_admit_api_agent_request

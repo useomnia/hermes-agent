@@ -23,6 +23,7 @@ makes the corresponding assertion fail.
 """
 
 import copy
+import json
 from types import SimpleNamespace
 from pathlib import Path
 import tempfile
@@ -400,10 +401,14 @@ def test_dangling_approval_continuation_consumes_once_grant_and_persists_real_re
     agent = _make_agent()
     tool_name = "mcp_connectors_TEST_WRITE"
     function_args = {"target": "Brand A"}
+    bridge_args = {"name": tool_name, "arguments": function_args}
     call = {
         "id": "approval-1",
         "type": "function",
-        "function": {"name": tool_name, "arguments": '{"target":"Brand A"}'},
+        "function": {
+            "name": "tool_call",
+            "arguments": '{"name":"mcp_connectors_TEST_WRITE","arguments":{"target":"Brand A"}}',
+        },
     }
     sibling_call = {
         "id": "read-1",
@@ -421,8 +426,8 @@ def test_dangling_approval_continuation_consumes_once_grant_and_persists_real_re
             "_omnio_resolved_approvals": {
                 "approval-1": {
                     "scope": "once",
-                    "tool_name": tool_name,
-                    "arguments": '{"target":"Brand A"}',
+                    "tool_name": "tool_call",
+                    "arguments": json.dumps(bridge_args, separators=(",", ":")),
                 }
             }
         },
@@ -442,6 +447,10 @@ def test_dangling_approval_continuation_consumes_once_grant_and_persists_real_re
     agent._flushed_db_message_session_id = "approval-session"
     agent.client.chat.completions.create.return_value = _mock_response("completed")
     monkeypatch.setattr(tool_approval, "is_gated_tool", lambda name: name == tool_name)
+    monkeypatch.setattr(
+        "tools.tool_search.resolve_underlying_call",
+        lambda args: (tool_name, args["arguments"], None),
+    )
     approval_wait = MagicMock()
     monkeypatch.setattr(tool_approval, "await_tool_approval", approval_wait)
     # Simulate a fresh gateway process: only SessionDB survives.
@@ -452,7 +461,7 @@ def test_dangling_approval_continuation_consumes_once_grant_and_persists_real_re
         pending = assistant_message.tool_calls[0]
         assert pending.id == "approval-1"
         assert tool_approval.maybe_require_tool_approval(
-            pending.function.name,
+            tool_name,
             pending.id,
             function_args,
         ) is None
@@ -482,6 +491,75 @@ def test_dangling_approval_continuation_consumes_once_grant_and_persists_real_re
     ]
     assert rows[1]["tool_call_id"] == "read-1"
     assert rows[2]["content"] == '{"ok":true}'
+    db.close()
+
+
+def test_denied_dangling_approval_continuation_never_redispatches_or_adds_user():
+    """A durable late Deny resumes from its result without asking again."""
+    agent = _make_agent()
+    tool_name = "mcp_connectors_TEST_WRITE"
+    call = {
+        "id": "approval-denied",
+        "type": "function",
+        "function": {"name": tool_name, "arguments": '{"target":"Brand A"}'},
+    }
+    denial = tool_approval._denial_result("deny")
+    db = SessionDB(Path(tempfile.mkdtemp(prefix="hermes-denial-db-")) / "state.db")
+    db.create_session("approval-denied-session", "api_server")
+    db.append_message(
+        "approval-denied-session",
+        "assistant",
+        "",
+        tool_calls=[call],
+        display_metadata={
+            "_omnio_resolved_approvals": {
+                "approval-denied": {
+                    "scope": "deny",
+                    "tool_name": tool_name,
+                    "arguments": '{"target":"Brand A"}',
+                }
+            }
+        },
+    )
+    db.append_message(
+        "approval-denied-session",
+        "tool",
+        denial,
+        tool_name=tool_name,
+        tool_call_id="approval-denied",
+        effect_disposition="none",
+    )
+    agent.session_id = "approval-denied-session"
+    agent._session_db = db
+    agent._session_db_created = True
+    agent._last_flushed_db_idx = 2
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = "approval-denied-session"
+    agent.client.chat.completions.create.return_value = _mock_response("denied")
+
+    with (
+        patch.object(agent, "_execute_tool_calls") as execute,
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            None,
+            conversation_history=db.get_messages_as_conversation(
+                "approval-denied-session"
+            ),
+            continuation=True,
+        )
+
+    execute.assert_not_called()
+    assert all(message.get("role") != "user" for message in result["messages"])
+    assert result["final_response"] == "denied"
+    assert [
+        message["role"] for message in db.get_messages("approval-denied-session")
+    ] == [
+        "assistant",
+        "tool",
+        "assistant",
+    ]
     db.close()
 
 

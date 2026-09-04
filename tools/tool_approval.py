@@ -263,6 +263,41 @@ def consume_once_approval(
         return True
 
 
+def resolve_approval_target(
+    function_name: str,
+    function_args: Optional[dict],
+) -> tuple[str, dict]:
+    """Return the tool identity that the approval gate actually protects.
+
+    Progressive disclosure presents deferred MCP tools to the model through
+    the ``tool_call`` bridge.  The persisted assistant call therefore names
+    the bridge even though ``model_tools.handle_function_call`` unwraps it
+    before applying this approval gate.  Durable grants must follow that same
+    unwrapping or they approve the inert bridge and the resumed underlying
+    call asks the user a second time.
+
+    Resolution is deliberately fail-closed: malformed or unavailable bridge
+    calls keep their outer identity, which cannot approve an underlying write.
+    """
+    args = function_args if isinstance(function_args, dict) else {}
+    if function_name != "tool_call":
+        return function_name, args
+    try:
+        from tools.tool_search import resolve_underlying_call
+
+        underlying_name, underlying_args, error = resolve_underlying_call(args)
+    except Exception:
+        return function_name, args
+    if (
+        error
+        or not isinstance(underlying_name, str)
+        or not underlying_name
+        or not isinstance(underlying_args, dict)
+    ):
+        return function_name, args
+    return underlying_name, underlying_args
+
+
 def rehydrate_resolved_approval(
     session_key: str,
     tool_call_id: str,
@@ -292,22 +327,28 @@ def rehydrate_resolved_approval(
         function_args = {}
     if not isinstance(function_args, dict):
         function_args = {}
+    approval_name, approval_args = resolve_approval_target(
+        function_name,
+        function_args,
+    )
     try:
-        credit_gated = is_credit_gated_tool(function_name)
+        credit_gated = is_credit_gated_tool(approval_name)
     except Exception:
         credit_gated = True
     if scope == "once" or credit_gated:
         record_once_approval(
             session_key,
             tool_call_id,
-            function_name,
-            function_args,
+            approval_name,
+            approval_args,
         )
     elif scope == "session":
-        record_session_approval(session_key, function_name)
+        record_session_approval(session_key, approval_name)
     else:
-        record_always_approval(function_name)
+        record_always_approval(approval_name)
     return True
+
+
 def register_always_approval_authority(
     cb: Callable[[str], bool] | None,
 ) -> None:

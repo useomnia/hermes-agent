@@ -1029,6 +1029,148 @@ async def test_durable_once_approval_survives_fresh_adapter_and_executes(
 
 
 @pytest.mark.asyncio
+async def test_tool_search_bridge_resolution_grants_the_underlying_credit_call(
+    adapter: APIServerAdapter,
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_name = "mcp__omnia__create_prompts_insights"
+    call_id = "bridge-credit"
+    bridge_args = {
+        "name": tool_name,
+        "arguments": {"prompt": "sentinel", "engines": ["openai"]},
+    }
+    await _seed_dangling(
+        db,
+        "bridge-credit-session",
+        {
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": "tool_call",
+                "arguments": json.dumps(bridge_args, separators=(",", ":")),
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "tools.tool_search.resolve_underlying_call",
+        lambda args: (tool_name, args["arguments"], None),
+    )
+    monkeypatch.setattr(
+        tool_approval,
+        "is_credit_gated_tool",
+        lambda name: name == tool_name,
+    )
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        resolved = await client.post(
+            f"/api/sessions/bridge-credit-session/interactions/{call_id}/resolve",
+            headers=AUTH,
+            json={"kind": "approval", "decision": {"scope": "session"}},
+        )
+
+    assert resolved.status == 200
+    grant_key = adapter._scoped_tool_approval_session_key(
+        "bridge-credit-session", None
+    )
+    assert tool_approval.consume_once_approval(
+        grant_key,
+        call_id,
+        tool_name,
+        bridge_args["arguments"],
+    )
+    assert not tool_approval.is_tool_approved(grant_key, tool_name)
+    assert not tool_approval.consume_once_approval(
+        grant_key,
+        call_id,
+        "tool_call",
+        bridge_args,
+    )
+    tool_approval.clear_session(grant_key)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_prepared_approval_retries_start_one_continuation(
+    adapter: APIServerAdapter,
+    db: SessionDB,
+) -> None:
+    tool_name = "mcp_connectors_TEST_WRITE"
+    call_id = "concurrent-prepared-approval"
+    session_id = "concurrent-prepared-session"
+    continuation_id = f"interaction-resume:{call_id}"
+    await _seed_dangling(db, session_id, _tool_call(call_id, tool_name))
+    agent = MagicMock()
+    agent.run_conversation.return_value = {
+        "final_response": "continued",
+        "messages": [],
+        "interrupted": False,
+    }
+    agent.session_prompt_tokens = agent.session_completion_tokens = 0
+    agent.session_total_tokens = 0
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        prepared = await client.post(
+            "/v1/continuations/prepare",
+            headers=AUTH,
+            json={
+                "session_id": session_id,
+                "turn_id": continuation_id,
+                "tool_call_id": call_id,
+            },
+        )
+        prepared_payload = await prepared.json()
+        resolve_body = {
+            "kind": "approval",
+            "resolutionId": continuation_id,
+            "decision": {"scope": "once"},
+        }
+        first_resolve, second_resolve = await asyncio.gather(
+            client.post(
+                f"/api/sessions/{session_id}/interactions/{call_id}/resolve",
+                headers=AUTH,
+                json=resolve_body,
+            ),
+            client.post(
+                f"/api/sessions/{session_id}/interactions/{call_id}/resolve",
+                headers=AUTH,
+                json=resolve_body,
+            ),
+        )
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            first_start, second_start = await asyncio.gather(
+                *[
+                    client.post(
+                        "/v1/runs",
+                        headers=AUTH,
+                        json={
+                            "session_id": session_id,
+                            "input": None,
+                            "turn_id": continuation_id,
+                            "start_prepared": prepared_payload["run_id"],
+                        },
+                    )
+                    for _ in range(2)
+                ]
+            )
+            start_payloads = [
+                await first_start.json(),
+                await second_start.json(),
+            ]
+            for _ in range(50):
+                if agent.run_conversation.call_count:
+                    break
+                await asyncio.sleep(0.01)
+
+    assert prepared.status == 202
+    assert first_resolve.status == second_resolve.status == 200
+    assert first_start.status == second_start.status == 202
+    assert {payload["run_id"] for payload in start_payloads} == {
+        prepared_payload["run_id"]
+    }
+    assert agent.run_conversation.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_approval_replay_cannot_escalate_stored_scope(
     adapter: APIServerAdapter,
     db: SessionDB,

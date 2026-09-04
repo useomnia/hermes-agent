@@ -33,6 +33,7 @@ from tools.tool_approval import (
     is_tool_approved,
     maybe_require_tool_approval,
     record_always_approval,
+    rehydrate_resolved_approval,
     record_session_approval,
     register_always_approval_authority,
     register_tool_approval_notify,
@@ -263,6 +264,49 @@ class TestMaybeRequireToolApproval:
 
 
 class TestCreditApproval:
+    def test_rehydrated_bridge_approval_targets_the_underlying_call_once(
+        self, monkeypatch
+    ):
+        bridge_args = {
+            "name": CREDIT_GATED,
+            "arguments": {"engines": ["openai"]},
+        }
+        monkeypatch.setattr(
+            "tools.tool_search.resolve_underlying_call",
+            lambda args: (
+                CREDIT_GATED,
+                args["arguments"],
+                None,
+            ),
+        )
+
+        assert rehydrate_resolved_approval(
+            SESSION,
+            "call-credit",
+            "tool_call",
+            json.dumps(bridge_args, separators=(",", ":")),
+            {
+                "scope": "once",
+                "tool_name": "tool_call",
+                "arguments": json.dumps(bridge_args, separators=(",", ":")),
+            },
+        )
+        assert (
+            maybe_require_tool_approval(
+                CREDIT_GATED,
+                "call-credit",
+                {"engines": ["openai"]},
+            )
+            is None
+        )
+
+        second = maybe_require_tool_approval(
+            CREDIT_GATED,
+            "call-credit",
+            {"engines": ["openai"]},
+        )
+        assert json.loads(second)["status"] == "approval_error"
+
     def test_should_surface_only_per_call_approve_and_deny_options(self):
         captured = {}
 
