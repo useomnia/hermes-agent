@@ -140,6 +140,7 @@ class RunEventLog:
     session_id: str
     owner_profile: Optional[str]
     created_at: float
+    turn_id: Optional[str] = None
     status: str = "queued"
     completed_at: Optional[float] = None
     failure_reason: Optional[str] = None
@@ -219,6 +220,7 @@ class TurnEventLogStore:
         session_id: str,
         *,
         owner_profile: Optional[str] = None,
+        turn_id: Optional[str] = None,
     ) -> RunEventLog:
         if run_id in self._seen_run_ids:
             raise ValueError(f"run ID must never be reused: {run_id}")
@@ -228,6 +230,7 @@ class TurnEventLogStore:
             session_id=session_id,
             owner_profile=owner_profile,
             created_at=self._clock(),
+            turn_id=turn_id,
         )
         self._logs[run_id] = log
         return log
@@ -422,6 +425,11 @@ class TurnEventLogStore:
         return [
             {
                 "runId": log.run_id,
+                # The key is always present in the v2 inventory. ``None`` is a
+                # legitimate legacy/non-Omnia run; omitting the key would make
+                # a mixed-version response indistinguishable from exact
+                # Turn-id support.
+                "turnId": log.turn_id,
                 "status": log.status,
                 "sessionId": log.session_id,
                 "sequence_number": log.sequence_number_high_water,
