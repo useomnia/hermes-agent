@@ -818,10 +818,57 @@ async def test_recoverable_runs_are_isolated_by_owning_profile() -> None:
         foreign_payload = await foreign_response.json()
 
     assert [item["runId"] for item in owner_payload["data"]] == [run_id]
+    assert owner_payload["object"] == "list"
+    assert owner_payload["inventory"] == {
+        "apiVersion": 1,
+        "complete": True,
+        "exactTurnIds": True,
+    }
+    assert owner_payload["data"][0]["turnId"] is None
     assert foreign_payload["data"] == []
     owned_log = adapter._turn_event_logs.get_log(run_id)
     assert owned_log is not None
     assert owned_log.owner_profile == "foo"
+
+
+@pytest.mark.asyncio
+async def test_recoverable_inventory_carries_exact_turn_identity() -> None:
+    adapter = _make_adapter()
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(
+            adapter,
+            "_create_agent",
+            return_value=_agent(
+                lambda **_kwargs: {
+                    "final_response": "done",
+                    "messages": [],
+                }
+            ),
+        ):
+            started = await client.post(
+                "/v1/runs",
+                json={
+                    "input": "hello",
+                    "turn_id": "turn-exact-1",
+                    "session_id": "session-exact-1",
+                },
+            )
+            run_id = (await started.json())["run_id"]
+            await _wait_for_terminal(adapter, run_id)
+
+        response = await client.get("/v1/runs?recoverable=1")
+        payload = await response.json()
+
+    assert response.status == 200
+    assert payload["inventory"] == {
+        "apiVersion": 1,
+        "complete": True,
+        "exactTurnIds": True,
+    }
+    assert [(item["runId"], item["turnId"]) for item in payload["data"]] == [
+        (run_id, "turn-exact-1")
+    ]
 
 
 @pytest.mark.asyncio
@@ -891,6 +938,7 @@ async def test_native_and_mirrored_default_profile_routes_share_turn_logs(
     assert events[-1]["type"] == "response.completed"
     assert events[0]["response"]["id"] == f"resp_{run_id.removeprefix('run_')}"
     assert [item["runId"] for item in recoverable_payload["data"]] == [run_id]
+    assert "turnId" in recoverable_payload["data"][0]
     owned_log = adapter._turn_event_logs.get_log(run_id)
     assert owned_log is not None
     assert owned_log.owner_profile == "default"
@@ -1526,6 +1574,7 @@ async def test_terminal_logs_evict_after_completion_grace_and_live_logs_do_not_a
     assert set(in_grace_by_id) == {"run_live", "run_terminal"}
     assert in_grace_by_id["run_live"] == {
         "runId": "run_live",
+        "turnId": None,
         "status": "running",
         "sessionId": "session-live",
         "sequence_number": 2,
