@@ -147,6 +147,14 @@ try:
     from tools.browser_camofox import is_camofox_mode as _is_camofox_mode
 except ImportError:
     _is_camofox_mode = lambda: False  # noqa: E731
+# Browser Use CLI 3.0 is the default browser surface; a missing managed
+# executable produces an explicit browser_exec setup error rather than a
+# legacy-tool downgrade. Keep this import optional so the legacy module stays
+# importable during bootstrap and in minimal test harnesses.
+try:
+    from tools.browser_use_cli import is_browser_use_cli_mode as _is_browser_use_cli_mode
+except ImportError:
+    _is_browser_use_cli_mode = lambda: False  # noqa: E731
 
 logger = logging.getLogger(__name__)
 
@@ -3503,6 +3511,61 @@ def _probe_navigation_readiness(
 # Browser Tool Functions
 # ============================================================================
 
+def evaluate_url_safety(url: str) -> Optional[dict]:
+    """Run browser URL policy checks for both browser surfaces.
+
+    ``browser_exec`` accepts model-authored Python rather than a structured
+    navigation argument, so it uses this shared predicate for literal URLs
+    before launching the managed CLI.  Keep the policy identical to
+    ``browser_navigate``: reject credential-like values, metadata endpoints,
+    private addresses on cloud backends, and configured website policy blocks.
+    """
+    import urllib.parse
+    from agent.redact import _PREFIX_RE
+
+    secret_error = {
+        "success": False,
+        "error": (
+            "Blocked: URL contains what appears to be an API key or token. "
+            "Secrets must not be sent in URLs."
+        ),
+    }
+    if _PREFIX_RE.search(url) or _PREFIX_RE.search(urllib.parse.unquote(url)):
+        return secret_error
+    url = _normalize_url_for_request(url)
+    if _PREFIX_RE.search(url) or _PREFIX_RE.search(urllib.parse.unquote(url)):
+        return secret_error
+
+    local = _is_local_backend()
+    sensitive_query_key = _sensitive_query_param_name(url)
+    if sensitive_query_key and not local:
+        return {
+            "success": False,
+            "error": (
+                "Blocked: URL contains a credential-like query parameter "
+                f"({sensitive_query_key}). Cloud browser backends are "
+                "third-party readers; use a local browser/CDP session or "
+                "remove the sensitive query parameter before navigating."
+            ),
+        }
+    if _is_always_blocked_url(url):
+        return {"success": False, "error": "Blocked: URL targets a cloud metadata endpoint"}
+    if not local and not _allow_private_urls() and not _is_safe_url(url):
+        return {"success": False, "error": "Blocked: URL targets a private or internal address"}
+    blocked = check_website_access(url)
+    if blocked:
+        return {
+            "success": False,
+            "error": blocked["message"],
+            "blocked_by_policy": {
+                "host": blocked["host"],
+                "rule": blocked["rule"],
+                "source": blocked["source"],
+            },
+        }
+    return None
+
+
 def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     """
     Navigate to a URL in the browser.
@@ -5347,6 +5410,17 @@ def cleanup_all_browsers() -> None:
 
     Useful for cleanup on shutdown.
     """
+    # Browser Use owns a separate named Browser Harness daemon registry.  Ask
+    # it to shut down its exact endpoints before resetting this legacy stack;
+    # never use the agent-browser/CDP cleanup path for those daemons because
+    # it can close Toolbox-owned Chrome contexts.
+    try:
+        from tools.browser_use_cli import cleanup_all_browser_use
+
+        cleanup_all_browser_use()
+    except Exception as exc:
+        logger.debug("Browser Use CLI cleanup failed: %s", exc)
+
     with _cleanup_lock:
         task_ids = list(_active_sessions.keys())
     for task_id in task_ids:
@@ -5641,6 +5715,25 @@ def check_browser_vision_requirements() -> bool:
     return check_vision_requirements()
 
 
+def _check_legacy_browser_requirements() -> bool:
+    """Registry gate for the legacy browser_* surface.
+
+    Keep ``check_browser_requirements`` callable for diagnostics and existing
+    integrations, but never advertise those tools once Browser Use owns the
+    browser surface.  This avoids making the process-wide check_fn itself
+    encode a session/installation policy.
+    """
+    if _is_browser_use_cli_mode():
+        return False
+    return check_browser_requirements()
+
+
+def _check_legacy_browser_vision_requirements() -> bool:
+    if _is_browser_use_cli_mode():
+        return False
+    return check_browser_vision_requirements()
+
+
 # ============================================================================
 # Module Test
 # ============================================================================
@@ -5709,7 +5802,7 @@ registry.register(
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_navigate"],
     handler=lambda args, **kw: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id")),
-    check_fn=check_browser_requirements,
+    check_fn=_check_legacy_browser_requirements,
     emoji="🌐",
 )
 registry.register(
@@ -5718,7 +5811,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_snapshot"],
     handler=lambda args, **kw: browser_snapshot(
         full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task")),
-    check_fn=check_browser_requirements,
+    check_fn=_check_legacy_browser_requirements,
     emoji="📸",
 )
 registry.register(
@@ -5726,7 +5819,7 @@ registry.register(
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_click"],
     handler=lambda args, **kw: browser_click(ref=args.get("ref", ""), task_id=kw.get("task_id")),
-    check_fn=check_browser_requirements,
+    check_fn=_check_legacy_browser_requirements,
     emoji="👆",
 )
 registry.register(
@@ -5734,7 +5827,7 @@ registry.register(
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_type"],
     handler=lambda args, **kw: browser_type(ref=args.get("ref", ""), text=args.get("text", ""), task_id=kw.get("task_id")),
-    check_fn=check_browser_requirements,
+    check_fn=_check_legacy_browser_requirements,
     emoji="⌨️",
 )
 registry.register(
@@ -5742,7 +5835,7 @@ registry.register(
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_scroll"],
     handler=lambda args, **kw: browser_scroll(direction=args.get("direction", "down"), task_id=kw.get("task_id")),
-    check_fn=check_browser_requirements,
+    check_fn=_check_legacy_browser_requirements,
     emoji="📜",
 )
 registry.register(
@@ -5750,7 +5843,7 @@ registry.register(
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_back"],
     handler=lambda args, **kw: browser_back(task_id=kw.get("task_id")),
-    check_fn=check_browser_requirements,
+    check_fn=_check_legacy_browser_requirements,
     emoji="◀️",
 )
 registry.register(
@@ -5758,7 +5851,7 @@ registry.register(
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_press"],
     handler=lambda args, **kw: browser_press(key=args.get("key", ""), task_id=kw.get("task_id")),
-    check_fn=check_browser_requirements,
+    check_fn=_check_legacy_browser_requirements,
     emoji="⌨️",
 )
 
@@ -5767,7 +5860,7 @@ registry.register(
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_get_images"],
     handler=lambda args, **kw: browser_get_images(task_id=kw.get("task_id")),
-    check_fn=check_browser_requirements,
+    check_fn=_check_legacy_browser_requirements,
     emoji="🖼️",
 )
 registry.register(
@@ -5780,7 +5873,7 @@ registry.register(
         task_id=kw.get("task_id"),
         full=args.get("full", False),
     ),
-    check_fn=check_browser_vision_requirements,
+    check_fn=_check_legacy_browser_vision_requirements,
     emoji="👁️",
 )
 registry.register(
@@ -5788,6 +5881,6 @@ registry.register(
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_console"],
     handler=lambda args, **kw: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id")),
-    check_fn=check_browser_requirements,
+    check_fn=_check_legacy_browser_requirements,
     emoji="🖥️",
 )

@@ -540,7 +540,7 @@ TOOL_CATEGORIES = {
                 "requires_nous_auth": True,
                 "managed_nous_feature": "browser",
                 "override_env_vars": ["BROWSER_USE_API_KEY"],
-                "post_setup": "agent_browser",
+                "post_setup": "browser_use_cli",
             },
             {
                 "name": "Camofox",
@@ -1384,6 +1384,49 @@ def _run_cua_driver_installer(label: str = "Installing", verbose: bool = True) -
 def _run_post_setup(post_setup_key: str):
     """Run post-setup hooks for tools that need extra installation steps."""
     import shutil
+    if post_setup_key == "agent_browser":
+        # Browser Use's plugin keeps the historical hook name so older picker
+        # clients continue to recognize it.  Once its provider is selected,
+        # install the pinned CLI surface; local/Browserbase/Firecrawl retain
+        # the legacy agent-browser setup path.
+        try:
+            from hermes_cli.config import read_raw_config
+
+            browser_cfg = read_raw_config().get("browser", {})
+            if (
+                isinstance(browser_cfg, dict)
+                and str(browser_cfg.get("cloud_provider") or "").strip().lower()
+                == "browser-use"
+            ):
+                from tools.browser_use_cli import install_cli
+
+                ok, message = install_cli()
+                if ok:
+                    _print_success(f"    {message}")
+                else:
+                    for line in str(message).splitlines():
+                        _print_warning(f"    {line[:200]}")
+                return
+        except Exception as exc:  # pragma: no cover - defensive setup path
+            _print_warning(f"    Browser Use CLI setup failed: {exc}")
+            return
+
+    if post_setup_key == "browser_use_cli":
+        _print_info("    Installing the pinned Browser Use CLI "
+                    "(browser-use==0.13.8; CLI 0.1.9)...")
+        try:
+            from tools.browser_use_cli import install_cli
+
+            ok, message = install_cli()
+        except Exception as exc:  # pragma: no cover - defensive setup path
+            ok, message = False, f"install failed: {exc}"
+        if ok:
+            _print_success(f"    {message}")
+        else:
+            for line in str(message).splitlines():
+                _print_warning(f"    {line[:200]}")
+        return
+
     if post_setup_key in {"agent_browser", "browserbase"}:
         node_modules = PROJECT_ROOT / "node_modules" / "agent-browser"
         npm_bin = shutil.which("npm")
@@ -2883,6 +2926,16 @@ def _camofox_installed() -> bool:
     return (PROJECT_ROOT / "node_modules" / "@askjo" / "camofox-browser").exists()
 
 
+def _browser_use_cli_installed() -> bool:
+    """True when the exact Hermes-managed Browser Use CLI is installed."""
+    try:
+        from tools.browser_use_cli import _find_cli
+
+        return _find_cli() is not None
+    except Exception:
+        return False
+
+
 # post_setup_key -> predicate(): True when the install side-effect is already
 # satisfied. Used by ``provider_readiness_status`` to decide whether a keyless
 # post_setup row (KittenTTS, Piper, Local Browser, …) is honestly "ready" or
@@ -2896,6 +2949,7 @@ _POST_SETUP_READY: dict = {
     "langfuse": lambda: _module_installed("langfuse"),
     "agent_browser": lambda: _agent_browser_installed(),
     "browserbase": lambda: _cloud_agent_browser_installed(),
+    "browser_use_cli": lambda: _browser_use_cli_installed(),
     "camofox": lambda: _camofox_installed(),
     "cua_driver": lambda: _resolved_cua_driver_cmd() is not None,
 }
