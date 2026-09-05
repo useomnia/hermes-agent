@@ -4170,7 +4170,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_streaming": True,
                 "run_submission": True,
                 "run_structured_output": True,
-                "run_turn_idempotency": {"apiVersion": 1},
+                "run_turn_idempotency": {
+                    "apiVersion": 2,
+                    "recoverableInventory": {
+                        "apiVersion": 1,
+                        "completeSnapshot": True,
+                        "exactTurnIds": True,
+                    },
+                },
                 "managed_run_identity": {
                     "apiVersion": 1,
                     "nonCreatingReconcile": True,
@@ -8170,6 +8177,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 record.run_id,
                 record.session_id,
                 owner_profile=record.owner_profile,
+                turn_id=record.turn_id,
             )
         except ValueError:
             # The process may have already swept this run's in-memory log;
@@ -8579,6 +8587,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 run_id,
                 session_id,
                 owner_profile=self._effective_request_profile(),
+                turn_id=(
+                    str(status["turn_id"])
+                    if isinstance(status.get("turn_id"), str)
+                    else None
+                ),
             )
         emitter = TurnEventEmitter(
             self._turn_event_logs,
@@ -9083,6 +9096,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 run_id,
                 session_id,
                 owner_profile=request_profile,
+                turn_id=turn_id,
             )
         except Exception:
             # The idempotency row was committed before the in-memory Turn log
@@ -10257,6 +10271,11 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(
             {
                 "object": "list",
+                "inventory": {
+                    "apiVersion": 1,
+                    "complete": True,
+                    "exactTurnIds": True,
+                },
                 "data": self._turn_event_logs.recoverable_runs(
                     owner_profile=self._effective_request_profile()
                 ),
