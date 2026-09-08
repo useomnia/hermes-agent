@@ -270,6 +270,24 @@ def _openrouter_concrete_model(model: str) -> str:
     return concrete if concrete.strip() and slug.strip() else model
 
 
+def openrouter_capability_model(provider: str, model: str, base_url: str = "") -> str:
+    """Return the id to use for catalogue lookups on an OpenRouter route.
+
+    ``concrete-model@preset/slug`` is a valid OpenRouter request model: the
+    preset supplies routing and parameters while the concrete id names the
+    model. Public catalogues (OpenRouter ``/models``, models.dev) only know the
+    concrete id, so capability and pricing lookups must strip the preset
+    suffix or they miss and misclassify the model (no vision, no pricing).
+    The request model itself is never rewritten. Pure ``@preset/slug`` aliases
+    and non-OpenRouter routes are returned unchanged.
+    """
+    if not isinstance(model, str) or not model:
+        return model
+    if not _is_openrouter_route(base_url, provider):
+        return model
+    return _openrouter_concrete_model(model)
+
+
 def _is_openrouter_route(base_url: str = "", provider: str = "") -> bool:
     """Return whether the effective route is OpenRouter.
 

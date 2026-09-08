@@ -192,6 +192,40 @@ def test_openrouter_models_api_pricing_is_converted_from_per_token_to_per_millio
     assert float(entry.cache_write_cost_per_million) == 6.25
 
 
+def test_openrouter_preset_suffixed_model_prices_as_its_concrete_id(monkeypatch):
+    # ``concrete@preset/slug`` request models have no catalogue entry of their
+    # own; pricing must resolve through the concrete id or the turn reads $0.
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata",
+        lambda: {
+            "openai/gpt-5.6-luna": {
+                "pricing": {"prompt": "0.000002", "completion": "0.000008"}
+            }
+        },
+    )
+
+    entry = get_pricing_entry(
+        "openai/gpt-5.6-luna@preset/omnio",
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert entry is not None
+    assert float(entry.input_cost_per_million) == 2.0
+    assert float(entry.output_cost_per_million) == 8.0
+
+
+def test_openrouter_pure_preset_alias_has_no_catalogue_pricing(monkeypatch):
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata",
+        lambda: {"openai/gpt-5.6-luna": {"pricing": {"prompt": "0.000002", "completion": "0.000008"}}},
+    )
+
+    assert get_pricing_entry(
+        "@preset/omnio", provider="openrouter", base_url="https://openrouter.ai/api/v1"
+    ) is None
+
+
 def test_estimate_usage_cost_marks_subscription_routes_included():
     result = estimate_usage_cost(
         "gpt-5.3-codex",

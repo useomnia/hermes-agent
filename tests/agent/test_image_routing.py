@@ -301,6 +301,30 @@ class TestLookupSupportsVisionOverride:
              patch("agent.image_routing._should_probe_ollama_vision", return_value=False):
             assert _lookup_supports_vision("custom", "my-llava", {}) is None
 
+    def test_openrouter_preset_suffix_is_stripped_for_caps_lookup(self):
+        # ``concrete@preset/slug`` is a valid OpenRouter request model; the
+        # catalogue only knows the concrete id, so that is what gets looked up.
+        fake_caps = type("Caps", (), {"supports_vision": True})()
+        with patch("agent.models_dev.get_model_capabilities", return_value=fake_caps) as caps:
+            assert _lookup_supports_vision(
+                "openrouter", "openai/gpt-5.6-luna@preset/omnio", {}
+            ) is True
+        caps.assert_called_once_with("openrouter", "openai/gpt-5.6-luna")
+
+    def test_pure_openrouter_preset_alias_is_looked_up_verbatim(self):
+        # A bare ``@preset/slug`` has no concrete id to strip to.
+        with patch("agent.models_dev.get_model_capabilities", return_value=None) as caps, \
+             patch("agent.image_routing._should_probe_ollama_vision", return_value=False):
+            assert _lookup_supports_vision("openrouter", "@preset/omnio", {}) is None
+        caps.assert_called_once_with("openrouter", "@preset/omnio")
+
+    def test_preset_suffix_is_not_stripped_off_openrouter(self):
+        # The suffix is an OpenRouter contract; other routes see the raw string.
+        with patch("agent.models_dev.get_model_capabilities", return_value=None) as caps, \
+             patch("agent.image_routing._should_probe_ollama_vision", return_value=False):
+            _lookup_supports_vision("custom", "openai/gpt-5.6-luna@preset/omnio", {})
+        caps.assert_called_once_with("custom", "openai/gpt-5.6-luna@preset/omnio")
+
     def test_ollama_probe_when_models_dev_missing(self):
         cfg = {"model": {"base_url": "http://localhost:11434/v1"}}
         with patch("agent.models_dev.get_model_capabilities", return_value=None), \
