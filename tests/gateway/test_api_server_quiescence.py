@@ -748,3 +748,41 @@ def test_force_latch_marker_is_rehydrated_on_replacement_boot(tmp_path):
             assert adapter._quiescence_force_boot_id == "retired-proof-boot"
         finally:
             quiescence._OFFLINE_BOOT_ID = original_boot
+
+
+@pytest.mark.asyncio
+async def test_prepare_marks_a_handover_barrier_for_completion_drains(monkeypatch):
+    """Graceful mode has no latch, so completion drains key off prepare recency."""
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "secret"}))
+    adapter.gateway_runner = SimpleNamespace(
+        _running_agent_count=lambda: 0,
+        _active_cron_job_count=lambda: 0,
+    )
+    assert adapter.quiescence_barrier_active() is False
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        status = await client.get(
+            "/v1/omnio/quiescence", headers={"Authorization": "Bearer secret"}
+        )
+        assert status.status == 200
+        assert adapter.quiescence_barrier_active() is False
+
+        prepared = await client.post(
+            "/v1/omnio/quiescence",
+            headers={"Authorization": "Bearer secret"},
+            json={"mode": "graceful", "request_id": "barrier-1"},
+        )
+        assert prepared.status == 200
+
+    assert adapter.quiescence_barrier_active() is True
+
+    observed = adapter._quiescence_prepare_observed_at
+    monkeypatch.setattr(
+        api_server_module.time,
+        "monotonic",
+        lambda: observed + api_server_module._OMNIO_QUIESCENCE_PREPARE_TTL_SECONDS + 1,
+    )
+    assert adapter.quiescence_barrier_active() is False
+
+    adapter._quiescence_force_latched = True
+    assert adapter.quiescence_barrier_active() is True

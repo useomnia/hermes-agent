@@ -18623,6 +18623,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    def _completion_barrier_active(self) -> bool:
+        """Whether the API server reports a handover barrier over this gateway.
+
+        See ``APIServerAdapter.quiescence_barrier_active``. Behind that
+        barrier no turn can be admitted here, so a completion notification
+        that needs a turn to be consumed is undeliverable on this gateway and
+        must not be requeued: the queue depth is counted as writer work by the
+        quiescence proof, and an event nothing can drain would otherwise hold
+        the handover open forever. Durable async-delegation rows stay owned by
+        their SQLite replay; process notices are best-effort and are dropped.
+        """
+        adapters = getattr(self, "adapters", None)
+        adapter = adapters.get(Platform.API_SERVER) if isinstance(adapters, dict) else None
+        helper = getattr(adapter, "quiescence_barrier_active", None)
+        if not callable(helper):
+            return False
+        try:
+            return bool(helper())
+        except Exception:
+            return False
+
+    def _requeue_async_completion(self, evt: dict, barrier_active: bool) -> None:
+        """Requeue a failed async completion unless a handover barrier owns the retry.
+
+        Delivery failure has already released the durable claim
+        (``release_completion_delivery``), so the SQLite row is what replays
+        this completion on the next gateway; the in-memory copy is only useful
+        while this gateway can still start a turn.
+        """
+        from tools.process_registry import process_registry as _pr
+
+        if not barrier_active:
+            _pr.completion_queue.put(evt)
+            return
+        logger.warning(
+            "Not requeueing async delegation %s completion: handover barrier "
+            "active; durable replay owns its delivery",
+            evt.get("delegation_id") or "<legacy>",
+        )
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -18655,7 +18695,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         async_events.append(evt)
                     else:
                         requeue.append(evt)
+                barrier_active = bool(requeue or async_events) and self._completion_barrier_active()
                 for evt in requeue:
+                    if barrier_active:
+                        # Only an agent turn drains these, and the barrier
+                        # admits none. Keeping the event would pin the
+                        # quiescence proof on a notice nobody can receive.
+                        logger.warning(
+                            "Dropping %s notification for process %s: handover "
+                            "barrier active, no turn can consume it on this gateway",
+                            evt.get("type", "?"),
+                            evt.get("session_id") or evt.get("session_key") or "?",
+                        )
+                        continue
                     _pr.completion_queue.put(evt)
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
@@ -18665,9 +18717,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         delivered = await self._deliver_completion_notification(synth_text, evt)
                         if delivered is False:
-                            _pr.completion_queue.put(evt)
+                            self._requeue_async_completion(evt, barrier_active)
                     except Exception as e:
-                        _pr.completion_queue.put(evt)
+                        self._requeue_async_completion(evt, barrier_active)
                         logger.error("Async delegation injection error: %s", e)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
@@ -18831,6 +18883,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         synth_text, completion_evt,
                     )
                     if delivered is False:
+                        if self._completion_barrier_active():
+                            # A fenced gateway cannot start the turn this
+                            # notice needs; retrying would keep the watcher
+                            # counted as writer work for the whole handover.
+                            logger.warning(
+                                "Process watcher: giving up delivery for %s: "
+                                "handover barrier active on this gateway",
+                                session_id,
+                            )
+                            break
                         # The process remains terminal; retry after failed
                         # adapter injection instead of suppressing the result.
                         continue

@@ -692,3 +692,83 @@ def test_autonomous_completion_redacts_real_command_and_output_secrets(monkeypat
     delivered = adapter.handle_message.await_args.args[0]
     assert secret not in delivered.text
     assert "HOME=/home/user" in delivered.text
+
+
+def _barrier_adapter(active):
+    """Stand-in for the API server's handover-barrier signal."""
+    return SimpleNamespace(quiescence_barrier_active=lambda: active)
+
+
+def test_turn_consumed_events_stay_queued_without_a_handover_barrier(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_completion_event(started_at=1.0))
+
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    runner.adapters[Platform.API_SERVER] = _barrier_adapter(False)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert isolated.qsize() == 1
+
+
+def test_handover_barrier_drops_turn_consumed_events_instead_of_requeueing(
+    monkeypatch, isolated_registry,
+):
+    """A fenced gateway admits no turn, so nothing can ever drain these.
+
+    Left queued they are counted as writer work by the quiescence proof and
+    hold the handover open forever (the phantom-writer wedge of 2026-09-07/08).
+    """
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_completion_event(started_at=1.0))
+    isolated.put({**_completion_event(started_at=2.0, session_id="proc_watch"), "type": "watch_match"})
+
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    runner.adapters[Platform.API_SERVER] = _barrier_adapter(True)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert isolated.empty()
+
+
+def test_handover_barrier_leaves_failed_async_delivery_to_durable_replay(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_async_event("deleg_fenced"))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=RuntimeError("fenced")))
+    runner = _runner(adapter)
+    runner.adapters[Platform.API_SERVER] = _barrier_adapter(True)
+    _stop_after_sleeps(monkeypatch, runner, count=3)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    # One attempt, then the in-memory copy is released to the durable row.
+    assert adapter.handle_message.await_count == 1
+    assert isolated.empty()
+
+
+def test_failed_async_delivery_is_still_requeued_without_a_barrier(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_async_event("deleg_open"))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=RuntimeError("temporary")))
+    runner = _runner(adapter)
+    runner.adapters[Platform.API_SERVER] = _barrier_adapter(False)
+    _stop_after_sleeps(monkeypatch, runner, count=3)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert adapter.handle_message.await_count == 2
+    assert isolated.qsize() == 1
