@@ -1387,7 +1387,14 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["run_structured_output"] is True
-            assert data["features"]["run_turn_idempotency"] == {"apiVersion": 1}
+            assert data["features"]["run_turn_idempotency"] == {
+                "apiVersion": 2,
+                "recoverableInventory": {
+                    "apiVersion": 1,
+                    "completeSnapshot": True,
+                    "exactTurnIds": True,
+                },
+            }
             assert data["features"]["omnio_quiescence"] == {
                 "apiVersion": 1,
                 "atomicWriterSnapshot": True,
