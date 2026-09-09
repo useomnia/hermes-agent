@@ -139,6 +139,12 @@ _OMNIO_TURN_FINALIZE_TIMEOUT_ENV = "OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS"
 # budget covers uploads, not just the path scan.
 _OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS = 30.0
 _OMNIO_QUIESCENCE_DEFAULT_FORCE_TIMEOUT_SECONDS = 30.0
+# How long after the last ``prepare`` this gateway still treats itself as
+# behind a handover barrier for completion-queue accounting. Omnia fences
+# admission in its durable journal before the first graceful prepare and
+# re-asks roughly once a minute while the barrier stands, so a generous
+# window covers one missed pass without outliving an aborted handover.
+_OMNIO_QUIESCENCE_PREPARE_TTL_SECONDS = 300.0
 _OMNIO_QUIESCENCE_MAX_FORCE_TIMEOUT_SECONDS = 120.0
 _OMNIO_QUIESCENCE_OBJECT = "hermes.gateway.quiescence"
 _MANAGED_RUN_IDENTITY_KEYS = {
@@ -1673,6 +1679,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._quiescence_mode: str = "graceful"
         self._quiescence_force_latched: bool = False
         self._quiescence_force_in_progress: bool = False
+        self._quiescence_prepare_observed_at: float = 0.0
         self._quiescence_force_boot_id: str = self._quiescence_boot_id
         self._quiescence_force_request_id: str = ""
         self._quiescence_force_request_required: bool = False
@@ -1756,6 +1763,29 @@ class APIServerAdapter(BasePlatformAdapter):
             + sum(not task.done() for task in self._background_agent_tasks)
             + detached
         )
+
+    def quiescence_barrier_active(self) -> bool:
+        """Whether a handover barrier is proving, or very recently proved, this gateway.
+
+        Omnia fences turn admission in its durable journal before it asks for
+        the first graceful proof, so from that moment no new turn can start on
+        this gateway. A queued completion notification that needs a turn to be
+        consumed (a background-process exit, a watch match, an async
+        delegation whose wake the fenced proxy refuses) can therefore never
+        drain here. Counting it as a writer would block the very proof that is
+        waiting on it, so the completion drains use this signal to hand such
+        events to durable replay instead of requeueing them forever. Graceful
+        mode keeps no latch by design; recency of the last prepare stands in
+        for it. Force mode is explicit.
+        """
+        if getattr(self, "_quiescence_force_in_progress", False) or getattr(
+            self, "_quiescence_force_latched", False
+        ):
+            return True
+        observed = float(getattr(self, "_quiescence_prepare_observed_at", 0.0) or 0.0)
+        if observed <= 0.0:
+            return False
+        return (time.monotonic() - observed) < _OMNIO_QUIESCENCE_PREPARE_TTL_SECONDS
 
     def _register_active_api_agent(self, agent: Any) -> None:
         """Expose an off-loop API agent to force-quiescence interruption."""
@@ -3638,6 +3668,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         request_id = str(body.get("request_id") or "").strip()[:128]
         supplied_request_id = bool(request_id)
+        if operation == "prepare":
+            # Recorded before mode validation on purpose: any prepare means a
+            # handover journal has already fenced admission on this gateway.
+            self._quiescence_prepare_observed_at = time.monotonic()
 
         if operation == "status":
             snapshot = self._collect_quiescence_snapshot()
