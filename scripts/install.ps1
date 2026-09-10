@@ -60,6 +60,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$BrowserUsePackage = "browser-use==0.13.8"
+$BrowserUseCliVersion = "0.1.9"
 
 # Suppress Invoke-WebRequest's per-chunk progress bar.  Windows PowerShell
 # 5.1's progress UI repaints synchronously on every received byte, which
@@ -3576,7 +3578,54 @@ function Stage-SystemPackages   { Install-SystemPackages }
 function Stage-Repository       { Install-Repository }
 function Stage-Venv             { Resolve-UvCmd; Install-Venv }
 function Stage-Dependencies     { Resolve-UvCmd; Install-Dependencies }
-function Stage-NodeDeps         { Install-NodeDeps }
+function Install-BrowserUseCli {
+    # Hermes' production browser surface is Browser Use CLI 3.0. Always
+    # install the exact package into the managed bin directory; runtime
+    # resolution separately verifies the CLI 0.1.9 version contract.
+    try { Resolve-UvCmd } catch {
+        Write-Warn "Skipping Browser Use CLI install (uv unavailable)"
+        return
+    }
+    if (-not $script:UvCmd) {
+        Write-Warn "Skipping Browser Use CLI install (uv unavailable)"
+        return
+    }
+    $managedBin = Join-Path $HermesHome "bin"
+    New-Item -ItemType Directory -Force -Path $managedBin | Out-Null
+    Write-Info "Installing Browser Use CLI ($BrowserUsePackage)..."
+    $previousToolBin = $env:UV_TOOL_BIN_DIR
+    $previousNoConfig = $env:UV_NO_CONFIG
+    try {
+        $env:UV_TOOL_BIN_DIR = $managedBin
+        $env:UV_NO_CONFIG = "1"
+        & $script:UvCmd tool install --force $BrowserUsePackage 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $cliCandidates = @(
+                (Join-Path $managedBin "browser-use.exe"),
+                (Join-Path $managedBin "browser-use.cmd"),
+                (Join-Path $managedBin "browser-use")
+            )
+            $cli = $cliCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            $version = if ($cli) { (& $cli --version 2>$null | Out-String).Trim() } else { "" }
+            if ($version -match "(?<![0-9])$([regex]::Escape($BrowserUseCliVersion))(?![0-9])") {
+                Write-Success "Browser Use CLI installed (CLI $BrowserUseCliVersion)"
+            } else {
+                Write-Warn "Browser Use CLI install produced an unexpected version; browser_exec will report setup errors"
+            }
+        } else {
+            Write-Warn "Browser Use CLI install failed (exit $LASTEXITCODE); browser_exec will report setup errors"
+        }
+    } catch {
+        Write-Warn "Browser Use CLI install failed: $_"
+    } finally {
+        if ($null -eq $previousToolBin) { Remove-Item Env:UV_TOOL_BIN_DIR -ErrorAction SilentlyContinue }
+        else { $env:UV_TOOL_BIN_DIR = $previousToolBin }
+        if ($null -eq $previousNoConfig) { Remove-Item Env:UV_NO_CONFIG -ErrorAction SilentlyContinue }
+        else { $env:UV_NO_CONFIG = $previousNoConfig }
+    }
+}
+
+function Stage-NodeDeps         { Install-NodeDeps; Install-BrowserUseCli }
 function Stage-Desktop          { Install-Desktop }
 function Stage-Path             { Set-PathVariable }
 function Stage-ConfigTemplates  { Copy-ConfigTemplates }
@@ -3694,6 +3743,16 @@ function Invoke-EnsureMode {
                 }
             }
             "browser" {
+                # Browser Use CLI is the production browser surface. Keep
+                # the legacy Node/Camofox dependency setup for its explicit
+                # compatibility backend, but always enforce the exact pin.
+                # Ensure-mode also powers upgrade/recovery flows, so bootstrap
+                # the managed uv before forcing a stale CLI replacement.
+                if (-not (Install-Uv)) {
+                    Write-Err "uv could not be installed; Browser Use CLI was not provisioned"
+                    exit 1
+                }
+                Install-BrowserUseCli
                 [void](Test-Node)
                 if ($script:HasNode) {
                     Install-AgentBrowser
