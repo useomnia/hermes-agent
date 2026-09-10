@@ -137,6 +137,8 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    origin_session_id: str = ""                 # Canonical API session that launched the process
+    origin_turn_id: str = ""                    # Managed product turn that owns its completion
 
 
 class ProcessRegistry:
@@ -410,6 +412,8 @@ class ProcessRegistry:
                 self.completion_queue.put({
                     "session_id": session.id,
                     "session_key": session.session_key,
+                    "origin_session_id": session.origin_session_id,
+                    "origin_turn_id": session.origin_turn_id,
                     "command": session.command,
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
@@ -441,6 +445,8 @@ class ProcessRegistry:
         self.completion_queue.put({
             "session_id": session.id,
             "session_key": session.session_key,
+            "origin_session_id": session.origin_session_id,
+            "origin_turn_id": session.origin_turn_id,
             "command": session.command,
             "type": "watch_match",
             "pattern": matched_pattern,
@@ -788,6 +794,8 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        origin_session_id: str = "",
+        origin_turn_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -813,6 +821,8 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            origin_session_id=origin_session_id,
+            origin_turn_id=origin_turn_id,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
@@ -936,6 +946,8 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        origin_session_id: str = "",
+        origin_turn_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -957,6 +969,8 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            origin_session_id=origin_session_id,
+            origin_turn_id=origin_turn_id,
         )
 
         # Run the command in the sandbox with output capture
@@ -1311,8 +1325,16 @@ class ProcessRegistry:
                     "type": "completion",
                     "session_id": session.id,
                     "session_key": session.session_key,
+                    "origin_session_id": session.origin_session_id,
+                    "origin_turn_id": session.origin_turn_id,
                     "command": session.command,
                     "exit_code": session.exit_code,
+                    "platform": session.watcher_platform,
+                    "chat_id": session.watcher_chat_id,
+                    "user_id": session.watcher_user_id,
+                    "user_name": session.watcher_user_name,
+                    "thread_id": session.watcher_thread_id,
+                    "message_id": session.watcher_message_id,
                     "completion_reason": session.completion_reason,
                     "termination_source": session.termination_source,
                     "output": output_tail,
@@ -2121,6 +2143,8 @@ class ProcessRegistry:
                             "started_at": s.started_at,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
+                            "origin_session_id": s.origin_session_id,
+                            "origin_turn_id": s.origin_turn_id,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_user_id": s.watcher_user_id,
@@ -2193,6 +2217,8 @@ class ProcessRegistry:
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
                 session_key=entry.get("session_key", ""),
+                origin_session_id=entry.get("origin_session_id", ""),
+                origin_turn_id=entry.get("origin_turn_id", ""),
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
@@ -2220,6 +2246,8 @@ class ProcessRegistry:
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
                     "session_key": session.session_key,
+                    "origin_session_id": session.origin_session_id,
+                    "origin_turn_id": session.origin_turn_id,
                     "platform": session.watcher_platform,
                     "chat_id": session.watcher_chat_id,
                     "user_id": session.watcher_user_id,

@@ -18202,6 +18202,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
         chat_id = str(evt.get("chat_id") or derived_chat_id or "").strip()
+        # Managed API runs have an execution-scoped approval key, while their
+        # explicit chat_id identifies the conversation. API sessions are direct
+        # conversations even when older process descriptors omit chat_type.
+        if platform_name == "api_server" and chat_id and not chat_type:
+            chat_type = "dm"
         if not platform_name or not chat_type or not chat_id:
             logger.warning(
                 "Synthetic event source unresolvable: "
@@ -18253,6 +18258,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         acceptance can still cause durable at-least-once replay.
         """
         source = self._build_process_event_source(evt)
+        wake_id = self._completion_wake_id(evt)
+        # Pattern notifications are repeatable emissions, not process
+        # completions. Without a distinct emission identity, routing them
+        # through the idempotent completion hook would suppress later notices.
+        wake_turn_id = (
+            str(evt.get("origin_turn_id") or "")
+            if evt.get("type") in {"completion", "async_delegation"}
+            else ""
+        )
         if not source:
             # API-server-originated sessions bind a RAW session key (the
             # X-Hermes-Session-Id value — see _bind_api_server_session), not a
@@ -18262,6 +18276,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # server's own /v1/chat/completions entry point instead of
             # dropping the event.
             raw_sid = str(evt.get("origin_session_id") or "").strip()
+            if not raw_sid and evt.get("platform") == "api_server":
+                raw_sid = str(evt.get("chat_id") or "").strip()
             if not raw_sid:
                 _sk = str(evt.get("session_key") or "").strip()
                 if _sk and _parse_session_key(_sk) is None:
@@ -18284,8 +18300,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             adapter,
                             text=synth_text,
                             session_id=raw_sid,
-                            delegation_id=str(evt.get("delegation_id") or ""),
-                            origin_turn_id=str(evt.get("origin_turn_id") or ""),
+                            delegation_id=wake_id,
+                            origin_turn_id=wake_turn_id,
                             subagent_ids=list(evt.get("subagent_ids") or []),
                         )
                         return True
@@ -18349,8 +18365,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter,
                     text=synth_text,
                     session_id=raw_sid,
-                    delegation_id=str(evt.get("delegation_id") or ""),
-                    origin_turn_id=str(evt.get("origin_turn_id") or ""),
+                    delegation_id=wake_id,
+                    origin_turn_id=wake_turn_id,
                     subagent_ids=list(evt.get("subagent_ids") or []),
                 )
                 return True
@@ -18397,6 +18413,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
             return False
+
+    @classmethod
+    def _completion_wake_id(cls, evt: dict) -> str:
+        """Keep process completions distinct in the existing idempotent hook.
+
+        Both the post-turn queue and the autonomous watcher describe the same
+        process incarnation, so they must produce the same key. The hook's
+        historical field name is delegation_id; no child IDs accompany a
+        terminal completion.
+        """
+        identity = cls._completion_delivery_identity(evt)
+        if identity and identity[0] == "completion":
+            return f"process:{identity[1]}:{identity[2]}"
+        return str(evt.get("delegation_id") or "")
 
     @staticmethod
     def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
@@ -18869,6 +18899,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "user_id": user_id,
                         "user_name": user_name,
                         "message_id": message_id,
+                        "origin_session_id": watcher.get("origin_session_id", "")
+                        or getattr(session, "origin_session_id", ""),
+                        "origin_turn_id": watcher.get("origin_turn_id", "")
+                        or getattr(session, "origin_turn_id", ""),
                         "started_at": getattr(session, "started_at", None),
                         "command": _command,
                         "exit_code": session.exit_code,
