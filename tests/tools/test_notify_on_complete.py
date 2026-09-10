@@ -11,6 +11,8 @@ Covers:
 import json
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -212,6 +214,40 @@ class TestCompletionQueue:
 # =========================================================================
 
 class TestCheckpointNotify:
+    @pytest.mark.parametrize("with_origin", [False, True])
+    def test_recovered_completion_preserves_origin_and_legacy_defaults(
+        self, registry, tmp_path, with_origin
+    ):
+        checkpoint = tmp_path / "procs.json"
+        entry = {
+            "session_id": "proc_origin",
+            "command": "sleep 10",
+            "pid": os.getpid(),
+            "session_key": "run_parent",
+            "watcher_platform": "api_server",
+            "watcher_chat_id": "canonical-parent",
+            "watcher_interval": 5,
+            "notify_on_complete": True,
+        }
+        if with_origin:
+            entry.update(origin_session_id="canonical-parent", origin_turn_id="turn-parent")
+        checkpoint.write_text(json.dumps([entry]))
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 1
+            session = registry.get("proc_origin")
+            watcher = registry.pending_watchers[0]
+            persisted = json.loads(checkpoint.read_text())[0]
+            session.exited = True
+            session.exit_code = 0
+            registry._move_to_finished(session)
+            completion = registry.completion_queue.get_nowait()
+
+        for metadata in (watcher, persisted, completion):
+            assert metadata["origin_session_id"] == ("canonical-parent" if with_origin else "")
+            assert metadata["origin_turn_id"] == ("turn-parent" if with_origin else "")
+        assert completion["platform"] == "api_server"
+        assert completion["chat_id"] == "canonical-parent"
+
     def test_checkpoint_includes_notify(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
             s = _make_session(notify_on_complete=True)
@@ -500,6 +536,99 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
     return terminal_tool_module
+
+
+def _origin_harness(monkeypatch, tmp_path, barrier=None):
+    from tools import process_registry as registry_module
+
+    terminal = _silent_bg_harness(monkeypatch, tmp_path)
+    registry = ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    checkpoints = []
+
+    def spawn(**kwargs):
+        if barrier is not None:
+            barrier.wait(timeout=5)
+        session = ProcessSession(
+            id="proc_" + kwargs["session_key"],
+            command=kwargs["command"],
+            session_key=kwargs["session_key"],
+            origin_session_id=kwargs["origin_session_id"],
+            origin_turn_id=kwargs["origin_turn_id"],
+        )
+        with registry._lock:
+            registry._running[session.id] = session
+        return session
+
+    monkeypatch.setattr(registry, "spawn_local", spawn)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: checkpoints.append(True))
+    return terminal, registry, checkpoints
+
+
+def test_simultaneous_managed_terminal_launches_keep_distinct_origins(monkeypatch, tmp_path):
+    from gateway.session_context import set_session_vars, clear_session_vars
+
+    terminal, registry, checkpoints = _origin_harness(
+        monkeypatch, tmp_path, threading.Barrier(2)
+    )
+
+    def launch(index):
+        tokens = set_session_vars(
+            platform="api_server", chat_id=f"canonical-{index}",
+            session_key=f"run_{index}", session_id=f"child-mutated-{index}",
+            origin_turn_id=f"turn-{index}", async_delivery=True,
+        )
+        try:
+            return json.loads(terminal.terminal_tool(
+                command="sleep 10", task_id=f"run_{index}",
+                background=True, notify_on_complete=True,
+            ))
+        finally:
+            clear_session_vars(tokens)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(launch, range(2)))
+
+    assert all(result.get("notify_on_complete") is True for result in results), results
+    assert len(checkpoints) == 2
+    watchers = {item["session_id"]: item for item in registry.pending_watchers}
+    for index, result in enumerate(results):
+        session = registry.get(result["session_id"])
+        assert session.origin_session_id == f"canonical-{index}"
+        assert session.origin_turn_id == f"turn-{index}"
+        session.exited = True
+        session.exit_code = 0
+        registry._move_to_finished(session)
+        event = registry.completion_queue.get_nowait()
+        assert event["origin_session_id"] == watchers[session.id]["origin_session_id"]
+        assert event["origin_turn_id"] == watchers[session.id]["origin_turn_id"]
+
+
+def test_delegated_child_cannot_inherit_parent_terminal_notification_route(monkeypatch, tmp_path):
+    from agent.delegation_context import delegated_child_context
+    from gateway.session_context import set_session_vars, clear_session_vars
+
+    terminal, registry, _ = _origin_harness(monkeypatch, tmp_path)
+    tokens = set_session_vars(
+        platform="api_server", chat_id="parent-canonical", session_key="run_parent",
+        origin_turn_id="parent-turn", async_delivery=True,
+    )
+    try:
+        with delegated_child_context():
+            result = json.loads(terminal.terminal_tool(
+                command="sleep 10", task_id="child-run", background=True,
+                notify_on_complete=True, watch_patterns=["ready"],
+            ))
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["error"] is None
+    assert result["notify_on_complete"] is False
+    assert "process(action='wait')" in result["notify_unsupported"]
+    session = registry.get(result["session_id"])
+    assert session.origin_session_id == session.origin_turn_id == ""
+    assert session.watch_patterns == []
+    assert registry.pending_watchers == []
 
 
 def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_path):
