@@ -126,6 +126,9 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
             self.calls.append(kwargs)
             return SimpleNamespace(id="proc_test", pid=1234)
 
+        def _write_checkpoint(self):
+            pass
+
     import tools.process_registry as process_registry_mod
 
     registry = FakeRegistry()
@@ -153,7 +156,7 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
         )
     )
 
-    assert result["exit_code"] == 0
+    assert result["exit_code"] == 0, result
     # session_key falls back to the raw task_id when no gateway contextvar is set
     # (it doesn't propagate to tool-worker threads), so process.kill / stop can
     # still find and terminate this background process.
@@ -164,6 +167,8 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
         "session_key": task_id,
         "env_vars": {},
         "use_pty": False,
+        "origin_session_id": "",
+        "origin_turn_id": "",
     }]
 
 
