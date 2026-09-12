@@ -3,6 +3,10 @@
 import json
 
 from run_agent import _repair_tool_call_arguments
+from agent.message_sanitization import (
+    _close_truncated_json,
+    _repair_tool_call_arguments_detailed,
+)
 
 
 class TestRepairToolCallArguments:
@@ -140,3 +144,74 @@ class TestRepairToolCallArguments:
         parsed = json.loads(result)
         assert "line" in parsed["msg"]
 
+
+
+class TestTruncatedStringRecovery:
+    """A fragment cut mid-string is recoverable, but only as a *lossy* repair.
+
+    Closing the quote makes the JSON parse again while silently dropping
+    whatever bytes the stream lost, so the two entry points diverge on
+    purpose: the detailed form hands back the recovered text for transcript
+    use, the string form reports ``"{}"`` so an executing caller refuses the
+    call instead of acting on incomplete arguments.
+    """
+
+    def test_detailed_recovers_truncated_string_as_lossy(self):
+        raw = '{"query":"Notion replace entire page content markdown update existing document m'
+        result = _repair_tool_call_arguments_detailed(raw, "tool_search")
+        assert result.ok is True
+        assert result.lossy is True
+        assert json.loads(result.arguments) == {
+            "query": "Notion replace entire page content markdown update existing document m"
+        }
+
+    def test_string_form_refuses_a_lossy_recovery(self):
+        """The execution path must not run a tool on truncated arguments."""
+        raw = '{"path":"/tmp/a.md","content":"the first half of the fi'
+        assert _repair_tool_call_arguments(raw, "write_file") == "{}"
+
+    def test_detailed_marks_intact_repairs_non_lossy(self):
+        result = _repair_tool_call_arguments_detailed('{"key": "value",}', "t")
+        assert result.ok is True
+        assert result.lossy is False
+        assert json.loads(result.arguments) == {"key": "value"}
+
+    def test_detailed_reports_unrepairable(self):
+        result = _repair_tool_call_arguments_detailed("totally not json", "t")
+        assert (result.arguments, result.ok, result.lossy) == ("{}", False, False)
+
+
+class TestStructuralClosing:
+    """Containers close innermost-first, and delimiters inside strings are text."""
+
+    def test_nested_containers_close_in_lifo_order(self):
+        """Counting openers would emit ``}]`` and discard the whole call."""
+        result = _repair_tool_call_arguments('{"a": [1, 2', "t")
+        assert json.loads(result) == {"a": [1, 2]}
+
+    def test_object_inside_array_closes_in_order(self):
+        result = _repair_tool_call_arguments('{"a": [1, {"b": 2', "t")
+        assert json.loads(result) == {"a": [1, {"b": 2}]}
+
+    def test_bracket_inside_string_value_is_not_structure(self):
+        result = _repair_tool_call_arguments('{"a":"[","b":[1,2', "t")
+        assert json.loads(result) == {"a": "[", "b": [1, 2]}
+
+    def test_brace_inside_string_value_is_not_structure(self):
+        result = _repair_tool_call_arguments('{"a":"{","b":[1,2', "t")
+        assert json.loads(result) == {"a": "{", "b": [1, 2]}
+
+    def test_escaped_quote_does_not_close_the_string(self):
+        raw = '{"a":"say \\"hi\\"","b":[1'
+        result = _repair_tool_call_arguments(raw, "t")
+        assert json.loads(result) == {"a": 'say "hi"', "b": [1]}
+
+    def test_balanced_json_is_untouched(self):
+        raw = '{"a": [1, 2], "b": {"c": 3}}'
+        assert json.loads(_repair_tool_call_arguments(raw, "t")) == {
+            "a": [1, 2], "b": {"c": 3},
+        }
+
+    def test_close_truncated_json_reports_lossiness(self):
+        assert _close_truncated_json('{"a": [1, 2') == ('{"a": [1, 2]}', False)
+        assert _close_truncated_json('{"a": "va') == ('{"a": "va"}', True)

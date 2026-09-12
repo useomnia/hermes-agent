@@ -55,7 +55,7 @@ from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
-    _repair_tool_call_arguments,
+    _repair_tool_call_arguments_detailed,
     insert_ephemeral_messages,
     _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates,
@@ -1629,9 +1629,16 @@ def run_conversation(
                             ),
                         }}
                     except Exception:
-                        tc["function"]["arguments"] = _repair_tool_call_arguments(
-                            tc["function"]["arguments"],
-                            tc["function"].get("name", "?"),
+                        # Transcript text, not an execution payload, so a lossy
+                        # recovery is kept: replaying the model's real (if
+                        # truncated) arguments describes the turn better than
+                        # "{}", which asserts it called with no arguments at
+                        # all and reads back as a legitimate zero-arg call.
+                        tc["function"]["arguments"] = (
+                            _repair_tool_call_arguments_detailed(
+                                tc["function"]["arguments"],
+                                tc["function"].get("name", "?"),
+                            ).arguments
                         )
                 new_tcs.append(tc)
             am["tool_calls"] = new_tcs
