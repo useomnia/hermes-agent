@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -217,26 +217,94 @@ def _escape_invalid_chars_in_json_strings(raw: str) -> str:
     return "".join(out)
 
 
-def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
-    """Attempt to repair malformed tool_call argument JSON.
+# When a repair is about to destroy the only copy of a tool call's original
+# argument bytes (rewriting them to "{}"), the WARNING log is the last
+# surviving copy of content that can hold real user data (#80498). Bound the
+# logged string at this size instead of a short preview so it stays
+# recoverable from agent.log without letting a pathological payload flood
+# the log.
+_FULL_ARGS_LOG_BOUND = 100_000
+
+
+class RepairedArguments(NamedTuple):
+    """Outcome of a :func:`_repair_tool_call_arguments_detailed` pass.
+
+    ``arguments`` is always wire-safe JSON text. ``ok`` is False when every
+    repair pass failed and the text fell back to ``"{}"``. ``lossy`` is True
+    when recovery succeeded only by closing a string the provider truncated
+    mid-value, so the parsed arguments are missing however many bytes the
+    stream dropped.
+    """
+
+    arguments: str
+    ok: bool
+    lossy: bool
+
+
+def _close_truncated_json(raw: str) -> tuple[str, bool]:
+    """Complete a truncated JSON fragment's open string and containers.
+
+    Walks ``raw`` tracking quoted-string and backslash-escape state, so a
+    ``{`` or ``[`` inside a string value counts as a literal character rather
+    than structure. Containers close in LIFO order, so a nested fragment like
+    ``{"a": [1, 2`` completes as ``{"a": [1, 2]}`` instead of the
+    order-insensitive ``{"a": [1, 2}]`` that a count of openers produces.
+
+    Returns the completed text and whether completing it had to close a
+    string the provider cut mid-value. That second flag marks a *lossy*
+    recovery: the JSON parses again, but the dropped bytes are gone, so the
+    value is silently shorter than the model intended.
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in ("}", "]") and stack and stack[-1] == ch:
+            stack.pop()
+    completed = raw + ('"' if in_string else "") + "".join(reversed(stack))
+    return completed, in_string
+
+
+def _repair_tool_call_arguments_detailed(
+    raw_args: str, tool_name: str = "?"
+) -> RepairedArguments:
+    """Attempt to repair malformed tool_call argument JSON, reporting how it went.
 
     Models like GLM-5.1 via Ollama can produce truncated JSON, trailing
     commas, Python ``None``, etc.  The API proxy rejects these with HTTP 400
     "invalid tool call arguments".  This function applies common repairs;
     if all fail it returns ``"{}"`` so the request succeeds (better than
     crashing the session).  All repairs are logged at WARNING level.
+
+    Callers that may *execute* the result must honour ``lossy``: a fragment
+    truncated mid-string parses again only because the quote was closed, so
+    executing it would run the tool against silently incomplete arguments.
     """
     raw_stripped = raw_args.strip() if isinstance(raw_args, str) else ""
 
     # Fast-path: empty / whitespace-only -> empty object
     if not raw_stripped:
         logger.warning("Sanitized empty tool_call arguments for %s", tool_name)
-        return "{}"
+        return RepairedArguments("{}", True, False)
 
     # Python-literal None -> normalise to {}
     if raw_stripped == "None":
         logger.warning("Sanitized Python-None tool_call arguments for %s", tool_name)
-        return "{}"
+        return RepairedArguments("{}", True, False)
 
     # Repair pass 0: llama.cpp backends sometimes emit literal control
     # characters (tabs, newlines) inside JSON string values. json.loads
@@ -251,7 +319,7 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
                 "Repaired unescaped control chars in tool_call arguments for %s",
                 tool_name,
             )
-        return reserialised
+        return RepairedArguments(reserialised, True, False)
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
@@ -259,13 +327,11 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     fixed = raw_stripped
     # 1. Strip trailing commas before } or ]
     fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
-    # 2. Close unclosed structures
-    open_curly = fixed.count('{') - fixed.count('}')
-    open_bracket = fixed.count('[') - fixed.count(']')
-    if open_curly > 0:
-        fixed += '}' * open_curly
-    if open_bracket > 0:
-        fixed += ']' * open_bracket
+    # 2. Close the open string (if the stream stopped inside one) and any
+    #    unclosed containers, in LIFO order. Counting openers instead would
+    #    emit closers in the wrong order for nested fragments, and treat a
+    #    brace inside a string value as structure.
+    fixed, lossy = _close_truncated_json(fixed)
     # 3. Remove excess closing braces/brackets (bounded to 50 iterations)
     for _ in range(50):
         try:
@@ -281,11 +347,20 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
 
     try:
         json.loads(fixed)
-        logger.warning(
-            "Repaired malformed tool_call arguments for %s: %s → %s",
-            tool_name, raw_stripped[:80], fixed[:80],
-        )
-        return fixed
+        if lossy:
+            # The value is shorter than the model intended. Say so plainly:
+            # a caller that executes this would act on truncated arguments.
+            logger.warning(
+                "Recovered truncated tool_call arguments for %s by closing an "
+                "unterminated string (lossy): %s → %s",
+                tool_name, raw_stripped[:80], fixed[:80],
+            )
+        else:
+            logger.warning(
+                "Repaired malformed tool_call arguments for %s: %s → %s",
+                tool_name, raw_stripped[:80], fixed[:80],
+            )
+        return RepairedArguments(fixed, True, lossy)
     except json.JSONDecodeError:
         pass
 
@@ -300,18 +375,37 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
                 "Repaired control-char-laced tool_call arguments for %s: %s → %s",
                 tool_name, raw_stripped[:80], escaped[:80],
             )
-            return escaped
+            return RepairedArguments(escaped, True, lossy)
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
     # Last resort: replace with empty object so the API request doesn't
-    # crash the entire session.
+    # crash the entire session. Log the FULL original string (bounded) —
+    # for callers that discard the original (e.g. the pre-send transcript
+    # sanitizer), this WARNING is the last surviving copy of bytes that can
+    # contain real user content (#80498: a truncated write_file call's
+    # streamed file content).
     logger.warning(
         "Unrepairable tool_call arguments for %s — "
         "replaced with empty object (was: %s)",
-        tool_name, raw_stripped[:80],
+        tool_name, raw_stripped[:_FULL_ARGS_LOG_BOUND],
     )
-    return "{}"
+    return RepairedArguments("{}", False, False)
+
+
+def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
+    """Repair malformed tool_call argument JSON, or ``"{}"`` when it cannot be.
+
+    A *lossy* recovery is deliberately reported as unrepairable here. Callers
+    on this path feed the result straight to tool execution, and a fragment
+    truncated mid-string parses again only because the quote was closed —
+    running a tool against silently incomplete arguments (a truncated
+    ``write_file`` content) is worse than refusing the call and letting the
+    turn retry. Callers that only need replayable transcript text should use
+    :func:`_repair_tool_call_arguments_detailed` and accept ``lossy`` results.
+    """
+    repaired = _repair_tool_call_arguments_detailed(raw_args, tool_name)
+    return repaired.arguments if repaired.ok and not repaired.lossy else "{}"
 
 
 def close_interrupted_tool_sequence(messages: list, final_response: Any = None) -> bool:
@@ -504,6 +598,9 @@ __all__ = [
     "_sanitize_messages_surrogates",
     "_escape_invalid_chars_in_json_strings",
     "_repair_tool_call_arguments",
+    "_repair_tool_call_arguments_detailed",
+    "_close_truncated_json",
+    "RepairedArguments",
     "_strip_non_ascii",
     "_sanitize_messages_non_ascii",
     "_sanitize_tools_non_ascii",

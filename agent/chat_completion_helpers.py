@@ -2540,6 +2540,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         for tool_call_id in call_ids:
             agent._fire_tool_gen_event_aborted(tool_call_id)
 
+    def _abandon_unexecuted_tool_call(tool_call_id) -> None:
+        """Retire the item for a call this attempt will never execute.
+
+        A Responses consumer can already hold an in-progress function-call
+        item opened while the provider streamed this call's name. When the
+        arguments then arrive unrepairable the call is dropped before
+        execution, so no execution boundary will ever close that item: it
+        stays in-progress until the run's terminal sweep, which a client
+        renders as a tool card running for the rest of the turn.
+
+        Abandoning is tentative, exactly as for a dropped stream attempt —
+        a retry reusing this deterministic call ID still reclaims the item.
+        """
+        if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+            return
+        attempt_rich_tool_call_ids.discard(tool_call_id)
+        agent._fire_tool_gen_event_aborted(tool_call_id)
+
     # Cross-turn stale-stream circuit breaker (#58962) — see the canonical
     # comment block above ``_stale_streak()``.  Raises past the give-up
     # threshold instead of burning another stale-timeout×retries cycle.
@@ -3109,6 +3127,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         else:
                             # Unrepairable — flag for truncation handling
                             has_truncated_tool_args = True
+                            _abandon_unexecuted_tool_call(tc["id"])
                 mock_tool_calls.append(SimpleNamespace(
                     id=tc["id"],
                     type=tc["type"],
