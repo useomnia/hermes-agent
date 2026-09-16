@@ -149,3 +149,53 @@ def test_aux_call_telemetry_records_durations_without_content(caplog):
     raw_log = json.dumps(payload)
     assert "TOPSECRET_TRANSCRIPT_TEXT" not in raw_log
     assert "SANITIZED SUMMARY" not in raw_log
+
+
+async def _compress_with_turn_log(summary):
+    import asyncio
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.turn_event_log import TurnEventEmitter, TurnEventLogStore
+
+    with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        compressor = ContextCompressor(model="test/main-model", provider="test-provider", threshold_percent=0.5, quiet_mode=True, config_context_length=100_000)
+    compressor.tail_token_budget = 10
+    compressor.abort_on_summary_failure = True
+    agent = _Agent(compressor)
+    store = TurnEventLogStore()
+    log = store.create_run("run_compaction", agent.session_id)
+    emitter = TurnEventEmitter(store, "run_compaction", agent.session_id)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": ""}))
+    agent.tool_progress_callback = adapter._make_run_custom_event_callback(emitter, asyncio.get_running_loop())
+    original = _messages()
+    with patch.object(compressor, "_generate_summary", return_value=summary):
+        compressed, _ = compress_context(agent, original, "system prompt", approx_tokens=75000, force=True)
+    await asyncio.sleep(0)
+    events = [json.loads(stored.frame.removeprefix(b"data: ").strip()) for stored in log.events]
+    return original, compressed, events
+
+
+def test_compaction_should_write_one_event_through_real_turn_bridge():
+    import asyncio
+    from agent.compaction_snapshot import capture_compaction, project_compaction
+    from agent.redact import redact_sensitive_text
+    from gateway.turn_event_log import _bounded_utf8
+
+    original, compressed, events = asyncio.run(_compress_with_turn_log("[CONTEXT COMPACTION] summary"))
+    assert len(compressed) < len(original)
+    assert len(events) == 1
+    event = events[0]
+    assert event["type"] == "response.omnio.compaction"
+    snapshot = capture_compaction(compressed, previous_count=len(original) - 1, session_id="session-telemetry-test")
+    expected = project_compaction(snapshot, redact=lambda text: redact_sensitive_text(text, force=True), bound=_bounded_utf8)
+    assert {key: value for key, value in event.items() if key not in {"type", "sequence_number"}} == expected
+    assert "_compressed_summary" not in json.dumps(event)
+    assert "TOPSECRET_TRANSCRIPT_TEXT" not in json.dumps(event)
+    assert event["retained_tail_refs"]
+
+
+def test_compaction_should_emit_no_snapshot_on_summary_abort():
+    import asyncio
+    original, compressed, events = asyncio.run(_compress_with_turn_log(""))
+    assert compressed == original
+    assert events == []

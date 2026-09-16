@@ -53,6 +53,7 @@ CUSTOM_TOOL_INPUT_KEYS = {
 OMNIO_EXTENSION_EVENT_TYPES = frozenset({
     "response.omnio.interaction",
     "response.omnio.interaction_completed",
+    "response.omnio.compaction",
     "response.omnio.client_event",
     "response.omnio.gen_ui",
     "response.omnio.task_list",

@@ -100,6 +100,7 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
+from agent.compaction_snapshot import project_compaction
 from agent.redact import redact_sensitive_text
 from agent.structured_output import (
     normalize_response_format as _normalize_response_format,
@@ -109,6 +110,7 @@ from agent.structured_output import (
 from gateway.readiness import collect_runtime_readiness
 from gateway.turn_event_log import (
     CUSTOM_TOOL_INPUT_KEYS as _CUSTOM_TOOL_INPUT_KEYS,
+    _bounded_utf8,
     client_projection_withheld,
     CursorExpiredError,
     InvalidCursorError,
@@ -1510,6 +1512,44 @@ class _ProviderAuthResolutionError(RuntimeError):
     closed OpenAI client"), which a bare `except RuntimeError` there would
     otherwise mislabel as an auth failure.
     """
+
+
+def _project_subagent_progress(preview: Any, fields: Dict[str, Any]) -> Dict[str, Any]:
+    """Whitelist progress fields and redact text before scheduling a Turn event."""
+    value: Dict[str, Any] = {}
+    if preview is not None:
+        value["preview"] = redact_sensitive_text(str(preview), force=True)
+    for source_key, wire_key in (
+        ("goal", "goal"),
+        ("task_count", "taskCount"),
+        ("task_index", "taskIndex"),
+        ("subagent_id", "subagentId"),
+        ("child_session_id", "childSessionId"),
+        ("parent_id", "parentId"),
+        ("depth", "depth"),
+        ("model", "model"),
+        ("tool_count", "toolCount"),
+        ("status", "status"),
+        ("summary", "summary"),
+        ("duration_seconds", "durationSeconds"),
+        ("input_tokens", "inputTokens"),
+        ("output_tokens", "outputTokens"),
+        ("reasoning_tokens", "reasoningTokens"),
+        ("api_calls", "apiCalls"),
+        ("cost_usd", "costUsd"),
+        ("files_read", "filesRead"),
+        ("files_written", "filesWritten"),
+        ("output_tail", "outputTail"),
+    ):
+        item = fields.get(source_key)
+        if item is None:
+            continue
+        if source_key in {"goal", "summary", "output_tail"} and isinstance(
+            item, str
+        ):
+            item = redact_sensitive_text(item, force=True)
+        value[wire_key] = item
+    return value
 
 
 class APIServerAdapter(BasePlatformAdapter):
@@ -4204,6 +4244,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_streaming": True,
                 "run_submission": True,
                 "run_structured_output": True,
+                "run_compaction_snapshots": True,
                 "run_turn_idempotency": {
                     "apiVersion": 2,
                     "recoverableInventory": {
@@ -8490,6 +8531,7 @@ class APIServerAdapter(BasePlatformAdapter):
             event_type = {
                 "subagent.start": "response.omnio.subagent_start",
                 "subagent.complete": "response.omnio.subagent_complete",
+                "compaction": "response.omnio.compaction",
             }[name]
             emitter.omnio_event(event_type, **value)
 
@@ -8522,40 +8564,21 @@ class APIServerAdapter(BasePlatformAdapter):
             args=None,
             **kwargs,
         ) -> None:
+            if event_type == "compaction":
+                value = project_compaction(
+                    kwargs["snapshot"],
+                    redact=lambda text: redact_sensitive_text(text, force=True),
+                    bound=_bounded_utf8,
+                )
+                if value is not None:
+                    try:
+                        loop.call_soon_threadsafe(_emit_custom, event_type, value)
+                    except RuntimeError:
+                        pass
+                return
+
             if event_type in {"subagent.start", "subagent.complete"}:
-                value: Dict[str, Any] = {}
-                if preview is not None:
-                    value["preview"] = redact_sensitive_text(str(preview), force=True)
-                for source_key, wire_key in (
-                    ("goal", "goal"),
-                    ("task_count", "taskCount"),
-                    ("task_index", "taskIndex"),
-                    ("subagent_id", "subagentId"),
-                    ("child_session_id", "childSessionId"),
-                    ("parent_id", "parentId"),
-                    ("depth", "depth"),
-                    ("model", "model"),
-                    ("tool_count", "toolCount"),
-                    ("status", "status"),
-                    ("summary", "summary"),
-                    ("duration_seconds", "durationSeconds"),
-                    ("input_tokens", "inputTokens"),
-                    ("output_tokens", "outputTokens"),
-                    ("reasoning_tokens", "reasoningTokens"),
-                    ("api_calls", "apiCalls"),
-                    ("cost_usd", "costUsd"),
-                    ("files_read", "filesRead"),
-                    ("files_written", "filesWritten"),
-                    ("output_tail", "outputTail"),
-                ):
-                    item = kwargs.get(source_key)
-                    if item is None:
-                        continue
-                    if source_key in {"goal", "summary", "output_tail"} and isinstance(
-                        item, str
-                    ):
-                        item = redact_sensitive_text(item, force=True)
-                    value[wire_key] = item
+                value = _project_subagent_progress(preview, kwargs)
                 try:
                     loop.call_soon_threadsafe(_emit_custom, event_type, value)
                 except RuntimeError:
