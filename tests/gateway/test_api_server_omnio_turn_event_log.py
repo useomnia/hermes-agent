@@ -236,6 +236,7 @@ def test_omnio_extension_event_types_are_explicit_and_namespaced() -> None:
     expected = {
         "response.omnio.interaction",
         "response.omnio.interaction_completed",
+        "response.omnio.compaction",
         "response.omnio.client_event",
         "response.omnio.gen_ui",
         "response.omnio.task_list",

@@ -63,6 +63,20 @@ COMPACTION_STATUS = (
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
 
 
+def _emit_compaction_snapshot(agent: Any, messages: list[dict], previous_count: int) -> None:
+    callback = getattr(agent, "tool_progress_callback", None)
+    if not callable(callback):
+        return
+    from agent.compaction_snapshot import capture_compaction
+
+    snapshot = capture_compaction(messages, previous_count=previous_count, session_id=agent.session_id)
+    if snapshot is not None:
+        try:
+            callback("compaction", snapshot=snapshot)
+        except Exception:
+            logger.debug("compaction snapshot callback failed", exc_info=True)
+
+
 def _emit_compaction_done(agent: Any) -> None:
     """Emit the structured terminal edge for a started compaction."""
     status_callback = getattr(agent, "status_callback", None)
@@ -2366,6 +2380,9 @@ def compress_context(
                 else None
             ),
         )
+        if _commit_status == "committed" and len(compressed) < len(messages_before_compression):
+            previous_count = sum(message.get("role") != "system" for message in messages_before_compression)
+            _emit_compaction_snapshot(agent, compressed, previous_count)
         return compressed, new_system_prompt
     finally:
         # Release the lock on the OLD session_id only AFTER rotation completed

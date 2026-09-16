@@ -100,6 +100,7 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
+from agent.compaction_snapshot import project_compaction
 from agent.redact import redact_sensitive_text
 from agent.structured_output import (
     normalize_response_format as _normalize_response_format,
@@ -109,6 +110,7 @@ from agent.structured_output import (
 from gateway.readiness import collect_runtime_readiness
 from gateway.turn_event_log import (
     CUSTOM_TOOL_INPUT_KEYS as _CUSTOM_TOOL_INPUT_KEYS,
+    _bounded_utf8,
     client_projection_withheld,
     CursorExpiredError,
     InvalidCursorError,
@@ -4204,6 +4206,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_streaming": True,
                 "run_submission": True,
                 "run_structured_output": True,
+                "run_compaction_snapshots": True,
                 "run_turn_idempotency": {
                     "apiVersion": 2,
                     "recoverableInventory": {
@@ -8490,6 +8493,7 @@ class APIServerAdapter(BasePlatformAdapter):
             event_type = {
                 "subagent.start": "response.omnio.subagent_start",
                 "subagent.complete": "response.omnio.subagent_complete",
+                "compaction": "response.omnio.compaction",
             }[name]
             emitter.omnio_event(event_type, **value)
 
@@ -8522,6 +8526,19 @@ class APIServerAdapter(BasePlatformAdapter):
             args=None,
             **kwargs,
         ) -> None:
+            if event_type == "compaction":
+                value = project_compaction(
+                    kwargs["snapshot"],
+                    redact=lambda text: redact_sensitive_text(text, force=True),
+                    bound=_bounded_utf8,
+                )
+                if value is not None:
+                    try:
+                        loop.call_soon_threadsafe(_emit_custom, event_type, value)
+                    except RuntimeError:
+                        pass
+                return
+
             if event_type in {"subagent.start", "subagent.complete"}:
                 value: Dict[str, Any] = {}
                 if preview is not None:
