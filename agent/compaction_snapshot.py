@@ -20,9 +20,19 @@ def _visible_message(message: dict) -> dict:
     return {"role": role, "content": message.get("content") or ""}
 
 
-def capture_compaction(messages: list[dict], *, previous_count: int, session_id: str) -> dict | None:
-    visible = [message for message in messages if message.get("role") in {"user", "assistant", "tool"}]
-    summaries = [index for index, message in enumerate(visible) if is_compaction_summary_message(message)]
+def capture_compaction(
+    messages: list[dict], *, previous_count: int, session_id: str
+) -> dict | None:
+    visible = [
+        message
+        for message in messages
+        if message.get("role") in {"user", "assistant", "tool"}
+    ]
+    summaries = [
+        index
+        for index, message in enumerate(visible)
+        if is_compaction_summary_message(message)
+    ]
     if len(summaries) != 1 or len(visible) - 1 > MAX_RETAINED_REFERENCES:
         return None
     index = summaries[0]
@@ -34,8 +44,12 @@ def capture_compaction(messages: list[dict], *, previous_count: int, session_id:
     return {
         "summary": summary["content"],
         "summary_role": summary["role"],
-        "retained_head_messages": [_visible_message(message) for message in visible[:index]],
-        "retained_tail_messages": [_visible_message(message) for message in visible[index + 1:]],
+        "retained_head_messages": [
+            _visible_message(message) for message in visible[:index]
+        ],
+        "retained_tail_messages": [
+            _visible_message(message) for message in visible[index + 1 :]
+        ],
         "compacted_messages": max(0, previous_count - (len(visible) - 1)),
         "session_id": session_id,
         "retained_tail_from": None,
@@ -51,12 +65,23 @@ def _message_reference(message: dict, redact: Callable[[str], str]) -> dict | No
     if not isinstance(content, str):
         return None
     canonical = redact(content).strip()
-    return {"role": message["role"], "text_sha256": hashlib.sha256(canonical.encode()).hexdigest()}
+    return {
+        "role": message["role"],
+        "text_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+    }
 
 
-def project_compaction(snapshot: dict, *, redact: Callable[[str], str], bound: Callable[[Any, int], str]) -> dict | None:
-    head = [_message_reference(message, redact) for message in snapshot["retained_head_messages"]]
-    tail = [_message_reference(message, redact) for message in snapshot["retained_tail_messages"]]
+def project_compaction(
+    snapshot: dict, *, redact: Callable[[str], str], bound: Callable[[Any, int], str]
+) -> dict | None:
+    head = [
+        _message_reference(message, redact)
+        for message in snapshot["retained_head_messages"]
+    ]
+    tail = [
+        _message_reference(message, redact)
+        for message in snapshot["retained_tail_messages"]
+    ]
     if None in head or None in tail:
         return None
     summary = redact(snapshot["summary"])

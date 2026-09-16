@@ -63,7 +63,12 @@ COMPACTION_STATUS = (
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
 
 
-def _emit_compaction_snapshot(agent: Any, messages: list[dict], previous_count: int) -> None:
+def _emit_compaction_snapshot(
+    agent: Any, messages: list[dict], previous_messages: list[dict], *, committed: bool
+) -> None:
+    if not committed or len(messages) >= len(previous_messages):
+        return
+    previous_count = sum(message.get("role") != "system" for message in previous_messages)
     callback = getattr(agent, "tool_progress_callback", None)
     if not callable(callback):
         return
@@ -2380,9 +2385,9 @@ def compress_context(
                 else None
             ),
         )
-        if _commit_status == "committed" and len(compressed) < len(messages_before_compression):
-            previous_count = sum(message.get("role") != "system" for message in messages_before_compression)
-            _emit_compaction_snapshot(agent, compressed, previous_count)
+        _emit_compaction_snapshot(
+            agent, compressed, messages_before_compression, committed=_commit_status == "committed"
+        )
         return compressed, new_system_prompt
     finally:
         # Release the lock on the OLD session_id only AFTER rotation completed
