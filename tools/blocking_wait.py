@@ -191,12 +191,15 @@ class BlockingWaitRegistry(Generic[ResultT, SurfaceT, PayloadT]):
         ) = None,
         *,
         fallback_on_miss: bool = False,
+        before_resolve: Callable[[], None] | None = None,
     ) -> bool:
         """Resolve one matching waiter, or the FIFO head when no id is given.
 
         ``on_release`` runs under the lock after the result is assigned and
         before the event is signalled.  This preserves commit-before-release
         ordering for gate state consumed immediately by the resumed worker.
+        ``before_resolve`` runs only for a matching waiter, before changing its
+        result or removing it. If it raises, the waiter remains available.
         ``fallback_on_miss`` exists for a gate whose established single-waiter
         contract treats an unknown defensive call id as a FIFO resolution.
         """
@@ -204,6 +207,15 @@ class BlockingWaitRegistry(Generic[ResultT, SurfaceT, PayloadT]):
         try:
             with self._lock:
                 queue = self._waits.get(session_key)
+                if before_resolve is not None:
+                    candidate = self._pop_waiter_locked(
+                        list(queue) if queue else [],
+                        tool_call_id or "",
+                        fallback_on_miss=fallback_on_miss,
+                    )
+                    if candidate is None:
+                        return False
+                    before_resolve()
                 entry = self._pop_waiter_locked(
                     queue,
                     tool_call_id or "",

@@ -1618,6 +1618,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        self._user_input_resolutions: Dict[str, Dict[str, Dict[str, Any]]] = {}
         # Legacy queue maps remain as a compatibility-only shadow for older
         # extensions/tests. The authoritative /v1/runs transport is the
         # immutable numbered log below; these queues are never read by SSE.
@@ -2463,6 +2464,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
             ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
+            ("POST", "/v1/runs/{run_id}/user-input", self._handle_run_user_input),
             # Authenticated Omnio handover contract. The operation-in-body
             # route is canonical; explicit aliases keep control-plane clients
             # simple and make feature detection additive.
@@ -4245,6 +4247,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_submission": True,
                 "run_structured_output": True,
                 "run_compaction_snapshots": True,
+                "run_user_input_resolution": {"apiVersion": 1},
                 "run_turn_idempotency": {
                     "apiVersion": 2,
                     "recoverableInventory": {
@@ -4319,6 +4322,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
+                "run_user_input": {"method": "POST", "path": "/v1/runs/{run_id}/user-input"},
                 "omnio_quiescence": {
                     "method": "POST",
                     "path": "/v1/omnio/quiescence",
@@ -10724,6 +10728,97 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
     @_admit_api_control_request
+    async def _handle_run_user_input(self, request: "web.Request") -> "web.Response":
+        """Resolve an exact run/question; supersession fences execution before release."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        log = self._turn_event_logs.get_log(run_id)
+        session_id = request.headers.get("X-Hermes-Session-Id", "")
+        if (
+            log is None
+            or not session_id
+            or log.session_id != session_id
+            or log.owner_profile != self._effective_request_profile()
+        ):
+            return web.json_response({"error": "run_not_found"}, status=404)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("Expected an object")
+            call_id = body.get("toolCallId")
+            response = body.get("response")
+            action = body.get("action", "answer")
+            if not isinstance(call_id, str) or not call_id.strip():
+                raise ValueError("Missing toolCallId")
+            if not isinstance(response, str) or action not in {"answer", "skip", "supersede"}:
+                raise ValueError("Invalid response or action")
+        except (ValueError, TypeError):
+            return web.json_response({"error": "invalid_user_input"}, status=400)
+        try:
+            result = self._resolve_run_user_input(run_id, call_id, response, action)
+        except ValueError:
+            previous = self._user_input_resolutions[run_id][call_id]
+            return web.json_response({
+                "error": "interaction_already_resolved",
+                "choice": self._user_input_choice(previous["response"]),
+            }, status=409)
+        except Exception:
+            logger.exception("[api_server] exact user input resolution failed")
+            return web.json_response({"error": "user_input_resolution_failed"}, status=500)
+        return web.json_response(result)
+
+    @staticmethod
+    def _user_input_choice(response: str) -> str:
+        """Project the answer, keeping the GenUI state envelope out of the card."""
+        try:
+            envelope = json.loads(response)
+        except (ValueError, TypeError):
+            envelope = None
+        if (
+            isinstance(envelope, dict)
+            and envelope.get("_omnio_interaction_answer") == 1
+            and isinstance(envelope.get("response"), str)
+        ):
+            response = envelope["response"]
+        return _redact_response_extension_value(response)
+
+    def _resolve_run_user_input(
+        self, run_id: str, call_id: str, response: str, action: str,
+    ) -> Dict[str, Any]:
+        from tools.user_input import resolve_user_input
+
+        resolutions = self._user_input_resolutions.setdefault(run_id, {})
+        previous = resolutions.get(call_id)
+        if previous is not None:
+            if previous["response"] != response or previous["action"] != action:
+                raise ValueError("The question already has a different resolution")
+            return {"resolved": True, "action": action, "replayed": True}
+
+        def commit() -> None:
+            if action == "supersede":
+                agent = self._active_run_agents.get(run_id)
+                if agent is None:
+                    raise RuntimeError("The question has no active agent")
+                agent.interrupt("Question superseded by a user message")
+                self._stopping_run_ids.add(run_id)
+                self._set_run_status(run_id, "stopping", last_event="run.stopping")
+            log = self._turn_event_logs.get_log(run_id)
+            emitter = TurnEventEmitter(self._turn_event_logs, run_id, log.session_id)
+            emitter.omnio_event(
+                "response.omnio.interaction_completed",
+                tool_call_id=call_id,
+                choice=self._user_input_choice(response),
+                disposition=action,
+            )
+            resolutions[call_id] = {"response": response, "action": action}
+
+        resolved = resolve_user_input(
+            run_id, response, call_id, strict=True, before_release=commit,
+        )
+        return {"resolved": resolved, "action": action, "replayed": False}
+
     async def _handle_omnio_user_input(
         self, request: "web.Request"
     ) -> "web.Response":
@@ -10969,6 +11064,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._user_input_resolutions.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

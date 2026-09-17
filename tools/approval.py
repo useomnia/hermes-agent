@@ -199,6 +199,11 @@ def reset_current_observability_context(
     _approval_turn_id.reset(turn_token)
 
 
+def get_current_tool_call_id() -> str:
+    """Return the tool identity bound by the tool dispatcher."""
+    return _approval_tool_call_id.get()
+
+
 def get_current_session_key(default: str = "default") -> str:
     """Return the active session key, preferring context-local state.
 

@@ -59,6 +59,66 @@ def _start_wait(
 
 
 class TestAwaitAndResolve:
+    def test_strict_resolution_does_not_release_a_different_question(self):
+        waiter, result = _start_wait("call-current")
+        try:
+            assert resolve_user_input(SESSION, "stale", "call-old", strict=True) is False
+            assert user_input._wait_registry.pending_count(SESSION) == 1
+            assert resolve_user_input(SESSION, "current", "call-current", strict=True) is True
+            waiter.join(timeout=3)
+            assert result["answer"] == "current"
+        finally:
+            clear_session(SESSION)
+            waiter.join(timeout=3)
+
+    def test_commits_control_before_the_waiting_worker_resumes(self):
+        committed = threading.Event()
+        observed: list[bool] = []
+
+        def worker():
+            await_user_input(SESSION, "call-1")
+            observed.append(committed.is_set())
+
+        waiter = threading.Thread(target=worker)
+        waiter.start()
+        try:
+            assert _wait_until_blocked()
+            assert resolve_user_input(
+                SESSION, "superseded", "call-1", strict=True,
+                before_release=committed.set,
+            ) is True
+            waiter.join(timeout=3)
+            assert observed == [True]
+        finally:
+            clear_session(SESSION)
+            waiter.join(timeout=3)
+
+    def test_waiter_inherits_the_dispatchers_tool_identity(self):
+        from tools.approval import (
+            reset_current_observability_context,
+            set_current_observability_context,
+        )
+
+        result: dict[str, object] = {}
+
+        def worker():
+            token = set_current_observability_context(tool_call_id="call-bound")
+            try:
+                result["answer"] = await_user_input(SESSION)
+            finally:
+                reset_current_observability_context(token)
+
+        waiter = threading.Thread(target=worker)
+        waiter.start()
+        try:
+            assert _wait_until_blocked()
+            assert resolve_user_input(SESSION, "answer", "call-bound", strict=True) is True
+            waiter.join(timeout=3)
+            assert result["answer"] == "answer"
+        finally:
+            clear_session(SESSION)
+            waiter.join(timeout=3)
+
     def test_resolve_delivers_the_answer_to_a_blocked_await(self):
         result: dict[str, object] = {}
 
