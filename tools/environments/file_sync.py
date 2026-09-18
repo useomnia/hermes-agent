@@ -108,7 +108,7 @@ def iter_sprites_sync_files(
     ]
 
 
-SPRITES_DELEGATION_ROOT = "/tmp/.hermes-session/cache/delegation"
+SPRITES_DELEGATION_ROOT = "/tmp/.omnio-session/cache/delegation"
 
 
 def iter_sprites_delegation_files() -> list[tuple[str, str]]:
