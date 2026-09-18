@@ -205,6 +205,7 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities.\n"
     "\n"
     "## Skill Safety Rule\n"
+    "A `[SKILL_INCOMPLETE:` receipt is an index, not a loaded skill. Read all required instructions through its section selectors before acting. Keep the same file_path when recovering a linked reference. A returned section or part does not mean the rest of the skill was loaded.\n"
     "1. **UNAVAILABLE** — If a skill placeholder contains `[SKILL_PRUNED]`, the skill content was lost in compression and is inaccessible.\n"
     "2. **RELOAD** — Before performing any action that depends on a skill, re-check its content with `skill_view(name='...')` if it shows `[SKILL_PRUNED]`.\n"
     "3. **WAIT** — If a skill is loading or was just pruned, wait for the reload confirmation before proceeding.\n"
