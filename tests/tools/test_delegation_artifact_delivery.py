@@ -91,7 +91,7 @@ def test_summary_path_can_be_read_completely_from_toolbox(pair):
     home, toolbox, env, requests = pair
     expected = "worker instruction\n" * 3000 + "FINAL RESULT"
     path = _spill_summary_to_file(0, expected)
-    assert path.startswith(SPRITES_DELEGATION_ROOT + "/")
+    assert path.startswith("/tmp/.omnio-session/cache/delegation/")
     result = SpritesFileOperations(env).read_file_raw(path)
     assert result.content == expected
     assert (toolbox / path.lstrip("/")).read_text() == expected
@@ -100,6 +100,7 @@ def test_summary_path_can_be_read_completely_from_toolbox(pair):
 def test_live_log_refreshes_before_each_parent_read(pair):
     home, toolbox, env, requests = pair
     _, writers, paths = create_live_transcripts([{"goal": "write"}])
+    assert paths[0].startswith("/tmp/.omnio-session/cache/delegation/")
     writers[0].assistant_text("FIRST OBSERVATION")
     assert "FIRST OBSERVATION" in SpritesFileOperations(env).read_file_raw(paths[0]).content
     writers[0].assistant_text("FINAL OBSERVATION")
