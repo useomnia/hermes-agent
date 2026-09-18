@@ -3540,8 +3540,8 @@ def delegate_task(
                 payload["live_transcripts_hint"] = (
                     "Each subagent streams a human-readable transcript of its "
                     "operations to the file listed above (append-only, one per "
-                    "task). Read or `tail -f` these paths at any time to watch "
-                    "a child work while it runs."
+                    "task). Read these paths to inspect a child while it runs. "
+                    "On remote backends, read again to refresh the snapshot."
                 )
             return json.dumps(payload, ensure_ascii=False)
 
@@ -3889,9 +3889,8 @@ def _build_top_level_description() -> str:
         "one append-only human-readable log file per task (under "
         "cache/delegation/live/<delegation_id>/). Each child streams its "
         "assistant text, tool calls, and tool results there while it runs. "
-        "Read (or `tail -f` in a terminal) those paths any time you or the "
-        "user want to see what a subagent is actually doing instead of "
-        "waiting for the final summary.\n\n"
+        "Read those paths to inspect a subagent before its final summary. "
+        "On remote backends, read again to refresh the snapshot.\n\n"
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
