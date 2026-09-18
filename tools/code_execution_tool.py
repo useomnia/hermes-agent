@@ -731,6 +731,8 @@ def _call(tool_name, args):
         pass
 
     result = json.loads(raw)
+    if isinstance(result, dict) and result.get("_rpc_transport_error"):
+        raise RuntimeError(result["_rpc_transport_error"])
     if isinstance(result, str):
         try:
             result = json.loads(result)
@@ -1005,6 +1007,14 @@ def _get_or_create_env(task_id: str):
 _SHIP_CHUNK_CHARS = 24_000
 
 
+def _checked_remote_execute(env, command: str, *, timeout: int = 30) -> dict:
+    """A nonzero shell exit must never count as successful response delivery."""
+    result = env.execute(command, cwd="/", timeout=timeout)
+    if result.get("returncode", 1) != 0:
+        raise RuntimeError("Remote file operation failed")
+    return result
+
+
 def _ship_file_to_remote(env, remote_path: str, content: str) -> None:
     """Write *content* to *remote_path* on the remote environment.
 
@@ -1031,18 +1041,14 @@ def _ship_file_to_remote(env, remote_path: str, content: str) -> None:
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     quoted_remote_path = shlex.quote(remote_path)
     quoted_b64_path = shlex.quote(f"{remote_path}.b64")
+    # Truncate staging even for an empty response and on every delivery retry.
+    _checked_remote_execute(env, f": > {quoted_b64_path}")
     for index in range(0, len(encoded), _SHIP_CHUNK_CHARS):
         chunk = encoded[index:index + _SHIP_CHUNK_CHARS]
-        redirect = ">" if index == 0 else ">>"
-        env.execute(
-            f"printf %s '{chunk}' {redirect} {quoted_b64_path}",
-            cwd="/",
-            timeout=30,
-        )
-    env.execute(
+        _checked_remote_execute(env, f"printf %s '{chunk}' >> {quoted_b64_path}")
+    _checked_remote_execute(
+        env,
         f"base64 -d < {quoted_b64_path} > {quoted_remote_path} && rm -f {quoted_b64_path}",
-        cwd="/",
-        timeout=30,
     )
 
 
@@ -1174,6 +1180,7 @@ def _rpc_poll_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    delivery_errors: Optional[list] = None,
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -1186,6 +1193,10 @@ def _rpc_poll_loop(
     poll_interval = 0.1  # 100 ms
 
     quoted_rpc_dir = shlex.quote(rpc_dir)
+    # A request is executed once for this RPC lifetime. Keep its result even
+    # after publication: a failed unlink or a stale listing cannot replay it.
+    completed = {}
+    delivery_attempts = {}
     while not stop_event.is_set():
         try:
             # List pending request files (skip .tmp partials)
@@ -1244,70 +1255,87 @@ def _rpc_poll_loop(
                 res_file = f"{rpc_dir}/res_{seq_str}"
                 quoted_res_file = shlex.quote(res_file)
 
-                # Enforce allow-list
-                if tool_name not in allowed_tools:
-                    available = ", ".join(sorted(allowed_tools))
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool '{tool_name}' is not available in execute_code. "
-                            f"Available: {available}"
-                        )
-                    })
-                # Enforce tool call limit
-                elif tool_call_counter[0] >= max_tool_calls:
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool call limit reached ({max_tool_calls}). "
-                            "No more tool calls allowed in this execution."
-                        )
-                    })
+                if req_file in completed:
+                    tool_result = completed[req_file]
                 else:
-                    # Strip forbidden terminal parameters
-                    if tool_name == "terminal" and isinstance(tool_args, dict):
-                        for param in _TERMINAL_BLOCKED_PARAMS:
-                            tool_args.pop(param, None)
-
-                    # Dispatch through the standard tool handler
-                    try:
-                        _real_stdout, _real_stderr = sys.stdout, sys.stderr
-                        devnull = open(os.devnull, "w", encoding="utf-8")
-                        try:
-                            sys.stdout = devnull
-                            sys.stderr = devnull
-                            tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
+                    # Enforce allow-list
+                    if tool_name not in allowed_tools:
+                        available = ", ".join(sorted(allowed_tools))
+                        tool_result = json.dumps({
+                            "error": (
+                                f"Tool '{tool_name}' is not available in execute_code. "
+                                f"Available: {available}"
                             )
-                        finally:
-                            sys.stdout, sys.stderr = _real_stdout, _real_stderr
-                            devnull.close()
-                    except Exception as exc:
-                        logger.error("Tool call failed in remote sandbox: %s",
-                                     exc, exc_info=True)
-                        tool_result = tool_error(str(exc))
+                        })
+                    # Enforce tool call limit
+                    elif tool_call_counter[0] >= max_tool_calls:
+                        tool_result = json.dumps({
+                            "error": (
+                                f"Tool call limit reached ({max_tool_calls}). "
+                                "No more tool calls allowed in this execution."
+                            )
+                        })
+                    else:
+                        # Strip forbidden terminal parameters
+                        if tool_name == "terminal" and isinstance(tool_args, dict):
+                            for param in _TERMINAL_BLOCKED_PARAMS:
+                                tool_args.pop(param, None)
 
-                    tool_call_counter[0] += 1
-                    call_duration = time.monotonic() - call_start
-                    tool_call_log.append({
-                        "tool": tool_name,
-                        "args_preview": str(tool_args)[:80],
-                        "duration": round(call_duration, 2),
-                    })
+                        # Dispatch through the standard tool handler
+                        try:
+                            _real_stdout, _real_stderr = sys.stdout, sys.stderr
+                            devnull = open(os.devnull, "w", encoding="utf-8")
+                            try:
+                                sys.stdout = devnull
+                                sys.stderr = devnull
+                                tool_result = handle_function_call(
+                                    tool_name, tool_args, task_id=task_id
+                                )
+                            finally:
+                                sys.stdout, sys.stderr = _real_stdout, _real_stderr
+                                devnull.close()
+                        except Exception as exc:
+                            logger.error("Tool call failed in remote sandbox: %s",
+                                         exc, exc_info=True)
+                            tool_result = tool_error(str(exc))
 
-                # Write response atomically (tmp + rename).
-                # Use echo piping (not stdin_data) because Modal doesn't
-                # reliably deliver stdin to chained commands.
-                encoded_result = base64.b64encode(
-                    tool_result.encode("utf-8")
-                ).decode("ascii")
-                env.execute(
-                    f"echo '{encoded_result}' | base64 -d > {quoted_res_file}.tmp"
-                    f" && mv {quoted_res_file}.tmp {quoted_res_file}",
-                    cwd="/",
-                    timeout=60,
-                )
+                        tool_call_counter[0] += 1
+                        call_duration = time.monotonic() - call_start
+                        tool_call_log.append({
+                            "tool": tool_name,
+                            "args_preview": str(tool_args)[:80],
+                            "duration": round(call_duration, 2),
+                        })
 
-                # Remove the request file
-                env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                    completed[req_file] = tool_result
+
+                try:
+                    _ship_file_to_remote(env, res_file + ".tmp", tool_result)
+                    _checked_remote_execute(
+                        env, f"mv {quoted_res_file}.tmp {quoted_res_file}"
+                    )
+                except Exception:
+                    attempts = delivery_attempts.get(req_file, 0) + 1
+                    delivery_attempts[req_file] = attempts
+                    if attempts < 3:
+                        continue
+                    message = "RPC result delivery failed; the tool already ran and was not repeated."
+                    if delivery_errors is not None:
+                        delivery_errors.append(message)
+                    logger.warning("Remote RPC response delivery failed after %d attempts", attempts)
+                    # A small receipt can still cross a size-limited transport.
+                    # The generated client raises instead of mistaking it for data.
+                    completed[req_file] = json.dumps({"_rpc_transport_error": message})
+                    try:
+                        _ship_file_to_remote(env, res_file + ".tmp", completed[req_file])
+                        _checked_remote_execute(env, f"mv {quoted_res_file}.tmp {quoted_res_file}")
+                    except Exception:
+                        # The transport is unavailable even for an error receipt.
+                        # End polling; the bounded script execution reports the
+                        # recorded infrastructure failure, without another dispatch.
+                        return
+
+                _checked_remote_execute(env, f"rm -f {quoted_req_file}", timeout=5)
 
         except Exception as e:
             if not stop_event.is_set():
@@ -1344,6 +1372,7 @@ def _execute_remote(
     quoted_sandbox_dir = shlex.quote(sandbox_dir)
     quoted_rpc_dir = shlex.quote(f"{sandbox_dir}/rpc")
 
+    delivery_errors: list = []
     tool_call_log: list = []
     tool_call_counter = [0]
     exec_start = time.monotonic()
@@ -1397,7 +1426,7 @@ def _execute_remote(
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event, rpc_token,
+                sandbox_tools, stop_event, rpc_token, delivery_errors,
             ),
             daemon=True,
         )
@@ -1533,6 +1562,9 @@ def _execute_remote(
         result["status"] = "error"
         result["error"] = f"Script exited with code {exit_code}"
 
+    if delivery_errors:
+        result["status"] = "error"
+        result["error"] = delivery_errors[-1]
     return json.dumps(result, ensure_ascii=False)
 
 

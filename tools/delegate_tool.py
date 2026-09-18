@@ -1811,7 +1811,8 @@ def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
         ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = cache_dir / f"subagent-summary-{task_index}-{ts}.txt"
         path.write_text(summary, encoding="utf-8")
-        return str(path)
+        from tools.credential_files import to_agent_visible_cache_path
+        return to_agent_visible_cache_path(str(path))
     except Exception as exc:
         logger.debug("Failed to spill subagent summary to file: %s", exc)
         return None
@@ -1892,9 +1893,14 @@ def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]
         if not isinstance(context_length, int) or context_length <= 0:
             return None
 
-        used_tokens = getattr(parent_agent, "session_prompt_tokens", 0)
-        if not isinstance(used_tokens, (int, float)) or used_tokens < 0:
-            used_tokens = 0
+        # Session totals count the same growing prompt on every request. Only
+        # the current parent prompt occupies its context window (#103486).
+        used_tokens = getattr(parent_agent, "_last_prompt_size_tokens", None)
+        if not isinstance(used_tokens, (int, float)) or used_tokens <= 0:
+            usage = getattr(parent_agent, "_last_turn_usage", None)
+            used_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        if not isinstance(used_tokens, (int, float)) or used_tokens <= 0:
+            return None
 
         # Reserve the compressor's output budget so we measure INPUT headroom.
         reserved = getattr(compressor, "max_tokens", 0) or 0
@@ -2966,7 +2972,14 @@ def delegate_task(
                 f"delegate_task calls, or increase "
                 f"delegation.max_concurrent_children in config.yaml."
             )
-        task_list = tasks
+        # Older prompts exposed shared context beside tasks[]. Preserve that
+        # input while the new model-facing schema asks for per-task context.
+        task_list = [dict(task) if isinstance(task, dict) else task for task in tasks]
+        if isinstance(context, str) and context.strip():
+            for task in task_list:
+                if isinstance(task, dict):
+                    own = task.get("context")
+                    task["context"] = context + ("\n\n" + own if isinstance(own, str) and own else "")
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [{"goal": goal, "context": context, "role": top_role}]
     else:
@@ -3527,8 +3540,8 @@ def delegate_task(
                 payload["live_transcripts_hint"] = (
                     "Each subagent streams a human-readable transcript of its "
                     "operations to the file listed above (append-only, one per "
-                    "task). Read or `tail -f` these paths at any time to watch "
-                    "a child work while it runs."
+                    "task). Read these paths to inspect a child while it runs. "
+                    "On remote backends, read again to refresh the snapshot."
                 )
             return json.dumps(payload, ensure_ascii=False)
 
@@ -3861,12 +3874,12 @@ def _build_top_level_description() -> str:
         "Each subagent gets its own conversation, terminal session, and toolset. "
         "Only the final summary is returned -- intermediate tool results "
         "never enter your context window.\n\n"
-        "TWO MODES (one of 'goal' or 'tasks' is required):\n"
-        "1. Single task: provide 'goal' (+ optional context and role).\n"
-        f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
+        "Provide tasks[] even for one child. Include all required source material "
+        "and instructions in EACH task's context; workers do not share context.\n"
+        f"Provide up to {max_children} "
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
-        "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately — "
+        "DELEGATIONS RUN IN THE BACKGROUND. delegate_task returns immediately — "
         "you and the user keep working, and the completed result re-enters "
         "the conversation as a new message. A "
         "batch returns one handle, runs N subagents concurrently, and delivers "
@@ -3876,9 +3889,8 @@ def _build_top_level_description() -> str:
         "one append-only human-readable log file per task (under "
         "cache/delegation/live/<delegation_id>/). Each child streams its "
         "assistant text, tool calls, and tool results there while it runs. "
-        "Read (or `tail -f` in a terminal) those paths any time you or the "
-        "user want to see what a subagent is actually doing instead of "
-        "waiting for the final summary.\n\n"
+        "Read those paths to inspect a subagent before its final summary. "
+        "On remote backends, read again to refresh the snapshot.\n\n"
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
@@ -3932,7 +3944,7 @@ def _build_tasks_param_description() -> str:
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
-        "When provided, top-level goal/context/role are ignored."
+        "Repeat shared source material and instructions in each task context."
     )
 
 
@@ -3988,7 +4000,12 @@ def _build_dynamic_schema_overrides() -> dict:
         k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
-    overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    tasks_param = overrides_params["properties"]["tasks"]
+    tasks_param["items"] = {**tasks_param["items"], "properties": {
+        **tasks_param["items"]["properties"],
+        "role": {**tasks_param["items"]["properties"]["role"],
+                 "description": _build_role_param_description()},
+    }}
 
     return {
         "description": _build_top_level_description(),
@@ -4014,22 +4031,6 @@ DELEGATE_TASK_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "goal": {
-                "type": "string",
-                "description": (
-                    "What the subagent should accomplish. Be specific and "
-                    "self-contained -- the subagent knows nothing about your "
-                    "conversation history."
-                ),
-            },
-            "context": {
-                "type": "string",
-                "description": (
-                    "Background information the subagent needs: file paths, "
-                    "error messages, project structure, constraints. The more "
-                    "specific you are, the better the subagent performs."
-                ),
-            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4043,7 +4044,7 @@ DELEGATE_TASK_SCHEMA = {
                         "role": {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
-                            "description": "Per-task role override. See top-level 'role' for semantics.",
+                            "description": "Per-task role: leaf or orchestrator; existing depth and permission limits apply.",
                         },
                     },
                     "required": ["goal"],
@@ -4053,25 +4054,8 @@ DELEGATE_TASK_SCHEMA = {
                 # enforced with a clear error in delegate_task().
                 "description": "(rebuilt at get_definitions() time)",
             },
-            "role": {
-                "type": "string",
-                "enum": ["leaf", "orchestrator"],
-                "description": "(rebuilt at get_definitions() time)",
-            },
-            "background": {
-                "type": "boolean",
-                "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
-                    "Setting this has no effect; the parameter remains only for "
-                    "backward compatibility."
-                ),
-            },
         },
-        "required": [],
+        "required": ["tasks"],
     },
 }
 

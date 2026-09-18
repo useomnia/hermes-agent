@@ -1211,6 +1211,7 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+    agent._last_prompt_size_tokens = None
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -2972,6 +2973,9 @@ def run_conversation(
                     # rate, not the aggregator's, so they are added as dollars
                     # (below) rather than folded into the priced usage.
                     aggregator_usage = canonical_usage
+                    # Keep the parent's actual prompt size separate from both
+                    # cumulative billing and the adviser fan-out below.
+                    agent._last_prompt_size_tokens = canonical_usage.prompt_tokens
                     # MoA: fold the reference (advisor) fan-out's token usage
                     # into this turn's REPORTED token counts. MoA runs advisors
                     # before the aggregator and returns only the aggregator's

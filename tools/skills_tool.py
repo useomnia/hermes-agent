@@ -1013,6 +1013,25 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    section: str = None,
+) -> str:
+    """Load a complete skill document, or recover a named section of it."""
+    result = _load_skill_content(name, file_path, task_id, preprocess)
+    if not section:
+        return result
+    from tools.skill_delivery import _apply_section_selection, render_skill_result
+
+    payload = json.loads(result)
+    if payload.get("success"):
+        _apply_section_selection(payload, section)
+    return render_skill_result(payload)
+
+
+def _load_skill_content(
+    name: str,
+    file_path: str = None,
+    task_id: str = None,
+    preprocess: bool = True,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -1774,6 +1793,10 @@ SKILL_VIEW_SCHEMA = {
                 "type": "string",
                 "description": "OPTIONAL: Path to a linked file within the skill (e.g., 'references/api.md', 'templates/config.yaml', 'scripts/validate.py'). Omit to get the main SKILL.md content.",
             },
+            "section": {
+                "type": "string",
+                "description": "Recover a complete named section or selector from a SKILL_INCOMPLETE receipt. Follow its section index until all required instructions are read. For a linked document, keep the SAME file_path on every recovery call.",
+            },
         },
         "required": ["name"],
     },
@@ -1794,7 +1817,8 @@ def _skill_view_with_bump(args, **kw):
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
     result = skill_view(
-        name, file_path=args.get("file_path"), task_id=kw.get("task_id")
+        name, file_path=args.get("file_path"), task_id=kw.get("task_id"),
+        section=args.get("section"),
     )
     try:
         parsed = json.loads(result)
@@ -1813,6 +1837,11 @@ def _skill_view_with_bump(args, **kw):
         pass
     return result
 
+
+from tools.oversized_result_formatters import register_formatter
+from tools.skill_delivery import _skill_view_incomplete_result
+
+register_formatter("skill_view", _skill_view_incomplete_result)
 
 registry.register(
     name="skill_view",

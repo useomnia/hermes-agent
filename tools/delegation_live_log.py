@@ -336,7 +336,8 @@ def create_live_transcripts(
             )
             writers.append(w if w.path is not None else None)
             if w.path is not None:
-                paths.append(str(w.path))
+                from tools.credential_files import to_agent_visible_cache_path
+                paths.append(to_agent_visible_cache_path(str(w.path)))
         if not paths:
             return None, [None] * n, []
         _write_manifest(deleg_id, task_list, paths)

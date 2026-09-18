@@ -25,6 +25,7 @@ class _FakeParent:
     def __init__(self, context_length, used_tokens, max_tokens):
         self.context_compressor = _FakeCompressor(context_length, max_tokens)
         self.session_prompt_tokens = used_tokens
+        self._last_turn_usage = {"prompt_tokens": used_tokens}
 
 
 def test_small_summaries_pass_through_untouched():
@@ -124,3 +125,25 @@ def test_empty_results_is_noop():
         [{"task_index": 0, "status": "failed", "summary": None}],
         _FakeParent(131_000, 1_000, 8_000),
     )
+
+
+def test_cumulative_usage_does_not_shrink_a_worker_reply():
+    parent = _FakeParent(1_050_000, 213_009, 8_000)
+    parent.session_prompt_tokens = 4_812_272
+    original = "worker result\n" + "x" * 20_100
+    results = [{"task_index": i, "summary": original} for i in range(3)]
+    dt._apply_summary_budget(results, parent)
+    assert all(result["summary"] == original for result in results)
+
+
+def test_unknown_current_usage_does_not_fall_back_to_session_total():
+    parent = _FakeParent(1_050_000, 4_812_272, 8_000)
+    parent._last_turn_usage = None
+    assert dt._parent_summary_char_budget(parent, 3) is None
+
+
+def test_parent_prompt_size_excludes_adviser_usage():
+    parent = _FakeParent(200_000, 250_000, 8_000)
+    parent._last_prompt_size_tokens = 30_000
+    expected = dt._parent_summary_char_budget(_FakeParent(200_000, 30_000, 8_000), 3)
+    assert dt._parent_summary_char_budget(parent, 3) == expected

@@ -483,12 +483,22 @@ def to_agent_visible_cache_path(
 
     Returns the input unchanged if it is not under any auto-mounted cache
     directory, or if the active terminal backend does not require path
-    translation (only Docker for now).
+    translation (Docker and Sprites).
     """
-    # Only Docker backend requires translation at this time.  Other backends
-    # (Modal, Daytona) use different mount semantics and will be
+    # Docker mounts caches; Sprites copies only delegation artifacts. Other
+    # backends (Modal, Daytona) use different mount semantics and will be
     # addressed separately if needed.  Backend is identified by TERMINAL_ENV
     # (same env var tools/terminal_tool.py reads in _get_environment_config).
+    if os.environ.get("TERMINAL_ENV", "local") == "sprites":
+        from hermes_constants import get_hermes_dir
+        from tools.environments.file_sync import SPRITES_DELEGATION_ROOT
+
+        root = get_hermes_dir("cache/delegation", "delegation_cache")
+        try:
+            relative = Path(host_path).resolve().relative_to(root.resolve())
+        except ValueError:
+            return host_path
+        return posixpath.join(SPRITES_DELEGATION_ROOT, relative.as_posix())
     if os.environ.get("TERMINAL_ENV", "local") != "docker":
         return host_path
 
