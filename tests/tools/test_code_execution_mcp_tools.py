@@ -12,8 +12,12 @@ sandbox's reach beyond the session's: a tool absent from the session list must b
 absent from the sandbox, whatever the registry knows about it.
 """
 
+import base64
 import json
 import os
+from pathlib import Path
+import subprocess
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -547,7 +551,13 @@ class TestShipFileToRemote(unittest.TestCase):
 
         def execute(self, command, cwd=None, timeout=None):
             self.commands.append(command)
-            return {"output": "", "returncode": 0}
+            if len(command) >= 32_000:
+                raise ValueError("Remote command exceeds the transport limit")
+            result = subprocess.run(
+                ["bash", "-c", command], cwd=cwd,
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return {"output": result.stdout, "returncode": result.returncode}
 
     def test_prefers_the_backends_own_file_write(self):
         env = self._EnvWithWriter()
@@ -568,21 +578,25 @@ class TestShipFileToRemote(unittest.TestCase):
     def test_shell_fallback_chunks_a_large_file(self):
         """A module the size of a real MCP catalog must not become one command."""
         env = self._EnvShellOnly()
-        _ship_file_to_remote(env, "/tmp/x/mod.py", "x = 1\n" * 20_000)
-        self.assertGreater(len(env.commands), 2)
-        for command in env.commands:
-            self.assertLess(len(command), 32_000)
-        self.assertTrue(env.commands[0].startswith("printf %s "))
-        self.assertIn(">>", env.commands[1])
-        self.assertIn("base64 -d", env.commands[-1])
-        self.assertIn("rm -f", env.commands[-1])
+        content = "x = 'ñ'\n" * 20_000 + "# final instruction\n"
+        with TemporaryDirectory() as directory:
+            target = Path(directory) / "module with spaces.py"
+            _ship_file_to_remote(env, str(target), content)
+            self.assertEqual(target.read_bytes(), content.encode("utf-8"))
+            self.assertFalse(Path(f"{target}.b64").exists())
 
-    def test_shell_fallback_writes_a_small_file_in_one_chunk(self):
-        env = self._EnvShellOnly()
-        _ship_file_to_remote(env, "/tmp/x/mod.py", "print('hi')")
-        self.assertEqual(len(env.commands), 2)  # one write + the decode
-        self.assertIn(">", env.commands[0])
-        self.assertNotIn(">>", env.commands[0])
+    def test_shell_fallback_replaces_stale_content_including_empty_files(self):
+        """Retries must discard staging left behind by an interrupted write."""
+        for content in ("print('hi')", ""):
+            with self.subTest(content=content), TemporaryDirectory() as directory:
+                env = self._EnvShellOnly()
+                target = Path(directory) / "module with spaces.py"
+                staging = Path(f"{target}.b64")
+                target.write_text("old destination", encoding="utf-8")
+                staging.write_bytes(base64.b64encode(b"stale partial upload"))
+                _ship_file_to_remote(env, str(target), content)
+                self.assertEqual(target.read_bytes(), content.encode("utf-8"))
+                self.assertFalse(staging.exists())
 
 
 # ---------------------------------------------------------------------------
