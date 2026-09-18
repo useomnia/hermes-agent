@@ -16,7 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from tools.environments.base import BaseEnvironment, _ThreadedProcessHandle
-from tools.environments.file_sync import FileSyncManager, iter_sprites_sync_files
+from tools.environments.file_sync import (
+    FileSyncManager, SPRITES_DELEGATION_ROOT, iter_sprites_delegation_files,
+    iter_sprites_sync_files,
+)
 from tools.file_operations import (
     PatchResult,
     ReadResult,
@@ -254,6 +257,12 @@ class SpritesEnvironment(BaseEnvironment):
             delete_fn=self._sprites_delete,
             bulk_upload_fn=self._sprites_bulk_upload,
         )
+        self._delegation_sync_lock = threading.Lock()
+        self._delegation_sync_manager = FileSyncManager(
+            get_files_fn=iter_sprites_delegation_files,
+            upload_fn=self._upload_delegation_artifact,
+            delete_fn=self._delete_delegation_artifacts,
+        )
         self._sync_manager.sync(force=True)
         self.init_session()
 
@@ -409,6 +418,7 @@ class SpritesEnvironment(BaseEnvironment):
         if max_bytes < 1:
             raise ValueError("max_bytes must be positive")
         path = _canonicalize_toolbox_path(path)
+        self.sync_delegation_artifacts()
         query = urllib.parse.urlencode({"path": path})
         request = urllib.request.Request(
             f"{self.toolbox_url}/files?{query}",
@@ -523,8 +533,57 @@ class SpritesEnvironment(BaseEnvironment):
                 )
             self.file_request({"operation": "deleteSkills", "path": remote_path, "missingOk": True})
 
+    def _upload_delegation_artifact(self, host_path: str, remote_path: str) -> None:
+        remote_path = _canonicalize_toolbox_path(remote_path)
+        if not remote_path.startswith(SPRITES_DELEGATION_ROOT + "/"):
+            raise SpritesToolboxError("Refused artifact outside delegation cache")
+        from tools.delegation_live_log import _redact
+
+        content = _redact(Path(host_path).read_text(encoding="utf-8"))
+        if len(content.encode("utf-8")) <= _MAX_FILE_CONTENT_BYTES:
+            if not self.write_file_content(remote_path, content):
+                raise SpritesToolboxError("Delegation artifact transfer failed")
+            return
+        self._write_large_delegation_artifact(remote_path, content)
+
+    def _write_large_delegation_artifact(self, path: str, content: str) -> None:
+        """The existing atomic raw-file endpoint avoids the JSON write cap."""
+        data = content.encode("utf-8")
+        query = urllib.parse.urlencode({
+            "path": path, "overwrite": "true", "maxBytes": len(data),
+        })
+        request = urllib.request.Request(
+            f"{self.toolbox_url}/files?{query}", data=data, method="PUT",
+            headers={"Authorization": f"Bearer {self.bearer_token}",
+                     "X-Omnio-Brand": self.brand,
+                     "Content-Type": "application/octet-stream"},
+        )
+        try:
+            with _URL_OPENER.open(request, timeout=self.timeout) as response:
+                result = json.loads(response.read(_MAX_RESPONSE_BYTES + 1))
+            if result.get("bytesWritten") != len(data):
+                raise SpritesToolboxError("Delegation artifact transfer was incomplete")
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            raise SpritesToolboxError("Delegation artifact transfer failed") from exc
+
+    def _delete_delegation_artifacts(self, paths: list[str]) -> None:
+        for path in paths:
+            path = _canonicalize_toolbox_path(path)
+            if not path.startswith(SPRITES_DELEGATION_ROOT + "/"):
+                raise SpritesToolboxError("Refused artifact outside delegation cache")
+            result = self.file_request({"operation": "delete", "path": path})
+            if result.get("error"):
+                raise SpritesToolboxError("Delegation artifact removal failed")
+
+    def sync_delegation_artifacts(self, *, raise_on_error: bool = True) -> None:
+        manager = getattr(self, "_delegation_sync_manager", None)
+        if manager is not None:
+            with self._delegation_sync_lock:
+                manager.sync(force=True, raise_on_error=raise_on_error)
+
     def _before_execute(self) -> None:
         self._sync_manager.sync()
+        self.sync_delegation_artifacts(raise_on_error=False)
 
     def _run_bash(
         self,
@@ -651,6 +710,9 @@ class SpritesFileOperations(ShellFileOperations):
             if isinstance(value, str) and value.startswith("~"):
                 payload[key] = self._expand_path(value)
         try:
+            if (payload.get("operation") in {"read", "readRaw", "search", "stat"}
+                    and str(payload.get("path", "")).startswith(SPRITES_DELEGATION_ROOT + "/")):
+                self.env.sync_delegation_artifacts()
             return self.env.file_request(payload)
         except SpritesToolboxError as error:
             operation = str(payload.get("operation", "unknown"))

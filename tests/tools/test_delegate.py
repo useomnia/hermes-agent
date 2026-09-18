@@ -68,9 +68,9 @@ class TestDelegateRequirements(unittest.TestCase):
     def test_schema_valid(self):
         self.assertEqual(DELEGATE_TASK_SCHEMA["name"], "delegate_task")
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
-        self.assertIn("goal", props)
+        self.assertNotIn("goal", props)
         self.assertIn("tasks", props)
-        self.assertIn("context", props)
+        self.assertNotIn("context", props)
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -105,7 +105,7 @@ class TestDelegateRequirements(unittest.TestCase):
 
         desc = overrides["description"]
         tasks_desc = overrides["parameters"]["properties"]["tasks"]["description"]
-        role_desc = overrides["parameters"]["properties"]["role"]["description"]
+        role_desc = overrides["parameters"]["properties"]["tasks"]["items"]["properties"]["role"]["description"]
 
         # Top-level description names the user's concurrency limit explicitly.
         self.assertIn(f"up to {max_children}", desc)
@@ -423,6 +423,20 @@ class TestDelegateTask(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("Too many tasks", result["error"])
         mock_run.assert_not_called()
+
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_legacy_shared_context_reaches_every_worker(self, mock_run, mock_build):
+        mock_run.return_value = {
+            "task_index": 0, "status": "completed", "summary": "Done",
+            "api_calls": 1, "duration_seconds": 1.0,
+        }
+        tasks = [{"goal": "Translate", "context": "French"}, {"goal": "Review"}]
+        delegate_task(tasks=tasks, context="Full source and governing rules", parent_agent=_make_mock_parent())
+        contexts = {call.kwargs["goal"]: call.kwargs["context"] for call in mock_build.call_args_list}
+        self.assertEqual(contexts["Translate"], "Full source and governing rules\n\nFrench")
+        self.assertEqual(contexts["Review"], "Full source and governing rules")
+        self.assertEqual(tasks, [{"goal": "Translate", "context": "French"}, {"goal": "Review"}])
 
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_ignores_toplevel_goal(self, mock_run):
@@ -2856,11 +2870,10 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         self.assertEqual(child._delegate_role, "leaf")
         self.assertTrue(any("coercing" in m.lower() for m in cm.output))
 
-    def test_schema_has_role_top_level_and_per_task(self):
+    def test_schema_has_only_per_task_role(self):
         from tools.delegate_tool import DELEGATE_TASK_SCHEMA
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
-        self.assertIn("role", props)
-        self.assertEqual(props["role"]["enum"], ["leaf", "orchestrator"])
+        self.assertNotIn("role", props)
         task_props = props["tasks"]["items"]["properties"]
         self.assertIn("role", task_props)
         self.assertEqual(task_props["role"]["enum"], ["leaf", "orchestrator"])

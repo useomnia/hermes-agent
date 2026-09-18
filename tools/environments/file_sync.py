@@ -108,6 +108,29 @@ def iter_sprites_sync_files(
     ]
 
 
+SPRITES_DELEGATION_ROOT = "/tmp/.hermes-session/cache/delegation"
+
+
+def iter_sprites_delegation_files() -> list[tuple[str, str]]:
+    """Only regular delegation artifacts may cross the harness boundary."""
+    from hermes_constants import get_hermes_dir
+
+    root = get_hermes_dir("cache/delegation", "delegation_cache")
+    if root.is_symlink() or not root.is_dir():
+        return []
+    files = []
+    for path in root.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if any(parent.is_symlink() for parent in path.parents if parent != root and root in parent.parents):
+            continue
+        if path.suffix not in {".txt", ".log", ".json"}:
+            continue
+        files.append((str(path), f"{SPRITES_DELEGATION_ROOT}/{relative.as_posix()}"))
+    return files
+
+
 def _credential_host_paths() -> set[str]:
     """Return credential files that are upload-only for remote sandboxes."""
     try:
@@ -191,7 +214,7 @@ class FileSyncManager:
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
         self._sync_interval = sync_interval
 
-    def sync(self, *, force: bool = False) -> None:
+    def sync(self, *, force: bool = False, raise_on_error: bool = False) -> None:
         """Run a sync cycle: upload changed files, delete removed files.
 
         Rate-limited to once per ``sync_interval`` unless *force* is True
@@ -271,6 +294,8 @@ class FileSyncManager:
             # leaving the remote with stale files — contradicting this method's
             # documented "next cycle retries everything" contract.
             logger.warning("file_sync: sync failed, rolled back state: %s", exc)
+            if raise_on_error:
+                raise
 
     # ------------------------------------------------------------------
     # Sync-back: pull remote changes to host on teardown
