@@ -244,7 +244,7 @@ _LEGACY_TOOLSET_MAP = {
         "browser_navigate", "browser_snapshot", "browser_click",
         "browser_type", "browser_scroll", "browser_back",
         "browser_press", "browser_get_images",
-        "browser_vision", "browser_console"
+        "browser_vision", "browser_console", "browser_exec"
     ],
     "cronjob_tools": ["cronjob"],
     "file_tools": ["read_file", "write_file", "patch", "search_files"],
@@ -537,6 +537,18 @@ def _compute_tool_definitions(
                         "function": {**td["function"], "description": desc},
                     }
                     break
+
+    # browser_exec runs model-authored Python in a managed subprocess.  A
+    # session whose selected toolsets omit the terminal surface must not
+    # regain host code execution through the browser toolset.  This is a
+    # session-level gate, not a check_fn: registry availability checks are
+    # process-wide and TTL-cached while one gateway serves many sessions.
+    if "browser_exec" in available_tool_names and "terminal" not in available_tool_names:
+        filtered_tools = [
+            td for td in filtered_tools
+            if td.get("function", {}).get("name") != "browser_exec"
+        ]
+        available_tool_names.discard("browser_exec")
 
     if not quiet_mode:
         if filtered_tools:
