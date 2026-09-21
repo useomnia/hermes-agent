@@ -34,15 +34,16 @@ async def test_video_attachment_adds_path_note_without_document_wording():
     )
 
     with patch(
-        "tools.credential_files.to_agent_visible_cache_path",
+        "tools.credential_files.publish_cache_path",
         side_effect=lambda path: path,
-    ):
+    ) as publish:
         result = await runner._prepare_inbound_message_text(
             event=event,
             source=source,
             history=[],
         )
 
+    publish.assert_called_once_with("/tmp/video_clip.mp4")
     assert "video attachment" in result
     assert "/tmp/video_clip.mp4" in result
     assert "video analysis or media tool" in result

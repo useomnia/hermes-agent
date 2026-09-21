@@ -167,9 +167,12 @@ def test_skill_config_raw_cache_invalidates_on_config_edit(tmp_path, monkeypatch
     skill_utils._external_dirs_cache_clear()
     assert get_disabled_skill_names() == {"old-skill"}
 
+    previous_mtime = config_path.stat().st_mtime_ns
     config_path.write_text("skills:\n  disabled: [new-skill]\n", encoding="utf-8")
     import os
-    os.utime(config_path, None)
+    # Fast equal-sized writes can retain the same timestamp on Linux. This
+    # tests invalidation after a metadata change, not filesystem clock ticks.
+    os.utime(config_path, ns=(previous_mtime + 1_000_000_000,) * 2)
 
     assert get_disabled_skill_names() == {"new-skill"}
 

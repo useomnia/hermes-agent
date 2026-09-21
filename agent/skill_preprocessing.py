@@ -40,6 +40,8 @@ def substitute_template_vars(
     content: str,
     skill_dir: Path | None,
     session_id: str | None,
+    *,
+    runtime_paths: bool = True,
 ) -> str:
     """Replace ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} in skill content.
 
@@ -49,7 +51,11 @@ def substitute_template_vars(
     if not content:
         return content
 
+    from agent.skill_path_mapping import map_skill_dir_for_backend
+
     skill_dir_str = str(skill_dir) if skill_dir else None
+    if skill_dir and runtime_paths:
+        skill_dir_str = map_skill_dir_for_backend(skill_dir, task_id=session_id)
 
     def _replace(match: re.Match) -> str:
         token = match.group(1)
@@ -107,6 +113,8 @@ def expand_inline_shell(
     content: str,
     skill_dir: Path | None,
     timeout: int,
+    session_id: str | None = None,
+    template_vars: bool = False,
 ) -> str:
     """Replace every !`cmd` snippet in ``content`` with its stdout.
 
@@ -120,6 +128,10 @@ def expand_inline_shell(
         cmd = match.group(1).strip()
         if not cmd:
             return ""
+        if template_vars:
+            # Inline preprocessing still runs on the host. Runtime path
+            # translation applies only to instructions handed to the agent.
+            cmd = substitute_template_vars(cmd, skill_dir, session_id, runtime_paths=False)
         return run_inline_shell(cmd, skill_dir, timeout)
 
     return _INLINE_SHELL_RE.sub(_replace, content)
@@ -136,9 +148,9 @@ def preprocess_skill_content(
         return content
 
     cfg = skills_cfg if isinstance(skills_cfg, dict) else load_skills_config()
-    if cfg.get("template_vars", True):
-        content = substitute_template_vars(content, skill_dir, session_id)
     if cfg.get("inline_shell", False):
         timeout = int(cfg.get("inline_shell_timeout", 10) or 10)
-        content = expand_inline_shell(content, skill_dir, timeout)
+        content = expand_inline_shell(content, skill_dir, timeout, session_id, cfg.get("template_vars", True))
+    if cfg.get("template_vars", True):
+        content = substitute_template_vars(content, skill_dir, session_id)
     return content

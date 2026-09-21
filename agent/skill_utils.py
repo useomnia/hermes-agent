@@ -749,6 +749,21 @@ def _resolve_dotpath(config: Dict[str, Any], dotted_key: str):
     return current
 
 
+_HOME_VAR_RE = re.compile(r"\$(?:\{HOME\}|HOME)(?=$|[/\\])")
+
+
+def _expand_skill_config_path(value: str) -> str:
+    """Expand skill defaults against tool HOME, not the gateway account."""
+    from hermes_constants import get_subprocess_home
+
+    tool_home = "/home" if os.getenv("TERMINAL_ENV", "").strip().lower() == "sprites" else get_subprocess_home()
+    if tool_home:
+        if value == "~" or value.startswith(("~/", "~\\")):
+            value = tool_home + value[1:]
+        value = _HOME_VAR_RE.sub(lambda _match: tool_home, value)
+    return os.path.expanduser(os.path.expandvars(value))
+
+
 def resolve_skill_config_values(
     config_vars: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -771,8 +786,8 @@ def resolve_skill_config_values(
             value = var.get("default", "")
 
         # Expand ~ in path-like values
-        if isinstance(value, str) and ("~" in value or "${" in value):
-            value = os.path.expanduser(os.path.expandvars(value))
+        if isinstance(value, str) and ("~" in value or "$" in value):
+            value = _expand_skill_config_path(value)
 
         resolved[logical_key] = value
 

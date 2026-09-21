@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Optional
 
 from hermes_constants import display_hermes_home
@@ -296,19 +296,23 @@ def _build_skill_message(
     # Done before anything else so downstream blocks (setup notes,
     # supporting-file hints) see the expanded content.
     skills_cfg = _load_skills_config()
-    if skills_cfg.get("template_vars", True):
-        content = _substitute_template_vars(content, skill_dir, session_id)
     if skills_cfg.get("inline_shell", False):
         timeout = int(skills_cfg.get("inline_shell_timeout", 10) or 10)
-        content = _expand_inline_shell(content, skill_dir, timeout)
+        content = _expand_inline_shell(content, skill_dir, timeout, session_id, skills_cfg.get("template_vars", True))
+    if skills_cfg.get("template_vars", True):
+        content = _substitute_template_vars(content, skill_dir, session_id)
 
+    from agent.skill_path_mapping import map_skill_dir_for_backend
+
+    mapped_dir = map_skill_dir_for_backend(skill_dir, task_id=session_id) if skill_dir else None
+    hint_dir = PurePosixPath(mapped_dir) if mapped_dir and mapped_dir != str(skill_dir) else skill_dir
     parts = [activation_note, "", content.strip()]
 
     # ── Inject the absolute skill directory so the agent can reference
     #    bundled scripts without an extra skill_view() round-trip. ──
     if skill_dir:
         parts.append("")
-        parts.append(f"[Skill directory: {skill_dir}]")
+        parts.append(f"[Skill directory: {hint_dir}]")
         parts.append(
             "Resolve any relative paths in this skill (e.g. `scripts/foo.js`, "
             "`templates/config.yaml`) against that directory, then run them "
@@ -364,11 +368,11 @@ def _build_skill_message(
         parts.append("")
         parts.append("[This skill has supporting files:]")
         for sf in supporting:
-            parts.append(f"- {sf}  ->  {skill_dir / sf}")
+            parts.append(f"- {sf}  ->  {hint_dir / sf}")
         parts.append(
             f'\nLoad any of these with skill_view(name="{skill_view_target}", '
             f'file_path="<path>"), or run scripts directly by absolute path '
-            f"(e.g. `node {skill_dir}/scripts/foo.js`)."
+            f"(e.g. `node {hint_dir}/scripts/foo.js`)."
         )
 
     if user_instruction:

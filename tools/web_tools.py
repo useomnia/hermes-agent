@@ -545,6 +545,14 @@ def _truncate_with_footer(
 
     total = len(content)
     stored_path = _store_full_text(url, content)
+    if stored_path:
+        # The footer is read by the AGENT, whose read_file runs inside the
+        # active backend: name the path where the sandbox sees the projected
+        # cache, not the host path (upstream #72389, #81984), and make sure
+        # the file is already there before the path is handed out.
+        from tools.credential_files import publish_cache_path
+
+        stored_path = publish_cache_path(stored_path)
     shown = len(head) + len(tail)
 
     footer_lines = [
