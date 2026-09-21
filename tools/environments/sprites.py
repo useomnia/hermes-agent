@@ -1,6 +1,7 @@
 """Omnio toolbox Sprite execution environment."""
 
 import base64
+import codecs
 import http.client
 import json
 import logging
@@ -12,6 +13,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import weakref
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +58,32 @@ _REDACTED_CACHE_SUFFIXES = frozenset({
 def _is_toolbox_cache_path(path: str) -> bool:
     """True for paths inside the projected harness cache on the Toolbox."""
     return path == SPRITES_CACHE_ROOT or path.startswith(SPRITES_CACHE_ROOT + "/")
+
+
+# Every live environment in this gateway process. A producer that publishes a
+# cache path flushes all of them (one Brand per process, normally one or two
+# environments), so the file is on the Toolbox before the path reaches the
+# model or the proxy. Weak references: reaped environments drop out.
+_live_environments: "weakref.WeakSet[SpritesEnvironment]" = weakref.WeakSet()
+_flush_hook_registered = False
+
+
+def _flush_live_environments() -> None:
+    for env in list(_live_environments):
+        env.sync_cache_files(raise_on_error=False)
+
+
+def _register_live_environment(env: "SpritesEnvironment") -> None:
+    global _flush_hook_registered
+    _live_environments.add(env)
+    if not _flush_hook_registered:
+        from tools.credential_files import register_cache_projection_flush
+
+        register_cache_projection_flush(_flush_live_environments)
+        _flush_hook_registered = True
+
+
+_STREAM_CHUNK_BYTES = 1024 * 1024
 
 
 def _expand_toolbox_home(path: str) -> str:
@@ -281,6 +310,7 @@ class SpritesEnvironment(BaseEnvironment):
             upload_fn=self._upload_cache_file,
             delete_fn=self._delete_cache_files,
         )
+        _register_live_environment(self)
         self._sync_manager.sync(force=True)
         self.init_session()
 
@@ -459,6 +489,47 @@ class SpritesEnvironment(BaseEnvironment):
                 http_status=exc.code,
             ) from exc
         except urllib.error.URLError as exc:
+            raise SpritesToolboxError(
+                f"Toolbox API /files is unreachable: {exc}"
+            ) from exc
+
+    def stream_file_bytes(
+        self, path: str, *, chunk_size: int = _STREAM_CHUNK_BYTES
+    ) -> Iterator[bytes]:
+        """Yield a Toolbox file's raw bytes in bounded chunks.
+
+        The raw ``GET /files`` route streams any size; consuming it in chunks
+        keeps memory bounded to the caller's window, which is what lets file
+        tools page through text the JSON read refuses as too large.
+        """
+        path = _canonicalize_toolbox_path(path)
+        if _is_toolbox_cache_path(path):
+            self.sync_cache_files()
+        query = urllib.parse.urlencode({"path": path})
+        request = urllib.request.Request(
+            f"{self.toolbox_url}/files?{query}",
+            headers={
+                "Authorization": f"Bearer {self.bearer_token}",
+                "X-Omnio-Brand": self.brand,
+            },
+            method="GET",
+        )
+        try:
+            with _URL_OPENER.open(request, timeout=self.timeout) as response:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        return
+                    yield chunk
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(_MAX_ERROR_BYTES).decode("utf-8", errors="replace")
+            raise SpritesToolboxError(
+                f"Toolbox API /files failed with HTTP {exc.code}: "
+                f"{detail or exc.reason}",
+                detail=detail or str(exc.reason),
+                http_status=exc.code,
+            ) from exc
+        except (OSError, http.client.HTTPException) as exc:
             raise SpritesToolboxError(
                 f"Toolbox API /files is unreachable: {exc}"
             ) from exc
@@ -813,29 +884,35 @@ class SpritesFileOperations(ShellFileOperations):
         """Page a text file the Toolbox's JSON ``read`` refuses as too large.
 
         Same window semantics and hint text as the Toolbox's own paged read,
-        computed here from the bounded raw stream.
+        computed from the raw stream one chunk at a time: only the requested
+        window is held in memory, so a file of any size pages, and the
+        ``offset/limit`` recipe the whole-read error gives out always works.
         """
-        whole = self._read_large_text(path)
-        if whole.error:
-            return whole
-        lines = whole.content.splitlines()
-        total = len(lines)
-        start = max(1, offset)
-        end = min(start + limit - 1, total)
-        page = "\n".join(lines[start - 1:end])
-        truncated = total > end
-        return ReadResult(
-            content=self._add_line_numbers(page, start),
-            total_lines=total,
-            file_size=whole.file_size,
-            truncated=truncated,
-            hint=f"Use offset={end + 1} to continue reading" if truncated else None,
-        )
-
-    def _read_large_text(self, path: str) -> ReadResult:
         expanded = self._expand_path(path)
+        start = max(1, offset)
+        end = start + limit - 1
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        window: list[str] = []
+        pending = ""
+        line_no = 0
+        size = 0
+
+        def take(line: str) -> None:
+            nonlocal line_no
+            line_no += 1
+            if start <= line_no <= end:
+                window.append(line.rstrip("\r"))
+
         try:
-            data = self.env.read_file_bytes(expanded, max_bytes=_MAX_RAW_TEXT_READ_BYTES + 1)
+            for chunk in self.env.stream_file_bytes(expanded):
+                size += len(chunk)
+                pieces = (pending + decoder.decode(chunk)).split("\n")
+                pending = pieces.pop()
+                for piece in pieces:
+                    take(piece)
+            pending += decoder.decode(b"", final=True)
+            if pending:
+                take(pending)
         except SpritesToolboxError as error:
             return ReadResult(
                 error=render_sprites_toolbox_error(
@@ -843,13 +920,49 @@ class SpritesFileOperations(ShellFileOperations):
                     context=f"path {expanded!r}",
                 )
             )
-        if len(data) > _MAX_RAW_TEXT_READ_BYTES:
+        total = line_no
+        if start > total:
             return ReadResult(
-                error=(
-                    f"File exceeds {_MAX_RAW_TEXT_READ_BYTES} bytes: {expanded}. "
-                    "Use read_file with offset/limit to page through it."
+                error=f"Offset {start} is beyond the end of the file ({total} lines): {expanded}",
+                total_lines=total, file_size=size,
+            )
+        if start == 1 and window:
+            window[0], _ = _strip_bom(window[0])
+        shown_end = min(end, total)
+        truncated = total > shown_end
+        return ReadResult(
+            content=self._add_line_numbers("\n".join(window), start),
+            total_lines=total,
+            file_size=size,
+            truncated=truncated,
+            hint=f"Use offset={shown_end + 1} to continue reading" if truncated else None,
+        )
+
+    def _read_large_text(self, path: str) -> ReadResult:
+        """Whole-file text read through the raw stream, bounded by
+        ``_MAX_RAW_TEXT_READ_BYTES``; larger files are paged instead."""
+        expanded = self._expand_path(path)
+        chunks: list[bytes] = []
+        size = 0
+        try:
+            for chunk in self.env.stream_file_bytes(expanded):
+                size += len(chunk)
+                if size > _MAX_RAW_TEXT_READ_BYTES:
+                    return ReadResult(
+                        error=(
+                            f"File exceeds {_MAX_RAW_TEXT_READ_BYTES} bytes: {expanded}. "
+                            "Use read_file with offset/limit to page through it."
+                        )
+                    )
+                chunks.append(chunk)
+        except SpritesToolboxError as error:
+            return ReadResult(
+                error=render_sprites_toolbox_error(
+                    error, service="file tools", action="file read",
+                    context=f"path {expanded!r}",
                 )
             )
+        data = b"".join(chunks)
         content, _ = _strip_bom(data.decode("utf-8", errors="replace"))
         return ReadResult(content=content, file_size=len(data))
 

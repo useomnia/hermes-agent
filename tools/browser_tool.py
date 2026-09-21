@@ -3223,15 +3223,15 @@ def _agent_visible_stored_path(stored_path: Optional[str]) -> Optional[str]:
 
     ``read_file`` runs inside the active terminal backend, so a footer that
     names the host path dangles on Docker and on the Omnio Toolbox (upstream
-    #72389). ``to_agent_visible_cache_path`` is a no-op on backends that keep
-    host paths.
+    #72389). ``publish_cache_path`` is a no-op on backends that keep host
+    paths and pushes the file first on backends that copy the cache.
     """
     if not stored_path:
         return stored_path
     try:
-        from tools.credential_files import to_agent_visible_cache_path
+        from tools.credential_files import publish_cache_path
 
-        return to_agent_visible_cache_path(stored_path)
+        return publish_cache_path(stored_path)
     except Exception:  # noqa: BLE001 — a failed translation must not lose the pointer
         return stored_path
 

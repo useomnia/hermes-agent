@@ -111,7 +111,7 @@ def iter_sprites_sync_files(
 # Where the harness cache set lands on the paired Toolbox (see
 # ``tools.credential_files.OMNIO_TOOLBOX_CACHE_BASE``); the delegation root is
 # kept as a named constant because the delegation tooling documents it.
-SPRITES_CACHE_ROOT = "/tmp/.omnio-session/cache"
+SPRITES_CACHE_ROOT = "/tmp/omnio-session/cache"
 SPRITES_DELEGATION_ROOT = f"{SPRITES_CACHE_ROOT}/delegation"
 
 # Per-file ceiling for the Toolbox cache projection. The cache can hold media

@@ -9,7 +9,8 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from tools.credential_files import (
-    _CACHE_DIRS, from_agent_visible_cache_path, to_agent_visible_cache_path,
+    _CACHE_DIRS, OMNIO_TOOLBOX_CACHE_BASE, from_agent_visible_cache_path,
+    to_agent_visible_cache_path,
 )
 from tools.delegate_tool import _spill_summary_to_file
 from tools.delegation_live_log import create_live_transcripts
@@ -17,6 +18,7 @@ from tools.environments import file_sync
 from tools.environments.file_sync import (
     FileSyncManager, SPRITES_CACHE_ROOT, SPRITES_DELEGATION_ROOT, iter_sprites_cache_files,
 )
+from tools.environments import sprites as sprites_module
 from tools.environments.sprites import SpritesEnvironment, SpritesFileOperations, SpritesToolboxError
 from tools.code_execution_tool import _truncate_stdout_text
 
@@ -101,6 +103,7 @@ def pair(tmp_path, monkeypatch):
     env._cache_sync_manager = FileSyncManager(
         iter_sprites_cache_files, env._upload_cache_file, env._delete_cache_files,
     )
+    sprites_module._register_live_environment(env)
     yield home, toolbox, env, requests
     server.shutdown()
     server.server_close()
@@ -111,16 +114,45 @@ def test_summary_path_can_be_read_completely_from_toolbox(pair):
     home, toolbox, env, requests = pair
     expected = "worker instruction\n" * 3000 + "FINAL RESULT"
     path = _spill_summary_to_file(0, expected)
-    assert path.startswith("/tmp/.omnio-session/cache/delegation/")
+    assert path.startswith("/tmp/omnio-session/cache/delegation/")
+    # Publishing the path already pushed the file: a consumer that reads the
+    # Toolbox directly (the proxy's deliverable warm-up) finds it at once.
+    assert [item["operation"] for item in requests] == ["raw-write"]
+    assert (toolbox / path.lstrip("/")).read_text() == expected
     result = SpritesFileOperations(env).read_file_raw(path)
     assert result.content == expected
-    assert (toolbox / path.lstrip("/")).read_text() == expected
+
+
+def test_published_paths_never_contain_hidden_segments(pair):
+    home, toolbox, env, requests = pair
+    path = _spill_summary_to_file(0, "deliverable")
+    assert not any(segment.startswith(".") for segment in path.strip("/").split("/"))
+    assert SPRITES_CACHE_ROOT == f"{OMNIO_TOOLBOX_CACHE_BASE}/cache"
+
+
+def test_publish_flush_failure_falls_back_to_read_time_sync(pair, monkeypatch):
+    home, toolbox, env, requests = pair
+    original = env._write_raw_artifact
+    attempts = []
+
+    def flaky(path, data):
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise SpritesToolboxError("Artifact transfer failed")
+        return original(path, data)
+
+    monkeypatch.setattr(env, "_write_raw_artifact", flaky)
+    path = _spill_summary_to_file(0, "eventually")
+    assert path.startswith("/tmp/omnio-session/cache/delegation/")  # publish never returns a host path
+    assert len(attempts) == 1 and not requests  # the publish-time push failed quietly
+    assert SpritesFileOperations(env).read_file_raw(path).content == "eventually"
+    assert len(attempts) == 2
 
 
 def test_live_log_refreshes_before_each_parent_read(pair):
     home, toolbox, env, requests = pair
     _, writers, paths = create_live_transcripts([{"goal": "write"}])
-    assert paths[0].startswith("/tmp/.omnio-session/cache/delegation/")
+    assert paths[0].startswith("/tmp/omnio-session/cache/delegation/")
     writers[0].assistant_text("FIRST OBSERVATION")
     assert "FIRST OBSERVATION" in SpritesFileOperations(env).read_file_raw(paths[0]).content
     writers[0].assistant_text("FINAL OBSERVATION")
@@ -266,10 +298,10 @@ def test_stdout_recovery_is_readable_through_toolbox_file_tools(pair):
     output, metadata = _truncate_stdout_text(expected)
     assert "MIDDLE_RECORD" not in output
     path = metadata["stdout_spill_path"]
-    assert path.startswith("/tmp/.omnio-session/cache/exec/")
-    # Host-side canonical copy, projected to the Toolbox before the first read.
+    assert path.startswith("/tmp/omnio-session/cache/exec/")
+    # Host-side canonical copy, projected to the Toolbox as the path is published.
     assert len(list(home.glob("cache/exec/*"))) == 1
-    assert not requests
+    assert [item["operation"] for item in requests] == ["raw-write"]
     result = SpritesFileOperations(env).read_file_raw(path)
     assert "MIDDLE_RECORD" in result.content
     assert secret not in result.content
@@ -285,17 +317,36 @@ def test_stdout_recovery_is_readable_through_toolbox_file_tools(pair):
     assert "offset=200002" in page.hint
 
 
-def test_stdout_artifact_read_is_bounded(pair):
+def test_text_above_the_raw_ceiling_pages_by_streaming(pair):
     home, toolbox, env, requests = pair
-    path = "/tmp/.omnio-session/cache/exec/too-large.txt"
+    path = "/tmp/omnio-session/cache/exec/too-large.txt"
     local = toolbox / path.lstrip("/")
     local.parent.mkdir(parents=True)
-    local.write_bytes(b"x" * (5 * 1024 * 1024 + 1))
-    result = SpritesFileOperations(env).read_file_raw(path)
-    assert result.error and "exceeds" in result.error and "offset/limit" in result.error
-    assert not result.content
-    paged = SpritesFileOperations(env).read_file(path, offset=1, limit=10)
-    assert paged.error and "exceeds" in paged.error
+    # ~6.9 MB, 600,000 lines: above the 2 MiB JSON read AND the 5 MiB whole-read ceiling.
+    local.write_text("".join(f"line {i:06d}\n" for i in range(600_000)))
+    ops = SpritesFileOperations(env)
+
+    whole = ops.read_file_raw(path)
+    assert whole.error and "exceeds" in whole.error and "offset/limit" in whole.error
+    assert not whole.content
+
+    middle = ops.read_file(path, offset=300_001, limit=2)
+    assert middle.error is None
+    assert middle.content == "300001|line 300000\n300002|line 300001"
+    assert middle.total_lines == 600_000 and middle.truncated is True
+    assert middle.hint == "Use offset=300003 to continue reading"
+
+    tail = ops.read_file(path, offset=599_999, limit=10)
+    assert tail.content == "599999|line 599998\n600000|line 599999"
+    assert tail.truncated is False and tail.hint is None
+
+    beyond = ops.read_file(path, offset=700_000, limit=10)
+    assert beyond.error and "beyond the end" in beyond.error
+
+    # The JSON reads were all refused as too large; every byte the pages and
+    # the whole-read attempt returned came from the streaming GET.
+    assert sum(1 for item in requests if item["operation"] == "raw-read") == 4
+    assert not any(item["operation"] == "raw-write" for item in requests)
 
 
 def test_failed_stdout_transfer_surfaces_as_a_read_error_not_a_host_path(pair, monkeypatch):
@@ -308,7 +359,7 @@ def test_failed_stdout_transfer_surfaces_as_a_read_error_not_a_host_path(pair, m
     output, metadata = _truncate_stdout_text("before\n" * 15000 + "END")
     assert output.endswith("END")
     path = metadata["stdout_spill_path"]
-    assert path.startswith("/tmp/.omnio-session/cache/exec/")
+    assert path.startswith("/tmp/omnio-session/cache/exec/")
     assert str(home) not in path
     result = SpritesFileOperations(env).read_file_raw(path)
     assert result.error and "temporarily unavailable" in result.error
@@ -324,13 +375,13 @@ def test_invalid_artifact_destination_is_rejected(pair):
 
 def test_failed_transfer_is_reported_and_retried(pair, monkeypatch):
     home, toolbox, env, requests = pair
-    path = _spill_summary_to_file(0, "complete")
     original = env._write_raw_artifact
 
     def failed(*args):
         raise SpritesToolboxError("Artifact transfer failed")
 
     monkeypatch.setattr(env, "_write_raw_artifact", failed)
+    path = _spill_summary_to_file(0, "complete")  # publish-time push fails quietly
     with pytest.raises(SpritesToolboxError, match="transfer failed"):
         env.sync_cache_files()
     monkeypatch.setattr(env, "_write_raw_artifact", original)

@@ -192,9 +192,9 @@ def _spill_full_stdout(stdout_text: str) -> str:
     fd, path = tempfile.mkstemp(prefix="stdout_", suffix=".txt", dir=spill_dir)
     with os.fdopen(fd, "w", encoding="utf-8") as output:
         output.write(stdout_text)
-    from tools.credential_files import to_agent_visible_cache_path
+    from tools.credential_files import publish_cache_path
 
-    return to_agent_visible_cache_path(path)
+    return publish_cache_path(path)
 
 
 def _add_stdout_spill(metadata: Dict[str, Any], captured: bytes, *,

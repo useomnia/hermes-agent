@@ -408,10 +408,48 @@ _CACHE_DIRS: list[tuple[str, str]] = [
 # no ``~/.hermes``: the harness runs on the Omnio sprite and only projects the
 # agent-facing cache subdirectories into the Brand's private ``/tmp``, so
 # ``<HERMES_HOME>/cache/web/x.md`` is read there as
-# ``/tmp/.omnio-session/cache/web/x.md``. Every cache producer that hands the
-# model a path goes through :func:`to_agent_visible_cache_path`; the Sprites
-# environment syncs the same set before commands and reads.
-OMNIO_TOOLBOX_CACHE_BASE = "/tmp/.omnio-session"
+# ``/tmp/omnio-session/cache/web/x.md``. The root is deliberately not a dot
+# directory: files under it are deliverables the reply may hand over as
+# ``sandbox:`` links, and the Omnio proxy refuses hidden path segments. Every
+# cache producer that hands the model a path goes through
+# :func:`publish_cache_path`; the Sprites environment syncs the same set before
+# commands and reads.
+OMNIO_TOOLBOX_CACHE_BASE = "/tmp/omnio-session"
+
+# Callables that push the projected cache to the active backend NOW. The
+# Sprites environment registers one per process so a producer can publish a
+# path only after the file is readable at that path — consumers other than
+# Hermes (the proxy's deliverable warm-up, the video wrapper) read the Toolbox
+# directly and cannot wait for the next command's sync.
+_cache_projection_flush_hooks: List[Callable[[], None]] = []
+
+
+def register_cache_projection_flush(hook: Callable[[], None]) -> None:
+    if hook not in _cache_projection_flush_hooks:
+        _cache_projection_flush_hooks.append(hook)
+
+
+def flush_cache_projection() -> None:
+    """Best effort: a failed flush leaves the read-triggered sync as the fallback."""
+    for hook in list(_cache_projection_flush_hooks):
+        try:
+            hook()
+        except Exception:
+            logger.debug("cache projection flush hook failed", exc_info=True)
+
+
+def publish_cache_path(host_path: str) -> str:
+    """Return the path the AGENT should be given for a host cache file, with
+    the file already readable there.
+
+    On backends that project the cache by copying (the Omnio Toolbox), the
+    copy is pushed before the path is handed out. Docker sees the bind mount
+    live and other backends keep host paths, so the flush is a no-op there.
+    """
+    agent_path = to_agent_visible_cache_path(host_path)
+    if agent_path != host_path:
+        flush_cache_projection()
+    return agent_path
 
 
 def _terminal_backend() -> str:
