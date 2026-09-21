@@ -441,8 +441,7 @@ class SpritesEnvironment(BaseEnvironment):
         if max_bytes < 1:
             raise ValueError("max_bytes must be positive")
         path = _canonicalize_toolbox_path(path)
-        if _is_toolbox_cache_path(path):
-            self.sync_cache_files()
+        self.sync_projected_path(path)
         query = urllib.parse.urlencode({"path": path})
         request = urllib.request.Request(
             f"{self.toolbox_url}/files?{query}",
@@ -482,8 +481,7 @@ class SpritesEnvironment(BaseEnvironment):
         tools page through text the JSON read refuses as too large.
         """
         path = _canonicalize_toolbox_path(path)
-        if _is_toolbox_cache_path(path):
-            self.sync_cache_files()
+        self.sync_projected_path(path)
         query = urllib.parse.urlencode({"path": path})
         request = urllib.request.Request(
             f"{self.toolbox_url}/files?{query}",
@@ -658,8 +656,26 @@ class SpritesEnvironment(BaseEnvironment):
             with self._cache_sync_lock:
                 manager.sync(force=True, raise_on_error=raise_on_error)
 
+    def sync_skill_files(self) -> None:
+        """Refresh helper files before use, including inside the sync throttle.
+
+        The manager still uploads only changed files. Serialize its state with
+        other projection work and propagate failure rather than executing an
+        old helper after an unsuccessful transfer.
+        """
+        with self._cache_sync_lock:
+            self._sync_manager.sync(force=True, raise_on_error=True)
+
+    def sync_projected_path(self, path: str) -> None:
+        """Refresh host-owned projections before a Toolbox file consumer."""
+        path = _canonicalize_toolbox_path(path)
+        if path == "/skills" or path.startswith("/skills/"):
+            self.sync_skill_files()
+        elif _is_toolbox_cache_path(path):
+            self.sync_cache_files()
+
     def _before_execute(self) -> None:
-        self._sync_manager.sync()
+        self.sync_skill_files()
         self.sync_cache_files(raise_on_error=False)
 
     def _run_bash(
@@ -787,9 +803,11 @@ class SpritesFileOperations(ShellFileOperations):
             if isinstance(value, str) and value.startswith("~"):
                 payload[key] = self._expand_path(value)
         try:
+            read_path = _canonicalize_toolbox_path(str(payload.get("path", "")))
             if (payload.get("operation") in {"read", "readRaw", "search", "stat"}
-                    and _is_toolbox_cache_path(str(payload.get("path", "")))):
-                self.env.sync_cache_files()
+                    and (read_path == "/skills" or read_path.startswith("/skills/")
+                         or _is_toolbox_cache_path(read_path))):
+                self.env.sync_projected_path(read_path)
             return self.env.file_request(payload)
         except SpritesToolboxError as error:
             operation = str(payload.get("operation", "unknown"))

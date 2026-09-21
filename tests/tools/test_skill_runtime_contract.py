@@ -30,6 +30,57 @@ def write_skill(root, relative, body='Use the helper.'):
     return directory
 
 
+@pytest.mark.parametrize('consumer', ['command', 'file'])
+def test_warm_toolbox_receives_new_helper_before_use(catalog, monkeypatch, consumer):
+    import threading
+    from tools.environments import file_sync
+    from tools.environments.sprites import SpritesEnvironment, SpritesFileOperations
+
+    directory = write_skill(catalog, 'ops/helper')
+    remote = {}
+    monkeypatch.setattr(file_sync, '_monotonic', lambda: 100.0)
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.cwd = '/brand'
+    env._cache_sync_lock = threading.Lock()
+    env._sync_manager = file_sync.FileSyncManager(
+        get_files_fn=lambda: file_sync.iter_sprites_sync_files('/skills'),
+        upload_fn=lambda host, target: remote.update({target: Path(host).read_bytes()}),
+        delete_fn=lambda paths: [remote.pop(path, None) for path in paths],
+    )
+    env._sync_manager.sync(force=True)
+    helper = directory / 'run.py'
+    helper.write_text("print('new helper')\n")
+    target = '/skills/ops/helper/run.py'
+    # Still inside the normal sync throttle window, with a warm environment.
+    assert target not in remote
+    if consumer == 'command':
+        env._before_execute()
+    else:
+        env.file_request = lambda payload: {'content': remote[payload['path']].decode()}
+        result = SpritesFileOperations(env)._files({'operation': 'read', 'path': target})
+        assert result['content'] == helper.read_text()
+    assert remote[target] == helper.read_bytes()
+
+
+def test_failed_skill_sync_prevents_execution_with_stale_helpers(catalog):
+    import threading
+    from tools.environments.file_sync import FileSyncManager, iter_sprites_sync_files
+    from tools.environments.sprites import SpritesEnvironment, SpritesToolboxError
+
+    write_skill(catalog, 'helper')
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env._cache_sync_lock = threading.Lock()
+    def fail_upload(host, target):
+        raise SpritesToolboxError('offline')
+    env._sync_manager = FileSyncManager(
+        get_files_fn=lambda: iter_sprites_sync_files('/skills'),
+        upload_fn=fail_upload,
+        delete_fn=lambda paths: None,
+    )
+    with pytest.raises(SpritesToolboxError, match='offline'):
+        env._before_execute()
+
+
 def test_skill_view_publishes_runtime_directory_but_internal_load_keeps_host(catalog, monkeypatch):
     directory = write_skill(catalog, 'ops/helper', 'python ${HERMES_SKILL_DIR}/scripts/run.py')
     scripts = directory / 'scripts'
