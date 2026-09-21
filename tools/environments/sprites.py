@@ -39,6 +39,8 @@ _MAX_SKILL_FILE_BYTES = 2 * 1024 * 1024
 _MAX_SKILL_BATCH_FILES = 200
 _MAX_SKILL_BATCH_BYTES = 16 * 1024 * 1024
 _MAX_FILE_CONTENT_BYTES = 2 * 1024 * 1024
+_STDOUT_ARTIFACT_ROOT = "/tmp/.omnio-session/cache/exec"
+_MAX_ARTIFACT_READ_BYTES = 5 * 1024 * 1024
 _EXEC_PREDISPATCH_RETRY_DELAYS_SECONDS = (2.0, 4.0)
 _EXEC_RETRY_MIN_REQUEST_BUDGET_SECONDS = 1.0
 
@@ -418,7 +420,8 @@ class SpritesEnvironment(BaseEnvironment):
         if max_bytes < 1:
             raise ValueError("max_bytes must be positive")
         path = _canonicalize_toolbox_path(path)
-        self.sync_delegation_artifacts()
+        if path.startswith(SPRITES_DELEGATION_ROOT + "/"):
+            self.sync_delegation_artifacts()
         query = urllib.parse.urlencode({"path": path})
         request = urllib.request.Request(
             f"{self.toolbox_url}/files?{query}",
@@ -544,9 +547,15 @@ class SpritesEnvironment(BaseEnvironment):
             if not self.write_file_content(remote_path, content):
                 raise SpritesToolboxError("Delegation artifact transfer failed")
             return
-        self._write_large_delegation_artifact(remote_path, content)
+        self._write_text_artifact(remote_path, content)
 
-    def _write_large_delegation_artifact(self, path: str, content: str) -> None:
+    def write_output_artifact(self, content: str) -> str:
+        """Publish already-redacted stdout in this Brand's Toolbox namespace."""
+        path = f"{_STDOUT_ARTIFACT_ROOT}/stdout_{uuid.uuid4().hex}.txt"
+        self._write_text_artifact(path, content)
+        return path
+
+    def _write_text_artifact(self, path: str, content: str) -> None:
         """The existing atomic raw-file endpoint avoids the JSON write cap."""
         data = content.encode("utf-8")
         query = urllib.parse.urlencode({
@@ -562,9 +571,9 @@ class SpritesEnvironment(BaseEnvironment):
             with _URL_OPENER.open(request, timeout=self.timeout) as response:
                 result = json.loads(response.read(_MAX_RESPONSE_BYTES + 1))
             if result.get("bytesWritten") != len(data):
-                raise SpritesToolboxError("Delegation artifact transfer was incomplete")
+                raise SpritesToolboxError("Artifact transfer was incomplete")
         except (OSError, http.client.HTTPException, ValueError) as exc:
-            raise SpritesToolboxError("Delegation artifact transfer failed") from exc
+            raise SpritesToolboxError("Artifact transfer failed") from exc
 
     def _delete_delegation_artifacts(self, paths: list[str]) -> None:
         for path in paths:
@@ -710,6 +719,13 @@ class SpritesFileOperations(ShellFileOperations):
             if isinstance(value, str) and value.startswith("~"):
                 payload[key] = self._expand_path(value)
         try:
+            path = _canonicalize_toolbox_path(str(payload.get("path", "")))
+            if (payload.get("operation") in {"read", "readRaw"}
+                    and any(path.startswith(root + "/") for root in
+                            (_STDOUT_ARTIFACT_ROOT, SPRITES_DELEGATION_ROOT))):
+                # Toolbox's JSON text reader refuses files above 2 MiB even
+                # when paging. Recovery artifacts use the existing raw route.
+                return self._read_text_artifact(path, payload)
             if (payload.get("operation") in {"read", "readRaw", "search", "stat"}
                     and str(payload.get("path", "")).startswith(SPRITES_DELEGATION_ROOT + "/")):
                 self.env.sync_delegation_artifacts()
@@ -738,6 +754,26 @@ class SpritesFileOperations(ShellFileOperations):
                     context=context,
                 )
             }
+
+    def _read_text_artifact(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        data = self.env.read_file_bytes(path, max_bytes=_MAX_ARTIFACT_READ_BYTES + 1)
+        if len(data) > _MAX_ARTIFACT_READ_BYTES:
+            return {"error": "Artifact exceeds the recovery read limit"}
+        text = data.decode("utf-8", errors="replace")
+        if payload["operation"] == "readRaw":
+            return {"content": text, "fileSize": len(data)}
+        lines = text.splitlines()
+        offset, limit = payload["offset"], payload["limit"]
+        end = offset + limit - 1
+        truncated = len(lines) > end
+        return {
+            "content": "\n".join(lines[offset - 1:end]),
+            "fileSize": len(data),
+            "totalLines": len(lines),
+            "lineNumbered": False,
+            "truncated": truncated,
+            "hint": f"Use offset={end + 1} to continue reading" if truncated else None,
+        }
 
     def read_file(self, path: str, offset: int = 1, limit: int = 500) -> ReadResult:
         from tools.file_operations import normalize_read_pagination

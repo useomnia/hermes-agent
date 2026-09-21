@@ -1,4 +1,4 @@
-"""Worker artifacts cross the real HTTP client into a separate filesystem."""
+"""Worker and stdout artifacts cross the HTTP client into a separate filesystem."""
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +14,7 @@ from tools.environments.file_sync import (
     FileSyncManager, SPRITES_DELEGATION_ROOT, iter_sprites_delegation_files,
 )
 from tools.environments.sprites import SpritesEnvironment, SpritesFileOperations, SpritesToolboxError
+from tools.code_execution_tool import _truncate_stdout_text
 
 
 @pytest.fixture
@@ -46,10 +47,26 @@ def pair(tmp_path, monkeypatch):
             else:
                 try:
                     content = path.read_text()
-                    result = {"content": content, "totalLines": len(content.splitlines())}
+                    if len(content.encode()) > 2 * 1024 * 1024:
+                        result = {"error": f"File too large: {payload['path']}"}
+                    else:
+                        result = {"content": content, "totalLines": len(content.splitlines())}
                 except FileNotFoundError:
                     result = {"error": "file not found"}
             self.reply(result)
+
+        def do_GET(self):
+            query = parse_qs(urlsplit(self.path).query)
+            assert self.headers["X-Omnio-Brand"] == "brand-a"
+            assert self.headers["Authorization"] == "Bearer test-token"
+            path = toolbox / query["path"][0].lstrip("/")
+            requests.append({"operation": "raw-read", "path": query["path"][0]})
+            if not path.is_file():
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(path.read_bytes())
 
         def do_PUT(self):
             query = parse_qs(urlsplit(self.path).query)
@@ -129,6 +146,55 @@ def test_large_artifact_uses_raw_upload_without_truncation(pair):
     env.sync_delegation_artifacts()
     assert (toolbox / path.lstrip("/")).read_text() == expected
     assert requests[0]["operation"] == "raw-write"
+    assert SpritesFileOperations(env).read_file_raw(path).content == expected
+
+
+def test_stdout_recovery_is_readable_through_toolbox_file_tools(pair):
+    home, toolbox, env, requests = pair
+    secret = "ghp_" + "a" * 36
+    expected = "before\n" * 200_000 + "MIDDLE_RECORD\n" + secret + "\nafter\n" * 200_000
+    output, metadata = _truncate_stdout_text(expected, env=env)
+    assert "MIDDLE_RECORD" not in output
+    path = metadata["stdout_spill_path"]
+    assert path.startswith("/tmp/.omnio-session/cache/exec/")
+    assert not list(home.glob("cache/exec/*"))
+    result = SpritesFileOperations(env).read_file_raw(path)
+    assert "MIDDLE_RECORD" in result.content
+    assert secret not in result.content
+    assert result.content.startswith("before\n") and result.content.endswith("after\n")
+    assert (toolbox / path.lstrip("/")).read_text() == result.content
+    assert requests[0]["operation"] == "raw-write"
+    assert metadata["stdout_spill_truncated"] is False
+    page = SpritesFileOperations(env).read_file(path, offset=200_001, limit=1)
+    assert page.error is None
+    assert "MIDDLE_RECORD" in page.content
+    assert "before" not in page.content and "after" not in page.content
+    assert page.truncated is True
+    assert "offset=200002" in page.hint
+
+
+def test_stdout_artifact_read_is_bounded(pair):
+    home, toolbox, env, requests = pair
+    path = "/tmp/.omnio-session/cache/exec/too-large.txt"
+    local = toolbox / path.lstrip("/")
+    local.parent.mkdir(parents=True)
+    local.write_bytes(b"x" * (5 * 1024 * 1024 + 1))
+    result = SpritesFileOperations(env).read_file_raw(path)
+    assert "exceeds" in result.error
+
+
+def test_failed_stdout_transfer_does_not_return_a_host_path(pair, monkeypatch):
+    home, toolbox, env, requests = pair
+
+    def failed(*args):
+        raise SpritesToolboxError("Artifact transfer failed")
+
+    monkeypatch.setattr(env, "_write_text_artifact", failed)
+    output, metadata = _truncate_stdout_text("before\n" * 15000 + "END", env=env)
+    assert output.endswith("END")
+    assert "stdout_spill_path" not in metadata
+    assert "unavailable" in metadata["warning"]
+    assert not requests
 
 
 def test_invalid_artifact_destination_is_rejected(pair):
