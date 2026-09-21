@@ -82,6 +82,7 @@ def test_symlink_cache_is_not_followed(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("backend", ["ssh", "modal", "docker"])
+@pytest.mark.skipif(os.name == "nt", reason="The remote-filesystem fixture runs a POSIX shell")
 def test_remote_execution_retains_recovery_on_execution_filesystem(tmp_path, monkeypatch, backend):
     remote = tmp_path / "remote"
     remote.mkdir()
