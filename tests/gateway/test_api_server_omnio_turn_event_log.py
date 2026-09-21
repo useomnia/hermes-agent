@@ -1431,9 +1431,14 @@ async def test_finalize_hook_failure_still_emits_terminal_promptly(
     monkeypatch: pytest.MonkeyPatch,
     hook_status: int | str,
 ) -> None:
+    release_hook = asyncio.Event()
+
     async def finalize(_request: web.Request) -> web.Response:
         if hook_status == "timeout":
-            await asyncio.sleep(1.0)
+            # The hook cannot complete until after the terminal event. A
+            # missing request deadline therefore fails the bounded terminal
+            # wait, without measuring unrelated CI scheduling latency.
+            await release_hook.wait()
             return web.json_response({"annotations": []})
         return web.json_response({"annotations": []}, status=hook_status)
 
@@ -1447,25 +1452,30 @@ async def test_finalize_hook_failure_still_emits_terminal_promptly(
             api_server_module._OMNIO_TURN_FINALIZE_HOOK_ENV,
             str(server.make_url("/internal/turn-finalize")),
         )
-        started_at = asyncio.get_running_loop().time()
-        with patch.object(
-            adapter,
-            "_create_agent",
-            return_value=_agent(
-                lambda **_kwargs: {
-                    "final_response": "Report: /brand/report.pdf",
-                    "messages": [],
-                }
-            ),
-        ):
-            started, events = await _run_without_http_server(
+        try:
+            with patch.object(
                 adapter,
-                {"input": "make report", "turn_id": "turn-1"},
-            )
-        elapsed = asyncio.get_running_loop().time() - started_at
+                "_create_agent",
+                return_value=_agent(
+                    lambda **_kwargs: {
+                        "final_response": "Report: /brand/report.pdf",
+                        "messages": [],
+                    }
+                ),
+            ), patch.object(
+                api_server_module,
+                "_request_turn_finalize_annotations",
+                wraps=api_server_module._request_turn_finalize_annotations,
+            ) as request_finalize:
+                started, events = await _run_without_http_server(
+                    adapter,
+                    {"input": "make report", "turn_id": "turn-1"},
+                )
+                request_finalize.assert_awaited_once()
+        finally:
+            release_hook.set()
 
     assert started.status == 202
-    assert elapsed < 0.5
     assert events[-1]["type"] == "response.completed"
     assert not any(
         event["type"] == "response.output_text.annotation.added" for event in events
