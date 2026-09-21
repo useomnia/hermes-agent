@@ -189,3 +189,17 @@ def test_stale_category_suggests_installed_name_without_silent_fallback(catalog,
     assert result['success'] is False
     assert result['matching_skills'][0]['name'] == 'helper'
     assert json.loads(skills_tool.skill_view(result['matching_skills'][0]['name']))['success']
+
+
+def test_path_mapping_does_not_replace_a_live_sanitized_mount(catalog, tmp_path, monkeypatch):
+    from agent.skill_path_mapping import map_skill_dir_for_backend
+    from tools import credential_files
+    directory = write_skill(catalog, 'helper')
+    (catalog / 'excluded-link').symlink_to(tmp_path / 'outside')
+    monkeypatch.setattr(credential_files, '_safe_skills_tempdir', None)
+    monkeypatch.setenv('TERMINAL_ENV', 'docker')
+    mounted = credential_files.get_skills_directory_mount()[0]
+    mounted_file = Path(mounted['host_path']) / 'helper' / 'SKILL.md'
+    assert mounted_file.is_file()
+    assert map_skill_dir_for_backend(directory) == '/root/.hermes/skills/helper'
+    assert mounted_file.is_file(), 'Rendering a path must not delete an existing bind mount source'

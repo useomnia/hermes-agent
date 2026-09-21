@@ -9,7 +9,7 @@ scripts via paths that do not exist in the sandbox (hermes-agent#41541,
 #73842).
 
 The authoritative mount layout is computed by
-``tools.credential_files.get_skills_directory_mount()``; this module consumes
+``tools.credential_files.get_skills_directory_layout()``; this module consumes
 it with a longest-prefix match and falls back to the host path whenever the
 backend is local or unknown, so behavior on local backends is unchanged.
 """
@@ -83,7 +83,7 @@ def map_skill_dir_for_backend(
     """Translate *host_skill_dir* to the path the agent sees on the backend.
 
     Longest-prefix-matches the host path against the existing skills mount
-    layout (``get_skills_directory_mount``) and returns the corresponding
+    layout (``get_skills_directory_layout``) and returns the corresponding
     backend-visible path (POSIX form, since container/remote paths are
     POSIX).  Falls back to the host path unchanged when:
 
@@ -102,9 +102,9 @@ def map_skill_dir_for_backend(
     if not base:
         return host
     try:
-        from tools.credential_files import get_skills_directory_mount
+        from tools.credential_files import get_skills_directory_layout
 
-        mounts = get_skills_directory_mount(container_base=base)
+        mounts = get_skills_directory_layout(container_base=base)
     except Exception:
         logger.debug("Could not resolve skills directory mount layout", exc_info=True)
         return host

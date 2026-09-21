@@ -259,15 +259,29 @@ def get_skills_directory_mount(
     symlinks are present (the common case), the original directory is returned
     directly with zero overhead.
 
-    Returns a list of dicts with ``host_path`` and ``container_path`` keys.
-    The local skills dir mounts at ``<container_base>/skills``, external dirs
+    Returns ``host_path`` (possibly sanitized), canonical ``source_path``,
+    and ``container_path`` for each directory. The local skills dir mounts at ``<container_base>/skills``, external dirs
     at ``<container_base>/external_skills/<index>``.
+    """
+    mounts = get_skills_directory_layout(container_base)
+    for mount in mounts:
+        mount["host_path"] = _safe_skills_path(Path(mount["source_path"]))
+    return mounts
+
+
+def get_skills_directory_layout(
+    container_base: str = "/root/.hermes",
+) -> list[Dict[str, str]]:
+    """Read the source/destination layout without preparing bind mounts.
+
+    Unlike get_skills_directory_mount, this never replaces a sanitized tree
+    that a running environment may still have mounted.
     """
     mounts = []
     hermes_home = _resolve_hermes_home()
     skills_dir = hermes_home / "skills"
     if skills_dir.is_dir():
-        host_path = _safe_skills_path(skills_dir)
+        host_path = str(skills_dir)
         mounts.append({
             "host_path": host_path,
             "source_path": str(skills_dir),
@@ -279,7 +293,7 @@ def get_skills_directory_mount(
         from agent.skill_utils import get_external_skills_dirs
         for idx, ext_dir in enumerate(get_external_skills_dirs()):
             if ext_dir.is_dir():
-                host_path = _safe_skills_path(ext_dir)
+                host_path = str(ext_dir)
                 mounts.append({
                     "host_path": host_path,
                     "source_path": str(ext_dir),
