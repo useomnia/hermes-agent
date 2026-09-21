@@ -165,16 +165,22 @@ def _sanitize_stdout(stdout_text: str) -> str:
     return redact_sensitive_text(strip_ansi(stdout_text), code_file=True)
 
 
-def _spill_full_stdout(stdout_text: str) -> str:
-    """Save recovery output under ``cache/exec`` and return the path the
-    AGENT can read it at.
+def _spill_full_stdout(stdout_text: str, *, env=None) -> str:
+    """Save recovery output where this execution's file tools can read it.
 
-    Adapted from upstream #97043. The file is written host-side; backends that
-    project the harness cache (Docker mounts it, the Omnio Toolbox syncs it
-    before reads) receive it through that projection, and
-    ``to_agent_visible_cache_path`` renders the path as the sandbox sees it.
-    Callers sanitize and bound the text before any disk write.
+    Adapted from upstream #97043. Local execution and Sprites use the host
+    cache and its existing publisher. Other remote executions pass their
+    environment so recovery does not rely on cache mounts or path translation.
+    Callers sanitize and bound the text before any disk or transport write.
     """
+    if env is not None:
+        publish = getattr(env, "write_output_artifact", None)
+        if callable(publish):
+            return publish(stdout_text)
+        path = f"{_env_temp_dir(env)}/stdout_{uuid.uuid4().hex}.txt"
+        _ship_file_to_remote(env, path, stdout_text)
+        return path
+
     from hermes_constants import get_hermes_dir, get_hermes_home
 
     spill_dir = get_hermes_dir("cache/exec", "exec_spill")
@@ -198,7 +204,7 @@ def _spill_full_stdout(stdout_text: str) -> str:
 
 
 def _add_stdout_spill(metadata: Dict[str, Any], captured: bytes, *,
-                      total_bytes: int) -> None:
+                      total_bytes: int, env=None) -> None:
     """Attach best-effort recovery without changing the execution outcome."""
     if not metadata["stdout_truncated"]:
         return
@@ -218,7 +224,7 @@ def _add_stdout_spill(metadata: Dict[str, Any], captured: bytes, *,
         text = data[:budget].decode("utf-8", errors="ignore")
         if not text:
             raise OSError("No complete output fits in the recovery artifact")
-        path = _spill_full_stdout(text + marker)
+        path = _spill_full_stdout(text + marker, env=env)
         if not isinstance(path, str) or not path:
             raise OSError("Backend did not return an output artifact path")
         metadata["stdout_spill_path"] = path
@@ -236,7 +242,7 @@ def _add_stdout_spill(metadata: Dict[str, Any], captured: bytes, *,
         )
 
 
-def _truncate_stdout_text(stdout_text: str) -> Tuple[str, Dict[str, Any]]:
+def _truncate_stdout_text(stdout_text: str, *, env=None) -> Tuple[str, Dict[str, Any]]:
     """Cap a complete stdout string by bytes using the same head/tail policy."""
     stdout_bytes = stdout_text.encode("utf-8", errors="replace")
     if len(stdout_bytes) <= MAX_STDOUT_BYTES:
@@ -249,7 +255,7 @@ def _truncate_stdout_text(stdout_text: str) -> Tuple[str, Dict[str, Any]]:
         stdout_bytes[-tail_bytes:],
         total_bytes=len(stdout_bytes),
     )
-    _add_stdout_spill(metadata, stdout_bytes, total_bytes=len(stdout_bytes))
+    _add_stdout_spill(metadata, stdout_bytes, total_bytes=len(stdout_bytes), env=env)
     return text, metadata
 
 # Environment variable scrubbing rules (shared between the local + remote
@@ -1591,7 +1597,12 @@ def _execute_remote(
 
     # --- Post-process output (same as local path) ---
 
-    stdout_text, stdout_metadata = _truncate_stdout_text(stdout_text)
+    # Sprites publishes via the shared cache projection. Keep #114's direct
+    # transfer for all other remote backends, including already-warm containers
+    # that may have been created before the stdout cache directory existed.
+    stdout_text, stdout_metadata = _truncate_stdout_text(
+        stdout_text, env=None if env_type == "sprites" else env,
+    )
 
     # Strip ANSI escape sequences
     from tools.ansi_strip import strip_ansi

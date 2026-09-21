@@ -1,5 +1,7 @@
 """Recover clipped execution output without repeating the original command."""
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -77,3 +79,60 @@ def test_symlink_cache_is_not_followed(tmp_path, monkeypatch):
     _, metadata = execution._truncate_stdout_text("data\n" * 15000)
     assert "stdout_spill_path" not in metadata
     assert not list(outside.iterdir())
+
+
+@pytest.mark.parametrize("backend", ["ssh", "modal", "docker"])
+def test_remote_execution_retains_recovery_on_execution_filesystem(tmp_path, monkeypatch, backend):
+    remote = tmp_path / "remote"
+    remote.mkdir()
+
+    class FileEnvironment:
+        def get_temp_dir(self):
+            return str(remote)
+
+        def write_file_content(self, path, content):
+            target = Path(path)
+            assert target.is_relative_to(remote)
+            target.write_text(content)
+            return True
+
+        def execute(self, command, cwd=None, timeout=30):
+            result = subprocess.run(
+                command, shell=True, executable="/bin/bash", cwd=cwd or remote,
+                env={"PATH": os.environ["PATH"], "HOME": str(remote)},
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return {"output": result.stdout + result.stderr, "returncode": result.returncode}
+
+    monkeypatch.setenv("TERMINAL_ENV", backend)
+    monkeypatch.setattr(execution, "_load_config", lambda: {"timeout": 10})
+    monkeypatch.setattr(execution, "_get_or_create_env", lambda task: (FileEnvironment(), backend))
+    receipt = remote / "executions.txt"
+    code = (
+        f"with open({str(receipt)!r}, 'a') as f: f.write('ran\\n')\n"
+        "print('head\\n' * 12000)\n"
+        "print('REMOTE_MIDDLE_RECORD')\n"
+        "print('tail\\n' * 12000)\n"
+    )
+    result = json.loads(execution._execute_remote(code, "recovery-test", []))
+    assert result["status"] == "success", result
+    assert result["exit_code"] == 0
+    assert "REMOTE_MIDDLE_RECORD" not in result["output"]
+    saved = Path(result["stdout_spill_path"])
+    assert saved.is_relative_to(remote), result
+    assert "REMOTE_MIDDLE_RECORD" in saved.read_text()
+    assert receipt.read_text() == "ran\n"
+
+
+def test_remote_publication_failure_does_not_return_a_host_path(monkeypatch):
+    class UnavailableEnvironment:
+        def execute(self, *args, **kwargs):
+            raise OSError("remote unavailable")
+
+    output, metadata = execution._truncate_stdout_text(
+        "start\n" * 15000 + "END", env=UnavailableEnvironment(),
+    )
+    assert output.endswith("END")
+    assert metadata["stdout_truncated"] is True
+    assert "stdout_spill_path" not in metadata
+    assert "unavailable" in metadata["warning"]
