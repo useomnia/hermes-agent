@@ -231,9 +231,23 @@ def _add_stdout_spill(metadata: Dict[str, Any], captured: bytes, *,
         metadata["stdout_spill_truncated"] = partial
         qualifier = "A partial copy of captured stdout" if partial else "Captured stdout"
         metadata["warning"] += (
-            f" {qualifier} was saved to {path}; page the artifact instead of "
-            "re-running the script."
+            f" {qualifier} was saved to {path}. Inspect this artifact before "
+            "requesting the same data again; do not repeat successful calls "
+            "solely to recover omitted output."
         )
+        if partial:
+            metadata["warning"] += (
+                " The artifact is incomplete: missing records remain unknown, "
+                "and whole-document JSON parsing may fail. Inspect the captured "
+                "content before choosing a targeted follow-up; never replay "
+                "side-effecting actions to reconstruct output."
+            )
+        else:
+            metadata["warning"] += (
+                " For JSON, use Python to load the saved file and print only "
+                "the keys or records you need; line paging cannot split a "
+                "single-line JSON document. For text, search or read bounded ranges."
+            )
     except Exception:
         logger.debug("Could not publish execute_code stdout recovery", exc_info=True)
         metadata["warning"] += (
@@ -2466,8 +2480,10 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     limits_note = (
         f"{_timeout_note} timeout, {MAX_STDOUT_BYTES // 1000}KB inline stdout head/tail "
         f"(larger captured output is saved to a recovery artifact, up to "
-        f"{MAX_SPILLED_STDOUT_BYTES // 1_000_000}MB; page the returned path instead "
-        f"of re-running the script), "
+        f"{MAX_SPILLED_STDOUT_BYTES // 1_000_000}MB; inspect the returned path "
+        f"instead of repeating successful calls. Parse saved JSON to select "
+        f"needed fields, or search/page text; check stdout_spill_truncated "
+        f"before claiming complete coverage), "
         f"max {_max_calls} tool calls per script"
     )
 

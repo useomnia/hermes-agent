@@ -40,6 +40,33 @@ def test_short_output_does_not_create_artifact():
     assert "stdout_spill_path" not in metadata
 
 
+def test_single_line_json_recovery_reads_middle_without_repeating_source(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution, "_load_config", lambda: {"timeout": 10})
+    receipt = tmp_path / "executions.txt"
+    code = (
+        "import json\n"
+        f"with open({str(receipt)!r}, 'a') as f: f.write('ran\\n')\n"
+        "print(json.dumps({'head': 'h' * 80000, "
+        "'finding': {'reference': 'MIDDLE_617', 'count': 37}, 'tail': 't' * 80000}))\n"
+    )
+    result = json.loads(execution.execute_code(code, enabled_tools=[]))
+    assert result["status"] == "success"
+    assert "MIDDLE_617" not in result["output"]
+    assert result["stdout_spill_truncated"] is False
+    assert "JSON" in result["warning"]
+    assert "same data" in result["warning"]
+
+    recovery = json.loads(execution.execute_code(
+        "import json\n"
+        f"with open({result['stdout_spill_path']!r}) as f: data = json.load(f)\n"
+        "print(json.dumps(data['finding']))\n",
+        enabled_tools=[],
+    ))
+    assert recovery["status"] == "success"
+    assert json.loads(recovery["output"]) == {"reference": "MIDDLE_617", "count": 37}
+    assert receipt.read_text() == "ran\n"
+
+
 def test_full_output_is_redacted_before_it_is_saved():
     secret = "ghp_" + "a" * 36
     _, metadata = execution._truncate_stdout_text("start\n" * 12000 + secret + "\nend\n" * 12000)
@@ -57,6 +84,8 @@ def test_spill_limit_is_bytes_and_reported_as_partial(monkeypatch):
     assert metadata["stdout_spill_truncated"] is True
     assert "partial" in metadata["warning"].lower()
     assert "FULL output" not in metadata["warning"]
+    assert "missing records" in metadata["warning"]
+    assert "JSON" in metadata["warning"]
 
 
 def test_storage_failure_preserves_result_without_unreadable_path(monkeypatch):

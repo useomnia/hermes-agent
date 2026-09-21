@@ -160,11 +160,12 @@ Switching mode changes where scripts run and which interpreter runs them, not wh
 | Resource | Limit | Notes |
 |----------|-------|-------|
 | **Timeout** | 5 minutes (300s) | Script is killed with SIGTERM, then SIGKILL after 5s grace |
-| **Stdout** | 50 KB | Output truncated with `[output truncated at 50KB]` notice |
+| **Stdout preview** | 50 KB | Head and tail are returned; omitted output has byte counts and a recovery path when available |
+| **Stdout recovery** | Up to 5 MB | Saved output is redacted; `stdout_spill_truncated` identifies an incomplete artifact |
 | **Stderr** | 10 KB | Included in output on non-zero exit for debugging |
 | **Tool calls** | 50 per execution | Error returned when limit reached |
 
-All limits are configurable via `config.yaml`:
+Timeout and tool-call limits are configurable via `config.yaml`:
 
 ```yaml
 # In ~/.hermes/config.yaml
@@ -173,6 +174,33 @@ code_execution:
   timeout: 300       # Max seconds per script (default: 300)
   max_tool_calls: 50 # Max tool calls per execution (default: 50)
 ```
+
+### Recovering oversized output
+
+`stdout_truncated` describes the inline preview, not whether the script succeeded.
+Check `status` and `exit_code` for the execution outcome. When `stdout_spill_path`
+is present, inspect that saved artifact before requesting the same data again.
+Do not repeat successful API calls or commands solely to recover omitted output.
+
+For a complete JSON artifact, parse the saved file and print only the fields or
+records needed for the answer. Line paging cannot split a single-line JSON
+document. For text, search or read bounded ranges instead of printing the whole
+file again.
+
+`stdout_spill_truncated: true` means the saved artifact is also incomplete.
+Missing records remain unknown, and a partial JSON document may not parse.
+Inspect what was captured before choosing a targeted follow-up. If saving the
+artifact failed, the response warns that recovery is unavailable and omits the
+path. Neither case justifies replaying side-effecting actions to recreate output.
+
+The opt-in `scripts/stdout_recovery_livetest.py` checks this behavior with a real
+model and a counted loopback HTTP fixture. Its `complete` case requires the
+answer from the omitted middle without fetching the report twice; `partial`
+requires an explicit unknown answer when the saved prefix lacks that record and
+the source has expired. Fresh reads remain valid when source data is missing.
+Run each case in a fresh process with a five-minute deadline and provide
+`OPENROUTER_API_KEY` through the environment. It does not use customer data or
+establish remote-backend conformance.
 
 ## How Tool Calls Work Inside Scripts
 
