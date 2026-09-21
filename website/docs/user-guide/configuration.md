@@ -1411,22 +1411,20 @@ agent:
 
 | Value | Behavior |
 |-------|----------|
-| `"auto"` (default) | Enabled for models matching: `gpt`, `codex`, `gemini`, `gemma`, `grok`. Disabled for all others (Claude, DeepSeek, Qwen, etc.). |
+| `"auto"` (default) | Enabled for models matching: `gpt`, `codex`, `gemini`, `gemma`, `grok`, `glm`, `qwen`, `deepseek`. |
 | `true` | Always enabled, regardless of model. Useful if you notice your current model describing actions instead of performing them. |
 | `false` | Always disabled, regardless of model. |
 | `["gpt", "codex", "qwen", "llama"]` | Enabled only when the model name contains one of the listed substrings (case-insensitive). |
 
 ### What it injects
 
-When enabled, three layers of guidance may be added to the system prompt:
+When enabled, two layers of guidance may be added to the system prompt:
 
 1. **General tool-use enforcement** (all matched models) — instructs the model to make tool calls immediately instead of describing intentions, keep working until the task is complete, and never end a turn with a promise of future action.
 
-2. **OpenAI execution discipline** (GPT and Codex models only) — additional guidance addressing GPT-specific failure modes: abandoning work on partial results, skipping prerequisite lookups, hallucinating instead of using tools, and declaring "done" without verification.
+2. **Google operational guidance** (Gemini and Gemma models only) — conciseness, absolute paths, parallel tool calls, and verify-before-edit patterns.
 
-3. **Google operational guidance** (Gemini and Gemma models only) — conciseness, absolute paths, parallel tool calls, and verify-before-edit patterns.
-
-These are transparent to the user and only affect the system prompt. Models that already use tools reliably (like Claude) don't need this guidance, which is why `"auto"` excludes them.
+These settings only affect the system prompt. Execution-discipline guidance has its own independent setting below.
 
 ### When to turn it on
 
@@ -1436,6 +1434,37 @@ If you're using a model not in the default auto list and notice it frequently de
 agent:
   tool_use_enforcement: ["gpt", "codex", "gemini", "grok", "my-custom-model"]
 ```
+
+## Execution-Discipline Guidance
+
+Execution guidance addresses stopping on partial results, skipping verification after external writes, changing literal identifiers, and declaring work complete before every acceptance criterion is satisfied. It is separate from tool-use enforcement and only appears when the agent has tools.
+
+```yaml
+agent:
+  execution_guidance: "auto"   # "auto" | true | false | ["model-substring", ...]
+```
+
+| Value | Behavior |
+|-------|----------|
+| `"auto"` (default) | Enabled for models matching: `gpt`, `codex`, `grok`, `deepseek`, `kimi`, `qwen`, `glm`, `minimax`, `mimo`, `mistral`. |
+| `true` | Enabled for every model with tools. |
+| `false` | Disabled for every model. |
+| `["deepseek", "my-custom-model"]` | Enabled only when the model name contains one of the listed substrings (case-insensitive). |
+
+The injected block covers:
+
+- **Tool persistence** — continue until the task is complete and verified; retry empty, partial, or suspiciously narrow lookup results with a broader or different query.
+- **Mandatory tool use** — use tools for arithmetic, hashes, dates, system state, and file facts.
+- **External-write read-back** — read back the exact external target before claiming success. Internal file edits already confirmed by a tool do not need redundant verification.
+- **Count reconciliation** — reconcile enumerated results with declared totals and pagination indicators such as `total`, `reply_count`, and `has_more`.
+- **Literal preservation** — preserve identifiers exactly and validate their stated format before lookup.
+- **Verified completion** — check every named acceptance criterion before calling the work done.
+
+The setting is captured at agent initialization and contributes to the stable system-prompt prefix. Editing configuration does not change it on an existing agent. A restored session may retain its persisted prompt; use a new session to verify a rollout.
+
+The two gates are independent: `tool_use_enforcement: false` no longer disables execution guidance. To disable both, explicitly set both options to `false`. Gemini/Gemma retain their separate Google operational guidance; Claude is not in the execution auto list, but either can be opted in with `true` or a substring list.
+
+Matching uses the configured model name, not a remote preset's resolved model. A model-qualified name such as `openai/gpt-5.6-luna@preset/internal` matches `gpt`; an opaque `@preset/internal` does not. Set `execution_guidance: true` if an opaque preset should always receive this guidance.
 
 ## Tool-Loop Guardrails
 

@@ -992,6 +992,12 @@ DEFAULT_CONFIG = {
         # (force on/off for all models), or a list of model-name substrings
         # to match (e.g. ["gpt", "codex", "gemini", "qwen"]).
         "tool_use_enforcement": "auto",
+        # Execution-discipline guidance: tool persistence, external-write
+        # read-back, count reconciliation, literal preservation, and verified
+        # completion. Independent of tool_use_enforcement, fixed at agent init.
+        # Values: "auto" (gpt/codex/grok/deepseek/kimi/qwen/glm/minimax/mimo/
+        # mistral), true/false, or a list of model-name substrings.
+        "execution_guidance": "auto",
         # Intent-ack continuation: when the model opens a turn by narrating an
         # action it will take ("I'll go check the logs...") but emits no tool
         # call, intercept the turn-end, inject a "continue now, execute the

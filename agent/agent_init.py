@@ -1717,6 +1717,10 @@ def init_agent(
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
+    # Execution discipline is independent of tool-use enforcement. Resolve
+    # configuration once at init; system_prompt applies the model-name gate.
+    agent._execution_guidance = _agent_section.get("execution_guidance", "auto")
+
     # Intent-ack continuation config: "auto" (default — codex_responses only,
     # the historical gate), true (all api_modes), false (never), or a list of
     # model-name substrings.  Resolved against the active api_mode/model in the

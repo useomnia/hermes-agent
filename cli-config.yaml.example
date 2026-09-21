@@ -814,6 +814,14 @@ agent:
   # underneath this wrapper — this is the Hermes-level loop.
   # api_max_retries: 3
 
+  # Execution discipline: finish and verify every acceptance criterion,
+  # read back external writes, reconcile result counts, and preserve identifiers.
+  # "auto" matches supported model families (including GPT/Luna); true/false
+  # forces it on/off, or use a list of case-insensitive model-name substrings.
+  # Independent of tool_use_enforcement; requires tools. Applied at agent init.
+  # For an opaque @preset/name, use true to opt in without a model-name match.
+  # execution_guidance: "auto"
+
   # After the agent edits code without fresh passing verification, nudge it to
   # verify before finishing. The default "auto" enables it on interactive
   # coding surfaces (CLI, TUI, desktop) and programmatic callers, and disables

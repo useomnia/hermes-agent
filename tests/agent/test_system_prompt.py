@@ -5,9 +5,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     HERMES_AGENT_HELP_GUIDANCE,
+    OPENAI_MODEL_EXECUTION_GUIDANCE,
     STEER_CHANNEL_NOTE,
 )
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
@@ -77,6 +80,57 @@ def _stable_prompt(agent):
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
         return build_system_prompt_parts(agent)["stable"]
+
+
+class TestExecutionGuidanceInjection:
+    def _prompt(self, model, setting="auto", *, tool_use=False, tools=("terminal",)):
+        return _stable_prompt(_make_agent(
+            model=model,
+            valid_tool_names=list(tools),
+            _tool_use_enforcement=tool_use,
+            _execution_guidance=setting,
+        ))
+
+    @pytest.mark.parametrize("model", [
+        "openai/gpt-5.6-luna@preset/internal", "openai/codex-mini", "x-ai/grok-4",
+        "deepseek/deepseek-v4-pro", "moonshotai/kimi-k2.6", "qwen/qwen3.6-plus",
+        "z-ai/glm-5.1", "minimax/minimax-m2.7", "xiaomi/mimo-v2-pro", "mistral-large",
+    ])
+    def test_auto_injects_once_independently_of_tool_use(self, model):
+        assert self._prompt(model).count(OPENAI_MODEL_EXECUTION_GUIDANCE) == 1
+
+    @pytest.mark.parametrize("model", [
+        "anthropic/claude-sonnet-4", "google/gemini-3.1-pro", "google/gemma-4",
+        "@preset/internal", "", None,
+    ])
+    def test_auto_skips_nonmatching_models(self, model):
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in self._prompt(model, tool_use=True)
+
+    @pytest.mark.parametrize("setting", [True, "TRUE", "always", "yes", "on"])
+    def test_explicit_enable_opts_other_models_in(self, setting):
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE in self._prompt("custom-model", setting)
+
+    @pytest.mark.parametrize("setting", [False, "FALSE", "never", "no", "off", []])
+    def test_explicit_disable_keeps_tool_use_independent(self, setting):
+        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
+
+        prompt = self._prompt("openai/gpt-5.6-luna", setting, tool_use=True)
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in prompt
+        assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
+
+    @pytest.mark.parametrize("setting,expected", [
+        (["LUNA"], True), ([None, 42, "LUNA"], True), (["deepseek"], False),
+        ([None, 42], False), (None, True), ("unrecognized", True),
+    ])
+    def test_custom_list_and_fallback_semantics(self, setting, expected):
+        prompt = self._prompt("openai/gpt-5.6-luna@preset/internal", setting)
+        assert (OPENAI_MODEL_EXECUTION_GUIDANCE in prompt) is expected
+
+    @pytest.mark.parametrize("setting", [True, "auto"])
+    def test_never_injects_without_tools(self, setting):
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in self._prompt(
+            "openai/gpt-5.6-luna", setting, tools=(),
+        )
 
 
 def _prompt_parts(agent):
