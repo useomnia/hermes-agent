@@ -1826,7 +1826,7 @@ def cache_media_bytes(
     ``application/octet-stream``); only images that fail validation
     (``cache_image_from_bytes`` raises ValueError) return None.
     """
-    from tools.credential_files import to_agent_visible_cache_path
+    from tools.credential_files import publish_cache_path
 
     ext = _resolve_media_ext(filename, mime_type)
     mime = (mime_type or "").lower()
@@ -1847,18 +1847,18 @@ def cache_media_bytes(
         except ValueError:
             return None
         out_mime = mime if mime.startswith("image/") else SUPPORTED_IMAGE_DOCUMENT_TYPES.get(img_ext, "image/jpeg")
-        return CachedMedia(to_agent_visible_cache_path(path), out_mime, "image", display)
+        return CachedMedia(publish_cache_path(path), out_mime, "image", display)
 
     if is_video:
         vid_ext = ext if ext in SUPPORTED_VIDEO_TYPES else ".mp4"
         path = cache_video_from_bytes(data, ext=vid_ext)
-        return CachedMedia(to_agent_visible_cache_path(path), SUPPORTED_VIDEO_TYPES.get(vid_ext, "video/mp4"), "video", display)
+        return CachedMedia(publish_cache_path(path), SUPPORTED_VIDEO_TYPES.get(vid_ext, "video/mp4"), "video", display)
 
     if is_audio:
         aud_ext = ext if ext in {".ogg", ".mp3", ".wav", ".m4a", ".opus", ".flac"} else ".ogg"
         path = cache_audio_from_bytes(data, ext=aud_ext)
         out_mime = mime if mime.startswith("audio/") else f"audio/{aud_ext.lstrip('.')}"
-        return CachedMedia(to_agent_visible_cache_path(path), out_mime, "audio", display)
+        return CachedMedia(publish_cache_path(path), out_mime, "audio", display)
 
     # Any other file type is cached and surfaced to the agent as a local path
     # so it can be inspected with terminal / read_file / etc. Authorization to
@@ -1873,7 +1873,7 @@ def cache_media_bytes(
         out_mime = SUPPORTED_DOCUMENT_TYPES[ext]
     else:
         out_mime = mime if mime else "application/octet-stream"
-    return CachedMedia(to_agent_visible_cache_path(path), out_mime, "document", display or fallback_name)
+    return CachedMedia(publish_cache_path(path), out_mime, "document", display or fallback_name)
 
 
 class MessageType(Enum):

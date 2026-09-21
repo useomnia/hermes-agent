@@ -12858,7 +12858,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # language. The hardcoded send has therefore been removed.
 
         if audio_file_paths:
-            from tools.credential_files import to_agent_visible_cache_path as _to_agent_path
+            from tools.credential_files import publish_cache_path as _to_agent_path
             for _apath in audio_file_paths:
                 _basename = os.path.basename(_apath)
                 _parts = _basename.split("_", 2)
@@ -12877,7 +12877,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_text = f"{_note}\n\n{message_text}"
 
         if video_paths:
-            from tools.credential_files import to_agent_visible_cache_path as _to_agent_path
+            from tools.credential_files import publish_cache_path as _to_agent_path
             for _vpath in video_paths:
                 _basename = os.path.basename(_vpath)
                 _parts = _basename.split("_", 2)
@@ -12897,7 +12897,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if event.media_urls:
             import mimetypes as _mimetypes
-            from tools.credential_files import to_agent_visible_cache_path
+            from tools.credential_files import publish_cache_path
 
             _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
             for i, path in enumerate(event.media_urls):
@@ -12934,10 +12934,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 display_name = parts[2] if len(parts) >= 3 else basename
                 display_name = re.sub(r'[^\w.\- ]', '_', display_name)
 
-                # Translate host cache path to in-container path if running under Docker backend.
-                # This ensures the agent receives a path it can open inside its sandbox, as the
-                # cache directories are auto-mounted at /root/.hermes/cache/* by get_cache_directory_mounts().
-                agent_path = to_agent_visible_cache_path(path)
+                # Publish before advertising the path: copying backends need
+                # the bytes on the remote filesystem, while Docker uses mounts.
+                agent_path = publish_cache_path(path)
 
                 context_note = _build_document_context_note(display_name, agent_path, mtype)
                 message_text = f"{context_note}\n\n{message_text}"

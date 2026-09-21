@@ -416,39 +416,25 @@ _CACHE_DIRS: list[tuple[str, str]] = [
 # commands and reads.
 OMNIO_TOOLBOX_CACHE_BASE = "/tmp/omnio-session"
 
-# Callables that push the projected cache to the active backend NOW. The
-# Sprites environment registers one per process so a producer can publish a
-# path only after the file is readable at that path — consumers other than
-# Hermes (the proxy's deliverable warm-up, the video wrapper) read the Toolbox
-# directly and cannot wait for the next command's sync.
-_cache_projection_flush_hooks: List[Callable[[], None]] = []
-
-
-def register_cache_projection_flush(hook: Callable[[], None]) -> None:
-    if hook not in _cache_projection_flush_hooks:
-        _cache_projection_flush_hooks.append(hook)
-
-
-def flush_cache_projection() -> None:
-    """Best effort: a failed flush leaves the read-triggered sync as the fallback."""
-    for hook in list(_cache_projection_flush_hooks):
-        try:
-            hook()
-        except Exception:
-            logger.debug("cache projection flush hook failed", exc_info=True)
-
-
 def publish_cache_path(host_path: str) -> str:
     """Return the path the AGENT should be given for a host cache file, with
     the file already readable there.
 
     On backends that project the cache by copying (the Omnio Toolbox), the
-    copy is pushed before the path is handed out. Docker sees the bind mount
-    live and other backends keep host paths, so the flush is a no-op there.
+    copy is pushed before the path is handed out, including before the first
+    terminal/file call. Reuse the file tools' lazy environment acquisition so
+    publication and later reads share the same transport and sync state.
+    Docker sees its bind mount live; other backends keep their existing paths.
+    A failed push retains the translated path for a later read-time retry.
     """
     agent_path = to_agent_visible_cache_path(host_path)
-    if agent_path != host_path:
-        flush_cache_projection()
+    if _terminal_backend() == "sprites" and agent_path != host_path:
+        try:
+            from tools.file_tools import _get_file_ops
+
+            _get_file_ops().env.sync_cache_files()
+        except Exception:
+            logger.warning("Cache publication failed; read-time sync will retry", exc_info=True)
     return agent_path
 
 
@@ -607,4 +593,3 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-

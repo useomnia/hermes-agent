@@ -18,7 +18,6 @@ from tools.environments import file_sync
 from tools.environments.file_sync import (
     FileSyncManager, SPRITES_CACHE_ROOT, SPRITES_DELEGATION_ROOT, iter_sprites_cache_files,
 )
-from tools.environments import sprites as sprites_module
 from tools.environments.sprites import SpritesEnvironment, SpritesFileOperations, SpritesToolboxError
 from tools.code_execution_tool import _truncate_stdout_text
 
@@ -103,7 +102,11 @@ def pair(tmp_path, monkeypatch):
     env._cache_sync_manager = FileSyncManager(
         iter_sprites_cache_files, env._upload_cache_file, env._delete_cache_files,
     )
-    sprites_module._register_live_environment(env)
+    from tools import file_tools, terminal_tool
+
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
+    monkeypatch.setattr(file_tools, "_file_ops_cache", {"default": SpritesFileOperations(env)})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
     yield home, toolbox, env, requests
     server.shutdown()
     server.server_close()
@@ -130,6 +133,82 @@ def test_published_paths_never_contain_hidden_segments(pair):
     assert SPRITES_CACHE_ROOT == f"{OMNIO_TOOLBOX_CACHE_BASE}/cache"
 
 
+def test_cold_publication_creates_transport_before_returning_path(pair, monkeypatch):
+    from tools import file_tools, terminal_tool
+    from tools.credential_files import publish_cache_path
+
+    home, toolbox, env, requests = pair
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(file_tools, "_file_ops_cache", {})
+    monkeypatch.setenv("OMNIO_TOOLBOX_URL", env.toolbox_url)
+    monkeypatch.setenv("OMNIO_TOOLBOX_BEARER", env.bearer_token)
+    monkeypatch.setenv("OMNIO_TOOLBOX_BRAND", env.brand)
+    monkeypatch.setenv("TERMINAL_CWD", "/brand")
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    # Session shell setup is unrelated to publishing: the file transport and
+    # environment factory remain real, with no pre-created active environment.
+    monkeypatch.setattr(SpritesEnvironment, "init_session", lambda self: None)
+    shot = home / "cache/screenshots/first.png"
+    shot.parent.mkdir(parents=True)
+    shot.write_bytes(b"screenshot bytes")
+
+    path = publish_cache_path(str(shot))
+
+    assert (toolbox / path.lstrip("/")).read_bytes() == shot.read_bytes()
+    assert [item["operation"] for item in requests] == ["raw-write"]
+
+
+@pytest.mark.parametrize("filename,mime", [
+    ("fresh.mp4", "video/mp4"),
+    ("fresh.mp3", "audio/mpeg"),
+    ("fresh.txt", "text/plain"),
+])
+def test_gateway_attachments_are_published_before_direct_consumers(pair, filename, mime):
+    from gateway.platforms.base import cache_media_bytes
+
+    home, toolbox, env, requests = pair
+    data = b"new attachment content"
+
+    media = cache_media_bytes(data, filename=filename, mime_type=mime)
+
+    assert media is not None
+    assert (toolbox / media.path.lstrip("/")).read_bytes() == data
+    assert [item["operation"] for item in requests] == ["raw-write"]
+
+
+@pytest.mark.parametrize("offset", [1, 2])
+def test_paged_read_bounds_memory_for_long_selected_and_skipped_lines(offset):
+    import tracemalloc
+    from tools.tool_output_limits import get_max_line_length
+
+    class LargeLineEnvironment:
+        cwd = "/brand"
+
+        def stream_file_bytes(self, path):
+            chunk = b"x" * (1024 * 1024)
+            for _ in range(24):
+                yield chunk
+            yield b"\nrequested line\n"
+
+    tracemalloc.start()
+    try:
+        result = SpritesFileOperations(LargeLineEnvironment())._read_large_text_page(
+            "/tmp/long-line.txt", offset, 1,
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result.error is None
+    assert result.total_lines == 2
+    assert result.file_size == 24 * 1024 * 1024 + len(b"\nrequested line\n")
+    if offset == 1:
+        assert result.content == "1|" + "x" * get_max_line_length() + "... [truncated]"
+    else:
+        assert result.content == "2|requested line"
+    assert peak < 12 * 1024 * 1024
+
+
 def test_publish_flush_failure_falls_back_to_read_time_sync(pair, monkeypatch):
     home, toolbox, env, requests = pair
     original = env._write_raw_artifact
@@ -147,6 +226,43 @@ def test_publish_flush_failure_falls_back_to_read_time_sync(pair, monkeypatch):
     assert len(attempts) == 1 and not requests  # the publish-time push failed quietly
     assert SpritesFileOperations(env).read_file_raw(path).content == "eventually"
     assert len(attempts) == 2
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 7])
+def test_streamed_pages_preserve_utf8_bom_crlf_and_empty_lines(chunk_size):
+    data = "\ufefffirst 🧪\r\n\r\nlast é".encode()
+
+    class SplitEnvironment:
+        cwd = "/brand"
+
+        def stream_file_bytes(self, path):
+            for index in range(0, len(data), chunk_size):
+                yield data[index:index + chunk_size]
+
+    result = SpritesFileOperations(SplitEnvironment())._read_large_text_page(
+        "/tmp/utf8.txt", 1, 3,
+    )
+    assert result.error is None
+    assert result.content == "1|first 🧪\n2|\n3|last é"
+    assert result.total_lines == 3
+    assert result.file_size == len(data)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_raw_reads_normalize_transport_failures(pair, monkeypatch, streaming):
+    from tools.environments import sprites
+
+    _, _, env, _ = pair
+
+    def disconnected(*args, **kwargs):
+        raise ConnectionResetError("connection lost")
+
+    monkeypatch.setattr(sprites._URL_OPENER, "open", disconnected)
+    with pytest.raises(SpritesToolboxError, match="unreachable"):
+        if streaming:
+            list(env.stream_file_bytes("/tmp/example.txt"))
+        else:
+            env.read_file_bytes("/tmp/example.txt", max_bytes=100)
 
 
 def test_live_log_refreshes_before_each_parent_read(pair):

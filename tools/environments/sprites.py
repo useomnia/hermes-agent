@@ -13,7 +13,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-import weakref
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -58,29 +57,6 @@ _REDACTED_CACHE_SUFFIXES = frozenset({
 def _is_toolbox_cache_path(path: str) -> bool:
     """True for paths inside the projected harness cache on the Toolbox."""
     return path == SPRITES_CACHE_ROOT or path.startswith(SPRITES_CACHE_ROOT + "/")
-
-
-# Every live environment in this gateway process. A producer that publishes a
-# cache path flushes all of them (one Brand per process, normally one or two
-# environments), so the file is on the Toolbox before the path reaches the
-# model or the proxy. Weak references: reaped environments drop out.
-_live_environments: "weakref.WeakSet[SpritesEnvironment]" = weakref.WeakSet()
-_flush_hook_registered = False
-
-
-def _flush_live_environments() -> None:
-    for env in list(_live_environments):
-        env.sync_cache_files(raise_on_error=False)
-
-
-def _register_live_environment(env: "SpritesEnvironment") -> None:
-    global _flush_hook_registered
-    _live_environments.add(env)
-    if not _flush_hook_registered:
-        from tools.credential_files import register_cache_projection_flush
-
-        register_cache_projection_flush(_flush_live_environments)
-        _flush_hook_registered = True
 
 
 _STREAM_CHUNK_BYTES = 1024 * 1024
@@ -310,7 +286,6 @@ class SpritesEnvironment(BaseEnvironment):
             upload_fn=self._upload_cache_file,
             delete_fn=self._delete_cache_files,
         )
-        _register_live_environment(self)
         self._sync_manager.sync(force=True)
         self.init_session()
 
@@ -492,6 +467,10 @@ class SpritesEnvironment(BaseEnvironment):
             raise SpritesToolboxError(
                 f"Toolbox API /files is unreachable: {exc}"
             ) from exc
+        except (OSError, http.client.HTTPException) as exc:
+            raise SpritesToolboxError(
+                f"Toolbox API /files is unreachable: {exc}"
+            ) from exc
 
     def stream_file_bytes(
         self, path: str, *, chunk_size: int = _STREAM_CHUNK_BYTES
@@ -528,10 +507,6 @@ class SpritesEnvironment(BaseEnvironment):
                 f"{detail or exc.reason}",
                 detail=detail or str(exc.reason),
                 http_status=exc.code,
-            ) from exc
-        except (OSError, http.client.HTTPException) as exc:
-            raise SpritesToolboxError(
-                f"Toolbox API /files is unreachable: {exc}"
             ) from exc
         except (OSError, http.client.HTTPException) as exc:
             raise SpritesToolboxError(
@@ -888,12 +863,18 @@ class SpritesFileOperations(ShellFileOperations):
         window is held in memory, so a file of any size pages, and the
         ``offset/limit`` recipe the whole-read error gives out always works.
         """
+        from tools.tool_output_limits import get_max_line_length
+
         expanded = self._expand_path(path)
         start = max(1, offset)
         end = start + limit - 1
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         window: list[str] = []
         pending = ""
+        # Retain only the displayable prefix, including room for a BOM and
+        # one over-limit character so _add_line_numbers marks truncation.
+        # A minified document must not grow this buffer to the file's size.
+        prefix_limit = get_max_line_length() + 2
         line_no = 0
         size = 0
 
@@ -906,11 +887,12 @@ class SpritesFileOperations(ShellFileOperations):
         try:
             for chunk in self.env.stream_file_bytes(expanded):
                 size += len(chunk)
-                pieces = (pending + decoder.decode(chunk)).split("\n")
-                pending = pieces.pop()
-                for piece in pieces:
-                    take(piece)
-            pending += decoder.decode(b"", final=True)
+                pieces = decoder.decode(chunk).split("\n")
+                for piece in pieces[:-1]:
+                    take(pending + piece[:prefix_limit - len(pending)])
+                    pending = ""
+                pending += pieces[-1][:prefix_limit - len(pending)]
+            pending += decoder.decode(b"", final=True)[:prefix_limit - len(pending)]
             if pending:
                 take(pending)
         except SpritesToolboxError as error:
