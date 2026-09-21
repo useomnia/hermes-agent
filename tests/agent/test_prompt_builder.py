@@ -1769,7 +1769,7 @@ class TestToolUseEnforcementGuidance:
 
 
 class TestOpenAIModelExecutionGuidance:
-    """Tests for GPT/Codex-specific execution discipline guidance."""
+    """Contracts for execution discipline shared across supported models."""
 
     def test_guidance_covers_tool_persistence(self):
         text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
@@ -1801,6 +1801,31 @@ class TestOpenAIModelExecutionGuidance:
     def test_guidance_is_string(self):
         assert isinstance(OPENAI_MODEL_EXECUTION_GUIDANCE, str)
         assert len(OPENAI_MODEL_EXECUTION_GUIDANCE) > 100
+
+    def test_guidance_covers_external_write_readback(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "read" in text and "back" in text
+        assert "successful tool call is not a successful task" in text
+        assert "do not re-verify internal file edits a tool already confirmed" in text
+
+    def test_guidance_covers_count_reconciliation(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "has_more" in text
+        assert "hard assertions" in text
+
+    def test_guidance_covers_literal_preservation(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "normalize" in text
+        assert "malformed" in text
+
+    def test_guidance_covers_retry_differently(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "suspiciously narrow" in text
+        assert "retry" in text
+
+    def test_guidance_gates_completion_on_verification(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "plausible subset" in text
 
 
 class TestParallelToolCallGuidance:
