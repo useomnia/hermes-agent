@@ -66,6 +66,7 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -1027,6 +1028,30 @@ def skill_view(
     return render_skill_result(payload)
 
 
+def _deduplicate_same_root_skills(candidates, all_dirs):
+    """Upstream #113126: prefer an unambiguous shallow copy of ONE skill."""
+    if len(candidates) < 2:
+        return candidates
+    roots = {
+        max((root for root in all_dirs if path.is_relative_to(root)),
+            key=lambda root: len(root.parts), default=None)
+        for _, path in candidates
+    }
+    if len(roots) != 1 or None in roots:
+        return candidates
+    try:
+        if len({hashlib.sha256(path.read_bytes()).digest() for _, path in candidates}) != 1:
+            return candidates
+    except OSError:
+        return candidates
+    root = roots.pop()
+    def rank(candidate):
+        path = candidate[1]
+        return path.name != "SKILL.md", len(path.relative_to(root).parts)
+    ranked = sorted(candidates, key=rank)
+    return [ranked[0]] if rank(ranked[0]) != rank(ranked[1]) else candidates
+
+
 def _load_skill_content(
     name: str,
     file_path: str = None,
@@ -1248,6 +1273,7 @@ def _load_skill_content(
                 ):
                     _record(None, found_md)
 
+        candidates = _deduplicate_same_root_skills(candidates, all_dirs)
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
             logging.getLogger(__name__).warning(
@@ -1276,13 +1302,20 @@ def _load_skill_content(
             skill_dir, skill_md = candidates[0]
 
         if not skill_md or not skill_md.exists():
-            available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
+            installed = _sort_skills(_find_all_skills())
+            available = [skill["name"] for skill in installed[:20]]
+            # Recover stale category references without silently choosing a
+            # different skill or bypassing qualified-name collision checks.
+            bare_name = name.replace(":", "/").rsplit("/", 1)[-1]
+            matching = [{"name": skill["name"], "category": skill.get("category")}
+                        for skill in installed if skill["name"] == bare_name]
             return json.dumps(
                 {
                     "success": False,
                     "error": f"Skill '{name}' not found.",
                     "available_skills": available,
-                    "hint": "Use skills_list to see all available skills",
+                    "matching_skills": matching,
+                    "hint": "Use a matching installed name, or skills_list to see all available skills. Do not guess a category.",
                 },
                 ensure_ascii=False,
             )
@@ -1386,7 +1419,7 @@ def _load_skill_content(
                     },
                     ensure_ascii=False,
                 )
-            if not target_file.exists():
+            if not target_file.is_file():
                 # List available files in the skill directory, organized by type
                 available_files = {
                     "references": [],
@@ -1630,6 +1663,9 @@ def _load_skill_content(
                     "Could not preprocess skill content for %s", skill_name, exc_info=True
                 )
 
+        from agent.skill_path_mapping import map_skill_dir_for_backend
+
+        runtime_skill_dir = map_skill_dir_for_backend(skill_dir, task_id=task_id) if skill_dir else None
         result = {
             "success": True,
             "name": skill_name,
@@ -1638,7 +1674,7 @@ def _load_skill_content(
             "related_skills": related_skills,
             "content": rendered_content,
             "path": rel_path,
-            "skill_dir": str(skill_dir) if skill_dir else None,
+            "skill_dir": runtime_skill_dir if preprocess else (str(skill_dir) if skill_dir else None),
             "linked_files": linked_files if linked_files else None,
             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
             if linked_files

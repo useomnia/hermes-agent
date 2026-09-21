@@ -270,6 +270,7 @@ def get_skills_directory_mount(
         host_path = _safe_skills_path(skills_dir)
         mounts.append({
             "host_path": host_path,
+            "source_path": str(skills_dir),
             "container_path": f"{container_base.rstrip('/')}/skills",
         })
 
@@ -281,6 +282,7 @@ def get_skills_directory_mount(
                 host_path = _safe_skills_path(ext_dir)
                 mounts.append({
                     "host_path": host_path,
+                    "source_path": str(ext_dir),
                     "container_path": f"{container_base.rstrip('/')}/external_skills/{idx}",
                 })
     except ImportError:
