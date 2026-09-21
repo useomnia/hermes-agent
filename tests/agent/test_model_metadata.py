@@ -31,12 +31,28 @@ from agent.model_metadata import (
     fetch_model_metadata,
     _MODEL_CACHE_TTL,
     estimate_request_tokens_rough,
+    is_openrouter_preset_model,
 )
 
 
 # =========================================================================
 # Token estimation
 # =========================================================================
+
+@pytest.mark.parametrize("model,expected", [
+    ("@preset/internal", True),
+    ("openai/gpt-5.6-luna@preset/internal", True),
+    (None, False),
+    ("", False),
+    ("openai/gpt-5.6-luna", False),
+    ("openai/gpt-5.6-luna@preset/", False),
+    ("@preset/ ", False),
+    ("@preset/nested/path", False),
+    ("@preset/nested\\path", False),
+])
+def test_is_openrouter_preset_model(model, expected):
+    assert is_openrouter_preset_model(model) is expected
+
 
 class TestEstimateTokensRough:
     def test_empty_string(self):

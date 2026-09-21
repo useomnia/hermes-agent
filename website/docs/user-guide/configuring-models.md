@@ -55,6 +55,35 @@ When you switch models **inside an active session** (Herm TUI model picker, `her
 Prompt caches are keyed to the model serving the request, so any mid-conversation model change — an explicit `/model` switch, an [automatic fallback](./features/fallback-providers.md), or a [credential-pool](./features/credential-pools.md) rotation onto a different account — means the next message re-reads the entire conversation at full input-token price instead of the cached (~75–90% discounted) rate. On a long session this one-time re-read can dwarf the per-token difference between the two models. Switch when you need to, but prefer doing it early in a conversation or right after starting a fresh session.
 :::
 
+## Reasoning with OpenRouter presets
+
+When the model is `@preset/<slug>` or `model-id@preset/<slug>`, leave
+`agent.reasoning_effort` empty to inherit the preset's reasoning configuration:
+
+```yaml
+agent:
+  reasoning_effort: ""
+```
+
+Hermes omits the request's reasoning block in this case. An explicit supported
+reasoning setting or request override still takes precedence over the preset.
+Requests without a preset retain their existing provider defaults.
+
+For OpenRouter conversation-loop requests, the profile's `logs/agent.log` includes
+a metadata-only line immediately before dispatch, after request middleware:
+
+```text
+API request <turn-id>:api:2: model=openai/gpt-5.6-luna@preset/internal reasoning=preset
+API request <turn-id>:api:3: model=openai/gpt-5.6-luna@preset/internal reasoning=explicit:max
+```
+
+`preset` means OpenRouter chooses the value from the preset; inspect that preset
+in OpenRouter to see its configured effort. It does not assert that the provider
+used `max`. Other labels are `explicit:disabled`, `explicit:configured` (a custom
+reasoning configuration), and `provider-default` (no preset or explicit setting).
+SDK-internal retries reuse the same body and do not produce another line.
+These diagnostics contain no messages, headers, or reasoning text.
+
 ## Setting auxiliary models
 
 Click **Show auxiliary** to reveal the 11 task slots:

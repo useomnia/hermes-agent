@@ -255,6 +255,14 @@ def _pure_openrouter_preset_slug(model: Any) -> Optional[str]:
     return slug
 
 
+def is_openrouter_preset_model(model: str | None) -> bool:
+    """Recognize pure and concrete-model preset references without resolving them."""
+    if not isinstance(model, str):
+        return False
+    _concrete, marker, slug = model.partition("@preset/")
+    return bool(marker and _pure_openrouter_preset_slug(f"@preset/{slug}"))
+
+
 def _openrouter_concrete_model(model: str) -> str:
     """Return the concrete portion of ``model@preset/slug`` for metadata only.
 

@@ -2174,6 +2174,9 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    from agent.chat_completion_helpers import log_openrouter_request_reasoning
+
+                    log_openrouter_request_reasoning(agent, next_api_kwargs, api_request_id)
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
