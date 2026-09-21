@@ -12,6 +12,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
+from agent.model_metadata import is_openrouter_preset_model
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
@@ -484,7 +485,11 @@ class ChatCompletionsTransport(ProviderTransport):
                 gh_reasoning = params.get("github_reasoning_extra")
                 if gh_reasoning is not None:
                     extra_body["reasoning"] = gh_reasoning
-            else:
+            elif not (
+                is_openrouter
+                and reasoning_config is None
+                and is_openrouter_preset_model(model)
+            ):
                 _effort = "medium"
                 if reasoning_config and isinstance(reasoning_config, dict):
                     _effort = reasoning_config.get("effort", "medium") or "medium"

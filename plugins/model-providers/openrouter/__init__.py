@@ -3,6 +3,7 @@
 import logging
 from typing import Any
 
+from agent.model_metadata import is_openrouter_preset_model
 from agent.portal_tags import get_conversation_context
 from providers import register_provider
 from providers.base import ProviderProfile
@@ -182,7 +183,9 @@ class OpenRouterProfile(ProviderProfile):
                     top_level["verbosity"] = effort
             elif reasoning_config is not None:
                 extra_body["reasoning"] = dict(reasoning_config)
-            else:
+            elif not is_openrouter_preset_model(model):
+                # Request reasoning overrides the preset. An unset local value
+                # must leave preset reasoning intact, not replace it with medium.
                 extra_body["reasoning"] = {"enabled": True, "effort": "medium"}
 
         # Same resolution as build_extra_body: xAI's prompt cache is pinned per

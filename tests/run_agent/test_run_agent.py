@@ -3863,6 +3863,24 @@ class TestMcpParallelToolBatch:
 
 
 class TestHandleMaxIterations:
+    @pytest.mark.parametrize("reasoning", [None, {"enabled": True, "effort": "max"}, {"enabled": False}])
+    def test_summary_preserves_preset_reasoning(self, agent, reasoning):
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._base_url_lower = agent.base_url
+        agent.model = "openai/gpt-5.6-luna@preset/internal"
+        agent.reasoning_config = reasoning
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+
+        result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60)
+
+        assert result == "Summary"
+        body = agent.client.chat.completions.create.call_args.kwargs.get("extra_body", {})
+        if reasoning is None:
+            assert "reasoning" not in body
+        else:
+            assert body["reasoning"] == reasoning
+
     def test_returns_summary(self, agent):
         resp = _mock_response(content="Here is a summary of what I did.")
         agent.client.chat.completions.create.return_value = resp
@@ -4193,6 +4211,34 @@ class TestRunConversation:
         agent.tool_delay = 0
         agent.compression_enabled = False
         agent.save_trajectories = False
+
+    def test_logs_final_reasoning_after_execution_middleware(self, agent, caplog):
+        self._setup_agent(agent)
+        agent.model = "openai/gpt-5.6-luna@preset/internal"
+        agent.provider = "openrouter"
+        agent.reasoning_config = None
+        agent.client.chat.completions.create.return_value = _mock_response(content="Done")
+
+        def rewrite_request(request, dispatch, **context):
+            assert "reasoning" not in request.get("extra_body", {})
+            rewritten = {**request, "extra_body": {
+                **request.get("extra_body", {}),
+                "reasoning": {"enabled": True, "effort": "max"},
+            }}
+            return dispatch(rewritten)
+
+        with caplog.at_level("INFO"), patch(
+            "hermes_cli.middleware.run_llm_execution_middleware",
+            side_effect=rewrite_request,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Done"
+        sent = agent.client.chat.completions.create.call_args.kwargs
+        assert sent["extra_body"]["reasoning"]["effort"] == "max"
+        request_lines = [r.message for r in caplog.records if r.message.startswith("API request ")]
+        assert len(request_lines) == 1
+        assert "reasoning=explicit:max" in request_lines[0]
 
     def test_stop_finish_reason_returns_response(self, agent):
         self._setup_agent(agent)
