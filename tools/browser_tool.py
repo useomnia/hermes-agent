@@ -3218,6 +3218,24 @@ def _store_full_snapshot(snapshot_text: str) -> Optional[str]:
         return None
 
 
+def _agent_visible_stored_path(stored_path: Optional[str]) -> Optional[str]:
+    """Render a stored cache path where the AGENT's read_file sees it.
+
+    ``read_file`` runs inside the active terminal backend, so a footer that
+    names the host path dangles on Docker and on the Omnio Toolbox (upstream
+    #72389). ``to_agent_visible_cache_path`` is a no-op on backends that keep
+    host paths.
+    """
+    if not stored_path:
+        return stored_path
+    try:
+        from tools.credential_files import to_agent_visible_cache_path
+
+        return to_agent_visible_cache_path(stored_path)
+    except Exception:  # noqa: BLE001 — a failed translation must not lose the pointer
+        return stored_path
+
+
 def _extract_relevant_content(
     snapshot_text: str,
     user_task: Optional[str] = None
@@ -3228,7 +3246,7 @@ def _extract_relevant_content(
     the pointer lets the agent read anything the summary dropped). Falls back
     to simple truncation when no auxiliary text model is configured.
     """
-    stored_path = _store_full_snapshot(snapshot_text)
+    stored_path = _agent_visible_stored_path(_store_full_snapshot(snapshot_text))
     stored_note = (
         f'\n\n[Summarized from a {len(snapshot_text):,}-char snapshot. Full snapshot '
         f'saved to: {stored_path} — read it with read_file if anything is missing.]'
@@ -3304,7 +3322,7 @@ def _truncate_snapshot(snapshot_text: str, max_chars: int = SNAPSHOT_SUMMARIZE_T
     if len(snapshot_text) <= max_chars:
         return snapshot_text
 
-    stored_path = _store_full_snapshot(snapshot_text)
+    stored_path = _agent_visible_stored_path(_store_full_snapshot(snapshot_text))
 
     lines = snapshot_text.split('\n')
     result: list[str] = []

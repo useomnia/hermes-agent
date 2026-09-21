@@ -114,6 +114,7 @@ DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
+MAX_SPILLED_STDOUT_BYTES = 5_000_000
 
 
 def _assemble_stdout_result(
@@ -152,10 +153,87 @@ def _assemble_stdout_result(
     if truncated:
         metadata["warning"] = (
             "execute_code stdout was truncated; the script did run, but only "
-            "the captured head/tail output is included. Re-run only with "
-            "narrower output if the omitted data is required."
+            "the captured head/tail output is included."
         )
     return stdout_text, metadata
+
+
+def _sanitize_stdout(stdout_text: str) -> str:
+    from agent.redact import redact_sensitive_text
+    from tools.ansi_strip import strip_ansi
+
+    return redact_sensitive_text(strip_ansi(stdout_text), code_file=True)
+
+
+def _spill_full_stdout(stdout_text: str) -> str:
+    """Save recovery output under ``cache/exec`` and return the path the
+    AGENT can read it at.
+
+    Adapted from upstream #97043. The file is written host-side; backends that
+    project the harness cache (Docker mounts it, the Omnio Toolbox syncs it
+    before reads) receive it through that projection, and
+    ``to_agent_visible_cache_path`` renders the path as the sandbox sees it.
+    Callers sanitize and bound the text before any disk write.
+    """
+    from hermes_constants import get_hermes_dir, get_hermes_home
+
+    spill_dir = get_hermes_dir("cache/exec", "exec_spill")
+    # Refuse links in the cache path before mkdir can follow them. The profile
+    # root itself remains the caller's configured location.
+    home = get_hermes_home()
+    for component in (spill_dir, *spill_dir.parents):
+        if component == home:
+            break
+        if component.is_symlink():
+            raise OSError("stdout cache contains a symlink")
+    spill_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Exclusive, unpredictable names avoid overwriting a prior artifact or
+    # following a pre-existing file symlink. mkstemp creates private files.
+    fd, path = tempfile.mkstemp(prefix="stdout_", suffix=".txt", dir=spill_dir)
+    with os.fdopen(fd, "w", encoding="utf-8") as output:
+        output.write(stdout_text)
+    from tools.credential_files import to_agent_visible_cache_path
+
+    return to_agent_visible_cache_path(path)
+
+
+def _add_stdout_spill(metadata: Dict[str, Any], captured: bytes, *,
+                      total_bytes: int) -> None:
+    """Attach best-effort recovery without changing the execution outcome."""
+    if not metadata["stdout_truncated"]:
+        return
+    try:
+        bounded = captured[:MAX_SPILLED_STDOUT_BYTES]
+        partial = total_bytes > len(bounded)
+        if partial:
+            # A cut credential may no longer match the redactor. Keep complete
+            # lines when capture stopped at the storage ceiling.
+            bounded = bounded[:bounded.rfind(b"\n") + 1]
+        sanitized = _sanitize_stdout(bounded.decode("utf-8", errors="replace"))
+        data = sanitized.encode("utf-8")
+        if len(data) > MAX_SPILLED_STDOUT_BYTES:
+            partial = True
+        marker = "\n[OUTPUT CAPTURE LIMIT: this artifact is partial.]\n" if partial else ""
+        budget = MAX_SPILLED_STDOUT_BYTES - len(marker.encode("utf-8"))
+        text = data[:budget].decode("utf-8", errors="ignore")
+        if not text:
+            raise OSError("No complete output fits in the recovery artifact")
+        path = _spill_full_stdout(text + marker)
+        if not isinstance(path, str) or not path:
+            raise OSError("Backend did not return an output artifact path")
+        metadata["stdout_spill_path"] = path
+        metadata["stdout_spill_truncated"] = partial
+        qualifier = "A partial copy of captured stdout" if partial else "Captured stdout"
+        metadata["warning"] += (
+            f" {qualifier} was saved to {path}; page the artifact instead of "
+            "re-running the script."
+        )
+    except Exception:
+        logger.debug("Could not publish execute_code stdout recovery", exc_info=True)
+        metadata["warning"] += (
+            " The recovery artifact is unavailable. Do not repeat commands "
+            "with side effects just to recover output."
+        )
 
 
 def _truncate_stdout_text(stdout_text: str) -> Tuple[str, Dict[str, Any]]:
@@ -166,11 +244,13 @@ def _truncate_stdout_text(stdout_text: str) -> Tuple[str, Dict[str, Any]]:
 
     head_bytes = int(MAX_STDOUT_BYTES * 0.4)
     tail_bytes = MAX_STDOUT_BYTES - head_bytes
-    return _assemble_stdout_result(
+    text, metadata = _assemble_stdout_result(
         stdout_bytes[:head_bytes],
         stdout_bytes[-tail_bytes:],
         total_bytes=len(stdout_bytes),
     )
+    _add_stdout_spill(metadata, stdout_bytes, total_bytes=len(stdout_bytes))
+    return text, metadata
 
 # Environment variable scrubbing rules (shared between the local + remote
 # backends).  Secret-substring block is applied first; anything left must
@@ -1836,6 +1916,7 @@ def execute_code(
                 logger.debug("Error reading process output: %s", e, exc_info=True)
 
         stdout_total_bytes = [0]  # mutable ref for total bytes seen
+        stdout_recovery = bytearray()
 
         def _drain_head_tail(pipe, head_chunks, tail_chunks, head_bytes, tail_bytes, total_ref):
             """Drain stdout keeping both head and tail data."""
@@ -1849,6 +1930,11 @@ def execute_code(
                     if not data:
                         break
                     total_ref[0] += len(data)
+                    # Retain the middle before the head/tail display discards
+                    # it. Memory stays bounded even for an infinite writer.
+                    remaining = MAX_SPILLED_STDOUT_BYTES - len(stdout_recovery)
+                    if remaining > 0:
+                        stdout_recovery.extend(data[:remaining])
                     # Fill head buffer first
                     if head_collected < head_bytes:
                         keep = min(len(data), head_bytes - head_collected)
@@ -1926,6 +2012,10 @@ def execute_code(
         stdout_text, stdout_metadata = _assemble_stdout_result(
             b"".join(stdout_head_chunks),
             b"".join(stdout_tail_chunks),
+            total_bytes=stdout_total_bytes[0],
+        )
+        _add_stdout_spill(
+            stdout_metadata, bytes(stdout_recovery),
             total_bytes=stdout_total_bytes[0],
         )
 
@@ -2363,7 +2453,10 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         f"{_timeout_s // 60}-minute" if _timeout_s % 60 == 0 else f"{_timeout_s}s"
     )
     limits_note = (
-        f"{_timeout_note} timeout, {MAX_STDOUT_BYTES // 1000}KB stdout cap, "
+        f"{_timeout_note} timeout, {MAX_STDOUT_BYTES // 1000}KB inline stdout head/tail "
+        f"(larger captured output is saved to a recovery artifact, up to "
+        f"{MAX_SPILLED_STDOUT_BYTES // 1_000_000}MB; page the returned path instead "
+        f"of re-running the script), "
         f"max {_max_calls} tool calls per script"
     )
 
