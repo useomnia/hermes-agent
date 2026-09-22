@@ -1464,21 +1464,60 @@ def test_sprites_environment_write_content_canonicalizes_before_sensitive_check(
         env.write_file_content("~/../etc/passwd", "blocked")
 
 
-def test_sprites_environment_should_reject_file_content_over_two_mib():
+def test_sprites_environment_should_upload_file_content_over_json_limit():
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    requests = []
+    uploads = []
+
+    def file_request(payload):
+        requests.append(payload)
+        return {"bytesWritten": len(payload["content"].encode("utf-8"))}
+
+    env.file_request = file_request
+    env._write_raw_artifact = lambda path, data: uploads.append((path, data))
+    content = "é" * (sprites_module._MAX_FILE_CONTENT_BYTES // 2)
+
+    assert env.write_file_content("/tmp/hermes-results/boundary.txt", content) is True
+    assert len(requests) == 1
+    assert requests[0]["content"] == content
+    assert uploads == []
+
+    assert env.write_file_content("~/brand/large.txt", content + "é") is True
+    assert len(requests) == 1
+    assert uploads == [("/home/brand/large.txt", (content + "é").encode("utf-8"))]
+
+
+def test_sprites_environment_should_reject_file_content_over_artifact_limit(monkeypatch):
     import pytest
 
     import tools.environments.sprites as sprites_module
     from tools.environments.sprites import SpritesEnvironment, SpritesToolboxError
 
     env = SpritesEnvironment.__new__(SpritesEnvironment)
-    requests = []
-    env.file_request = requests.append
-    content = "x" * (sprites_module._MAX_FILE_CONTENT_BYTES + 1)
+    env.file_request = lambda _payload: pytest.fail("oversized content reached JSON upload")
+    env._write_raw_artifact = lambda *_args: pytest.fail("oversized content reached raw upload")
+    monkeypatch.setattr(sprites_module, "SPRITES_CACHE_FILE_MAX_BYTES", 1024)
 
     with pytest.raises(SpritesToolboxError, match="write content exceeded"):
-        env.write_file_content("/tmp/hermes-results/too-large.txt", content)
+        env.write_file_content("/tmp/hermes-results/too-large.txt", "é" * 513)
 
-    assert requests == []
+
+def test_sprites_environment_should_refuse_protected_large_file_before_upload():
+    import pytest
+
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment, SpritesToolboxError
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.file_request = lambda _payload: pytest.fail("protected content reached JSON upload")
+    env._write_raw_artifact = lambda *_args: pytest.fail("protected content reached raw upload")
+    content = "x" * (sprites_module._MAX_FILE_CONTENT_BYTES + 1)
+
+    with pytest.raises(SpritesToolboxError, match="Write denied"):
+        env.write_file_content("~/../etc/passwd", content)
 
 
 def test_execute_code_guard_should_approve_sprites_backend():

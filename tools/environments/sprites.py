@@ -19,7 +19,7 @@ from typing import Any
 
 from tools.environments.base import BaseEnvironment, _ThreadedProcessHandle
 from tools.environments.file_sync import (
-    FileSyncManager, SPRITES_CACHE_ROOT, iter_sprites_cache_files,
+    FileSyncManager, SPRITES_CACHE_FILE_MAX_BYTES, SPRITES_CACHE_ROOT, iter_sprites_cache_files,
     iter_sprites_sync_files,
 )
 from tools.file_operations import (
@@ -515,17 +515,21 @@ class SpritesEnvironment(BaseEnvironment):
         return "/tmp/.hermes-session"
 
     def write_file_content(self, path: str, content: str) -> bool:
-        """Write one UTF-8 file through `/files`, within its 2 MiB request cap."""
-        content_size = len(content.encode("utf-8"))
-        if content_size > _MAX_FILE_CONTENT_BYTES:
-            raise SpritesToolboxError(
-                f"Toolbox API /files write content exceeded "
-                f"{_MAX_FILE_CONTENT_BYTES} bytes ({content_size} bytes)"
-            )
-
+        """Write UTF-8 content, using atomic raw upload above the JSON limit."""
         path = _canonicalize_toolbox_path(path)
         if _is_write_denied(path):
             raise SpritesToolboxError(f"Write denied: {path} is a protected path")
+
+        data = content.encode("utf-8")
+        if len(data) > SPRITES_CACHE_FILE_MAX_BYTES:
+            raise SpritesToolboxError(
+                f"Toolbox API /files write content exceeded "
+                f"{SPRITES_CACHE_FILE_MAX_BYTES} bytes ({len(data)} bytes)"
+            )
+
+        if len(data) > _MAX_FILE_CONTENT_BYTES:
+            self._write_raw_artifact(path, data)
+            return True
 
         response = self.file_request(
             {

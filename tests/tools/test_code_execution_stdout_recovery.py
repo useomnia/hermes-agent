@@ -40,6 +40,57 @@ def test_short_output_does_not_create_artifact():
     assert "stdout_spill_path" not in metadata
 
 
+def test_sprites_stdout_and_tool_results_share_large_file_transport(monkeypatch):
+    import io
+    import re
+    import threading
+    from types import SimpleNamespace
+    from urllib.parse import parse_qs, urlsplit
+
+    from tools import file_tools
+    from tools.environments import sprites
+    from tools.environments.file_sync import FileSyncManager, iter_sprites_cache_files
+    from tools.tool_result_storage import maybe_persist_tool_result
+
+    monkeypatch.setenv("TERMINAL_ENV", "sprites")
+    env = sprites.SpritesEnvironment.__new__(sprites.SpritesEnvironment)
+    env.toolbox_url = "https://toolbox.example/internal/toolbox"
+    env.bearer_token = "pair-secret"
+    env.brand = "brand-123"
+    env.timeout = 30
+    env.file_request = lambda _payload: pytest.fail("large result used JSON upload")
+    env._cache_sync_lock = threading.Lock()
+    env._cache_sync_manager = FileSyncManager(
+        get_files_fn=iter_sprites_cache_files,
+        upload_fn=env._upload_cache_file,
+        delete_fn=lambda _paths: pytest.fail("publication deleted an artifact"),
+    )
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda: SimpleNamespace(env=env))
+    uploaded = {}
+
+    def upload(request, timeout):
+        assert request.get_method() == "PUT"
+        query = parse_qs(urlsplit(request.full_url).query)
+        assert query["maxBytes"] == [str(len(request.data))]
+        uploaded[query["path"][0]] = request.data
+        return io.BytesIO(json.dumps({"bytesWritten": len(request.data)}).encode())
+
+    monkeypatch.setattr(sprites._URL_OPENER, "open", upload)
+    content = "record é\n" * 280_000 + "FINAL RECORD\n"
+    preview, metadata = execution._truncate_stdout_text(content)
+    result = maybe_persist_tool_result(content, "connector", "tc_shared", env=env)
+    result_path = re.search(r"^Full output saved to: (.+)$", result, re.MULTILINE)
+
+    assert metadata["stdout_truncated"] is True
+    assert metadata["stdout_spill_truncated"] is False
+    assert result_path is not None
+    assert len(preview) < len(content)
+    assert len(result) < len(content)
+    assert len(uploaded) == 2
+    assert uploaded[metadata["stdout_spill_path"]] == content.encode("utf-8")
+    assert uploaded[result_path.group(1)] == content.encode("utf-8")
+
+
 def test_single_line_json_recovery_reads_middle_without_repeating_source(tmp_path, monkeypatch):
     monkeypatch.setattr(execution, "_load_config", lambda: {"timeout": 10})
     receipt = tmp_path / "executions.txt"

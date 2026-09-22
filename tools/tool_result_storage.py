@@ -105,7 +105,7 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     Environments with a first-class file-write capability avoid command-string
     and stdin transport limits. Other backends retain the existing exec + stdin
     path, which avoids Linux's per-argument ceiling on local and SSH backends.
-    A capability may reject content above its API's file-size limit; callers
+    A capability may reject content above its artifact-size limit; callers
     then keep the in-context preview rather than silently truncating the file.
     """
     write_file_content = getattr(env, "write_file_content", None)
