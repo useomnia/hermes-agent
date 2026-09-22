@@ -296,6 +296,61 @@ class TestMaybePersistToolResult:
             }
         ]
 
+    @pytest.mark.parametrize("delivery", ["complete", "short", "unavailable"])
+    def test_sprites_large_result_is_recoverable_only_after_complete_upload(
+        self, monkeypatch, tmp_path, delivery
+    ):
+        import io
+        import json
+        from urllib.parse import parse_qs, urlsplit
+
+        import tools.environments.sprites as sprites_module
+        from tools.environments.sprites import SpritesEnvironment
+
+        env = SpritesEnvironment.__new__(SpritesEnvironment)
+        env.toolbox_url = "https://toolbox.example/internal/toolbox"
+        env.bearer_token = "pair-secret"
+        env.brand = "brand-123"
+        env.timeout = 30
+        env.file_request = lambda _payload: pytest.fail("large result used JSON upload")
+        requests = []
+        content = json.dumps({"results": ["é" * 1_350_000, "FINAL RECORD"]}, ensure_ascii=False)
+        expected = content.encode("utf-8")
+        artifact = tmp_path / "result.txt"
+
+        def upload(request, timeout):
+            requests.append(request)
+            assert timeout == 30
+            assert request.get_method() == "PUT"
+            assert request.get_header("Authorization") == "Bearer pair-secret"
+            assert request.get_header("X-omnio-brand") == "brand-123"
+            assert request.get_header("Content-type") == "application/octet-stream"
+            assert request.data == expected
+            if delivery == "unavailable":
+                raise OSError("connection closed")
+            data = request.data if delivery == "complete" else request.data[:-1]
+            artifact.write_bytes(data)
+            return io.BytesIO(json.dumps({"bytesWritten": len(data)}).encode())
+
+        monkeypatch.setattr(sprites_module._URL_OPENER, "open", upload)
+
+        result = maybe_persist_tool_result(content, "connector", "tc_large", env=env)
+
+        assert len(requests) == 1
+        assert parse_qs(urlsplit(requests[0].full_url).query) == {
+            "path": ["/tmp/.hermes-session/hermes-results/tc_large.txt"],
+            "overwrite": ["true"],
+            "maxBytes": [str(len(expected))],
+        }
+        if delivery == "complete":
+            assert PERSISTED_OUTPUT_TAG in result
+            assert "Full output saved to: /tmp/.hermes-session/hermes-results/tc_large.txt" in result
+            assert artifact.read_bytes() == expected
+            assert json.loads(artifact.read_text())["results"][-1] == "FINAL RECORD"
+        else:
+            assert PERSISTED_OUTPUT_TAG not in result
+            assert "Full output could not be saved to sandbox" in result
+
     def test_persists_full_content_as_is(self):
         """Content is persisted verbatim — no JSON extraction."""
         import json
