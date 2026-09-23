@@ -3863,6 +3863,21 @@ class TestMcpParallelToolBatch:
 
 
 class TestHandleMaxIterations:
+    @pytest.mark.parametrize("output_error", [ValueError("closed stream"), BrokenPipeError("closed pipe")])
+    def test_summary_survives_broken_console_output(self, agent, monkeypatch, output_error):
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+
+        def broken_print(*_args, **_kwargs):
+            raise output_error
+
+        with monkeypatch.context() as broken_console:
+            broken_console.setattr("builtins.print", broken_print)
+            result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60)
+
+        assert result == "Summary"
+        agent.client.chat.completions.create.assert_called_once()
+
     @pytest.mark.parametrize("reasoning", [None, {"enabled": True, "effort": "max"}, {"enabled": False}])
     def test_summary_preserves_preset_reasoning(self, agent, reasoning):
         agent.base_url = "https://openrouter.ai/api/v1"

@@ -9,9 +9,11 @@ Covers:
 """
 
 import asyncio
+import builtins
 import json
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -811,6 +813,65 @@ class TestRunStatus:
 
 
 class TestRunEvents:
+    @pytest.mark.asyncio
+    async def test_concurrent_budget_summaries_and_followup_survive_broken_output(
+        self, adapter, monkeypatch,
+    ):
+        """Exercise the actual agent loop/finalizer behind the real HTTP adapter."""
+        from run_agent import AIAgent
+
+        monkeypatch.setattr("run_agent.get_tool_definitions", lambda **_kw: [])
+        monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
+        monkeypatch.setattr("run_agent.OpenAI", MagicMock())
+        agents = []
+
+        def create_agent(**_kwargs):
+            agent = AIAgent(
+                api_key="test-key", model="test/model", provider="openrouter",
+                base_url="https://openrouter.ai/api/v1", api_mode="chat_completions",
+                max_iterations=0, quiet_mode=True, skip_context_files=True, skip_memory=True,
+            )
+            agent.client = MagicMock()
+            agent.client.chat.completions.create.return_value = SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content="Budget summary", tool_calls=None),
+                    finish_reason="stop",
+                )],
+                usage=None,
+            )
+            agents.append(agent)
+            return agent
+
+        monkeypatch.setattr(adapter, "_create_agent", create_agent)
+        real_print = builtins.print
+        notices = []
+
+        def broken_summary_output(*args, **kwargs):
+            if args and "Reached maximum iterations" in str(args[0]):
+                notices.append(str(args[0]))
+                raise ValueError("I/O operation on closed file")
+            return real_print(*args, **kwargs)
+
+        monkeypatch.setattr(builtins, "print", broken_summary_output)
+        async with TestClient(TestServer(_create_runs_app(adapter))) as client:
+            async def run_turn(text):
+                response = await client.post("/v1/runs", json={"input": text})
+                assert response.status == 202
+                run_id = (await response.json())["run_id"]
+                events = await client.get(f"/v1/runs/{run_id}/events")
+                body = await asyncio.wait_for(events.text(), timeout=15)
+                status = await (await client.get(f"/v1/runs/{run_id}")).json()
+                assert status["status"] == "completed", body
+                assert "Budget summary" in body
+                assert "run.failed" not in body
+
+            await asyncio.gather(run_turn("first"), run_turn("second"))
+            await run_turn("follow-up")
+
+        assert len(notices) == 3
+        for agent in agents:
+            agent.client.chat.completions.create.assert_called_once()
+
     @pytest.mark.asyncio
     async def test_events_stream_returns_completed(self, adapter):
         """Events stream should receive run.completed when agent finishes."""
