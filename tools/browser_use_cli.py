@@ -1402,7 +1402,7 @@ def _run_cli_killing_process_group(cmd, code, env, timeout, **popen_extra):
         stdout, stderr = proc.communicate(input=code, timeout=timeout)
     except subprocess.TimeoutExpired:
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — Windows returned above
         try:
             proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
