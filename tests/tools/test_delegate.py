@@ -109,12 +109,12 @@ class TestDelegateRequirements(unittest.TestCase):
 
         # Top-level description names the user's concurrency limit explicitly.
         self.assertIn(f"up to {max_children}", desc)
-        # Top-level description names the user's spawn-depth limit explicitly.
-        self.assertIn(f"max_spawn_depth={max_depth}", desc)
+        # Default depth is flat: both the description and role say nesting is off.
+        self.assertEqual(max_depth, 1)
+        self.assertIn("Nested delegation is OFF", desc)
         # tasks parameter description repeats the concurrency cap.
         self.assertIn(f"up to {max_children}", tasks_desc)
-        # role parameter description names the spawn-depth limit.
-        self.assertIn(f"max_spawn_depth={max_depth}", role_desc)
+        self.assertIn("Nesting is OFF", role_desc)
         # The misleading "default 3" / "default 2" wording is gone from
         # every dynamic surface (model-facing).
         for surface in (desc, tasks_desc, role_desc):
@@ -135,7 +135,77 @@ class TestDelegateRequirements(unittest.TestCase):
             _get_max_spawn_depth,
         )
         self.assertIn(f"up to {_get_max_concurrent_children()}", fn["description"])
-        self.assertIn(f"max_spawn_depth={_get_max_spawn_depth()}", fn["description"])
+        self.assertIn("Nested delegation is OFF", fn["description"])
+
+    def test_schema_description_advertises_child_budget(self):
+        """The model must see each child's round budget and time cap so it can
+        size delegated tasks to fit them."""
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"max_iterations": 200, "child_timeout_seconds": 3600},
+        ):
+            desc = _build_dynamic_schema_overrides()["description"]
+        self.assertIn(
+            "Each subagent gets up to 200 tool-calling rounds and 1 hour of "
+            "wall-clock time.",
+            desc,
+        )
+        self.assertIn("runs out of time is stopped", desc)
+
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"max_iterations": 80, "child_timeout_seconds": 0},
+        ):
+            desc = _build_dynamic_schema_overrides()["description"]
+        self.assertIn("Each subagent gets up to 80 tool-calling rounds.", desc)
+        self.assertNotIn("wall-clock", desc)
+
+    def test_model_facing_delegation_text_never_names_config(self):
+        """Limits are stated as facts. The model is not the operator, so the
+        text must not point it (or, through it, the end user) at config keys."""
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        configs = (
+            {},
+            {"max_spawn_depth": 3, "orchestrator_enabled": True},
+            {"max_spawn_depth": 3, "orchestrator_enabled": False},
+            {"max_iterations": 200, "child_timeout_seconds": 3600},
+        )
+        for cfg in configs:
+            with self.subTest(cfg=cfg), patch(
+                "tools.delegate_tool._load_config", return_value=cfg
+            ):
+                overrides = _build_dynamic_schema_overrides()
+                tasks = overrides["parameters"]["properties"]["tasks"]
+                surfaces = (
+                    overrides["description"],
+                    tasks["description"],
+                    tasks["items"]["properties"]["role"]["description"],
+                )
+                for surface in surfaces:
+                    for leak in ("config.yaml", "delegation.", "max_spawn_depth",
+                                 "max_concurrent_children", "for this user", "cronjob"):
+                        self.assertNotIn(leak, surface)
+
+    def test_nesting_clause_reflects_depth_and_kill_switch(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"max_spawn_depth": 3, "orchestrator_enabled": True},
+        ):
+            desc = _build_dynamic_schema_overrides()["description"]
+        self.assertIn("Nested delegation is ON", desc)
+        self.assertIn("up to 2 more level(s) deep", desc)
+
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"max_spawn_depth": 3, "orchestrator_enabled": False},
+        ):
+            desc = _build_dynamic_schema_overrides()["description"]
+        self.assertIn("Nested delegation is OFF", desc)
 
 
 class TestChildSystemPrompt(unittest.TestCase):
@@ -154,6 +224,33 @@ class TestChildSystemPrompt(unittest.TestCase):
     def test_empty_context_ignored(self):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
+
+    def test_budget_states_rounds_and_time_cap(self):
+        prompt = _build_child_system_prompt(
+            "Research", max_iterations=200, timeout_seconds=3600
+        )
+        self.assertIn("BUDGET", prompt)
+        self.assertIn(
+            "You have up to 200 tool-calling rounds and 1 hour of wall-clock time.",
+            prompt,
+        )
+
+    def test_budget_without_time_cap_omits_it(self):
+        prompt = _build_child_system_prompt("Research", max_iterations=50)
+        self.assertIn("You have up to 50 tool-calling rounds.", prompt)
+        self.assertNotIn("wall-clock", prompt)
+
+    def test_budget_omitted_when_unknown(self):
+        self.assertNotIn("BUDGET", _build_child_system_prompt("Research"))
+
+    def test_format_duration_uses_whole_units(self):
+        from tools.delegate_tool import _format_duration
+
+        self.assertEqual(_format_duration(3600), "1 hour")
+        self.assertEqual(_format_duration(7200), "2 hours")
+        self.assertEqual(_format_duration(1200), "20 minutes")
+        self.assertEqual(_format_duration(60), "1 minute")
+        self.assertEqual(_format_duration(90), "90 seconds")
 
 
 class TestStripBlockedTools(unittest.TestCase):
@@ -422,6 +519,8 @@ class TestDelegateTask(unittest.TestCase):
         # Should return an error instead of silently truncating
         self.assertIn("error", result)
         self.assertIn("Too many tasks", result["error"])
+        self.assertIn(f"at most {limit} can run at once", result["error"])
+        self.assertNotIn("config.yaml", result["error"])
         mock_run.assert_not_called()
 
     @patch("tools.delegate_tool._build_child_preserving_parent_tools")
@@ -3025,7 +3124,8 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         self.assertIn("Orchestrator Role", prompt)
         # Depth/max-depth note present and literal:
         self.assertIn("depth 1", prompt)
-        self.assertIn("max_spawn_depth=2", prompt)
+        self.assertIn("capped at depth 2", prompt)
+        self.assertNotIn("max_spawn_depth", prompt)
 
     def test_orchestrator_prompt_at_depth_floor_says_children_are_leaves(self):
         """With max_spawn_depth=2 and child_depth=1, the orchestrator's

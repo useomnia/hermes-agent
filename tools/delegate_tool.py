@@ -640,6 +640,31 @@ def _get_max_spawn_depth() -> int:
     return floored
 
 
+
+def _get_max_iterations(cfg: Optional[dict] = None) -> int:
+    """Read delegation.max_iterations: each child's tool-calling round budget."""
+    if cfg is None:
+        cfg = _load_config()
+    return cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+
+
+def _format_duration(seconds: float) -> str:
+    """Render a whole-unit duration for model-facing text ("1 hour", "20 minutes")."""
+    total = int(round(seconds))
+    for unit_seconds, unit in ((3600, "hour"), (60, "minute")):
+        if total >= unit_seconds and total % unit_seconds == 0:
+            count = total // unit_seconds
+            return f"{count} {unit}" + ("" if count == 1 else "s")
+    return f"{total} seconds"
+
+
+def _describe_child_budget(max_iterations: int, timeout_seconds: Optional[float]) -> str:
+    """Phrase a child's round budget and optional wall-clock cap."""
+    budget = f"up to {max_iterations} tool-calling rounds"
+    if timeout_seconds:
+        budget += f" and {_format_duration(timeout_seconds)} of wall-clock time"
+    return budget
+
 def _get_orchestrator_enabled() -> bool:
     """Global kill switch for the orchestrator role.
 
@@ -803,6 +828,8 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    max_iterations: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -839,6 +866,12 @@ def _build_child_system_prompt(
         "response is returned to the parent agent as a summary, and overlong "
         "summaries crowd out the parent's context window."
     )
+    if max_iterations:
+        parts.append(
+            f"\nBUDGET:\nYou have {_describe_child_budget(max_iterations, timeout_seconds)}. "
+            "Pace the work to fit. If you are running out, stop and write your "
+            "summary, saying what is left undone, rather than starting new work."
+        )
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
@@ -868,7 +901,7 @@ def _build_child_system_prompt(
             "reporting back to your parent. You are responsible for the "
             "final summary, not your workers.\n\n"
             f"NOTE: You are at depth {child_depth}. The delegation tree "
-            f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
+            f"is capped at depth {max_spawn_depth}. {child_note}"
         )
     return "\n".join(parts)
 
@@ -1339,6 +1372,8 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        max_iterations=max_iterations,
+        timeout_seconds=_get_child_timeout(),
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -2921,17 +2956,15 @@ def delegate_task(
             {
                 "error": (
                     f"Delegation depth limit reached (depth={depth}, "
-                    f"max_spawn_depth={max_spawn}). Raise "
-                    f"delegation.max_spawn_depth in config.yaml if deeper "
-                    f"nesting is required (no hard ceiling, but each level "
-                    f"multiplies API cost)."
+                    f"limit={max_spawn}). Do this part of the work yourself "
+                    f"instead of delegating it."
                 )
             }
         )
 
     # Load config
     cfg = _load_config()
-    default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+    default_max_iter = _get_max_iterations(cfg)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
     # and tests; a model-emitted value here would only shrink the budget and
@@ -2966,11 +2999,9 @@ def delegate_task(
     if tasks and isinstance(tasks, list):
         if len(tasks) > max_children:
             return tool_error(
-                f"Too many tasks: {len(tasks)} provided, but "
-                f"max_concurrent_children is {max_children}. "
-                f"Either reduce the task count, split into multiple "
-                f"delegate_task calls, or increase "
-                f"delegation.max_concurrent_children in config.yaml."
+                f"Too many tasks: {len(tasks)} provided, but at most "
+                f"{max_children} can run at once. Reduce the task count or "
+                f"split them across several delegate_task calls."
             )
         # Older prompts exposed shared context beside tasks[]. Preserve that
         # input while the new model-facing schema asks for per-task context.
@@ -3556,11 +3587,8 @@ def delegate_task(
         _cap_result = _execute_and_aggregate()
         if isinstance(_cap_result, dict):
             _cap_result["note"] = (
-                "The background delegation pool was at capacity "
-                "(delegation.max_concurrent_children), so the subagent(s) ran "
-                "SYNCHRONOUSLY and the result is included above. Raise "
-                "delegation.max_concurrent_children in config.yaml to allow "
-                "more concurrent background delegations."
+                "The background delegation pool was at capacity, so the "
+                "subagent(s) ran SYNCHRONOUSLY and the result is included above."
             )
         return json.dumps(_cap_result, ensure_ascii=False)
 
@@ -3830,9 +3858,14 @@ def _build_top_level_description() -> str:
 
     The model needs to know its actual ceilings (not the framework defaults),
     otherwise it self-caps at "default 3" / "default 2" even when the user has
-    raised delegation.max_concurrent_children / max_spawn_depth. Called both
-    at module import (to seed DELEGATE_TASK_SCHEMA) and on every
+    raised delegation.max_concurrent_children / max_spawn_depth, and it cannot
+    size a child's task without the per-child round budget and time cap.
+    Called both at module import (to seed DELEGATE_TASK_SCHEMA) and on every
     get_definitions() call via dynamic_schema_overrides.
+
+    The text states limits as facts and never names config keys or files: the
+    model reading it is not the operator, cannot change them, and would repeat
+    that advice to the end user.
     """
     try:
         max_children = _get_max_concurrent_children()
@@ -3846,28 +3879,32 @@ def _build_top_level_description() -> str:
         orchestrator_on = _get_orchestrator_enabled()
     except Exception:
         orchestrator_on = True
+    try:
+        max_iterations = _get_max_iterations()
+    except Exception:
+        max_iterations = DEFAULT_MAX_ITERATIONS
+    try:
+        child_timeout = _get_child_timeout()
+    except Exception:
+        child_timeout = None
 
     if max_depth >= 2 and orchestrator_on:
         nesting_clause = (
-            f"Nested delegation IS enabled for this user "
-            f"(max_spawn_depth={max_depth}): pass role='orchestrator' on a "
-            f"child to let it spawn its own workers, up to {max_depth - 1} "
-            f"additional level(s) deep."
-        )
-    elif max_depth >= 2 and not orchestrator_on:
-        nesting_clause = (
-            f"Nested delegation is DISABLED on this install "
-            f"(delegation.orchestrator_enabled=false), even though "
-            f"max_spawn_depth={max_depth}. role='orchestrator' is silently "
-            f"forced to 'leaf'."
+            f"Nested delegation is ON: pass role='orchestrator' on a child to "
+            f"let it spawn its own workers, up to {max_depth - 1} more "
+            f"level(s) deep."
         )
     else:
         nesting_clause = (
-            f"Nested delegation is OFF for this user "
-            f"(max_spawn_depth={max_depth}): every child is a leaf and "
-            f"cannot delegate further. Raise delegation.max_spawn_depth in "
-            f"config.yaml to enable nesting."
+            "Nested delegation is OFF: every child is a leaf and cannot "
+            "delegate further; role='orchestrator' is treated as 'leaf'."
         )
+    budget_clause = (
+        f"Each subagent gets {_describe_child_budget(max_iterations, child_timeout)}. "
+        "One that runs out of rounds stops and summarises what it finished"
+        + ("; one that runs out of time is stopped and returns an error" if child_timeout else "")
+        + ". Size each task to fit, and split bigger work across several tasks."
+    )
 
     return (
         "Spawn one or more subagents to work on tasks in isolated contexts. "
@@ -3876,9 +3913,8 @@ def _build_top_level_description() -> str:
         "never enter your context window.\n\n"
         "Provide tasks[] even for one child. Include all required source material "
         "and instructions in EACH task's context; workers do not share context.\n"
-        f"Provide up to {max_children} "
-        f"items concurrently for this user (configured via "
-        f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
+        f"Provide up to {max_children} tasks at once. {budget_clause} "
+        f"{nesting_clause}\n\n"
         "DELEGATIONS RUN IN THE BACKGROUND. delegate_task returns immediately — "
         "you and the user keep working, and the completed result re-enters "
         "the conversation as a new message. A "
@@ -3899,12 +3935,11 @@ def _build_top_level_description() -> str:
         "- Mechanical multi-step work with no reasoning needed -> use execute_code\n"
         "- Single tool call -> just call the tool directly\n"
         "- Tasks needing user interaction -> subagents cannot use clarify\n"
-        "- Durable long-running work that must outlive the current turn -> "
-        "use cronjob (action='create') or terminal(background=True, "
-        "notify_on_complete=True) instead. Background delegations are NOT "
-        "durable: if the parent session is closed (/new) or the process exits "
-        "before a subagent finishes, that subagent's work is discarded, and "
-        "/stop cancels every running background subagent.\n\n"
+        "- Work that must outlive the current session or process -> do not "
+        "delegate it. Background delegations are NOT durable: if the session "
+        "ends or the process exits before a subagent finishes, that "
+        "subagent's work is discarded, and stopping the turn cancels every "
+        "running background subagent.\n\n"
         "IMPORTANT:\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
@@ -3924,11 +3959,10 @@ def _build_top_level_description() -> str:
         "delegate_task, clarify, memory, send_message.\n"
         "- Orchestrator subagents (role='orchestrator') retain "
         "delegate_task so they can spawn their own workers, but still "
-        "cannot use clarify, memory, or send_message. "
-        f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
-        f"user and can be disabled globally via "
-        "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "cannot use clarify, memory, or send_message. Orchestrators are "
+        "bounded by the nesting limit above.\n"
+        "- Subagent model is NOT selectable per call: children use the "
+        "subagent model set for this deployment, normally your own.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3941,8 +3975,8 @@ def _build_tasks_param_description() -> str:
     except Exception:
         max_children = _DEFAULT_MAX_CONCURRENT_CHILDREN
     return (
-        f"Batch mode: tasks to run in parallel (up to {max_children} for this "
-        f"user, set via delegation.max_concurrent_children). Each gets "
+        f"Batch mode: tasks to run in parallel (up to {max_children} at "
+        f"once). Each gets "
         "its own subagent with isolated context and terminal session. "
         "Repeat shared source material and instructions in each task context."
     )
@@ -3961,22 +3995,11 @@ def _build_role_param_description() -> str:
 
     if max_depth >= 2 and orchestrator_on:
         nesting_note = (
-            f"Nesting IS enabled for this user (max_spawn_depth={max_depth}): "
-            f"orchestrator children can themselves delegate up to {max_depth - 1} "
-            "more level(s) deep."
-        )
-    elif max_depth >= 2 and not orchestrator_on:
-        nesting_note = (
-            "Nesting is currently disabled "
-            "(delegation.orchestrator_enabled=false); 'orchestrator' is "
-            "silently forced to 'leaf'."
+            f"Nesting is ON: orchestrator children can themselves delegate up "
+            f"to {max_depth - 1} more level(s) deep."
         )
     else:
-        nesting_note = (
-            f"Nesting is OFF for this user (max_spawn_depth={max_depth}); "
-            "'orchestrator' is silently forced to 'leaf'. Raise "
-            "delegation.max_spawn_depth in config.yaml to enable."
-        )
+        nesting_note = "Nesting is OFF; 'orchestrator' is treated as 'leaf'."
 
     return (
         "Role of the child agent. 'leaf' (default) = focused "
