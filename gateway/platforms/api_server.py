@@ -4245,6 +4245,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "run_slash_commands": True,
                 "run_structured_output": True,
                 "run_compaction_snapshots": True,
                 "run_user_input_resolution": {"apiVersion": 1},
@@ -9905,8 +9906,15 @@ class APIServerAdapter(BasePlatformAdapter):
                                     "messages": [],
                                 }
                             else:
+                                expanded_message = self._maybe_expand_slash_command(
+                                    user_message, effective_task_id
+                                )
                                 r = agent.run_conversation(
-                                    user_message=user_message,
+                                    user_message=(
+                                        expanded_message
+                                        if expanded_message is not None
+                                        else user_message
+                                    ),
                                     conversation_history=conversation_history,
                                     task_id=effective_task_id,
                                 )
