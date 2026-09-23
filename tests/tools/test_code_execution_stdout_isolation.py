@@ -81,7 +81,12 @@ def _dispatch(transport, directory, task_id, done):
         done.set()
 
 
-@pytest.mark.parametrize("transport", ["socket", "remote"])
+@pytest.mark.parametrize("transport", [
+    "socket",
+    pytest.param("remote", marks=pytest.mark.skipif(
+        sys.platform == "win32", reason="The remote filesystem fixture requires a POSIX shell",
+    )),
+])
 @pytest.mark.parametrize("handler_fails", [False, True])
 def test_overlapping_dispatch_preserves_other_threads_output(
     transport, handler_fails, tmp_path, monkeypatch,
