@@ -113,6 +113,7 @@ from agent.process_bootstrap import (
     _SafeWriter,  # noqa: F401  # re-exported for tests that `from run_agent import _SafeWriter`
     _get_proxy_for_base_url,
 )
+from agent.cost_budget import CostBudget
 from agent.iteration_budget import IterationBudget
 
 
@@ -492,6 +493,7 @@ class AIAgent:
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
+        cost_budget: "CostBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
         checkpoints_enabled: bool = False,
@@ -574,6 +576,7 @@ class AIAgent:
             session_db=session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
+            cost_budget=cost_budget,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
             checkpoints_enabled=checkpoints_enabled,
@@ -3423,6 +3426,13 @@ class AIAgent:
                 prefix
                 + "the per-turn iteration/cost budget was exhausted before a "
                 "final answer. Send `continue` to keep going."
+            )
+        if reason == "cost_budget_exhausted":
+            return (
+                prefix
+                + "the turn reached its spend ceiling before a final answer. "
+                "Send `continue` to keep going, or raise the request's "
+                "`budget.max_cost_usd`."
             )
         if reason == "ollama_runtime_context_too_small":
             return (

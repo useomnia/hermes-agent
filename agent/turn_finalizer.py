@@ -95,6 +95,14 @@ def finalize_turn(
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
     )
+    # Do NOT add ``cost_budget_exhausted`` (agent/cost_budget.py) to this set.
+    # The fallback below spends one more toolless full-context call — the most
+    # expensive single call in a run — on precisely the turn whose spend
+    # ceiling just tripped. This reason set is the only thing keeping it out.
+    #
+    # ``budget_exhausted`` above is False on that path too, since the cost
+    # guard breaks with iterations still remaining — but that is a side effect
+    # of where the guard sits, not a guarantee. This set is the one to keep.
     budget_fallback_eligible = (
         budget_exhausted
         and not interrupted
