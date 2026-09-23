@@ -149,12 +149,43 @@ _OMNIO_QUIESCENCE_DEFAULT_FORCE_TIMEOUT_SECONDS = 30.0
 _OMNIO_QUIESCENCE_PREPARE_TTL_SECONDS = 300.0
 _OMNIO_QUIESCENCE_MAX_FORCE_TIMEOUT_SECONDS = 120.0
 _OMNIO_QUIESCENCE_OBJECT = "hermes.gateway.quiescence"
+_OMNIO_COMPLETE_BRAND_SETUP_TOOL = "mcp__omnia__complete_brand_setup"
 _MANAGED_RUN_IDENTITY_KEYS = {
     "version",
     "submission_id",
     "execution_fingerprint",
 }
 _MANAGED_EXECUTION_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _complete_brand_setup_succeeded(function_result: Any) -> bool:
+    """Project only the exact Omnia MCP success envelope; unknown is failure.
+
+    Hermes' MCP bridge wraps Omnia's single text block as ``{"result": text}``,
+    and ``complete_brand_setup`` returns that text as ``{"data": ...}``. MCP
+    errors use the separate ``{"error": ...}`` envelope. No result or error
+    content is copied into the client-visible progress event.
+    """
+    if not isinstance(function_result, str):
+        return False
+    source = function_result.lstrip()
+    try:
+        envelope, end = json.JSONDecoder().raw_decode(source)
+    except (TypeError, ValueError):
+        return False
+    if source[end:].strip() or not isinstance(envelope, dict):
+        return False
+    if set(envelope) != {"result"} or not isinstance(envelope["result"], str):
+        return False
+    try:
+        result = json.loads(envelope["result"])
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(result, dict)
+        and set(result) == {"data"}
+        and isinstance(result["data"], dict)
+    )
 
 
 def _parse_managed_run_identity(value: Any) -> ManagedRunIdentity:
@@ -9357,6 +9388,16 @@ class APIServerAdapter(BasePlatformAdapter):
             except RuntimeError:
                 pass
 
+        def _start_complete_brand_setup_progress(
+            tool_call_id: str, tool_name: str
+        ) -> None:
+            if (
+                tool_name == _OMNIO_COMPLETE_BRAND_SETUP_TOOL
+                and tool_call_id not in semantic_tool_calls
+            ):
+                semantic_tool_calls[tool_call_id] = tool_name
+                emitter.semantic_tool_start(tool_call_id, tool_name)
+
         def _emit_tool_start(
             tool_call_id: str, tool_name: str, function_args: Dict[str, Any]
         ) -> None:
@@ -9381,6 +9422,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         if isinstance(function_args, dict)
                         else {},
                     )
+                    _start_complete_brand_setup_progress(tool_call_id, tool_name)
                 elif semantic_tool_calls.get(tool_call_id) != tool_name:
                     # Tool Search keeps the provider-authored ``tool_call``
                     # item intact for Responses replay, while execution and
@@ -9398,6 +9440,7 @@ class APIServerAdapter(BasePlatformAdapter):
             started_tool_calls[tool_call_id] = (tool_name, args_copy)
             emitter.function_call_start(tool_call_id, tool_name)
             emitter.function_call_arguments(tool_call_id, tool_name, args_copy)
+            _start_complete_brand_setup_progress(tool_call_id, tool_name)
 
         def _emit_tool_generation_start(
             tool_call_id: str, tool_name: str
@@ -9489,6 +9532,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_call_id: str,
             tool_name: str,
             todos: Optional[List[Dict[str, Any]]] = None,
+            success: Optional[bool] = None,
         ) -> None:
             if tool_call_id not in started_tool_calls or tool_call_id in ended_tool_calls:
                 return
@@ -9497,14 +9541,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 emitter.task_list(todos)
             emitter.function_call_done(tool_call_id)
             if tool_call_id in semantic_tool_calls:
-                emitter.semantic_tool_done(tool_call_id)
-                semantic_tool_calls.pop(tool_call_id, None)
+                semantic_tool_name = semantic_tool_calls.pop(tool_call_id)
+                projected_success = None
+                if semantic_tool_name == _OMNIO_COMPLETE_BRAND_SETUP_TOOL:
+                    # A call closed without a result is not confirmed successful.
+                    projected_success = success if isinstance(success, bool) else False
+                emitter.semantic_tool_done(
+                    tool_call_id,
+                    success=projected_success,
+                )
             ended_tool_calls.add(tool_call_id)
 
         def _tool_complete_cb(
             tool_call_id, tool_name, function_args, function_result
         ) -> None:
             projected_todos: Optional[List[Dict[str, Any]]] = None
+            projected_success: Optional[bool] = None
             approval_timed_out = False
             user_input_turn_ending = False
             normalized_tool_call_id = str(tool_call_id or "")
@@ -9513,6 +9565,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 parsed_result = json.loads(function_result or "{}")
             except Exception:
                 parsed_result = {}
+            if normalized_tool_name == _OMNIO_COMPLETE_BRAND_SETUP_TOOL:
+                projected_success = _complete_brand_setup_succeeded(function_result)
             if normalized_tool_name == "todo":
                 raw_todos = (
                     parsed_result.get("todos")
@@ -9628,6 +9682,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     normalized_tool_call_id,
                     normalized_tool_name,
                     projected_todos,
+                    projected_success,
                 )
             except RuntimeError:
                 pass

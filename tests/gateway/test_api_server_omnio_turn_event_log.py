@@ -3136,6 +3136,78 @@ async def test_runs_emit_function_call_boundary_while_arguments_are_generating()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call_shape",
+    ["direct", "direct-streamed", "tool-search"],
+    ids=["direct", "direct-streamed", "tool-search"],
+)
+@pytest.mark.parametrize(
+    ("function_result", "expected_success"),
+    [
+        (
+            json.dumps({"result": json.dumps({"data": {"brand": {"id": "brand-secret"}}})}),
+            True,
+        ),
+        (json.dumps({"error": "MCP_RESULT_SECRET"}), False),
+        (json.dumps({"result": "unexpected MCP shape"}), False),
+    ],
+    ids=["success", "mcp-error", "unknown-result"],
+)
+async def test_complete_brand_setup_projects_bounded_outcome_for_exact_call(
+    call_shape: str,
+    function_result: str,
+    expected_success: bool,
+) -> None:
+    adapter = _make_adapter()
+    tool_name = "mcp__omnia__complete_brand_setup"
+    call_id = "call-brand-setup-exact"
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            if call_shape == "direct-streamed":
+                callbacks["tool_gen_event_callback"](tool_name, call_id)
+            elif call_shape == "tool-search":
+                callbacks["tool_gen_event_callback"]("tool_call", call_id)
+            callbacks["tool_start_callback"](call_id, tool_name, {"domain": "example.test"})
+            callbacks["tool_complete_callback"](
+                call_id,
+                tool_name,
+                {"domain": "example.test"},
+                function_result,
+            )
+            return {"final_response": "done", "messages": []}
+
+        return _agent(run)
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", side_effect=build_agent):
+            started = await client.post("/v1/runs", json={"input": "finish brand setup"})
+            run_id = (await started.json())["run_id"]
+            response = await client.get(f"/v1/runs/{run_id}/events")
+            events = _sse_events(await response.text())
+
+    progress = [
+        event for event in events if event["type"] == "response.omnio.tool_progress"
+    ]
+    assert [event["status"] for event in progress] == ["running", "completed"]
+    assert all(event["source_call_id"] == call_id for event in progress)
+    assert all(event["tool"] == tool_name for event in progress)
+    assert "success" not in progress[0]
+    assert progress[1]["success"] is expected_success
+    assert "brand-secret" not in json.dumps(progress)
+    assert "MCP_RESULT_SECRET" not in json.dumps(progress)
+    raw_call = next(
+        event["item"]
+        for event in events
+        if event["type"] == "response.output_item.added"
+        and event["item"].get("type") == "function_call"
+    )
+    assert raw_call["name"] == (
+        "tool_call" if call_shape == "tool-search" else tool_name
+    )
+
+
+@pytest.mark.asyncio
 async def test_deferred_tool_keeps_raw_call_and_emits_semantic_progress() -> None:
     adapter = _make_adapter()
 
