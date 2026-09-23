@@ -27,9 +27,8 @@ import { type MockServer, startMockServer } from './mock-server'
 import { RealSessionBuilder } from './real-session-builder'
 import { type ElectronApplication, expect, type Page, test } from './test'
 
-// A seeded session has no generated title, so every label falls back to the
-// session preview — the first 60 characters of the first user message.
-const SESSION_TITLE = 'E2E attached image session'
+// Keep the requested title and preview aligned: the pending title can be
+// persisted after the gateway emits the turn's completion event.
 const CAPTION = 'E2E attached image must survive a relaunch'
 const IMAGE_DIR = 'Application Support/e2e shots'
 const IMAGE_NAME = 'e2e capture.png'
@@ -67,7 +66,7 @@ async function setupSeededDesktop(): Promise<SeededFixture> {
 
   try {
     await builder.createSession({
-      title: SESSION_TITLE,
+      title: CAPTION,
       turns: [{ images: [writeImage(sandbox)], text: CAPTION }],
     })
   } finally {
@@ -172,8 +171,7 @@ test.describe('attached image resume', () => {
     fixture = await setupSeededDesktop()
     await waitForAppReady(fixture, 120_000)
 
-    // The sidebar labels a session by its preview, so the caption has to lead
-    // the persisted turn — a leading directive reads as a truncated file path.
+    // Both the requested title and the untitled preview identify this session.
     const row = sessionRow(fixture.page)
     await row.waitFor({ state: 'visible', timeout: 60_000 })
 
