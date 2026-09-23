@@ -28,6 +28,7 @@ from gateway.turn_event_log import (
     DELTA_COALESCE_SECONDS,
     OMNIO_EXTENSION_EVENT_TYPES,
     TERMINAL_FRAME_RESERVE_BYTES,
+    TURN_EVENT_LOG_API_VERSION,
     TurnEventEmitter,
     TurnEventLogStore,
     UnknownRunError,
@@ -227,7 +228,7 @@ async def test_capabilities_stamp_turn_event_log_without_changing_legacy_boolean
         payload = await response.json()
 
     assert response.status == 200
-    assert payload["turn_event_log_api_version"] == 2
+    assert payload["turn_event_log_api_version"] == TURN_EVENT_LOG_API_VERSION
     assert payload["features"]["run_events_sse"] is True
 
 
@@ -235,6 +236,7 @@ def test_omnio_extension_event_types_are_explicit_and_namespaced() -> None:
     expected = {
         "response.omnio.interaction",
         "response.omnio.interaction_completed",
+        "response.omnio.compaction",
         "response.omnio.client_event",
         "response.omnio.gen_ui",
         "response.omnio.task_list",
@@ -818,10 +820,57 @@ async def test_recoverable_runs_are_isolated_by_owning_profile() -> None:
         foreign_payload = await foreign_response.json()
 
     assert [item["runId"] for item in owner_payload["data"]] == [run_id]
+    assert owner_payload["object"] == "list"
+    assert owner_payload["inventory"] == {
+        "apiVersion": 1,
+        "complete": True,
+        "exactTurnIds": True,
+    }
+    assert owner_payload["data"][0]["turnId"] is None
     assert foreign_payload["data"] == []
     owned_log = adapter._turn_event_logs.get_log(run_id)
     assert owned_log is not None
     assert owned_log.owner_profile == "foo"
+
+
+@pytest.mark.asyncio
+async def test_recoverable_inventory_carries_exact_turn_identity() -> None:
+    adapter = _make_adapter()
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(
+            adapter,
+            "_create_agent",
+            return_value=_agent(
+                lambda **_kwargs: {
+                    "final_response": "done",
+                    "messages": [],
+                }
+            ),
+        ):
+            started = await client.post(
+                "/v1/runs",
+                json={
+                    "input": "hello",
+                    "turn_id": "turn-exact-1",
+                    "session_id": "session-exact-1",
+                },
+            )
+            run_id = (await started.json())["run_id"]
+            await _wait_for_terminal(adapter, run_id)
+
+        response = await client.get("/v1/runs?recoverable=1")
+        payload = await response.json()
+
+    assert response.status == 200
+    assert payload["inventory"] == {
+        "apiVersion": 1,
+        "complete": True,
+        "exactTurnIds": True,
+    }
+    assert [(item["runId"], item["turnId"]) for item in payload["data"]] == [
+        (run_id, "turn-exact-1")
+    ]
 
 
 @pytest.mark.asyncio
@@ -891,6 +940,7 @@ async def test_native_and_mirrored_default_profile_routes_share_turn_logs(
     assert events[-1]["type"] == "response.completed"
     assert events[0]["response"]["id"] == f"resp_{run_id.removeprefix('run_')}"
     assert [item["runId"] for item in recoverable_payload["data"]] == [run_id]
+    assert "turnId" in recoverable_payload["data"][0]
     owned_log = adapter._turn_event_logs.get_log(run_id)
     assert owned_log is not None
     assert owned_log.owner_profile == "default"
@@ -1381,9 +1431,14 @@ async def test_finalize_hook_failure_still_emits_terminal_promptly(
     monkeypatch: pytest.MonkeyPatch,
     hook_status: int | str,
 ) -> None:
+    release_hook = asyncio.Event()
+
     async def finalize(_request: web.Request) -> web.Response:
         if hook_status == "timeout":
-            await asyncio.sleep(1.0)
+            # The hook cannot complete until after the terminal event. A
+            # missing request deadline therefore fails the bounded terminal
+            # wait, without measuring unrelated CI scheduling latency.
+            await release_hook.wait()
             return web.json_response({"annotations": []})
         return web.json_response({"annotations": []}, status=hook_status)
 
@@ -1397,25 +1452,30 @@ async def test_finalize_hook_failure_still_emits_terminal_promptly(
             api_server_module._OMNIO_TURN_FINALIZE_HOOK_ENV,
             str(server.make_url("/internal/turn-finalize")),
         )
-        started_at = asyncio.get_running_loop().time()
-        with patch.object(
-            adapter,
-            "_create_agent",
-            return_value=_agent(
-                lambda **_kwargs: {
-                    "final_response": "Report: /brand/report.pdf",
-                    "messages": [],
-                }
-            ),
-        ):
-            started, events = await _run_without_http_server(
+        try:
+            with patch.object(
                 adapter,
-                {"input": "make report", "turn_id": "turn-1"},
-            )
-        elapsed = asyncio.get_running_loop().time() - started_at
+                "_create_agent",
+                return_value=_agent(
+                    lambda **_kwargs: {
+                        "final_response": "Report: /brand/report.pdf",
+                        "messages": [],
+                    }
+                ),
+            ), patch.object(
+                api_server_module,
+                "_request_turn_finalize_annotations",
+                wraps=api_server_module._request_turn_finalize_annotations,
+            ) as request_finalize:
+                started, events = await _run_without_http_server(
+                    adapter,
+                    {"input": "make report", "turn_id": "turn-1"},
+                )
+                request_finalize.assert_awaited_once()
+        finally:
+            release_hook.set()
 
     assert started.status == 202
-    assert elapsed < 0.5
     assert events[-1]["type"] == "response.completed"
     assert not any(
         event["type"] == "response.output_text.annotation.added" for event in events
@@ -1526,6 +1586,7 @@ async def test_terminal_logs_evict_after_completion_grace_and_live_logs_do_not_a
     assert set(in_grace_by_id) == {"run_live", "run_terminal"}
     assert in_grace_by_id["run_live"] == {
         "runId": "run_live",
+        "turnId": None,
         "status": "running",
         "sessionId": "session-live",
         "sequence_number": 2,
@@ -3660,12 +3721,8 @@ async def test_runs_register_the_user_input_surface_so_questions_park_and_resolv
 
 
 @pytest.mark.asyncio
-async def test_runs_thread_delegation_sync_only_into_session_context() -> None:
-    """The Omnio proxy's ``delegation_sync_only`` on ``POST /v1/runs`` must
-    reach the running agent via ``HERMES_DELEGATION_SYNC_ONLY`` — bound by
-    ``_bind_api_server_session`` exactly like ``turn_id`` -> ``HERMES_ORIGIN_TURN_ID``
-    — so ``tools.async_delegation._current_delegation_sync_only()`` (read by
-    ``delegate_task``) sees it while the run is live."""
+async def test_runs_forbidden_interaction_forces_sync_delegation() -> None:
+    """Unattended runs must finish child delegation before returning."""
     from gateway.session_context import get_session_env
 
     adapter = _make_adapter()
@@ -3683,7 +3740,7 @@ async def test_runs_thread_delegation_sync_only_into_session_context() -> None:
             {
                 "input": "run headless",
                 "session_id": "session-sync-only",
-                "delegation_sync_only": True,
+                "interaction_policy": "forbid",
             },
         )
 
@@ -3692,10 +3749,8 @@ async def test_runs_thread_delegation_sync_only_into_session_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runs_default_delegation_sync_only_false_when_omitted() -> None:
-    """Callers that never pass ``delegation_sync_only`` (every non-Omnio and
-    most Omnio deployments) must not force delegate_task's synchronous
-    fallback."""
+async def test_runs_default_interaction_policy_allows_async_delegation() -> None:
+    """Existing callers remain interactive when the policy is omitted."""
     from gateway.session_context import get_session_env
 
     adapter = _make_adapter()
@@ -3715,3 +3770,89 @@ async def test_runs_default_delegation_sync_only_false_when_omitted() -> None:
 
     assert started.status == 202
     assert captured["delegation_sync_only"] == ""
+
+
+def _projection_events(run_id: str, store: TurnEventLogStore) -> List[Dict[str, Any]]:
+    log = store.get_log(run_id)
+    assert log is not None
+    return [
+        json.loads(stored.frame.removeprefix(b"data: ").strip())
+        for stored in log.events
+    ]
+
+
+def _emit_request_user_input_call(
+    run_id: str, arguments: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    store = TurnEventLogStore()
+    store.create_run(run_id, f"session-{run_id}")
+    emitter = TurnEventEmitter(store, run_id, f"session-{run_id}")
+    emitter.response_started()
+    emitter.function_call_start("call-1", "request_user_input")
+    emitter.function_call_arguments("call-1", "request_user_input", arguments)
+    emitter.function_call_done("call-1")
+    emitter.response_completed()
+    return _projection_events(run_id, store)
+
+
+def test_function_call_arguments_projects_the_card_when_no_hook_withholds() -> None:
+    arguments = {"kind": "choice", "question": "Which?", "options": ["a", "b"]}
+
+    with patch(
+        "hermes_cli.plugins.resolve_tool_projection_withhold", return_value=None
+    ):
+        events = _emit_request_user_input_call("run_projection_allowed", arguments)
+
+    types = [event["type"] for event in events]
+    assert "response.function_call_arguments.delta" in types
+    card = next(event for event in events if event["type"] == "response.omnio.interaction")
+    assert card["interaction"] == arguments
+
+
+def test_function_call_arguments_keeps_the_transcript_but_withholds_the_card() -> None:
+    arguments = {"kind": "choice", "question": "Which?", "render": {"component": ""}}
+
+    with patch(
+        "hermes_cli.plugins.resolve_tool_projection_withhold",
+        return_value="request_user_input 'render' is valid only for 'approval_gate'.",
+    ):
+        events = _emit_request_user_input_call("run_projection_withheld", arguments)
+
+    types = [event["type"] for event in events]
+    assert "response.omnio.interaction" not in types
+    delta = next(
+        event for event in events if event["type"] == "response.function_call_arguments.delta"
+    )
+    assert json.loads(delta["delta"]) == arguments
+    done_item = next(
+        event["item"]
+        for event in events
+        if event["type"] == "response.output_item.done"
+        and event["item"].get("type") == "function_call"
+    )
+    assert done_item["status"] == "completed"
+    assert json.loads(done_item["arguments"]) == arguments
+
+
+def test_function_call_arguments_projects_the_card_when_the_projection_hook_raises() -> None:
+    arguments = {"kind": "confirm", "question": "Proceed?"}
+
+    with patch(
+        "hermes_cli.plugins.resolve_tool_projection_withhold",
+        side_effect=RuntimeError("plugin bug"),
+    ):
+        events = _emit_request_user_input_call("run_projection_failopen", arguments)
+
+    assert any(event["type"] == "response.omnio.interaction" for event in events)
+
+
+def test_client_projection_withheld_skips_hooks_for_non_allowlisted_tools() -> None:
+    from gateway.turn_event_log import client_projection_withheld
+
+    with patch(
+        "hermes_cli.plugins.resolve_tool_projection_withhold",
+        return_value="never consulted",
+    ) as resolve:
+        assert client_projection_withheld("terminal", {"command": "ls"}) is False
+
+    resolve.assert_not_called()

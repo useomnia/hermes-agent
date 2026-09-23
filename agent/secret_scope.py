@@ -100,6 +100,10 @@ _GLOBAL_ENV_EXACT = frozenset({
     "HERMES_MAX_ITERATIONS", "HERMES_MAX_TOKENS", "HERMES_API_TIMEOUT",
     "HERMES_REDACT_SECRETS", "HERMES_NOUS_TIMEOUT_SECONDS",
     "_HERMES_GATEWAY",
+    # Per-sandbox conformance capability. Every multiplexed Brand gateway in
+    # the same runtime must present the same fixture token; it is generated at
+    # provision time and never belongs to a profile's credential scope.
+    "OMNIO_CONFORMANCE_CONNECTOR_TOKEN",
     # OS / interpreter
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TZ", "PWD", "SHELL", "TMPDIR",
     "VIRTUAL_ENV", "PYTHONPATH", "SSL_CERT_FILE",

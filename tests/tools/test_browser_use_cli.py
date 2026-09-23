@@ -15,6 +15,71 @@ import pytest
 from tools import browser_use_cli as bu
 
 
+@pytest.mark.parametrize("setting", ["BROWSER_CDP_URL_TEMPLATE", "OMNIO_TOOLBOX_URL", "OMNIO_BRAND_ID"])
+def test_omnio_without_exec_capability_never_launches_host_python(monkeypatch, setting):
+    monkeypatch.delenv("OMNIO_BROWSER_EXEC_URL", raising=False)
+    monkeypatch.setenv(setting, "configured")
+    monkeypatch.setattr(bu, "_find_cli", lambda: pytest.fail("host CLI was resolved"))
+
+    result = json.loads(bu.browser_exec("print('must stay in Toolbox')"))
+
+    assert "Reprovision this Omnio sandbox" in result["error"]
+
+
+def test_remote_output_forces_secret_redaction(monkeypatch):
+    _configure_remote_omnio(monkeypatch)
+    secret = "ghp_" + "a" * 36
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+    monkeypatch.setattr(bu.requests, "post", lambda *a, **kw: _RemoteResponse(payload={
+        "output": f"result {secret}", "stderr": f"warning {secret}",
+        "returncode": 0, "workspace": "/workspace", "downloads": [],
+    }))
+
+    result = json.loads(bu.browser_exec("print('done')"))
+
+    assert result["success"]
+    assert secret not in result["output"]
+    assert secret not in result["stderr"]
+
+
+def test_standalone_output_forces_secret_redaction(monkeypatch):
+    secret = "ghp_" + "b" * 36
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+    monkeypatch.setattr(bu, "_find_cli", lambda: ["/managed/browser-use"])
+    monkeypatch.setattr(bu, "_base_subprocess_env", lambda: {})
+    monkeypatch.setattr(bu, "_resolve_backend_cdp", lambda *a, **kw: None)
+    monkeypatch.setattr(bu, "_workspace_dir", lambda *a: None)
+    monkeypatch.setattr(bu, "_run_cli_killing_process_group", lambda *a, **kw:
+        SimpleNamespace(returncode=0, stdout=secret, stderr=secret))
+    monkeypatch.setattr(bu, "_touch_harness", lambda *a: None)
+    monkeypatch.setattr(bu, "_ACTIVE_HARNESSES", {})
+
+    result = json.loads(bu.browser_exec("print('done')"))
+
+    assert result["success"]
+    assert secret not in result["output"]
+    assert secret not in result["stderr"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+def test_timeout_kills_pipe_holding_descendants(tmp_path):
+    marker = tmp_path / "descendant-survived"
+    script = (
+        "import os, time, pathlib\n"
+        "if os.fork() == 0:\n"
+        "    time.sleep(1)\n"
+        f"    pathlib.Path({str(marker)!r}).write_text('survived')\n"
+        "else:\n"
+        "    time.sleep(5)\n"
+    )
+    started = time.monotonic()
+    with pytest.raises(bu.subprocess.TimeoutExpired):
+        bu._run_cli_killing_process_group([sys.executable, "-c", script], "", {}, 0.2)
+    assert time.monotonic() - started < 2
+    time.sleep(1.1)
+    assert not marker.exists()
+
+
 def test_same_explicit_session_isolated_by_conversation(monkeypatch):
     from gateway import session_context
 
@@ -125,14 +190,14 @@ def test_managed_browser_use_cli_is_shared_from_root_for_profile_gateway(
     assert bu._find_cli() == [str(executable)]
 
 
-def test_missing_managed_cli_explains_omnio_agent_side_reprovision(monkeypatch):
+def test_missing_runner_explains_omnio_reprovision(monkeypatch):
     monkeypatch.setattr(bu, "_find_cli", lambda: None)
     monkeypatch.setattr(bu, "_omnio_template_cdp_configured", lambda: True)
 
     result = json.loads(bu.browser_exec("print(page_info())"))
 
     assert "Reprovision this Omnio sandbox" in result["error"]
-    assert "Toolbox terminal" in result["error"]
+    assert "Hermes host" in result["error"]
     assert "hermes tools" not in result["error"]
 
 
@@ -192,6 +257,7 @@ def test_timeout_stops_exact_named_harness(monkeypatch):
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(bu.subprocess, "run", fake_run)
+    monkeypatch.setattr(bu, "_run_cli_killing_process_group", lambda cmd, code, env, timeout, **kw: fake_run(cmd, env=env))
     result = json.loads(
         bu.browser_exec(
             "print('work')", session="shared", task_id="conv-1", timeout_s=5
@@ -204,270 +270,20 @@ def test_timeout_stops_exact_named_harness(monkeypatch):
     assert bu._ACTIVE_HARNESSES == {}
 
 
-def test_omnio_cdp_uses_isolated_default_harness_instance(monkeypatch, tmp_path):
-    """Omnio's Toolbox tab is reused while IPC/temp state stays per session."""
-    calls = []
-    monkeypatch.setenv("BROWSER_CDP_URL_TEMPLATE", "http://relay/{session_id}")
-    monkeypatch.setattr(
-        "hermes_constants.get_hermes_home", lambda: str(tmp_path / "home")
-    )
-    monkeypatch.setattr(bu, "_find_cli", lambda: ["/managed/browser-use"])
-    monkeypatch.setattr(
-        bu,
-        "_base_subprocess_env",
-        lambda: {
-            "PATH": "/usr/bin",
-            "BROWSER_USE_API_KEY": "must-not-reach-local-runtime",
-            "BU_AUTOSPAWN": "1",
-        },
-    )
-    monkeypatch.setattr(bu, "_blocked_url_in_code", lambda code: None)
-    monkeypatch.setattr(bu, "_resolve_backend_cdp", lambda *args, **kwargs: None)
-    monkeypatch.setattr(bu, "_workspace_dir", lambda *args: str(tmp_path / "workspace"))
-
-    def fake_run(command, **kwargs):
-        calls.append((command, kwargs))
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(bu.subprocess, "run", fake_run)
-    from gateway import session_context
-
-    nonce = f"{os.getpid()}-{time.time_ns()}"
-    values = {"HERMES_SESSION_ID": f"conversation-omnio-a-{nonce}"}
-    monkeypatch.setattr(session_context, "get_session_env", lambda key: values.get(key))
-    monkeypatch.setattr(bu, "_owner_pid_is_alive", lambda pid: True)
-    bu.browser_exec("print('a')", session="", task_id="child-a")
-    first_env = calls[-1][1]["env"]
-
-    values["HERMES_SESSION_ID"] = f"conversation-omnio-b-{nonce}"
-    bu.browser_exec("print('b')", session="", task_id="child-b")
-    second_env = calls[-1][1]["env"]
-
-    assert first_env["BU_NAME"] == second_env["BU_NAME"] == "default"
-    assert "BROWSER_USE_API_KEY" not in first_env
-    assert first_env["BU_AUTOSPAWN"] == "0"
-    assert first_env["BH_RUNTIME_DIR"] != second_env["BH_RUNTIME_DIR"]
-    assert first_env["BH_TMP_DIR"] != second_env["BH_TMP_DIR"]
-    assert "conversation-omnio-a" not in first_env["BH_RUNTIME_DIR"]
-    assert "conversation-omnio-a" not in first_env["BH_TMP_DIR"]
-    runtime_path = Path(first_env["BH_RUNTIME_DIR"])
-    tmp_path_for_harness = Path(first_env["BH_TMP_DIR"])
-    assert runtime_path.parent == Path("/tmp")
-    for private_path in (runtime_path, tmp_path_for_harness):
-        metadata = private_path.lstat()
-        assert stat.S_ISDIR(metadata.st_mode)
-        assert not stat.S_ISLNK(metadata.st_mode)
-        assert stat.S_IMODE(metadata.st_mode) == 0o700
-        if hasattr(os, "getuid"):
-            assert metadata.st_uid == os.getuid()
-    owner_marker = runtime_path / "gateway.owner_pid"
-    assert owner_marker.read_text(encoding="ascii").strip() == str(os.getpid())
-    assert stat.S_IMODE(owner_marker.stat().st_mode) == 0o600
-    bu.cleanup_all_browser_use()
-    reloads = [item for item in calls if item[0][-1] == "--reload"]
-    assert len(reloads) == 2
-    assert all(item[1]["env"]["BU_NAME"] == "default" for item in reloads)
-    with bu._HARNESS_LOCK:
-        bu._ACTIVE_HARNESSES.clear()
 
 
-def test_omnio_named_sessions_keep_hashed_dedicated_daemons(monkeypatch, tmp_path):
-    """Explicit names keep dedicated tabs and private runtime state."""
-    calls = []
-    monkeypatch.setenv("BROWSER_CDP_URL_TEMPLATE", "http://relay/{session_id}")
-    monkeypatch.setattr(bu, "_find_cli", lambda: ["/managed/browser-use"])
-    monkeypatch.setattr(bu, "_base_subprocess_env", lambda: {"PATH": "/usr/bin"})
-    monkeypatch.setattr(bu, "_blocked_url_in_code", lambda code: None)
-    monkeypatch.setattr(bu, "_resolve_backend_cdp", lambda *args, **kwargs: None)
-    monkeypatch.setattr(bu, "_workspace_dir", lambda *args: str(tmp_path / "workspace"))
-    monkeypatch.setattr(
-        bu.subprocess,
-        "run",
-        lambda command, **kwargs: (
-            calls.append((command, kwargs))
-            or SimpleNamespace(returncode=0, stdout="", stderr="")
-        ),
-    )
-    from gateway import session_context
-
-    named_conversation = f"same-conversation-{os.getpid()}-{time.time_ns()}"
-    monkeypatch.setattr(
-        session_context,
-        "get_session_env",
-        lambda key: named_conversation if key == "HERMES_SESSION_ID" else None,
-    )
-    monkeypatch.setattr(bu, "_owner_pid_is_alive", lambda pid: True)
-    bu.browser_exec("print('one')", session="one", task_id="child-one")
-    bu.browser_exec("print('two')", session="two", task_id="child-two")
-    first_env = calls[-2][1]["env"]
-    second_env = calls[-1][1]["env"]
-
-    assert first_env["BU_NAME"].startswith("bu-")
-    assert second_env["BU_NAME"].startswith("bu-")
-    assert first_env["BU_NAME"] != second_env["BU_NAME"]
-    assert first_env["BU_NAME"] != "default"
-    assert first_env["BH_RUNTIME_DIR"] != second_env["BH_RUNTIME_DIR"]
-    assert first_env["BH_TMP_DIR"] != second_env["BH_TMP_DIR"]
-    for env in (first_env, second_env):
-        runtime = Path(env["BH_RUNTIME_DIR"])
-        assert runtime.parent == Path("/tmp")
-        assert stat.S_IMODE(runtime.stat().st_mode) == 0o700
-        marker = runtime / "gateway.owner_pid"
-        assert marker.read_text(encoding="ascii").strip() == str(os.getpid())
-        assert stat.S_IMODE(marker.stat().st_mode) == 0o600
-    with bu._HARNESS_LOCK:
-        bu._ACTIVE_HARNESSES.clear()
 
 
-def test_omnio_stale_owner_reloads_exact_harness(monkeypatch, tmp_path):
-    """A dead gateway owner is reaped without touching another daemon."""
-    calls = []
-    monkeypatch.setattr(
-        "hermes_constants.get_hermes_home", lambda: str(tmp_path / "home")
-    )
-    monkeypatch.setattr(bu, "_owner_pid_is_alive", lambda pid: True)
-    env = {}
-    logical = f"stale-owner-{os.getpid()}-{time.time_ns()}"
-    assert (
-        bu._configure_omnio_harness_dirs(
-            env, logical, harness_name="bu-stale-owner", cmd=["/managed/browser-use"]
-        )
-        is None
-    )
-    runtime = Path(env["BH_RUNTIME_DIR"])
-    marker = runtime / "gateway.owner_pid"
-    marker.write_text("999999\n", encoding="ascii")
-    marker.chmod(0o600)
-
-    monkeypatch.setattr(bu, "_owner_pid_is_alive", lambda pid: False)
-    monkeypatch.setattr(
-        bu,
-        "_stop_harness_daemon",
-        lambda *args: calls.append(args) or True,
-    )
-    assert (
-        bu._configure_omnio_harness_dirs(
-            env, logical, harness_name="bu-stale-owner", cmd=["/managed/browser-use"]
-        )
-        is None
-    )
-    assert calls
-    assert calls[0][0] == "bu-stale-owner"
-    assert calls[0][1]["BU_NAME"] == "bu-stale-owner"
 
 
-def test_omnio_live_owner_is_not_taken_over(monkeypatch, tmp_path):
-    """A live gateway owner blocks a second process from sharing the daemon."""
-    monkeypatch.setattr(
-        "hermes_constants.get_hermes_home", lambda: str(tmp_path / "home")
-    )
-    monkeypatch.setattr(bu, "_owner_pid_is_alive", lambda pid: True)
-    env = {}
-    logical = f"live-owner-{os.getpid()}-{time.time_ns()}"
-    assert (
-        bu._configure_omnio_harness_dirs(
-            env, logical, harness_name="bu-live-owner", cmd=["/managed/browser-use"]
-        )
-        is None
-    )
-    marker = Path(env["BH_RUNTIME_DIR"]) / "gateway.owner_pid"
-    marker.write_text("424242\n", encoding="ascii")
-    marker.chmod(0o600)
-
-    error = bu._configure_omnio_harness_dirs(
-        {}, logical, harness_name="bu-live-owner", cmd=["/managed/browser-use"]
-    )
-
-    assert error and "live gateway process" in error
-    assert marker.read_text(encoding="ascii").strip() == "424242"
 
 
-def test_omnio_dead_owner_requires_successful_reclaim(monkeypatch, tmp_path):
-    """A failed exact reload never overwrites the stale ownership marker."""
-    monkeypatch.setattr(
-        "hermes_constants.get_hermes_home", lambda: str(tmp_path / "home")
-    )
-    monkeypatch.setattr(bu, "_owner_pid_is_alive", lambda pid: False)
-    monkeypatch.setattr(bu, "_stop_harness_daemon", lambda *args: False)
-    env = {}
-    logical = f"failed-reclaim-{os.getpid()}-{time.time_ns()}"
-    # Seed the deterministic runtime and then replace its marker with a dead
-    # owner PID, just as a crashed gateway would leave it.
-    assert (
-        bu._configure_omnio_harness_dirs(
-            env, logical, harness_name="bu-failed-reclaim", cmd=["/managed/browser-use"]
-        )
-        is None
-    )
-    marker = Path(env["BH_RUNTIME_DIR"]) / "gateway.owner_pid"
-    marker.write_text("999999\n", encoding="ascii")
-    marker.chmod(0o600)
-
-    error = bu._configure_omnio_harness_dirs(
-        {}, logical, harness_name="bu-failed-reclaim", cmd=["/managed/browser-use"]
-    )
-
-    assert error and "could not be reloaded safely" in error
-    assert marker.read_text(encoding="ascii").strip() == "999999"
 
 
-def test_owner_marker_rejects_symlink(tmp_path):
-    """The gateway marker cannot be redirected through a symlink."""
-    if not hasattr(os, "O_NOFOLLOW"):
-        return
-    runtime = tmp_path / "runtime"
-    runtime.mkdir(mode=0o700)
-    target = tmp_path / "outside"
-    target.write_text("keep", encoding="ascii")
-    (runtime / "gateway.owner_pid").symlink_to(target)
-
-    error = bu._write_omnio_owner_pid(runtime)
-
-    assert error and "owner marker" in error
-    assert target.read_text(encoding="ascii") == "keep"
 
 
-def test_owner_pid_probe_uses_cross_platform_fallback(monkeypatch):
-    """PID fallback must not use the Windows-unsafe os.kill probe."""
-    from gateway import status
-
-    def unavailable_probe(_pid):
-        raise OSError("simulated helper failure")
-
-    monkeypatch.setattr(status, "_pid_exists", unavailable_probe)
-    monkeypatch.setattr(
-        bu.os,
-        "kill",
-        lambda *_args: pytest.fail("os.kill must not be used"),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "psutil",
-        SimpleNamespace(pid_exists=lambda _pid: True),
-    )
-
-    assert bu._owner_pid_is_alive(12345) is True
 
 
-def test_owner_pid_probe_keeps_uncertainty_alive(monkeypatch):
-    """A failure of both probes must not permit unsafe owner takeover."""
-    from gateway import status
-
-    def unknown_probe(_pid):
-        raise OSError("unknown")
-
-    monkeypatch.setattr(status, "_pid_exists", unknown_probe)
-
-    def unknown_psutil_probe(_pid):
-        raise OSError("unknown")
-
-    monkeypatch.setitem(
-        sys.modules,
-        "psutil",
-        SimpleNamespace(pid_exists=unknown_psutil_probe),
-    )
-
-    assert bu._owner_pid_is_alive(12345) is True
 
 
 def test_inactivity_cleanup_only_stops_stale_named_daemon(monkeypatch):

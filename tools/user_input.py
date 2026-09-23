@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from typing import Optional
 
 from tools.blocking_wait import BlockingWaitRegistry
@@ -105,6 +106,10 @@ def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
     if not session_key:
         # No conversation surface to receive an answer on — don't park forever.
         return None
+    if not tool_call_id:
+        from tools.approval import get_current_tool_call_id
+
+        tool_call_id = get_current_tool_call_id()
     # The public completion contract is one slot per session. Clear a prior
     # sequential call's unconsumed reason before parking the next request.
     _wait_registry.consume_session_completion_reason(session_key)
@@ -117,7 +122,14 @@ def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
     return answer
 
 
-def resolve_user_input(session_key: str, answer: str, tool_call_id: str = "") -> bool:
+def resolve_user_input(
+    session_key: str,
+    answer: str,
+    tool_call_id: str = "",
+    *,
+    strict: bool = False,
+    before_release: Callable[[], None] | None = None,
+) -> bool:
     """Apply the user's answer posted from the Omnia chat: unblock the waiting
     ``request_user_input`` call.
 
@@ -128,11 +140,14 @@ def resolve_user_input(session_key: str, answer: str, tool_call_id: str = "") ->
     """
     if not session_key:
         return False
+    if strict and not tool_call_id:
+        return False
     return _wait_registry.resolve(
         session_key,
         tool_call_id,
         answer if answer is not None else "",
-        fallback_on_miss=True,
+        before_resolve=before_release,
+        fallback_on_miss=not strict,
     )
 
 

@@ -48,6 +48,7 @@ from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
+from tools.tool_approval import ToolApprovalDenial
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
@@ -916,6 +917,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
             if blocked:
                 effect_disposition = "none"
+            elif isinstance(function_result, ToolApprovalDenial):
+                effect_disposition = "none"
 
             if not blocked:
                 function_result = agent._append_guardrail_observation(
@@ -1095,6 +1098,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     function_name,
                     malformed_args_result,
                     tool_call.id,
+                    effect_disposition="none",
                 )
             )
             _flush_session_db_after_tool_progress(
@@ -1178,6 +1182,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _guardrail_block_decision = guardrail_decision
 
         _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
+        effect_disposition = "none" if _execution_blocked else None
 
         if _execution_blocked:
             # Tool blocked by plugin or guardrail policy — skip counters,
@@ -1604,6 +1609,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
+        if isinstance(function_result, ToolApprovalDenial):
+            effect_disposition = "none"
+
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
@@ -1713,7 +1721,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
+        tool_message = make_tool_result_message(
+            function_name,
+            _tool_content,
+            tool_call.id,
+            effect_disposition=effect_disposition,
+        )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if (

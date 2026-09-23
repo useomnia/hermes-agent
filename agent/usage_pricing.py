@@ -1023,9 +1023,13 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
 
 
 def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+    # ``concrete@preset/slug`` request models price as the concrete id; the
+    # OpenRouter catalogue has no entry for the preset-suffixed form.
+    from agent.model_metadata import openrouter_capability_model
+
     return _pricing_entry_from_metadata(
         fetch_model_metadata(),
-        route.model,
+        openrouter_capability_model(route.provider, route.model, route.base_url),
         source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
         pricing_version="openrouter-models-api",
     )

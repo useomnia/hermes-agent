@@ -199,6 +199,11 @@ def reset_current_observability_context(
     _approval_turn_id.reset(turn_token)
 
 
+def get_current_tool_call_id() -> str:
+    """Return the tool identity bound by the tool dispatcher."""
+    return _approval_tool_call_id.get()
+
+
 def get_current_session_key(default: str = "default") -> str:
     """Return the active session key, preferring context-local state.
 
@@ -2856,6 +2861,20 @@ def _run_approval_gate(
     session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
+
+    from gateway.session_context import get_session_env
+
+    if get_session_env("HERMES_INTERACTION_POLICY", "allow") == "forbid":
+        return {
+            "approved": False,
+            "pattern_key": pattern_key,
+            "description": description,
+            "message": (
+                f"BLOCKED: approval required ({description}), but this run "
+                "forbids user interaction. Do not retry this action; continue "
+                "with work that does not require approval."
+            ),
+        }
 
     if approval_callback is None:
         try:

@@ -739,6 +739,61 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_successful_call_includes_origin_turn_id_meta_from_session_context(self, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("hello world", is_error=False)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+        monkeypatch.setenv("HERMES_ORIGIN_TURN_ID", "env-turn-id")
+        tokens = set_session_vars(origin_turn_id="context-turn-id")
+
+        try:
+            handler = _make_tool_handler("test_srv", "greet", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({"name": "world"}))
+
+            assert result == {"result": "hello world"}
+            mock_session.call_tool.assert_called_once_with(
+                "greet",
+                arguments={"name": "world"},
+                meta={"omnia/originTurnId": "context-turn-id"},
+            )
+        finally:
+            clear_session_vars(tokens)
+            _servers.pop("test_srv", None)
+
+    def test_successful_call_omits_meta_when_origin_turn_id_is_missing(self, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("hello world", is_error=False)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+        monkeypatch.delenv("HERMES_ORIGIN_TURN_ID", raising=False)
+        tokens = set_session_vars(origin_turn_id="")
+
+        try:
+            handler = _make_tool_handler("test_srv", "greet", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({"name": "world"}))
+
+            assert result == {"result": "hello world"}
+            mock_session.call_tool.assert_called_once_with(
+                "greet",
+                arguments={"name": "world"},
+            )
+        finally:
+            clear_session_vars(tokens)
+            _servers.pop("test_srv", None)
+
     def test_mcp_error_result(self):
         from tools.mcp_tool import _make_tool_handler, _servers
 

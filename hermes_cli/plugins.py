@@ -134,6 +134,13 @@ _install_plugin_debug_handler()
 
 VALID_HOOKS: Set[str] = {
     "pre_tool_call",
+    # Client-projection gate. Fired when a client-rendered tool's arguments
+    # (an interaction card, a rendered component, a client event) are about
+    # to be copied onto a client-visible event. The plugin that owns the tool
+    # may return {"action": "withhold", "message": "..."} to keep arguments
+    # the tool will reject off the client; the call itself still streams and
+    # is recorded. Kwargs: tool_name, args.
+    "pre_tool_projection",
     "post_tool_call",
     "transform_terminal_output",
     "transform_tool_result",
@@ -2282,6 +2289,37 @@ def _get_pre_tool_call_directive_details(
         return _PreToolCallDirective(action=action, message=message, rule_key=rule_key)
 
     return _PreToolCallDirective()
+
+
+def resolve_tool_projection_withhold(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Check ``pre_tool_projection`` hooks for a withhold directive.
+
+    Plugins that own a client-rendered tool return::
+
+        {"action": "withhold", "message": "Reason the projection was withheld"}
+
+    to keep an argument set the tool will reject from reaching a client that
+    would render it. Only the client projection is affected: the function call
+    and its result still stream and are recorded. Returns the message, or
+    ``None`` when every hook lets the projection through. The first valid
+    directive wins; a withhold without a message and any other return value
+    are ignored so observer-only hooks are unaffected.
+    """
+    hook_results = invoke_hook(
+        "pre_tool_projection",
+        tool_name=tool_name,
+        args=args if isinstance(args, dict) else {},
+    )
+    for result in hook_results:
+        if not isinstance(result, dict) or result.get("action") != "withhold":
+            continue
+        message = result.get("message")
+        if isinstance(message, str) and message:
+            return message
+    return None
 
 
 def get_pre_tool_call_directive(

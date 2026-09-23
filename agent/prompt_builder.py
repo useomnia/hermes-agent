@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 # placeholder; the actual content never reaches the system prompt).
 # ---------------------------------------------------------------------------
 
+from agent.unattended import UNATTENDED_RUN_GUIDANCE
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
 
 
@@ -204,6 +205,7 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities.\n"
     "\n"
     "## Skill Safety Rule\n"
+    "A `[SKILL_INCOMPLETE:` receipt is an index, not a loaded skill. Read all required instructions through its section selectors before acting. Keep the same file_path when recovering a linked reference. A returned section or part does not mean the rest of the skill was loaded.\n"
     "1. **UNAVAILABLE** — If a skill placeholder contains `[SKILL_PRUNED]`, the skill content was lost in compression and is inaccessible.\n"
     "2. **RELOAD** — Before performing any action that depends on a skill, re-check its content with `skill_view(name='...')` if it shows `[SKILL_PRUNED]`.\n"
     "3. **WAIT** — If a skill is loading or was just pruned, wait for the reload confirmation before proceeding.\n"
@@ -329,6 +331,25 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
 
+# Model name substrings whose sessions receive OPENAI_MODEL_EXECUTION_GUIDANCE
+# (execution discipline: tool persistence, mandatory tool use for arithmetic,
+# external-write read-back, count reconciliation, literal preservation,
+# verification-gated completion) when agent.execution_guidance is "auto".
+#
+# gpt/codex/grok are the historical set; deepseek/kimi/qwen/glm/minimax/
+# mimo/mistral were added after Composio agentic-eval traces showed the same
+# failure modes on those families (financial math in prose, no read-back after
+# external writes, identifier "repair", completeness claims despite count
+# mismatches). GLM's tool-calls-as-plain-text stall (#53847) and MiMo (#41874)
+# are covered here too. Gemini/Gemma are excluded — they get the more specific
+# GOOGLE_MODEL_OPERATIONAL_GUIDANCE block instead. Claude is not auto-enabled;
+# users can opt any model in via
+# config.yaml `agent.execution_guidance: true` or a substring list.
+EXECUTION_GUIDANCE_MODELS = (
+    "gpt", "codex", "grok",
+    "deepseek", "kimi", "qwen", "glm", "minimax", "mimo", "mistral",
+)
+
 # Universal "finish the job" guidance — applied to ALL models, not gated
 # by model family.  Addresses two cross-model failure modes:
 #   1. Stopping after a stub: writing a tiny file or running one command
@@ -409,13 +430,28 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
 # without tool calls, suggests workarounds instead of using existing tools,
 # replies with plans/suggestions instead of executing). The body is
 # family-agnostic; the OPENAI_ prefix reflects origin, not exclusivity.
+#
+# As of the Composio agentic-eval follow-up, the block is no longer fenced to
+# gpt/codex/grok: eval traces showed DeepSeek/Kimi doing financial math in
+# prose, skipping read-back verification after external writes, "repairing"
+# malformed identifiers, and claiming completeness despite count mismatches —
+# exactly the failure modes this block targets. The injection gate lives in
+# agent/system_prompt.py and is controlled by config.yaml
+# ``agent.execution_guidance`` (auto/true/false/list); "auto" matches the
+# EXECUTION_GUIDANCE_MODELS substring tuple above.
 OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "# Execution discipline\n"
     "<tool_persistence>\n"
     "- Use tools whenever they improve correctness, completeness, or grounding.\n"
     "- Do not stop early when another tool call would materially improve the result.\n"
-    "- If a tool returns empty or partial results, retry with a different query or "
-    "strategy before giving up.\n"
+    "- If the underlying source returns empty, partial, or suspiciously narrow "
+    "results, retry with a broader or different query or strategy before concluding. "
+    "A truncated output preview is not incomplete source data or an execution failure.\n"
+    "- When a tool provides a saved output path, inspect that artifact before "
+    "requesting the same data again. Do not repeat successful calls solely to "
+    "recover omitted output. For JSON, parse the saved file and print only the "
+    "needed fields; for text, search or read bounded ranges. Check whether the "
+    "artifact itself is partial before claiming complete coverage.\n"
     "- Keep calling tools until: (1) the task is complete, AND (2) you have verified "
     "the result.\n"
     "</tool_persistence>\n"
@@ -458,7 +494,29 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- Formatting: does the output match the requested format or schema?\n"
     "- Safety: if the next step has side effects (file writes, commands, API calls), "
     "confirm scope before executing.\n"
+    "- Completion: 'done' means every named acceptance criterion is verified — "
+    "never a plausible subset. Completing your plan is not itself the answer; "
+    "the requested output must appear in your response.\n"
     "</verification>\n"
+    "\n"
+    "<external_state_verification>\n"
+    "- After any state-changing write to an external system (API call, message "
+    "post, record update), verify the effect by reading back the exact target "
+    "before claiming success — a successful tool call is not a successful task. "
+    "Do NOT re-verify internal file edits a tool already confirmed.\n"
+    "- Declared totals in responses (total, reply_count, has_more, '...N more') "
+    "are hard assertions. If your enumerated count disagrees, re-fetch or parse "
+    "programmatically — never finalize on 'go with what I have'.\n"
+    "- When building write payloads, set fields explicitly rather than relying "
+    "on provider defaults that could contradict intent.\n"
+    "</external_state_verification>\n"
+    "\n"
+    "<literal_preservation>\n"
+    "- Preserve identifiers, commands, and values exactly as given — never "
+    "'repair' or normalize a token that fails a stated format. A successful "
+    "lookup does not validate a malformed source token; validate format first, "
+    "then look up.\n"
+    "</literal_preservation>\n"
     "\n"
     "<missing_context>\n"
     "- If required context is missing, do NOT guess or hallucinate an answer.\n"
@@ -771,9 +829,8 @@ PLATFORM_HINTS = {
         "contextually appropriate."
     ),
     "cron": (
-        "You are running as a scheduled cron job. There is no user present — you "
-        "cannot ask questions, request clarification, or wait for follow-up. Execute "
-        "the task fully and autonomously, making reasonable decisions where needed. "
+        "You are running as a scheduled cron job. "
+        f"{UNATTENDED_RUN_GUIDANCE} "
         "Your final response is automatically delivered to the job's configured "
         "destination — put the primary content directly in your response."
     ),
@@ -1354,7 +1411,11 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 2
+# Bump whenever the meaning of a snapshot field changes. The manifest only
+# catches SKILL.md/DESCRIPTION.md mtime and size changes, so a change to how an
+# entry is DERIVED leaves an existing snapshot looking valid and serving the old
+# values indefinitely.
+_SKILLS_SNAPSHOT_VERSION = 3
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1453,12 +1514,15 @@ def _build_snapshot_entry(
     """Build a serialisable metadata dict for one skill."""
     rel_path = skill_file.relative_to(skills_dir)
     parts = rel_path.parts
-    if len(parts) >= 2:
-        skill_name = parts[-2]
-        category = "/".join(parts[:-2]) if len(parts) > 2 else parts[0]
-    else:
-        category = "general"
-        skill_name = skill_file.parent.name
+    # Every directory between the skills root and the skill's own directory is
+    # the category, joined with "/" — the same derivation as
+    # tools.skills_tool._get_category_from_path, which the skills_list filter
+    # matches against. A skill sitting at the root has no category directory, so
+    # it falls in the "general" bucket (the name the category DESCRIPTION.md
+    # lookup below already uses for the root) rather than becoming a category
+    # named after itself.
+    category = "/".join(parts[:-2]) or "general"
+    skill_name = parts[-2] if len(parts) >= 2 else skill_file.parent.name
 
     platforms = frontmatter.get("platforms") or []
     if isinstance(platforms, str):

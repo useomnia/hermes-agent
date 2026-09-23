@@ -2480,6 +2480,24 @@ def terminal_tool(
             # For local backends: uses subprocess.Popen with output buffering.
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
+            from agent.delegation_context import is_delegated_child_context
+            from gateway.session_context import async_delivery_supported
+
+            # A delegated child is finite even when it inherits a managed
+            # parent's context. It must join processes before returning.
+            notifications_supported = (
+                not is_delegated_child_context() and async_delivery_supported()
+            )
+            origin_session_id = ""
+            origin_turn_id = ""
+            if notifications_supported and (notify_on_complete or watch_patterns):
+                from tools.async_delegation import (
+                    _current_origin_session_id,
+                    _current_origin_turn_id,
+                )
+
+                origin_session_id = _current_origin_session_id()
+                origin_turn_id = _current_origin_turn_id()
 
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
@@ -2495,6 +2513,8 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        origin_session_id=origin_session_id,
+                        origin_turn_id=origin_turn_id,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -2503,6 +2523,8 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        origin_session_id=origin_session_id,
+                        origin_turn_id=origin_turn_id,
                     )
 
                 result_data = {
@@ -2630,7 +2652,6 @@ def terminal_tool(
                 # routed back to the correct chat/thread.
                 if background and (notify_on_complete or watch_patterns):
                     from gateway.session_context import (
-                        async_delivery_supported as _async_ok,
                         get_session_env as _gse,
                     )
 
@@ -2638,7 +2659,7 @@ def terminal_tool(
                     # Kanban workers) cannot route a completion back to the
                     # agent after the turn/process ends. Refuse the promise:
                     # drop the flags and tell the agent to poll.
-                    if not _async_ok():
+                    if not notifications_supported:
                         notify_on_complete = False
                         watch_patterns = None
                         result_data["notify_on_complete"] = False
@@ -2646,7 +2667,7 @@ def terminal_tool(
                             "notify_on_complete / watch_patterns are not available in "
                             "this session — it cannot receive an async completion after "
                             "the turn ends (a one-shot runner such as `hermes -z`, a "
-                            "cron job, a Kanban worker, or a stateless HTTP endpoint). "
+                            "cron job, a Kanban worker, a delegated child, or a stateless HTTP endpoint). "
                             "The process is "
                             "running in the background; retrieve its result with "
                             "process(action='poll') or process(action='wait')."
@@ -2708,6 +2729,8 @@ def terminal_tool(
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
                             "notify_on_complete": True,
+                            "origin_session_id": proc_session.origin_session_id,
+                            "origin_turn_id": proc_session.origin_turn_id,
                         })
 
                 # Set watch patterns for output monitoring
@@ -2715,6 +2738,8 @@ def terminal_tool(
                     proc_session.watch_patterns = list(watch_patterns)
                     result_data["watch_patterns"] = proc_session.watch_patterns
 
+                # Spawn checkpoints precede routing/notification configuration.
+                process_registry._write_checkpoint()
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
                 return json.dumps({

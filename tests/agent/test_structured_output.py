@@ -76,6 +76,18 @@ class TestNormalizeResponsesTextFormat:
     def test_no_format_key(self):
         assert normalize_responses_text_format({}) == (None, None)
 
+    @pytest.mark.parametrize("value", ["json", [], True])
+    def test_non_object_text_errors(self, value):
+        norm, err = normalize_responses_text_format(value)
+        assert norm is None
+        assert err == "'text' must be an object"
+
+    @pytest.mark.parametrize("value", ["json", [], True])
+    def test_non_object_format_errors(self, value):
+        norm, err = normalize_responses_text_format({"format": value})
+        assert norm is None
+        assert err == "'text.format' must be an object"
+
     def test_text_format(self):
         assert normalize_responses_text_format({"format": {"type": "text"}}) == (None, None)
 

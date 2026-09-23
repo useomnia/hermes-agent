@@ -100,6 +100,57 @@ class TestRequestToolApproval:
         assert res["status"] == "approval_required"
         assert submitted["pattern_key"] == "plugin_rule:ext-nav"
 
+    def test_forbidden_interaction_policy_fails_closed_without_pending_approval(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": (
+                "forbid" if name == "HERMES_INTERACTION_POLICY" else default
+            ),
+        )
+        monkeypatch.setattr(
+            approval,
+            "submit_pending",
+            lambda *_args, **_kwargs: pytest.fail(
+                "unattended runs must not create pending approvals"
+            ),
+        )
+
+        result = request_tool_approval(
+            "browser_navigate", "external URL", rule_key="ext-nav"
+        )
+
+        assert result["approved"] is False
+        assert result.get("status") != "approval_required"
+        assert "blocked" in result["message"].lower()
+
+    def test_forbidden_interaction_policy_honors_existing_approval(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(approval, "is_approved", lambda _sk, _pk: True)
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": (
+                "forbid" if name == "HERMES_INTERACTION_POLICY" else default
+            ),
+        )
+        monkeypatch.setattr(
+            approval,
+            "submit_pending",
+            lambda *_args, **_kwargs: pytest.fail(
+                "an existing approval must not create a pending request"
+            ),
+        )
+
+        result = request_tool_approval(
+            "browser_navigate", "external URL", rule_key="ext-nav"
+        )
+
+        assert result == {"approved": True, "message": None}
+
     def test_cron_deny_mode_blocks(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)

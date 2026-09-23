@@ -1,4 +1,5 @@
 import json
+import uuid
 from typing import cast
 
 
@@ -100,6 +101,7 @@ def test_sprites_environment_should_send_exec_to_toolbox():
         retry_exec_predispatch=False,
         retry_deadline_seconds=None,
         cancel_event=None,
+        request_id=None,
     ):
         calls.append(
             {
@@ -110,6 +112,7 @@ def test_sprites_environment_should_send_exec_to_toolbox():
                 "retry_exec_predispatch": retry_exec_predispatch,
                 "retry_deadline_seconds": retry_deadline_seconds,
                 "cancel_event": cancel_event is not None,
+                "request_id": request_id,
             }
         )
         return {"output": "ok\n", "returncode": 0}
@@ -119,23 +122,73 @@ def test_sprites_environment_should_send_exec_to_toolbox():
 
     assert handle.wait(timeout=2) == 0
     assert handle.stdout.read() == "ok\n"
-    assert calls == [
-        {
-            "path": "/exec",
-            "payload": {
-                "command": "echo ok",
-                "cwd": "/brand",
-                "login": False,
-                "stdin": "payload",
-                "timeoutSeconds": 9,
-            },
-            "timeout": 14,
-            "method": "POST",
-            "retry_exec_predispatch": True,
-            "retry_deadline_seconds": 9,
-            "cancel_event": True,
-        }
-    ]
+    assert len(calls) == 1
+    assert calls[0] == {
+        "path": "/exec",
+        "payload": {
+            "command": "echo ok",
+            "cwd": "/brand",
+            "login": False,
+            "stdin": "payload",
+            "timeoutSeconds": 9,
+        },
+        "timeout": 14,
+        "method": "POST",
+        "retry_exec_predispatch": True,
+        "retry_deadline_seconds": 9,
+        "cancel_event": True,
+        "request_id": calls[0]["request_id"],
+    }
+    assert str(uuid.UUID(calls[0]["request_id"])) == calls[0]["request_id"]
+
+
+def test_sprites_environment_kill_should_cancel_exact_toolbox_exec():
+    import threading
+
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.cwd = "/brand"
+    env.timeout = 60
+    env.toolbox_url = "https://toolbox.example"
+    env.bearer_token = "pair-secret"
+    env.brand = "brand-123"
+    exec_started = threading.Event()
+    cancellation_seen = threading.Event()
+    calls = []
+
+    def fake_request(
+        path,
+        payload=None,
+        *,
+        timeout=None,
+        method="POST",
+        retry_exec_predispatch=False,
+        retry_deadline_seconds=None,
+        cancel_event=None,
+        request_id=None,
+    ):
+        calls.append((path, request_id, timeout))
+        if path == "/exec":
+            exec_started.set()
+            assert cancellation_seen.wait(timeout=2)
+            return {"output": "[Command interrupted]", "returncode": 130}
+        assert path == "/exec/cancel"
+        cancellation_seen.set()
+        return {"status": "cancellation_requested", "active": True}
+
+    env._request_json = fake_request
+    handle = env._run_bash("sleep 20", timeout=30)
+    assert exec_started.wait(timeout=2)
+
+    handle.kill()
+
+    assert handle.wait(timeout=2) == 130
+    assert handle.stdout.read() == "[Command interrupted]"
+    assert calls[0][0] == "/exec"
+    assert calls[1][0] == "/exec/cancel"
+    assert calls[0][1] == calls[1][1]
+    assert calls[1][2] == 5
 
 
 def test_sprites_execute_forwards_effective_cwd_when_shared_env_is_stale():
@@ -164,6 +217,7 @@ def test_sprites_execute_forwards_effective_cwd_when_shared_env_is_stale():
         retry_exec_predispatch=False,
         retry_deadline_seconds=None,
         cancel_event=None,
+        request_id=None,
     ):
         calls.append(payload)
         return {"output": "ok\n", "returncode": 0}
@@ -400,13 +454,19 @@ def test_sprites_request_should_send_bearer_and_brand_headers(monkeypatch):
 
     monkeypatch.setattr(sprites_module._URL_OPENER, "open", fake_urlopen)
 
-    response = env._request_json("/health", {"ping": True}, timeout=5)
+    response = env._request_json(
+        "/health",
+        {"ping": True},
+        timeout=5,
+        request_id="request-123",
+    )
 
     assert response == {"ok": True}
     assert captured["url"] == "https://toolbox.example/health"
     assert captured["timeout"] == 5
     assert captured["headers"]["Authorization"] == "Bearer pair-secret"
     assert captured["headers"]["X-omnio-brand"] == "brand-123"
+    assert captured["headers"]["X-request-id"] == "request-123"
     assert json.loads(captured["body"]) == {"ping": True}
 
 
@@ -801,10 +861,24 @@ def test_sprites_exec_should_stop_retrying_when_handle_is_killed(monkeypatch):
     env.brand = "brand-123"
     env.timeout = 60
     attempts = 0
+    cancel_calls = 0
     first_attempt = threading.Event()
 
+    class FakeCancelResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, _limit):
+            return b'{"status":"cancellation_requested","active":true}'
+
     def fake_open(request, timeout):
-        nonlocal attempts
+        nonlocal attempts, cancel_calls
+        if request.full_url.endswith("/exec/cancel"):
+            cancel_calls += 1
+            return FakeCancelResponse()
         attempts += 1
         first_attempt.set()
         body = json.dumps(
@@ -834,6 +908,7 @@ def test_sprites_exec_should_stop_retrying_when_handle_is_killed(monkeypatch):
 
     assert handle.wait(timeout=1) == 1
     assert attempts == 1
+    assert cancel_calls == 1
 
 
 def test_sprites_exec_should_not_retry_unsafe_http_errors(monkeypatch):
@@ -1389,21 +1464,60 @@ def test_sprites_environment_write_content_canonicalizes_before_sensitive_check(
         env.write_file_content("~/../etc/passwd", "blocked")
 
 
-def test_sprites_environment_should_reject_file_content_over_two_mib():
+def test_sprites_environment_should_upload_file_content_over_json_limit():
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    requests = []
+    uploads = []
+
+    def file_request(payload):
+        requests.append(payload)
+        return {"bytesWritten": len(payload["content"].encode("utf-8"))}
+
+    env.file_request = file_request
+    env._write_raw_artifact = lambda path, data: uploads.append((path, data))
+    content = "é" * (sprites_module._MAX_FILE_CONTENT_BYTES // 2)
+
+    assert env.write_file_content("/tmp/hermes-results/boundary.txt", content) is True
+    assert len(requests) == 1
+    assert requests[0]["content"] == content
+    assert uploads == []
+
+    assert env.write_file_content("~/brand/large.txt", content + "é") is True
+    assert len(requests) == 1
+    assert uploads == [("/home/brand/large.txt", (content + "é").encode("utf-8"))]
+
+
+def test_sprites_environment_should_reject_file_content_over_artifact_limit(monkeypatch):
     import pytest
 
     import tools.environments.sprites as sprites_module
     from tools.environments.sprites import SpritesEnvironment, SpritesToolboxError
 
     env = SpritesEnvironment.__new__(SpritesEnvironment)
-    requests = []
-    env.file_request = requests.append
-    content = "x" * (sprites_module._MAX_FILE_CONTENT_BYTES + 1)
+    env.file_request = lambda _payload: pytest.fail("oversized content reached JSON upload")
+    env._write_raw_artifact = lambda *_args: pytest.fail("oversized content reached raw upload")
+    monkeypatch.setattr(sprites_module, "SPRITES_CACHE_FILE_MAX_BYTES", 1024)
 
     with pytest.raises(SpritesToolboxError, match="write content exceeded"):
-        env.write_file_content("/tmp/hermes-results/too-large.txt", content)
+        env.write_file_content("/tmp/hermes-results/too-large.txt", "é" * 513)
 
-    assert requests == []
+
+def test_sprites_environment_should_refuse_protected_large_file_before_upload():
+    import pytest
+
+    import tools.environments.sprites as sprites_module
+    from tools.environments.sprites import SpritesEnvironment, SpritesToolboxError
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.file_request = lambda _payload: pytest.fail("protected content reached JSON upload")
+    env._write_raw_artifact = lambda *_args: pytest.fail("protected content reached raw upload")
+    content = "x" * (sprites_module._MAX_FILE_CONTENT_BYTES + 1)
+
+    with pytest.raises(SpritesToolboxError, match="Write denied"):
+        env.write_file_content("~/../etc/passwd", content)
 
 
 def test_execute_code_guard_should_approve_sprites_backend():

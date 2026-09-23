@@ -30,6 +30,7 @@ from unittest.mock import MagicMock, patch
 
 from agent.tool_dispatch_helpers import make_tool_result_message
 from run_agent import AIAgent
+from tools.tool_approval import ToolApprovalDenial
 
 
 def _make_tool_defs(*names: str) -> list:
@@ -250,3 +251,80 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
     # production flush call breaks one of these assertions.
     assert flushed_tool_ids == ["c1", "c2"]
     assert flush_lengths == [1, 2]
+
+
+def test_execute_tool_calls_sequential_marks_blocked_result_as_no_effect():
+    agent = _make_agent()
+    tool_call = _mock_tool_call(name="mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT", call_id="c-blocked")
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+
+    with (
+        patch(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            return_value="connector approval is required",
+        ),
+        patch("run_agent.handle_function_call") as dispatch,
+    ):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+
+    dispatch.assert_not_called()
+    assert messages[0]["effect_disposition"] == "none"
+
+
+def test_execute_tool_calls_sequential_marks_approval_denial_as_no_effect():
+    agent = _make_agent()
+    tool_call = _mock_tool_call(name="mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT", call_id="c-denied-seq")
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+
+    with (
+        patch(
+            "tools.tool_approval.maybe_require_tool_approval",
+            return_value=ToolApprovalDenial(
+                '{"status":"approval_denied","error":"It was NOT performed."}'
+            ),
+        ),
+        patch("model_tools.registry.dispatch") as dispatch,
+    ):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+
+    dispatch.assert_not_called()
+    assert messages[0]["effect_disposition"] == "none"
+
+
+def test_execute_tool_calls_concurrent_marks_approval_denial_as_no_effect():
+    agent = _make_agent()
+    tool_call = _mock_tool_call(name="mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT", call_id="c-denied")
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+
+    with (
+        patch(
+            "tools.tool_approval.maybe_require_tool_approval",
+            return_value=ToolApprovalDenial(
+                '{"status":"approval_denied","error":"It was NOT performed."}'
+            ),
+        ),
+        patch("model_tools.registry.dispatch") as dispatch,
+    ):
+        agent._execute_tool_calls_concurrent(assistant_message, messages, "task-1")
+
+    dispatch.assert_not_called()
+    assert messages[0]["effect_disposition"] == "none"
+
+
+def test_execute_tool_calls_concurrent_does_not_trust_provider_approval_like_content():
+    agent = _make_agent()
+    tool_call = _mock_tool_call(name="mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT", call_id="c-provider")
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+
+    with patch.object(
+        agent,
+        "_invoke_tool",
+        return_value='{"status":"approval_denied","error":"It was NOT performed."}',
+    ):
+        agent._execute_tool_calls_concurrent(assistant_message, messages, "task-1")
+
+    assert "effect_disposition" not in messages[0]

@@ -137,6 +137,8 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    origin_session_id: str = ""                 # Canonical API session that launched the process
+    origin_turn_id: str = ""                    # Managed product turn that owns its completion
 
 
 class ProcessRegistry:
@@ -167,6 +169,12 @@ class ProcessRegistry:
         # ownership changes must be protected separately from process state.
         self._watcher_lock = threading.Lock()
         self.pending_watchers: List[Dict[str, Any]] = []
+        # Watchers which have been dequeued and are currently running in the
+        # gateway event loop.  ``pending_watchers`` alone misses the interval
+        # between dispatch and watcher completion, allowing a handover
+        # snapshot to claim quiescence while a watcher can still enqueue a
+        # completion event.
+        self._active_watchers: set[str] = set()
 
         # Notification queue — unified queue for all background process events.
         # Completion notifications (notify_on_complete) and watch pattern matches
@@ -235,6 +243,79 @@ class ProcessRegistry:
             watchers = self.pending_watchers
             self.pending_watchers = []
             return watchers
+
+    @staticmethod
+    def _watcher_id(watcher: Dict[str, Any]) -> str:
+        """Return an identity unique to this queued watcher descriptor."""
+        return f"{watcher.get('session_id', '')}:{id(watcher)}"
+
+    def claim_pending_watchers(self) -> List[tuple[Dict[str, Any], str]]:
+        """Claim queued watchers and publish active ownership atomically.
+
+        The dispatcher receives descriptors only after they are represented in
+        ``_active_watchers``. This closes the pending-to-task-start gap where
+        a quiescence reader could otherwise observe neither pending nor active
+        watcher work.
+        """
+        with self._watcher_lock:
+            watchers = self.pending_watchers
+            self.pending_watchers = []
+            claimed = []
+            for watcher in watchers:
+                watcher_id = self._watcher_id(watcher)
+                self._active_watchers.add(watcher_id)
+                claimed.append((watcher, watcher_id))
+            return claimed
+
+    def register_watcher(self, watcher_id: str) -> None:
+        """Record a dequeued process watcher until its task has settled."""
+        with self._watcher_lock:
+            self._active_watchers.add(str(watcher_id))
+
+    def release_watcher(self, watcher_id: str) -> None:
+        """Remove a process watcher after its task has fully returned."""
+        with self._watcher_lock:
+            self._active_watchers.discard(str(watcher_id))
+
+    def watcher_work_count(self) -> int:
+        """Return active plus queued watcher descriptors."""
+        with self._watcher_lock:
+            return len(self._active_watchers) + len(self.pending_watchers)
+
+    def quiescence_work_snapshot(self) -> Dict[str, int]:
+        """Return process, watcher, and completion-queue work for handover.
+
+        Detached process sessions are refreshed before counting so a process
+        that exited without its reader thread being reaped cannot hold the
+        gateway busy forever.  The individual registry locks make each field
+        internally consistent; the gateway's surrounding snapshot lock
+        prevents a new API turn from racing this read.
+        """
+        with self._lock:
+            sessions = list(self._running.values())
+        for session in sessions:
+            self._refresh_detached_session(session)
+
+        with self._lock:
+            active_processes = sum(
+                1 for session in self._running.values() if not session.exited
+            )
+        with self._watcher_lock:
+            active_watchers = len(self._active_watchers)
+            pending_watchers = len(self.pending_watchers)
+        try:
+            completion_queue = max(0, int(self.completion_queue.qsize()))
+        except Exception:
+            # A queue implementation that cannot report depth is unsafe for
+            # a quiescence proof; fail closed with one unit of work.
+            completion_queue = 1
+        return {
+            "processes": active_processes,
+            "active_watchers": active_watchers,
+            "pending_watchers": pending_watchers,
+            "process_watchers": active_watchers + pending_watchers,
+            "completion_queue": completion_queue,
+        }
 
     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
         """Forward a freshly-read chunk to the live-output sink, if one is set.
@@ -331,6 +412,8 @@ class ProcessRegistry:
                 self.completion_queue.put({
                     "session_id": session.id,
                     "session_key": session.session_key,
+                    "origin_session_id": session.origin_session_id,
+                    "origin_turn_id": session.origin_turn_id,
                     "command": session.command,
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
@@ -362,6 +445,8 @@ class ProcessRegistry:
         self.completion_queue.put({
             "session_id": session.id,
             "session_key": session.session_key,
+            "origin_session_id": session.origin_session_id,
+            "origin_turn_id": session.origin_turn_id,
             "command": session.command,
             "type": "watch_match",
             "pattern": matched_pattern,
@@ -709,6 +794,8 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        origin_session_id: str = "",
+        origin_turn_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -734,6 +821,8 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            origin_session_id=origin_session_id,
+            origin_turn_id=origin_turn_id,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
@@ -857,6 +946,8 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        origin_session_id: str = "",
+        origin_turn_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -878,6 +969,8 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            origin_session_id=origin_session_id,
+            origin_turn_id=origin_turn_id,
         )
 
         # Run the command in the sandbox with output capture
@@ -1215,31 +1308,45 @@ class ProcessRegistry:
         completion notification is enqueued.
         """
         with self._lock:
-            was_running = self._running.pop(session.id, None) is not None
+            was_running = session.id in self._running
+            # Publish completion delivery before removing the running unit's
+            # ownership from the registry. A quiescence reader can therefore
+            # observe either active process work or its queued delivery, but
+            # never the false-zero interval between those transitions.
+            if was_running and session.notify_on_complete:
+                from tools.ansi_strip import strip_ansi
+
+                output_tail = (
+                    strip_ansi(session.output_buffer[-2000:])
+                    if session.output_buffer
+                    else ""
+                )
+                self.completion_queue.put({
+                    "type": "completion",
+                    "session_id": session.id,
+                    "session_key": session.session_key,
+                    "origin_session_id": session.origin_session_id,
+                    "origin_turn_id": session.origin_turn_id,
+                    "command": session.command,
+                    "exit_code": session.exit_code,
+                    "platform": session.watcher_platform,
+                    "chat_id": session.watcher_chat_id,
+                    "user_id": session.watcher_user_id,
+                    "user_name": session.watcher_user_name,
+                    "thread_id": session.watcher_thread_id,
+                    "message_id": session.watcher_message_id,
+                    "completion_reason": session.completion_reason,
+                    "termination_source": session.termination_source,
+                    "output": output_tail,
+                    # Stable producer identity across checkpoint recovery;
+                    # unlike a consumer-observed completion timestamp, this
+                    # does not vary based on which watcher notices exit first.
+                    "started_at": session.started_at,
+                })
+            self._running.pop(session.id, None)
             self._finished[session.id] = session
         session._completion_event.set()
         self._write_checkpoint()
-
-        # Only enqueue completion notification on the FIRST move.  Without
-        # this guard, kill_process() and the reader thread can both call
-        # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
-        if was_running and session.notify_on_complete:
-            from tools.ansi_strip import strip_ansi
-            output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            self.completion_queue.put({
-                "type": "completion",
-                "session_id": session.id,
-                "session_key": session.session_key,
-                "command": session.command,
-                "exit_code": session.exit_code,
-                "completion_reason": session.completion_reason,
-                "termination_source": session.termination_source,
-                "output": output_tail,
-                # Stable producer identity across checkpoint recovery; unlike
-                # a consumer-observed completion timestamp, this does not vary
-                # based on which watcher notices exit first.
-                "started_at": session.started_at,
-            })
 
     # ----- Query Methods -----
 
@@ -2036,6 +2143,8 @@ class ProcessRegistry:
                             "started_at": s.started_at,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
+                            "origin_session_id": s.origin_session_id,
+                            "origin_turn_id": s.origin_turn_id,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_user_id": s.watcher_user_id,
@@ -2108,6 +2217,8 @@ class ProcessRegistry:
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
                 session_key=entry.get("session_key", ""),
+                origin_session_id=entry.get("origin_session_id", ""),
+                origin_turn_id=entry.get("origin_turn_id", ""),
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
@@ -2135,6 +2246,8 @@ class ProcessRegistry:
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
                     "session_key": session.session_key,
+                    "origin_session_id": session.origin_session_id,
+                    "origin_turn_id": session.origin_turn_id,
                     "platform": session.watcher_platform,
                     "chat_id": session.watcher_chat_id,
                     "user_id": session.watcher_user_id,

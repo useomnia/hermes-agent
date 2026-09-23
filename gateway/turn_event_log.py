@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 from hermes_constants import MAX_TODO_ITEMS
 
 
-TURN_EVENT_LOG_API_VERSION = 2
+TURN_EVENT_LOG_API_VERSION = 3
 DEFAULT_RUN_LOG_CAP_BYTES = 8 * 1024 * 1024
 DEFAULT_TERMINAL_RETENTION_SECONDS = 5 * 60
 DEFAULT_TOMBSTONE_LIMIT = 1000
@@ -53,6 +53,7 @@ CUSTOM_TOOL_INPUT_KEYS = {
 OMNIO_EXTENSION_EVENT_TYPES = frozenset({
     "response.omnio.interaction",
     "response.omnio.interaction_completed",
+    "response.omnio.compaction",
     "response.omnio.client_event",
     "response.omnio.gen_ui",
     "response.omnio.task_list",
@@ -72,6 +73,25 @@ _TOOL_EXTENSION_EVENTS = {
     "emit_client_event": ("response.omnio.client_event", "client_event"),
     "render_component": ("response.omnio.gen_ui", "gen_ui"),
 }
+
+
+def client_projection_withheld(name: str, arguments: Dict[str, Any]) -> bool:
+    """Whether a plugin keeps this call's arguments off client-visible events.
+
+    Both projectors ask this before copying an allowlisted tool's inputs to a
+    client, so an argument set the owning tool will reject never renders as a
+    card or component. The function-call item is unaffected: the call and its
+    result stay in the transcript. Fail-open — a hook fault projects as before,
+    since a missing card is a worse failure than a stray one.
+    """
+    if name not in CUSTOM_TOOL_INPUT_KEYS:
+        return False
+    try:
+        from hermes_cli.plugins import resolve_tool_projection_withhold
+
+        return resolve_tool_projection_withhold(name, arguments) is not None
+    except Exception:
+        return False
 
 
 def response_id_for_run_id(run_id: str) -> str:
@@ -121,6 +141,7 @@ class RunEventLog:
     session_id: str
     owner_profile: Optional[str]
     created_at: float
+    turn_id: Optional[str] = None
     status: str = "queued"
     completed_at: Optional[float] = None
     failure_reason: Optional[str] = None
@@ -200,6 +221,7 @@ class TurnEventLogStore:
         session_id: str,
         *,
         owner_profile: Optional[str] = None,
+        turn_id: Optional[str] = None,
     ) -> RunEventLog:
         if run_id in self._seen_run_ids:
             raise ValueError(f"run ID must never be reused: {run_id}")
@@ -209,6 +231,7 @@ class TurnEventLogStore:
             session_id=session_id,
             owner_profile=owner_profile,
             created_at=self._clock(),
+            turn_id=turn_id,
         )
         self._logs[run_id] = log
         return log
@@ -403,6 +426,11 @@ class TurnEventLogStore:
         return [
             {
                 "runId": log.run_id,
+                # The key is always present in the v2 inventory. ``None`` is a
+                # legitimate legacy/non-Omnia run; omitting the key would make
+                # a mixed-version response indistinguishable from exact
+                # Turn-id support.
+                "turnId": log.turn_id,
                 "status": log.status,
                 "sessionId": log.session_id,
                 "sequence_number": log.sequence_number_high_water,
@@ -777,6 +805,8 @@ class TurnEventEmitter:
             output_index=state["output_index"],
             delta=serialized,
         )
+        if client_projection_withheld(name, arguments):
+            return
         extension_type, payload_key = _TOOL_EXTENSION_EVENTS[name]
         self.omnio_event(extension_type, **{payload_key: arguments})
 
@@ -929,6 +959,7 @@ class TurnEventEmitter:
 
 
 __all__ = [
+    "client_projection_withheld",
     "CursorExpiredError",
     "CUSTOM_TOOL_INPUT_KEYS",
     "DEFAULT_RUN_LOG_CAP_BYTES",

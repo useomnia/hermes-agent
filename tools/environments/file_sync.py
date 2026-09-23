@@ -108,6 +108,62 @@ def iter_sprites_sync_files(
     ]
 
 
+# Where the harness cache set lands on the paired Toolbox (see
+# ``tools.credential_files.OMNIO_TOOLBOX_CACHE_BASE``); the delegation root is
+# kept as a named constant because the delegation tooling documents it.
+SPRITES_CACHE_ROOT = "/tmp/omnio-session/cache"
+SPRITES_DELEGATION_ROOT = f"{SPRITES_CACHE_ROOT}/delegation"
+
+# Per-file ceiling for the Toolbox cache projection. The cache can hold media
+# (videos, screenshots); anything above this stays host-only and is logged so
+# the gap is visible instead of silently stalling every command's sync.
+SPRITES_CACHE_FILE_MAX_BYTES = 50 * 1024 * 1024
+_oversized_cache_files_warned: set[str] = set()
+
+
+def iter_sprites_cache_files() -> list[tuple[str, str]]:
+    """Enumerate the harness cache files projected onto the paired Toolbox.
+
+    Mirrors :func:`iter_cache_files` with the Toolbox layout: every
+    ``credential_files._CACHE_DIRS`` subdirectory lands under
+    :data:`SPRITES_CACHE_ROOT`. Only regular files below a non-symlinked
+    directory chain cross the boundary, and files above
+    :data:`SPRITES_CACHE_FILE_MAX_BYTES` are skipped (once-logged). Text
+    redaction happens in the uploader, not here.
+    """
+    from hermes_constants import get_hermes_dir
+    from tools.credential_files import _CACHE_DIRS, OMNIO_TOOLBOX_CACHE_BASE
+
+    files: list[tuple[str, str]] = []
+    for new_subpath, old_name in _CACHE_DIRS:
+        root = get_hermes_dir(new_subpath, old_name)
+        if root.is_symlink() or not root.is_dir():
+            continue
+        remote_root = f"{OMNIO_TOOLBOX_CACHE_BASE}/{new_subpath}"
+        for path in root.rglob("*"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative = path.relative_to(root)
+            if any(parent.is_symlink() for parent in path.parents if parent != root and root in parent.parents):
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if size > SPRITES_CACHE_FILE_MAX_BYTES:
+                key = str(path)
+                if key not in _oversized_cache_files_warned:
+                    _oversized_cache_files_warned.add(key)
+                    logger.warning(
+                        "file_sync: %s is %d bytes, above the %d-byte Toolbox cache "
+                        "ceiling; it stays on the harness only",
+                        key, size, SPRITES_CACHE_FILE_MAX_BYTES,
+                    )
+                continue
+            files.append((str(path), f"{remote_root}/{relative.as_posix()}"))
+    return files
+
+
 def _credential_host_paths() -> set[str]:
     """Return credential files that are upload-only for remote sandboxes."""
     try:
@@ -191,7 +247,7 @@ class FileSyncManager:
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
         self._sync_interval = sync_interval
 
-    def sync(self, *, force: bool = False) -> None:
+    def sync(self, *, force: bool = False, raise_on_error: bool = False) -> None:
         """Run a sync cycle: upload changed files, delete removed files.
 
         Rate-limited to once per ``sync_interval`` unless *force* is True
@@ -271,6 +327,8 @@ class FileSyncManager:
             # leaving the remote with stale files — contradicting this method's
             # documented "next cycle retries everything" contract.
             logger.warning("file_sync: sync failed, rolled back state: %s", exc)
+            if raise_on_error:
+                raise
 
     # ------------------------------------------------------------------
     # Sync-back: pull remote changes to host on teardown

@@ -429,16 +429,25 @@ def _lookup_supports_vision(
         return override
     if not provider or not model:
         return None
+    base_url = _resolve_inference_base_url(cfg, provider)
+    # OpenRouter ``concrete@preset/slug`` request models: the catalogue only
+    # knows the concrete id, so look that up. The request model is untouched.
+    caps_model = model
+    try:
+        from agent.model_metadata import openrouter_capability_model
+
+        caps_model = openrouter_capability_model(provider, model, base_url)
+    except Exception:  # pragma: no cover - defensive
+        caps_model = model
     caps = None
     try:
         from agent.models_dev import get_model_capabilities
-        caps = get_model_capabilities(provider, model)
+        caps = get_model_capabilities(provider, caps_model)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("image_routing: caps lookup failed for %s:%s — %s", provider, model, exc)
+        logger.debug("image_routing: caps lookup failed for %s:%s — %s", provider, caps_model, exc)
     if caps is not None:
         return bool(caps.supports_vision)
 
-    base_url = _resolve_inference_base_url(cfg, provider)
     if not base_url and (provider or "").strip().lower() == "ollama":
         base_url = "http://localhost:11434/v1"
     if _should_probe_ollama_vision(provider, base_url):

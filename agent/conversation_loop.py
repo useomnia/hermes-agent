@@ -55,7 +55,7 @@ from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
-    _repair_tool_call_arguments,
+    _repair_tool_call_arguments_detailed,
     insert_ephemeral_messages,
     _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates,
@@ -631,6 +631,23 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     if stored_provider and current_provider and stored_provider != current_provider:
         return False
 
+    # The resolved context window is part of the prompt's runtime identity.
+    # This is especially important for OpenRouter aliases: a gateway may build
+    # a fresh AIAgent after the preset changes, so its in-memory compressor is
+    # already current while SQLite still contains a prompt sized for the old
+    # designated model. The volatile marker is emitted after project context,
+    # which makes the last-match parser safe from AGENTS.md shadowing.
+    stored_context_window = line_value("Context window")
+    compressor = getattr(agent, "context_compressor", None)
+    current_context_window = getattr(compressor, "context_length", None)
+    if (
+        stored_context_window
+        and isinstance(current_context_window, int)
+        and current_context_window > 0
+        and stored_context_window != str(current_context_window)
+    ):
+        return False
+
     # Detect cwd drift: if the stored prompt was built in a different working
     # directory, reuse would silently inject a stale path into the prefix cache.
     # Compare against resolve_agent_cwd() — the SAME resolver used to build the
@@ -1194,6 +1211,7 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+    agent._last_prompt_size_tokens = None
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -1612,9 +1630,16 @@ def run_conversation(
                             ),
                         }}
                     except Exception:
-                        tc["function"]["arguments"] = _repair_tool_call_arguments(
-                            tc["function"]["arguments"],
-                            tc["function"].get("name", "?"),
+                        # Transcript text, not an execution payload, so a lossy
+                        # recovery is kept: replaying the model's real (if
+                        # truncated) arguments describes the turn better than
+                        # "{}", which asserts it called with no arguments at
+                        # all and reads back as a legitimate zero-arg call.
+                        tc["function"]["arguments"] = (
+                            _repair_tool_call_arguments_detailed(
+                                tc["function"]["arguments"],
+                                tc["function"].get("name", "?"),
+                            ).arguments
                         )
                 new_tcs.append(tc)
             am["tool_calls"] = new_tcs
@@ -2149,6 +2174,9 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    from agent.chat_completion_helpers import log_openrouter_request_reasoning
+
+                    log_openrouter_request_reasoning(agent, next_api_kwargs, api_request_id)
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -2948,6 +2976,9 @@ def run_conversation(
                     # rate, not the aggregator's, so they are added as dollars
                     # (below) rather than folded into the priced usage.
                     aggregator_usage = canonical_usage
+                    # Keep the parent's actual prompt size separate from both
+                    # cumulative billing and the adviser fan-out below.
+                    agent._last_prompt_size_tokens = canonical_usage.prompt_tokens
                     # MoA: fold the reference (advisor) fan-out's token usage
                     # into this turn's REPORTED token counts. MoA runs advisors
                     # before the aggregator and returns only the aggregator's

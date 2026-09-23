@@ -83,6 +83,18 @@ CREDIT_APPROVAL_OPTION_SCOPES = ["once", "deny"]
 # there was never anyone who could have answered in time.
 _NO_SURFACE = "__no_surface__"
 
+
+class ToolApprovalDenial(str):
+    """A trusted tool result produced when approval prevents dispatch.
+
+    The JSON body is intentionally still a plain string for existing callers,
+    but the type carries control-flow provenance that the executor can persist
+    without inspecting attacker-controlled tool-result content.
+    """
+
+    effect_disposition = "none"
+
+
 _lock = threading.Lock()
 # session_key -> tool names approved for the whole conversation.
 _session_approved: dict[str, set[str]] = {}
@@ -529,7 +541,9 @@ def _is_recordable_tool_name(function_name: str, *, require_hint: bool) -> bool:
         return False
 
 
-def _denial_result(choice: Optional[str], *, status: Optional[str] = None) -> str:
+def _denial_result(
+    choice: Optional[str], *, status: Optional[str] = None
+) -> ToolApprovalDenial:
     """A tool result telling the agent the write did NOT happen. This is status
     data (not an instruction), so it's safe even wrapped as an untrusted result.
 
@@ -566,15 +580,17 @@ def _denial_result(choice: Optional[str], *, status: Optional[str] = None) -> st
         )
         default_status = "approval_no_response"
         tail = "let them know it needs their approval."
-    return json.dumps(
-        {
-            "status": status or default_status,
-            "error": (
-                f"{reason} It was NOT performed. Do not retry it or tell the user it "
-                f"succeeded; {tail}"
-            ),
-        },
-        ensure_ascii=False,
+    return ToolApprovalDenial(
+        json.dumps(
+            {
+                "status": status or default_status,
+                "error": (
+                    f"{reason} It was NOT performed. Do not retry it or tell the user it "
+                    f"succeeded; {tail}"
+                ),
+            },
+            ensure_ascii=False,
+        )
     )
 
 

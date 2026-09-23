@@ -2346,6 +2346,12 @@ atexit.register(_stop_browser_cleanup_thread)
 # Tool Schemas
 # ============================================================================
 
+_BROWSER_VISION_FILE_DELIVERY_GUIDANCE = (
+    "Follow the file-delivery instructions for your active interface when "
+    "sharing the screenshot_path with the user."
+)
+
+
 BROWSER_TOOL_SCHEMAS = [
     {
         "name": "browser_navigate",
@@ -2457,7 +2463,18 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_vision",
-        "description": "Take a screenshot of the current page so you can inspect it visually. Use this when you need to understand what the page looks like - especially for CAPTCHAs, visual verification challenges, complex layouts, or cases where the text snapshot misses important visual information. When your active model has native vision, the screenshot is attached to your context directly and you inspect it on the next turn; otherwise the runtime falls back to an auxiliary vision model and returns a text analysis. Includes a screenshot_path that you can share with the user by including MEDIA:<screenshot_path> in your response. Requires browser_navigate to be called first.",
+        "description": (
+            "Take a screenshot of the current page so you can inspect it visually. "
+            "Use this when you need to understand what the page looks like - "
+            "especially for CAPTCHAs, visual verification challenges, complex "
+            "layouts, or cases where the text snapshot misses important visual "
+            "information. When your active model has native vision, the screenshot "
+            "is attached to your context directly and you inspect it on the next "
+            "turn; otherwise the runtime falls back to an auxiliary vision model "
+            "and returns a text analysis. Includes a screenshot_path. "
+            f"{_BROWSER_VISION_FILE_DELIVERY_GUIDANCE} "
+            "Requires browser_navigate to be called first."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -3209,6 +3226,24 @@ def _store_full_snapshot(snapshot_text: str) -> Optional[str]:
         return None
 
 
+def _agent_visible_stored_path(stored_path: Optional[str]) -> Optional[str]:
+    """Render a stored cache path where the AGENT's read_file sees it.
+
+    ``read_file`` runs inside the active terminal backend, so a footer that
+    names the host path dangles on Docker and on the Omnio Toolbox (upstream
+    #72389). ``publish_cache_path`` is a no-op on backends that keep host
+    paths and pushes the file first on backends that copy the cache.
+    """
+    if not stored_path:
+        return stored_path
+    try:
+        from tools.credential_files import publish_cache_path
+
+        return publish_cache_path(stored_path)
+    except Exception:  # noqa: BLE001 — a failed translation must not lose the pointer
+        return stored_path
+
+
 def _extract_relevant_content(
     snapshot_text: str,
     user_task: Optional[str] = None
@@ -3219,7 +3254,7 @@ def _extract_relevant_content(
     the pointer lets the agent read anything the summary dropped). Falls back
     to simple truncation when no auxiliary text model is configured.
     """
-    stored_path = _store_full_snapshot(snapshot_text)
+    stored_path = _agent_visible_stored_path(_store_full_snapshot(snapshot_text))
     stored_note = (
         f'\n\n[Summarized from a {len(snapshot_text):,}-char snapshot. Full snapshot '
         f'saved to: {stored_path} — read it with read_file if anything is missing.]'
@@ -3295,7 +3330,7 @@ def _truncate_snapshot(snapshot_text: str, max_chars: int = SNAPSHOT_SUMMARIZE_T
     if len(snapshot_text) <= max_chars:
         return snapshot_text
 
-    stored_path = _store_full_snapshot(snapshot_text)
+    stored_path = _agent_visible_stored_path(_store_full_snapshot(snapshot_text))
 
     lines = snapshot_text.split('\n')
     result: list[str] = []
@@ -4899,8 +4934,9 @@ def browser_vision(
     for visual content the text-based snapshot may not capture (CAPTCHAs,
     verification challenges, images, complex layouts, etc.).
 
-    The screenshot is saved persistently and its file path is returned so it
-    can be shared with users via MEDIA:<path> in the response.
+    The screenshot is saved persistently and its file path is returned. Follow
+    the file-delivery instructions for your active interface when sharing the
+    screenshot with users.
 
     Args:
         question: What you want to know about the page visually
@@ -5216,7 +5252,10 @@ def browser_vision(
         error_info = {"success": False, "error": f"Error during vision analysis: {str(e)}"}
         if screenshot_path.exists():
             error_info["screenshot_path"] = str(screenshot_path)
-            error_info["note"] = "Screenshot was captured but vision analysis failed. You can still share it via MEDIA:<path>."
+            error_info["note"] = (
+                "Screenshot was captured but vision analysis failed. "
+                f"{_BROWSER_VISION_FILE_DELIVERY_GUIDANCE}"
+            )
         _copy_fallback_warning(error_info, result if 'result' in locals() else {})
         return json.dumps(error_info, ensure_ascii=False)
 

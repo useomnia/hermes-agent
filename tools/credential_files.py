@@ -259,17 +259,32 @@ def get_skills_directory_mount(
     symlinks are present (the common case), the original directory is returned
     directly with zero overhead.
 
-    Returns a list of dicts with ``host_path`` and ``container_path`` keys.
-    The local skills dir mounts at ``<container_base>/skills``, external dirs
+    Returns ``host_path`` (possibly sanitized), canonical ``source_path``,
+    and ``container_path`` for each directory. The local skills dir mounts at ``<container_base>/skills``, external dirs
     at ``<container_base>/external_skills/<index>``.
+    """
+    mounts = get_skills_directory_layout(container_base)
+    for mount in mounts:
+        mount["host_path"] = _safe_skills_path(Path(mount["source_path"]))
+    return mounts
+
+
+def get_skills_directory_layout(
+    container_base: str = "/root/.hermes",
+) -> list[Dict[str, str]]:
+    """Read the source/destination layout without preparing bind mounts.
+
+    Unlike get_skills_directory_mount, this never replaces a sanitized tree
+    that a running environment may still have mounted.
     """
     mounts = []
     hermes_home = _resolve_hermes_home()
     skills_dir = hermes_home / "skills"
     if skills_dir.is_dir():
-        host_path = _safe_skills_path(skills_dir)
+        host_path = str(skills_dir)
         mounts.append({
             "host_path": host_path,
+            "source_path": str(skills_dir),
             "container_path": f"{container_base.rstrip('/')}/skills",
         })
 
@@ -278,9 +293,10 @@ def get_skills_directory_mount(
         from agent.skill_utils import get_external_skills_dirs
         for idx, ext_dir in enumerate(get_external_skills_dirs()):
             if ext_dir.is_dir():
-                host_path = _safe_skills_path(ext_dir)
+                host_path = str(ext_dir)
                 mounts.append({
                     "host_path": host_path,
+                    "source_path": str(ext_dir),
                     "container_path": f"{container_base.rstrip('/')}/external_skills/{idx}",
                 })
     except ImportError:
@@ -400,7 +416,46 @@ _CACHE_DIRS: list[tuple[str, str]] = [
     ("cache/screenshots", "browser_screenshots"),
     ("cache/web", "web_cache"),
     ("cache/delegation", "delegation_cache"),
+    # execute_code stdout recovery artifacts (upstream #97043).
+    ("cache/exec", "exec_spill"),
 ]
+
+# Where the paired Omnio Toolbox sees the harness cache set. The Toolbox has
+# no ``~/.hermes``: the harness runs on the Omnio sprite and only projects the
+# agent-facing cache subdirectories into the Brand's private ``/tmp``, so
+# ``<HERMES_HOME>/cache/web/x.md`` is read there as
+# ``/tmp/omnio-session/cache/web/x.md``. The root is deliberately not a dot
+# directory: files under it are deliverables the reply may hand over as
+# ``sandbox:`` links, and the Omnio proxy refuses hidden path segments. Every
+# cache producer that hands the model a path goes through
+# :func:`publish_cache_path`; the Sprites environment syncs the same set before
+# commands and reads.
+OMNIO_TOOLBOX_CACHE_BASE = "/tmp/omnio-session"
+
+def publish_cache_path(host_path: str) -> str:
+    """Return the path the AGENT should be given for a host cache file, with
+    the file already readable there.
+
+    On backends that project the cache by copying (the Omnio Toolbox), the
+    copy is pushed before the path is handed out, including before the first
+    terminal/file call. Reuse the file tools' lazy environment acquisition so
+    publication and later reads share the same transport and sync state.
+    Docker sees its bind mount live; other backends keep their existing paths.
+    A failed push retains the translated path for a later read-time retry.
+    """
+    agent_path = to_agent_visible_cache_path(host_path)
+    if _terminal_backend() == "sprites" and agent_path != host_path:
+        try:
+            from tools.file_tools import _get_file_ops
+
+            _get_file_ops().env.sync_cache_files()
+        except Exception:
+            logger.warning("Cache publication failed; read-time sync will retry", exc_info=True)
+    return agent_path
+
+
+def _terminal_backend() -> str:
+    return (os.environ.get("TERMINAL_ENV", "local") or "local").strip().lower()
 
 
 def get_cache_directory_mounts(
@@ -441,12 +496,21 @@ def map_cache_path_to_container(
     regardless of the host OS.
     """
     path = Path(host_path)
+    resolved_path: Optional[Path] = None
     for mount in get_cache_directory_mounts(container_base=container_base):
         host_dir = Path(mount["host_path"])
         try:
             rel = path.relative_to(host_dir)
         except ValueError:
-            continue
+            # A profile home reached through a symlink (or a caller that
+            # already resolved its path) must still map: compare the
+            # resolved forms before giving up on this mount.
+            try:
+                if resolved_path is None:
+                    resolved_path = path.resolve()
+                rel = resolved_path.relative_to(host_dir.resolve())
+            except (OSError, ValueError):
+                continue
         return posixpath.join(mount["container_path"], rel.as_posix())
     return None
 
@@ -458,11 +522,15 @@ def from_agent_visible_cache_path(
     """Translate a sandbox/container cache path back to its host path.
 
     Inverse of :func:`to_agent_visible_cache_path`. Returns the input unchanged
-    when the active backend is not Docker, or when the path is not under any
-    auto-mounted cache directory — the caller then treats a still-container
-    path as "no host file" and falls back to an in-container read.
+    when the active backend does not project the cache (only Docker and the
+    Omnio Toolbox do), or when the path is not under any projected cache
+    directory — the caller then treats a still-container path as "no host
+    file" and falls back to an in-container read.
     """
-    if os.environ.get("TERMINAL_ENV", "local") != "docker":
+    backend = _terminal_backend()
+    if backend == "sprites":
+        container_base = OMNIO_TOOLBOX_CACHE_BASE
+    elif backend != "docker":
         return container_path
 
     path = Path(container_path)
@@ -481,15 +549,30 @@ def to_agent_visible_cache_path(
 ) -> str:
     """Translate a host cache path to its mounted path inside the sandbox.
 
-    Returns the input unchanged if it is not under any auto-mounted cache
-    directory, or if the active terminal backend does not require path
-    translation (only Docker for now).
+    Returns the input unchanged if it is not under any projected cache
+    directory, or if the active terminal backend does not project the cache.
+
+    * ``docker`` bind-mounts the cache set at *container_base*.
+    * ``sprites`` (the paired Omnio Toolbox) receives a synced copy of the
+      cache set under :data:`OMNIO_TOOLBOX_CACHE_BASE`; the host path is
+      resolved first so a profile home reached through a symlink still maps.
+    * Every other backend keeps host paths (Modal, Daytona and SSH sync the
+      cache too, but nothing translates for them in this fork yet).
+
+    The backend is identified by ``TERMINAL_ENV`` (the same env var
+    ``tools/terminal_tool.py`` reads in ``_get_environment_config``).
     """
-    # Only Docker backend requires translation at this time.  Other backends
-    # (Modal, Daytona) use different mount semantics and will be
-    # addressed separately if needed.  Backend is identified by TERMINAL_ENV
-    # (same env var tools/terminal_tool.py reads in _get_environment_config).
-    if os.environ.get("TERMINAL_ENV", "local") != "docker":
+    backend = _terminal_backend()
+    if backend == "sprites":
+        try:
+            resolved = str(Path(host_path).resolve())
+        except OSError:
+            resolved = host_path
+        mapped = map_cache_path_to_container(
+            resolved, container_base=OMNIO_TOOLBOX_CACHE_BASE
+        )
+        return mapped if mapped is not None else host_path
+    if backend != "docker":
         return host_path
 
     mapped = map_cache_path_to_container(host_path, container_base=container_base)
@@ -526,4 +609,3 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-

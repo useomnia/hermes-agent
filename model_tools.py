@@ -543,12 +543,13 @@ def _compute_tool_definitions(
     # regain host code execution through the browser toolset.  This is a
     # session-level gate, not a check_fn: registry availability checks are
     # process-wide and TTL-cached while one gateway serves many sessions.
-    if "browser_exec" in available_tool_names and "terminal" not in available_tool_names:
+    browser_python_tools = {"browser_exec", "browser_exec_headless"}
+    if browser_python_tools & available_tool_names and "terminal" not in available_tool_names:
         filtered_tools = [
             td for td in filtered_tools
-            if td.get("function", {}).get("name") != "browser_exec"
+            if td.get("function", {}).get("name") not in browser_python_tools
         ]
-        available_tool_names.discard("browser_exec")
+        available_tool_names.difference_update(browser_python_tools)
 
     if not quiet_mode:
         if filtered_tools:

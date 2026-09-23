@@ -71,6 +71,15 @@ class TestMultiplexActiveFailClosed:
         ss.set_multiplex_active(True)
         assert ss.get_secret("HERMES_KANBAN_DB") == "/x/kanban.db"
 
+    def test_connector_conformance_token_is_sandbox_global(self, monkeypatch):
+        monkeypatch.setenv("OMNIO_CONFORMANCE_CONNECTOR_TOKEN", "sandbox-token")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            assert ss.get_secret("OMNIO_CONFORMANCE_CONNECTOR_TOKEN") == "sandbox-token"
+        finally:
+            ss.reset_secret_scope(token)
+
 
 class TestScopedSingleProfile:
     """Multiplex OFF with a scope installed: the scope is an overlay, not a

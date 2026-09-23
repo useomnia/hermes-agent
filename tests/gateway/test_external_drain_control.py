@@ -242,7 +242,9 @@ class TestDrainStateMachine:
     def test_active_work_count_includes_api_and_cron_work(self, monkeypatch):
         runner, _ = _drain_runner()
         runner.adapters = {
-            Platform.API_SERVER: MagicMock(active_agent_work_count=MagicMock(return_value=2))
+            Platform.API_SERVER: MagicMock(
+                quiescence_agent_work_count=MagicMock(return_value=2)
+            )
         }
         runner._running_agents = {"session": MagicMock()}
         monkeypatch.setattr("cron.scheduler.get_running_job_ids", lambda: {"job-1"})

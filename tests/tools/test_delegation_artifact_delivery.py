@@ -1,0 +1,505 @@
+"""Harness cache artifacts (worker output, stdout recovery, stored pages,
+screenshots) cross the HTTP client into a separate Toolbox filesystem."""
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+
+from tools.credential_files import (
+    _CACHE_DIRS, OMNIO_TOOLBOX_CACHE_BASE, from_agent_visible_cache_path,
+    to_agent_visible_cache_path,
+)
+from tools.delegate_tool import _spill_summary_to_file
+from tools.delegation_live_log import create_live_transcripts
+from tools.environments import file_sync
+from tools.environments.file_sync import (
+    FileSyncManager, SPRITES_CACHE_ROOT, SPRITES_DELEGATION_ROOT, iter_sprites_cache_files,
+)
+from tools.environments.sprites import SpritesEnvironment, SpritesFileOperations, SpritesToolboxError
+from tools.code_execution_tool import _truncate_stdout_text
+
+
+@pytest.fixture
+def pair(tmp_path, monkeypatch):
+    home = tmp_path / "harness" / "brand-a"
+    home.mkdir(parents=True)
+    toolbox = tmp_path / "toolbox"
+    toolbox.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("TERMINAL_ENV", "sprites")
+    requests = []
+
+    class Files(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append(payload)
+            path = toolbox / payload["path"].lstrip("/")
+            operation = payload["operation"]
+            if operation == "write":
+                assert len(payload["content"].encode()) <= 2 * 1024 * 1024
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(payload["content"])
+                result = {"bytesWritten": len(payload["content"].encode())}
+            elif operation == "delete":
+                path.unlink(missing_ok=True)
+                result = {"ok": True}
+            else:
+                try:
+                    content = path.read_text()
+                    if len(content.encode()) > 2 * 1024 * 1024:
+                        result = {"error": f"File too large: {payload['path']}"}
+                    else:
+                        result = {"content": content, "totalLines": len(content.splitlines())}
+                except FileNotFoundError:
+                    result = {"error": "file not found"}
+            self.reply(result)
+
+        def do_GET(self):
+            query = parse_qs(urlsplit(self.path).query)
+            assert self.headers["X-Omnio-Brand"] == "brand-a"
+            assert self.headers["Authorization"] == "Bearer test-token"
+            path = toolbox / query["path"][0].lstrip("/")
+            requests.append({"operation": "raw-read", "path": query["path"][0]})
+            if not path.is_file():
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(path.read_bytes())
+
+        def do_PUT(self):
+            query = parse_qs(urlsplit(self.path).query)
+            assert query["overwrite"] == ["true"]
+            data = self.rfile.read(int(self.headers["Content-Length"]))
+            path = toolbox / query["path"][0].lstrip("/")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            requests.append({"operation": "raw-write", "path": query["path"][0]})
+            self.reply({"bytesWritten": len(data)})
+
+        def reply(self, result):
+            assert self.headers["X-Omnio-Brand"] == "brand-a"
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Files)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    env.toolbox_url = f"http://127.0.0.1:{server.server_port}"
+    env.bearer_token = "test-token"
+    env.brand = "brand-a"
+    env.timeout = 5
+    env.cwd = "/brand"
+    env._cache_sync_lock = threading.Lock()
+    env._cache_sync_manager = FileSyncManager(
+        iter_sprites_cache_files, env._upload_cache_file, env._delete_cache_files,
+    )
+    from tools import file_tools, terminal_tool
+
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
+    monkeypatch.setattr(file_tools, "_file_ops_cache", {"default": SpritesFileOperations(env)})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    yield home, toolbox, env, requests
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=5)
+
+
+def test_summary_path_can_be_read_completely_from_toolbox(pair):
+    home, toolbox, env, requests = pair
+    expected = "worker instruction\n" * 3000 + "FINAL RESULT"
+    path = _spill_summary_to_file(0, expected)
+    assert path.startswith("/tmp/omnio-session/cache/delegation/")
+    # Publishing the path already pushed the file: a consumer that reads the
+    # Toolbox directly (the proxy's deliverable warm-up) finds it at once.
+    assert [item["operation"] for item in requests] == ["raw-write"]
+    assert (toolbox / path.lstrip("/")).read_text() == expected
+    result = SpritesFileOperations(env).read_file_raw(path)
+    assert result.content == expected
+
+
+def test_published_paths_never_contain_hidden_segments(pair):
+    home, toolbox, env, requests = pair
+    path = _spill_summary_to_file(0, "deliverable")
+    assert not any(segment.startswith(".") for segment in path.strip("/").split("/"))
+    assert SPRITES_CACHE_ROOT == f"{OMNIO_TOOLBOX_CACHE_BASE}/cache"
+
+
+def test_cold_publication_creates_transport_before_returning_path(pair, monkeypatch):
+    from tools import file_tools, terminal_tool
+    from tools.credential_files import publish_cache_path
+
+    home, toolbox, env, requests = pair
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(file_tools, "_file_ops_cache", {})
+    monkeypatch.setenv("OMNIO_TOOLBOX_URL", env.toolbox_url)
+    monkeypatch.setenv("OMNIO_TOOLBOX_BEARER", env.bearer_token)
+    monkeypatch.setenv("OMNIO_TOOLBOX_BRAND", env.brand)
+    monkeypatch.setenv("TERMINAL_CWD", "/brand")
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    # Session shell setup is unrelated to publishing: the file transport and
+    # environment factory remain real, with no pre-created active environment.
+    monkeypatch.setattr(SpritesEnvironment, "init_session", lambda self: None)
+    shot = home / "cache/screenshots/first.png"
+    shot.parent.mkdir(parents=True)
+    shot.write_bytes(b"screenshot bytes")
+
+    path = publish_cache_path(str(shot))
+
+    assert (toolbox / path.lstrip("/")).read_bytes() == shot.read_bytes()
+    assert [item["operation"] for item in requests] == ["raw-write"]
+
+
+@pytest.mark.parametrize("filename,mime", [
+    ("fresh.mp4", "video/mp4"),
+    ("fresh.mp3", "audio/mpeg"),
+    ("fresh.txt", "text/plain"),
+])
+def test_gateway_attachments_are_published_before_direct_consumers(pair, filename, mime):
+    from gateway.platforms.base import cache_media_bytes
+
+    home, toolbox, env, requests = pair
+    data = b"new attachment content"
+
+    media = cache_media_bytes(data, filename=filename, mime_type=mime)
+
+    assert media is not None
+    assert (toolbox / media.path.lstrip("/")).read_bytes() == data
+    assert [item["operation"] for item in requests] == ["raw-write"]
+
+
+@pytest.mark.parametrize("offset", [1, 2])
+def test_paged_read_bounds_memory_for_long_selected_and_skipped_lines(offset):
+    import tracemalloc
+    from tools.tool_output_limits import get_max_line_length
+
+    class LargeLineEnvironment:
+        cwd = "/brand"
+
+        def stream_file_bytes(self, path):
+            chunk = b"x" * (1024 * 1024)
+            for _ in range(24):
+                yield chunk
+            yield b"\nrequested line\n"
+
+    tracemalloc.start()
+    try:
+        result = SpritesFileOperations(LargeLineEnvironment())._read_large_text_page(
+            "/tmp/long-line.txt", offset, 1,
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result.error is None
+    assert result.total_lines == 2
+    assert result.file_size == 24 * 1024 * 1024 + len(b"\nrequested line\n")
+    if offset == 1:
+        assert result.content == "1|" + "x" * get_max_line_length() + "... [truncated]"
+    else:
+        assert result.content == "2|requested line"
+    assert peak < 12 * 1024 * 1024
+
+
+def test_publish_flush_failure_falls_back_to_read_time_sync(pair, monkeypatch):
+    home, toolbox, env, requests = pair
+    original = env._write_raw_artifact
+    attempts = []
+
+    def flaky(path, data):
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise SpritesToolboxError("Artifact transfer failed")
+        return original(path, data)
+
+    monkeypatch.setattr(env, "_write_raw_artifact", flaky)
+    path = _spill_summary_to_file(0, "eventually")
+    assert path.startswith("/tmp/omnio-session/cache/delegation/")  # publish never returns a host path
+    assert len(attempts) == 1 and not requests  # the publish-time push failed quietly
+    assert SpritesFileOperations(env).read_file_raw(path).content == "eventually"
+    assert len(attempts) == 2
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 7])
+def test_streamed_pages_preserve_utf8_bom_crlf_and_empty_lines(chunk_size):
+    data = "\ufefffirst 🧪\r\n\r\nlast é".encode()
+
+    class SplitEnvironment:
+        cwd = "/brand"
+
+        def stream_file_bytes(self, path):
+            for index in range(0, len(data), chunk_size):
+                yield data[index:index + chunk_size]
+
+    result = SpritesFileOperations(SplitEnvironment())._read_large_text_page(
+        "/tmp/utf8.txt", 1, 3,
+    )
+    assert result.error is None
+    assert result.content == "1|first 🧪\n2|\n3|last é"
+    assert result.total_lines == 3
+    assert result.file_size == len(data)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_raw_reads_normalize_transport_failures(pair, monkeypatch, streaming):
+    from tools.environments import sprites
+
+    _, _, env, _ = pair
+
+    def disconnected(*args, **kwargs):
+        raise ConnectionResetError("connection lost")
+
+    monkeypatch.setattr(sprites._URL_OPENER, "open", disconnected)
+    with pytest.raises(SpritesToolboxError, match="unreachable"):
+        if streaming:
+            list(env.stream_file_bytes("/tmp/example.txt"))
+        else:
+            env.read_file_bytes("/tmp/example.txt", max_bytes=100)
+
+
+def test_live_log_refreshes_before_each_parent_read(pair):
+    home, toolbox, env, requests = pair
+    _, writers, paths = create_live_transcripts([{"goal": "write"}])
+    assert paths[0].startswith("/tmp/omnio-session/cache/delegation/")
+    writers[0].assistant_text("FIRST OBSERVATION")
+    assert "FIRST OBSERVATION" in SpritesFileOperations(env).read_file_raw(paths[0]).content
+    writers[0].assistant_text("FINAL OBSERVATION")
+    assert "FINAL OBSERVATION" in SpritesFileOperations(env).read_file_raw(paths[0]).content
+
+
+def test_profile_credentials_other_caches_and_symlinks_are_not_transferred(pair):
+    home, toolbox, env, requests = pair
+    path = _spill_summary_to_file(0, "legitimate")
+    secret = home / "auth.json"
+    secret.write_text('{"credential":"never copy"}')
+    cache = home / "cache" / "delegation"
+    (cache / "secret.json").symlink_to(secret)
+    (cache / "outside").symlink_to(home, target_is_directory=True)
+    # Files at the cache ROOT (model metadata, encrypted secret caches) are
+    # not part of the projected set: only the listed subdirectories cross.
+    (home / "cache" / "other.json").write_text("private")
+    (home / "cache" / "bws_cache.enc.json").write_text("encrypted")
+    env.sync_cache_files()
+    assert [item["path"] for item in requests] == [path]
+    assert to_agent_visible_cache_path(str(secret)) == str(secret)
+    assert to_agent_visible_cache_path(str(cache / ".." / "other.json")) == str(cache / ".." / "other.json")
+
+
+def test_every_cache_subdirectory_maps_to_the_toolbox_and_back(pair):
+    home, toolbox, env, requests = pair
+    for subpath, _old in _CACHE_DIRS:
+        host = home / subpath / "nested" / "artifact.bin"
+        host.parent.mkdir(parents=True, exist_ok=True)
+        host.write_bytes(b"\x00\x01binary\xff")
+        agent = to_agent_visible_cache_path(str(host))
+        assert agent == f"{SPRITES_CACHE_ROOT}/{subpath.removeprefix('cache/')}/nested/artifact.bin"
+        assert from_agent_visible_cache_path(agent) == str(host)
+    env.sync_cache_files()
+    landed = sorted(item["path"] for item in requests)
+    assert landed == sorted(
+        f"{SPRITES_CACHE_ROOT}/{subpath.removeprefix('cache/')}/nested/artifact.bin"
+        for subpath, _old in _CACHE_DIRS
+    )
+    for subpath, _old in _CACHE_DIRS:
+        copy = toolbox / f"{SPRITES_CACHE_ROOT}/{subpath.removeprefix('cache/')}/nested/artifact.bin".lstrip("/")
+        assert copy.read_bytes() == b"\x00\x01binary\xff"
+
+
+def test_symlinked_profile_home_still_maps(tmp_path, monkeypatch):
+    real = tmp_path / "real-home"
+    (real / "cache" / "web").mkdir(parents=True)
+    link = tmp_path / "linked-home"
+    link.symlink_to(real, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(link))
+    monkeypatch.setenv("TERMINAL_ENV", "sprites")
+    page = link / "cache" / "web" / "page.md"
+    page.write_text("stored")
+    assert to_agent_visible_cache_path(str(page)) == f"{SPRITES_CACHE_ROOT}/web/page.md"
+    assert to_agent_visible_cache_path(str(page.resolve())) == f"{SPRITES_CACHE_ROOT}/web/page.md"
+
+
+def test_paths_are_not_translated_on_other_backends(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / "cache" / "web").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    page = home / "cache" / "web" / "page.md"
+    page.write_text("stored")
+    for backend in ("local", "ssh", "modal"):
+        monkeypatch.setenv("TERMINAL_ENV", backend)
+        assert to_agent_visible_cache_path(str(page)) == str(page)
+        assert from_agent_visible_cache_path(f"{SPRITES_CACHE_ROOT}/web/page.md") == f"{SPRITES_CACHE_ROOT}/web/page.md"
+
+
+def test_oversized_cache_files_stay_on_the_harness(pair, monkeypatch):
+    home, toolbox, env, requests = pair
+    monkeypatch.setattr(file_sync, "SPRITES_CACHE_FILE_MAX_BYTES", 1024)
+    videos = home / "cache" / "videos"
+    videos.mkdir(parents=True)
+    (videos / "small.mp4").write_bytes(b"v" * 512)
+    (videos / "huge.mp4").write_bytes(b"v" * 4096)
+    assert [remote for _host, remote in iter_sprites_cache_files()] == [f"{SPRITES_CACHE_ROOT}/videos/small.mp4"]
+    env.sync_cache_files()
+    assert [item["path"] for item in requests] == [f"{SPRITES_CACHE_ROOT}/videos/small.mp4"]
+
+
+def test_text_artifacts_are_redacted_and_media_is_byte_exact(pair):
+    home, toolbox, env, requests = pair
+    secret = "ghp_" + "b" * 36
+    web = home / "cache" / "web"
+    web.mkdir(parents=True)
+    (web / "page.md").write_text(f"title\ntoken {secret}\n")
+    shots = home / "cache" / "screenshots"
+    shots.mkdir(parents=True)
+    png = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) + secret.encode()
+    (shots / "shot.png").write_bytes(png)
+    env.sync_cache_files()
+    stored_page = (toolbox / f"{SPRITES_CACHE_ROOT}/web/page.md".lstrip("/")).read_text()
+    assert secret not in stored_page and "title" in stored_page
+    assert (toolbox / f"{SPRITES_CACHE_ROOT}/screenshots/shot.png".lstrip("/")).read_bytes() == png
+
+
+def test_raw_reads_under_the_cache_refresh_the_projection_first(pair):
+    home, toolbox, env, requests = pair
+    shots = home / "cache" / "screenshots"
+    shots.mkdir(parents=True)
+    (shots / "shot.png").write_bytes(b"\x89PNG first")
+    agent_path = to_agent_visible_cache_path(str(shots / "shot.png"))
+    assert env.read_file_bytes(agent_path, max_bytes=64) == b"\x89PNG first"
+    (shots / "shot.png").write_bytes(b"\x89PNG second, longer")
+    assert env.read_file_bytes(agent_path, max_bytes=64) == b"\x89PNG second, longer"
+    # A read outside the projected cache does not trigger a sync round.
+    before = len(requests)
+    (toolbox / "brand").mkdir()
+    (toolbox / "brand" / "notes.txt").write_text("brand")
+    assert env.read_file_bytes("/brand/notes.txt", max_bytes=64) == b"brand"
+    assert [item["operation"] for item in requests[before:]] == ["raw-read"]
+
+
+def test_web_and_browser_footers_name_the_toolbox_path(pair):
+    home, toolbox, env, requests = pair
+    from tools.web_tools import _truncate_with_footer
+    from tools.browser_tool import _truncate_snapshot
+
+    page, truncated = _truncate_with_footer("line\n" * 5000, "https://example.com/doc", 2000)
+    assert truncated
+    assert f"{SPRITES_CACHE_ROOT}/web/" in page
+    assert str(home) not in page
+    snapshot = _truncate_snapshot("- element\n" * 5000, max_chars=2000)
+    assert f"{SPRITES_CACHE_ROOT}/web/browser-snapshot-" in snapshot
+    assert str(home) not in snapshot
+
+
+def test_large_artifact_uses_raw_upload_without_truncation(pair):
+    home, toolbox, env, requests = pair
+    expected = "result line\n" * 210_000 + "FINAL RECORD"
+    path = _spill_summary_to_file(0, expected)
+    env.sync_cache_files()
+    assert (toolbox / path.lstrip("/")).read_text() == expected
+    assert requests[0]["operation"] == "raw-write"
+    assert SpritesFileOperations(env).read_file_raw(path).content == expected
+
+
+def test_stdout_recovery_is_readable_through_toolbox_file_tools(pair):
+    home, toolbox, env, requests = pair
+    secret = "ghp_" + "a" * 36
+    expected = "before\n" * 200_000 + "MIDDLE_RECORD\n" + secret + "\nafter\n" * 200_000
+    output, metadata = _truncate_stdout_text(expected)
+    assert "MIDDLE_RECORD" not in output
+    path = metadata["stdout_spill_path"]
+    assert path.startswith("/tmp/omnio-session/cache/exec/")
+    # Host-side canonical copy, projected to the Toolbox as the path is published.
+    assert len(list(home.glob("cache/exec/*"))) == 1
+    assert [item["operation"] for item in requests] == ["raw-write"]
+    result = SpritesFileOperations(env).read_file_raw(path)
+    assert "MIDDLE_RECORD" in result.content
+    assert secret not in result.content
+    assert result.content.startswith("before\n") and result.content.endswith("after\n")
+    assert (toolbox / path.lstrip("/")).read_text() == result.content
+    assert requests[0]["operation"] == "raw-write"
+    assert metadata["stdout_spill_truncated"] is False
+    page = SpritesFileOperations(env).read_file(path, offset=200_001, limit=1)
+    assert page.error is None
+    assert "MIDDLE_RECORD" in page.content
+    assert "before" not in page.content and "after" not in page.content
+    assert page.truncated is True
+    assert "offset=200002" in page.hint
+
+
+def test_text_above_the_raw_ceiling_pages_by_streaming(pair):
+    home, toolbox, env, requests = pair
+    path = "/tmp/omnio-session/cache/exec/too-large.txt"
+    local = toolbox / path.lstrip("/")
+    local.parent.mkdir(parents=True)
+    # ~6.9 MB, 600,000 lines: above the 2 MiB JSON read AND the 5 MiB whole-read ceiling.
+    local.write_text("".join(f"line {i:06d}\n" for i in range(600_000)))
+    ops = SpritesFileOperations(env)
+
+    whole = ops.read_file_raw(path)
+    assert whole.error and "exceeds" in whole.error and "offset/limit" in whole.error
+    assert not whole.content
+
+    middle = ops.read_file(path, offset=300_001, limit=2)
+    assert middle.error is None
+    assert middle.content == "300001|line 300000\n300002|line 300001"
+    assert middle.total_lines == 600_000 and middle.truncated is True
+    assert middle.hint == "Use offset=300003 to continue reading"
+
+    tail = ops.read_file(path, offset=599_999, limit=10)
+    assert tail.content == "599999|line 599998\n600000|line 599999"
+    assert tail.truncated is False and tail.hint is None
+
+    beyond = ops.read_file(path, offset=700_000, limit=10)
+    assert beyond.error and "beyond the end" in beyond.error
+
+    # The JSON reads were all refused as too large; every byte the pages and
+    # the whole-read attempt returned came from the streaming GET.
+    assert sum(1 for item in requests if item["operation"] == "raw-read") == 4
+    assert not any(item["operation"] == "raw-write" for item in requests)
+
+
+def test_failed_stdout_transfer_surfaces_as_a_read_error_not_a_host_path(pair, monkeypatch):
+    home, toolbox, env, requests = pair
+
+    def failed(*args):
+        raise SpritesToolboxError("Artifact transfer failed")
+
+    monkeypatch.setattr(env, "_write_raw_artifact", failed)
+    output, metadata = _truncate_stdout_text("before\n" * 15000 + "END")
+    assert output.endswith("END")
+    path = metadata["stdout_spill_path"]
+    assert path.startswith("/tmp/omnio-session/cache/exec/")
+    assert str(home) not in path
+    result = SpritesFileOperations(env).read_file_raw(path)
+    assert result.error and "temporarily unavailable" in result.error
+    assert not requests
+
+
+def test_invalid_artifact_destination_is_rejected(pair):
+    home, toolbox, env, requests = pair
+    with pytest.raises(SpritesToolboxError, match="outside the Toolbox cache"):
+        env._upload_cache_file(str(home / "auth.json"), SPRITES_DELEGATION_ROOT + "/../../../auth.json")
+    assert not requests
+
+
+def test_failed_transfer_is_reported_and_retried(pair, monkeypatch):
+    home, toolbox, env, requests = pair
+    original = env._write_raw_artifact
+
+    def failed(*args):
+        raise SpritesToolboxError("Artifact transfer failed")
+
+    monkeypatch.setattr(env, "_write_raw_artifact", failed)
+    path = _spill_summary_to_file(0, "complete")  # publish-time push fails quietly
+    with pytest.raises(SpritesToolboxError, match="transfer failed"):
+        env.sync_cache_files()
+    monkeypatch.setattr(env, "_write_raw_artifact", original)
+    env.sync_cache_files()
+    assert (toolbox / path.lstrip("/")).read_text() == "complete"

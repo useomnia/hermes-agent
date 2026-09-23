@@ -6,7 +6,13 @@ to replace flags, every assertion here must still pass — any failure is
 a behavioral regression.
 """
 
+import json
+
+import httpx
 import pytest
+from openai import OpenAI
+
+from hermes_constants import parse_reasoning_effort
 from agent.transports.chat_completions import ChatCompletionsTransport
 from providers import get_provider_profile
 
@@ -193,6 +199,77 @@ class TestOpenRouterParity:
             supports_reasoning=True,
         )
         assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "medium"}
+
+    @pytest.mark.parametrize("profile_loaded", [True, False])
+    @pytest.mark.parametrize("model", [
+        "@preset/omnio-internal",
+        "openai/gpt-5.6-luna@preset/omnio-internal",
+    ])
+    def test_preset_inherits_reasoning_on_wire(self, transport, model, profile_loaded):
+        """An empty local setting must not overwrite preset reasoning in JSON."""
+        kw = transport.build_kwargs(
+            model=model,
+            messages=_simple_messages(),
+            provider_profile=get_provider_profile("openrouter") if profile_loaded else None,
+            is_openrouter=True,
+            supports_reasoning=True,
+            reasoning_config=parse_reasoning_effort(""),
+        )
+        requests = []
+
+        def capture(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json={
+                "id": "test-response", "object": "chat.completion", "created": 0,
+                "model": "openai/gpt-5.6-luna",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": "ok"}}],
+            })
+
+        with OpenAI(
+            api_key="test-key", base_url="https://openrouter.ai/api/v1",
+            http_client=httpx.Client(transport=httpx.MockTransport(capture)),
+        ) as client:
+            client.chat.completions.create(**kw)
+
+        assert len(requests) == 1
+        assert requests[0]["model"] == model
+        assert "reasoning" not in requests[0]
+        assert "reasoning_effort" not in requests[0]
+
+    @pytest.mark.parametrize("reasoning", [
+        {"enabled": True, "effort": "max"},
+        {"enabled": False},
+        {"max_tokens": 4096, "exclude": True},
+    ])
+    def test_preset_preserves_explicit_reasoning(self, transport, reasoning):
+        kw = transport.build_kwargs(
+            model="openai/gpt-5.6-luna@preset/omnio-internal",
+            messages=_simple_messages(),
+            provider_profile=get_provider_profile("openrouter"),
+            supports_reasoning=True,
+            reasoning_config=reasoning,
+        )
+        assert kw["extra_body"]["reasoning"] == reasoning
+
+    def test_preset_preserves_request_override(self, transport):
+        reasoning = {"enabled": True, "effort": "max"}
+        kw = transport.build_kwargs(
+            model="openai/gpt-5.6-luna@preset/omnio-internal",
+            messages=_simple_messages(),
+            provider_profile=get_provider_profile("openrouter"),
+            supports_reasoning=True,
+            request_overrides={"extra_body": {"reasoning": reasoning}},
+        )
+        assert kw["extra_body"]["reasoning"] == reasoning
+
+    def test_non_openrouter_preset_name_keeps_default(self, transport):
+        kw = transport.build_kwargs(
+            model="openai/gpt-5.6-luna@preset/local",
+            messages=_simple_messages(),
+            supports_reasoning=True,
+        )
+        assert kw["extra_body"]["reasoning"]["effort"] == "medium"
 
 
 class TestNousParity:

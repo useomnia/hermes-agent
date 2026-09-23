@@ -3,14 +3,13 @@
 The CLI is a managed subprocess boundary and the selected browser surface;
 when the exact Hermes-managed installation is missing, ``browser_exec``
 returns an actionable setup error rather than downgrading. There is no
-user-facing backend switch or floating ``uvx`` fallback. Omnio supplies a
-conversation-scoped CDP relay. Hermes keeps a
-hashed logical identity for every conversation/session; shared browsers use
-it as ``BU_NAME``, while Omnio uses a hashed private IPC directory for every
-conversation/session (``default`` only for the unnamed live Toolbox tab).
+user-facing backend switch or floating ``uvx`` fallback. Omnio executes Python in the paired Toolbox holder and never on the
+Hermes host. Standalone Hermes keeps a hashed logical identity for every
+conversation/session and uses it as ``BU_NAME``.
 """
 
 import atexit
+import contextlib
 import hashlib
 import json
 import logging
@@ -18,7 +17,7 @@ import os
 import posixpath
 import re
 import shutil
-import stat
+import signal
 import subprocess
 import tempfile
 import threading
@@ -437,200 +436,6 @@ def _omnio_template_cdp_configured() -> bool:
     return bool(os.environ.get("BROWSER_CDP_URL_TEMPLATE", "").strip())
 
 
-def _owner_marker_path(runtime_dir: Path) -> Path:
-    """Return the gateway ownership marker inside one private runtime dir."""
-    return runtime_dir / "gateway.owner_pid"
-
-
-def _read_omnio_owner_pid(runtime_dir: Path) -> Optional[int]:
-    """Read a validated owner marker, returning ``None`` when absent/stale."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(str(_owner_marker_path(runtime_dir)), flags)
-        try:
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode):
-                return None
-            owner = getattr(os, "getuid", lambda: metadata.st_uid)()
-            if metadata.st_uid != owner or (
-                os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o600
-            ):
-                return None
-            raw = os.read(fd, 128).decode("ascii", errors="strict").strip()
-        finally:
-            os.close(fd)
-    except (OSError, UnicodeError):
-        return None
-    try:
-        pid = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return pid if pid > 0 else None
-
-
-def _write_omnio_owner_pid(runtime_dir: Path) -> Optional[str]:
-    """Record this gateway as the private runtime's owner.
-
-    The marker is deliberately owner-only and opened with ``O_NOFOLLOW`` so a
-    hostile or stale symlink cannot redirect writes outside the already
-    validated runtime directory. It lets a new gateway process distinguish a
-    dead owner (whose exact Browser Harness daemon can be reloaded) from a
-    live gateway using the same canonical conversation.
-    """
-    marker = _owner_marker_path(runtime_dir)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(str(marker), flags, 0o600)
-        try:
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode):
-                return f"Browser Harness owner marker {marker} is not a regular file"
-            owner = getattr(os, "getuid", lambda: metadata.st_uid)()
-            if metadata.st_uid != owner:
-                return f"Browser Harness owner marker {marker} is owned by another user"
-            if hasattr(os, "fchmod"):
-                os.fchmod(fd, 0o600)
-            payload = f"{os.getpid()}\n".encode("ascii")
-            written = 0
-            while written < len(payload):
-                written += os.write(fd, payload[written:])
-            os.fsync(fd)
-            verified = os.fstat(fd)
-            if os.name != "nt" and stat.S_IMODE(verified.st_mode) != 0o600:
-                return f"Browser Harness owner marker {marker} is not owner-only"
-        finally:
-            os.close(fd)
-    except OSError as exc:
-        logger.debug("Could not write Browser Harness owner marker %s: %s", marker, exc)
-        return f"Browser Harness owner marker {marker} is unavailable: {exc}"
-    return None
-
-
-def _owner_pid_is_alive(pid: int) -> bool:
-    """Use a cross-platform PID probe without importing it at module load.
-
-    ``gateway.status._pid_exists`` is the canonical Hermes probe and handles
-    Windows without the dangerous ``os.kill(pid, 0)`` fallback. The direct
-    ``psutil`` fallback is only for scaffold/partial-import environments. A
-    probe failure is deliberately treated as alive: uncertainty must never
-    let a restarted gateway take over another process's runtime.
-    """
-    if pid <= 0:
-        return False
-    try:
-        from gateway.status import _pid_exists
-    except Exception as exc:
-        logger.debug("Could not import Hermes PID probe: %s", exc)
-        _pid_exists = None
-
-    if _pid_exists is not None:
-        try:
-            return bool(_pid_exists(pid))
-        except Exception as exc:
-            logger.debug("Hermes PID probe failed for %s: %s", pid, exc)
-
-    # ``psutil.pid_exists`` is the repository's dependency-backed,
-    # cross-platform fallback. Do not substitute ``os.kill(pid, 0)`` here:
-    # on Windows it sends CTRL+C to the target's console process group.
-    try:
-        import psutil
-
-        return bool(psutil.pid_exists(pid))
-    except Exception as exc:
-        logger.debug("Fallback PID probe failed for %s: %s", pid, exc)
-        return True
-
-
-def _configure_omnio_harness_dirs(
-    env: dict,
-    logical_bu_name: str,
-    harness_name: str = "default",
-    cmd: Optional[List[str]] = None,
-) -> Optional[str]:
-    """Isolate one Omnio harness instance while reusing Toolbox's sole tab.
-
-    Browser Harness treats a non-default ``BU_NAME`` as a request for a
-    dedicated automation tab. The unnamed Omnio call already has its own
-    Toolbox Chrome process/context, and the live screencast is attached to
-    that process's original tab, so only that path keeps the harness name
-    ``default``. Explicit names retain their hashed non-default name while
-    every path gets isolated IPC/temp files and an owner marker.
-    """
-    digest = hashlib.sha256(
-        f"hermes-browser-use-omnio-runtime-v1\0{logical_bu_name}".encode("utf-8")
-    ).hexdigest()[:24]
-    # AF_UNIX sun_path is only 104 bytes on macOS.  ``tempfile.gettempdir()``
-    # commonly expands to a long per-user TMPDIR there, so use the guaranteed
-    # short POSIX root for the harness IPC path.
-    runtime_root = Path("/tmp") if os.name != "nt" else Path(tempfile.gettempdir())
-    runtime_dir = runtime_root / f"hermes-bu-{digest}"
-    try:
-        from hermes_constants import get_hermes_home
-
-        tmp_dir = Path(get_hermes_home()) / "cache" / "browser-use" / "tmp" / digest
-    except Exception:
-        tmp_dir = Path(tempfile.gettempdir()) / f"hermes-bu-tmp-{digest}"
-    for path in (runtime_dir, tmp_dir):
-        try:
-            # Do not let Browser Harness inherit a pre-existing 0755/symlink
-            # directory: it contains the daemon socket/pid and must be a
-            # private endpoint owned by this gateway user.
-            try:
-                current = path.lstat()
-            except FileNotFoundError:
-                path.mkdir(parents=True, mode=0o700, exist_ok=False)
-                current = path.lstat()
-            if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
-                return f"Browser Harness directory {path} is not a private directory"
-            owner = getattr(os, "getuid", lambda: current.st_uid)()
-            if current.st_uid != owner:
-                return f"Browser Harness directory {path} is owned by another user"
-            path.chmod(0o700)
-            verified = path.lstat()
-            if (
-                stat.S_ISLNK(verified.st_mode)
-                or not stat.S_ISDIR(verified.st_mode)
-                or verified.st_uid != owner
-                or (os.name != "nt" and stat.S_IMODE(verified.st_mode) != 0o700)
-            ):
-                return f"Browser Harness directory {path} could not be made private"
-        except OSError as exc:
-            logger.debug(
-                "Could not prepare Browser Harness directory %s: %s", path, exc
-            )
-            return f"Browser Harness directory {path} is unavailable: {exc}"
-    if not _SESSION_RE.match(harness_name):
-        return "Browser Harness name is invalid"
-    env["BU_NAME"] = harness_name
-    env["BH_RUNTIME_DIR"] = str(runtime_dir)
-    env["BH_TMP_DIR"] = str(tmp_dir)
-    env.pop("BH_RUNTIME_DIR_SHARED", None)
-    env.pop("BH_TMP_DIR_SHARED", None)
-
-    # A gateway restart loses the in-memory registry while the named harness
-    # daemon may still be alive. Reap only when the marker's exact owner PID
-    # is dead. A live different owner means another gateway is actively using
-    # this canonical conversation; fail closed rather than sharing its daemon
-    # or overwriting its marker.
-    previous_owner = _read_omnio_owner_pid(runtime_dir)
-    if previous_owner and previous_owner != os.getpid():
-        if _owner_pid_is_alive(previous_owner):
-            return (
-                f"Browser Harness runtime {runtime_dir} is owned by a live "
-                f"gateway process (PID {previous_owner})"
-            )
-        if not _stop_harness_daemon(harness_name, env, cmd):
-            return (
-                f"Browser Harness runtime {runtime_dir} has a dead owner "
-                "but its exact daemon could not be reloaded safely; retry "
-                "after confirming the previous gateway is stopped"
-            )
-    marker_error = _write_omnio_owner_pid(runtime_dir)
-    if marker_error:
-        return marker_error
-    return None
-
-
 def _browser_use_cloud_autospawn_enabled() -> bool:
     """Whether the existing Browser Use cloud credentials opt into spawning.
 
@@ -785,13 +590,7 @@ def _native_vision_enabled() -> bool:
 
 
 def _omnio_browser_exec_url() -> str:
-    """Return the explicit Toolbox Browser Use capability, if provisioned.
-
-    The URL is deliberately a separately injected capability rather than a
-    deduction from ``BROWSER_CDP_URL_TEMPLATE``. Older Omnio proxies expose
-    the CDP relay but do not own the Browser Use runner; keeping those proxies
-    on the managed local CLI path makes mixed-version rollout safe.
-    """
+    """Return the separately provisioned Toolbox execution endpoint."""
     return os.environ.get("OMNIO_BROWSER_EXEC_URL", "").strip().rstrip("/")
 
 
@@ -1042,6 +841,8 @@ def _remote_browser_result(
     requested_session: str,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Validate and map the Toolbox response to Hermes result fields."""
+    from agent.redact import redact_sensitive_text
+
     if not isinstance(payload, dict):
         return None, "Toolbox returned an invalid browser execution response."
     output = payload.get("output")
@@ -1064,7 +865,7 @@ def _remote_browser_result(
     result: Dict[str, Any] = {
         "success": returncode == 0,
         "exit_code": returncode,
-        "output": output,
+        "output": redact_sensitive_text(output, force=True),
         "workspace": workspace,
         # The Omnia paths wrapper uses presence of this field to identify the
         # remote runner and skips its legacy post-call drain. Keep [] too.
@@ -1083,7 +884,7 @@ def _remote_browser_result(
     if stderr is not None:
         if not isinstance(stderr, str):
             return None, "Toolbox returned an invalid browser execution response."
-        stderr = stderr.strip()
+        stderr = redact_sensitive_text(stderr.strip(), force=True)
         if stderr:
             if len(stderr) > _STDERR_CAP_CHARS:
                 stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
@@ -1583,6 +1384,37 @@ def cleanup_all_browser_use() -> None:
 atexit.register(cleanup_all_browser_use)
 
 
+def _run_cli_killing_process_group(cmd, code, env, timeout, **popen_extra):
+    """Bound timeout cleanup even when CLI descendants inherit output pipes.
+
+    Adapted from upstream 60debff28d56ab126816cf009f63143af5936488.
+    """
+    if os.name == "nt":
+        return subprocess.run(
+            cmd, input=code, capture_output=True, text=True,
+            env=env, timeout=timeout, **popen_extra,
+        )
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, start_new_session=True, **popen_extra,
+    )
+    try:
+        stdout, stderr = proc.communicate(input=code, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            # An independently detached child may still own a pipe. Do not
+            # let its EOF keep this tool invocation alive indefinitely.
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
 def browser_exec(
     code: str,
     session: str = "",
@@ -1590,6 +1422,7 @@ def browser_exec(
     task_id: Optional[str] = None,
 ):
     """Run Python code through the browser-use CLI, and return its output"""
+    from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
 
     if not code or not code.strip():
@@ -1601,28 +1434,22 @@ def browser_exec(
     if blocked:
         return tool_error(blocked)
 
-    # The explicit capability is authoritative. New paired Omnio runtimes
-    # execute model code inside Toolbox; they must never resolve, launch, or
-    # track the local managed Browser Use CLI. Older Omnio runtimes omit the
-    # capability and continue through the unchanged local path below.
+    # Paired runtimes must never execute model Python on the Hermes host,
+    # including during mixed-version rollout when the endpoint is absent.
     if _omnio_browser_exec_url():
-        return _browser_exec_remote(
-            code,
-            session=session,
-            timeout_s=timeout_s,
-            task_id=task_id,
+        return _browser_exec_remote(code, session=session, timeout_s=timeout_s, task_id=task_id)
+    if _omnio_template_cdp_configured() or any(
+        os.environ.get(key, "").strip()
+        for key in ("OMNIO_TOOLBOX_URL", "OMNIO_TOOLBOX_BRAND", "OMNIO_BRAND_ID")
+    ):
+        return tool_error(
+            "Omnio's paired Toolbox browser runner is unavailable. "
+            "Reprovision this Omnio sandbox, then retry. "
+            "Browser Python cannot run on the Hermes host."
         )
 
-    omnio_local_cdp = _omnio_template_cdp_configured()
     cmd = _find_cli()
     if not cmd:
-        if omnio_local_cdp:
-            return tool_error(
-                "Omnio's pinned Browser Use CLI is unavailable in the agent "
-                "runtime. Reprovision this Omnio sandbox, then retry; installing "
-                "browser-use from the Toolbox terminal or PATH cannot repair "
-                "the agent-side managed runtime."
-            )
         return tool_error(
             "The Hermes-managed Browser Use CLI is not installed. Install the "
             f"pinned package `{BROWSER_USE_PACKAGE}` with `hermes tools`, then "
@@ -1630,37 +1457,15 @@ def browser_exec(
         )
 
     env = _base_subprocess_env()
-    if omnio_local_cdp:
-        # Omnio runs Browser Use locally against Toolbox-owned Chrome. Never
-        # pass a Browser Use cloud credential or permit cloud autospawn on
-        # this path: an unavailable conversation CDP relay must fail closed,
-        # not create a remote browser as a fallback.
-        env.pop("BROWSER_USE_API_KEY", None)
-        env["BU_AUTOSPAWN"] = "0"
     if session:
         if not _SESSION_RE.match(session):
             return tool_error(
                 f"Invalid session name {session!r}: use 1-64 letters, digits, "
                 "dashes, or underscores (e.g. 'r7k2')."
             )
-    # Never export the human-readable session. The same explicit name is
-    # stable within one conversation, while two conversations produce
-    # different logical identities and private state paths.
-    # ``bu_name`` is always the hashed logical identity used by Hermes' own
-    # registry/workspace bookkeeping. Omnio gets private IPC/temp directories
-    # for every logical session. Only the unnamed path uses the harness's
-    # ``default`` tab so the live view remains on Toolbox's original tab;
-    # explicit sessions keep their hashed non-default dedicated tab.
+    # Use a digest so names and state never collide across conversations.
     bu_name = _derive_bu_name(task_id, session)
-    if omnio_local_cdp:
-        harness_name = bu_name if session else "default"
-        harness_error = _configure_omnio_harness_dirs(
-            env, bu_name, harness_name=harness_name, cmd=cmd
-        )
-        if harness_error:
-            return tool_error(harness_error)
-    else:
-        env["BU_NAME"] = bu_name
+    env["BU_NAME"] = bu_name
     # Route through the configured browser backend (Browserbase, Firecrawl,
     # Nous gateway, CDP override, local Chrome, …). Named sessions compose
     # with the backend: BU_NAME namespaces the harness daemon (its IPC
@@ -1736,15 +1541,7 @@ def browser_exec(
     timeout_error: Optional[subprocess.TimeoutExpired] = None
     launch_error: Optional[OSError] = None
     try:
-        proc = subprocess.run(
-            cmd,
-            input=code,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            **popen_extra,
-        )
+        proc = _run_cli_killing_process_group(cmd, code, env, timeout, **popen_extra)
     except subprocess.TimeoutExpired as exc:
         timeout_error = exc
     except OSError as exc:
@@ -1777,13 +1574,13 @@ def browser_exec(
     result = {
         "success": proc.returncode == 0,
         "exit_code": proc.returncode,
-        "output": proc.stdout,
+        "output": redact_sensitive_text(proc.stdout, force=True),
     }
     if workspace:
         result["workspace"] = workspace
     if session:
         result["session"] = session
-    stderr = (proc.stderr or "").strip()
+    stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
     if stderr:
         if len(stderr) > _STDERR_CAP_CHARS:
             stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"

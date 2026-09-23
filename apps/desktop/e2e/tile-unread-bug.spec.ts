@@ -18,6 +18,7 @@
 import { expect, test } from '@playwright/test'
 
 import {
+  approvePendingCommand,
   type MockBackendFixture,
   setupMockBackend,
   waitForAppReady,
@@ -56,6 +57,11 @@ async function startTurnAndSwitchAway(page: import('@playwright/test').Page) {
     undefined,
     { timeout: 15_000 },
   )
+
+  // The held sentinel command is intentionally compound, so the real
+  // command guard asks for approval before it can start. Resolve that
+  // user-facing event before observing the background process state.
+  await approvePendingCommand(page, `[aria-label="${BG_DOT_LABEL}"]`)
 
   // Wait for the background dot — confirms the turn is running.
   await expect

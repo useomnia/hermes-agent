@@ -145,8 +145,8 @@ class TestRunConversationCodexPath:
                 thread_id="thread-compact-1",
                 compacted=True,
                 token_usage_last={
-                    "totalTokens": 300_000,
-                    "inputTokens": 300_000,
+                    "totalTokens": 900_000,
+                    "inputTokens": 900_000,
                     "cachedInputTokens": 0,
                     "outputTokens": 0,
                     "reasoningOutputTokens": 0,
@@ -167,7 +167,7 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.compression_count == 1
         # A compacted turn with real usage is judged against that same real
         # prompt count, exactly like a normal completed compression boundary.
-        assert agent.context_compressor.last_prompt_tokens == 300_000
+        assert agent.context_compressor.last_prompt_tokens == 900_000
         assert agent.context_compressor.awaiting_real_usage_after_compression is False
         assert agent.context_compressor._ineffective_compression_count == 1
         assert events == [
@@ -786,4 +786,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-

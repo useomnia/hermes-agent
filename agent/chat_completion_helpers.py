@@ -27,12 +27,12 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
-from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH, VALID_REASONING_EFFORTS
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
-from agent.model_metadata import is_local_endpoint
+from agent.model_metadata import is_local_endpoint, is_openrouter_preset_model
 from agent.message_content import flatten_message_text
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
@@ -45,6 +45,40 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+
+
+def log_openrouter_request_reasoning(agent, api_kwargs: dict, api_request_id: str) -> None:
+    """Log only the final request's reasoning mode, never its messages or headers.
+
+    ``preset`` means OpenRouter resolves the value; it is not a claim about the
+    remotely configured effort. SDK-internal retries reuse this request body.
+    """
+    if not base_url_host_matches(agent.base_url, "openrouter.ai"):
+        return
+    extra = api_kwargs.get("extra_body")
+    extra = extra if isinstance(extra, dict) else {}
+    model = extra.get("model", api_kwargs.get("model"))
+    reasoning = extra.get("reasoning", api_kwargs.get("reasoning"))
+    if isinstance(reasoning, dict):
+        if reasoning.get("enabled") is False or reasoning.get("effort") == "none":
+            mode = "explicit:disabled"
+        elif reasoning.get("effort") in VALID_REASONING_EFFORTS:
+            mode = f"explicit:{reasoning['effort']}"
+        else:
+            mode = "explicit:configured"
+    elif "reasoning" in extra or "reasoning" in api_kwargs:
+        mode = "explicit:configured"
+    elif "reasoning_effort" in extra or "reasoning_effort" in api_kwargs:
+        effort = extra.get("reasoning_effort", api_kwargs.get("reasoning_effort"))
+        mode = f"explicit:{effort}" if effort in (*VALID_REASONING_EFFORTS, "none") else "explicit:configured"
+    elif is_openrouter_preset_model(model) or is_openrouter_preset_model(
+        extra.get("preset", api_kwargs.get("preset"))
+    ):
+        mode = "preset"
+    else:
+        mode = "provider-default"
+    logger.info("API request %s: model=%s reasoning=%s", api_request_id, model, mode)
+
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -1951,7 +1985,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
-    print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
+    agent._safe_print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
 
     summary_request = (
         "You've reached the maximum number of tool-calling iterations allowed. "
@@ -2058,7 +2092,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         if not _is_lmstudio_summary and agent._supports_reasoning_extra_body():
             if agent.reasoning_config is not None:
                 summary_extra_body["reasoning"] = agent.reasoning_config
-            else:
+            elif not (agent._is_openrouter_url() and is_openrouter_preset_model(agent.model)):
                 summary_extra_body["reasoning"] = {
                     "enabled": True,
                     "effort": "medium"
@@ -2147,6 +2181,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
+                log_openrouter_request_reasoning(
+                    agent, summary_kwargs,
+                    f"{getattr(agent, '_current_api_request_id', 'turn')}:summary",
+                )
                 summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
                 _summary_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_summary_result.content or "").strip()
@@ -2190,6 +2228,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
+                log_openrouter_request_reasoning(
+                    agent, summary_kwargs,
+                    f"{getattr(agent, '_current_api_request_id', 'turn')}:summary-retry",
+                )
                 summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry").chat.completions.create(**summary_kwargs)
                 _retry_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_retry_result.content or "").strip()
@@ -2539,6 +2581,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         attempt_rich_tool_call_ids.clear()
         for tool_call_id in call_ids:
             agent._fire_tool_gen_event_aborted(tool_call_id)
+
+    def _abandon_unexecuted_tool_call(tool_call_id) -> None:
+        """Retire the item for a call this attempt will never execute.
+
+        A Responses consumer can already hold an in-progress function-call
+        item opened while the provider streamed this call's name. When the
+        arguments then arrive unrepairable the call is dropped before
+        execution, so no execution boundary will ever close that item: it
+        stays in-progress until the run's terminal sweep, which a client
+        renders as a tool card running for the rest of the turn.
+
+        Abandoning is tentative, exactly as for a dropped stream attempt —
+        a retry reusing this deterministic call ID still reclaims the item.
+        """
+        if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+            return
+        attempt_rich_tool_call_ids.discard(tool_call_id)
+        agent._fire_tool_gen_event_aborted(tool_call_id)
 
     # Cross-turn stale-stream circuit breaker (#58962) — see the canonical
     # comment block above ``_stale_streak()``.  Raises past the give-up
@@ -3109,6 +3169,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         else:
                             # Unrepairable — flag for truncation handling
                             has_truncated_tool_args = True
+                            _abandon_unexecuted_tool_call(tc["id"])
                 mock_tool_calls.append(SimpleNamespace(
                     id=tc["id"],
                     type=tc["type"],

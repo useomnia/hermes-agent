@@ -66,6 +66,7 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -570,7 +571,19 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     """
     Extract category from skill path based on directory structure.
 
-    For paths like: ~/.hermes/skills/mlops/axolotl/SKILL.md -> "mlops"
+    The category is every directory between the skills root and the skill's own
+    directory, joined with "/". A single level behaves as it always has:
+
+        ~/.hermes/skills/mlops/axolotl/SKILL.md          -> "mlops"
+        ~/.hermes/skills/marketing/audits/site-audit/... -> "marketing/audits"
+        ~/.hermes/skills/my-skill/SKILL.md               -> None
+
+    This must agree with the category the system prompt advertises, which
+    `agent.prompt_builder` derives the same way. `skills_list` filters on an
+    exact match, so a first-segment category would collapse every skill in a
+    multi-level tree under its top directory and make a filter on the category
+    name the prompt showed return nothing.
+
     Also works for external skill dirs configured via skills.external_dirs.
     """
     # Try the active profile skills dir first (respects monkeypatching in tests),
@@ -585,8 +598,9 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
         try:
             rel_path = skill_path.relative_to(skills_dir)
             parts = rel_path.parts
+            # parts[-1] is the file, parts[-2] the skill's own directory.
             if len(parts) >= 3:
-                return parts[0]
+                return "/".join(parts[:-2])
         except ValueError:
             continue
     return None
@@ -1000,6 +1014,49 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    section: str = None,
+) -> str:
+    """Load a complete skill document, or recover a named section of it."""
+    result = _load_skill_content(name, file_path, task_id, preprocess)
+    if not section:
+        return result
+    from tools.skill_delivery import _apply_section_selection, render_skill_result
+
+    payload = json.loads(result)
+    if payload.get("success"):
+        _apply_section_selection(payload, section)
+    return render_skill_result(payload)
+
+
+def _deduplicate_same_root_skills(candidates, all_dirs):
+    """Upstream #113126: prefer an unambiguous shallow copy of ONE skill."""
+    if len(candidates) < 2:
+        return candidates
+    roots = {
+        max((root for root in all_dirs if path.is_relative_to(root)),
+            key=lambda root: len(root.parts), default=None)
+        for _, path in candidates
+    }
+    if len(roots) != 1 or None in roots:
+        return candidates
+    try:
+        if len({hashlib.sha256(path.read_bytes()).digest() for _, path in candidates}) != 1:
+            return candidates
+    except OSError:
+        return candidates
+    root = roots.pop()
+    def rank(candidate):
+        path = candidate[1]
+        return path.name != "SKILL.md", len(path.relative_to(root).parts)
+    ranked = sorted(candidates, key=rank)
+    return [ranked[0]] if rank(ranked[0]) != rank(ranked[1]) else candidates
+
+
+def _load_skill_content(
+    name: str,
+    file_path: str = None,
+    task_id: str = None,
+    preprocess: bool = True,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -1216,6 +1273,7 @@ def skill_view(
                 ):
                     _record(None, found_md)
 
+        candidates = _deduplicate_same_root_skills(candidates, all_dirs)
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
             logging.getLogger(__name__).warning(
@@ -1244,13 +1302,20 @@ def skill_view(
             skill_dir, skill_md = candidates[0]
 
         if not skill_md or not skill_md.exists():
-            available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
+            installed = _sort_skills(_find_all_skills())
+            available = [skill["name"] for skill in installed[:20]]
+            # Recover stale category references without silently choosing a
+            # different skill or bypassing qualified-name collision checks.
+            bare_name = name.replace(":", "/").rsplit("/", 1)[-1]
+            matching = [{"name": skill["name"], "category": skill.get("category")}
+                        for skill in installed if skill["name"] == bare_name]
             return json.dumps(
                 {
                     "success": False,
                     "error": f"Skill '{name}' not found.",
                     "available_skills": available,
-                    "hint": "Use skills_list to see all available skills",
+                    "matching_skills": matching,
+                    "hint": "Use a matching installed name, or skills_list to see all available skills. Do not guess a category.",
                 },
                 ensure_ascii=False,
             )
@@ -1354,7 +1419,7 @@ def skill_view(
                     },
                     ensure_ascii=False,
                 )
-            if not target_file.exists():
+            if not target_file.is_file():
                 # List available files in the skill directory, organized by type
                 available_files = {
                     "references": [],
@@ -1598,6 +1663,9 @@ def skill_view(
                     "Could not preprocess skill content for %s", skill_name, exc_info=True
                 )
 
+        from agent.skill_path_mapping import map_skill_dir_for_backend
+
+        runtime_skill_dir = map_skill_dir_for_backend(skill_dir, task_id=task_id) if skill_dir else None
         result = {
             "success": True,
             "name": skill_name,
@@ -1606,7 +1674,7 @@ def skill_view(
             "related_skills": related_skills,
             "content": rendered_content,
             "path": rel_path,
-            "skill_dir": str(skill_dir) if skill_dir else None,
+            "skill_dir": runtime_skill_dir if preprocess else (str(skill_dir) if skill_dir else None),
             "linked_files": linked_files if linked_files else None,
             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
             if linked_files
@@ -1761,6 +1829,10 @@ SKILL_VIEW_SCHEMA = {
                 "type": "string",
                 "description": "OPTIONAL: Path to a linked file within the skill (e.g., 'references/api.md', 'templates/config.yaml', 'scripts/validate.py'). Omit to get the main SKILL.md content.",
             },
+            "section": {
+                "type": "string",
+                "description": "Recover a complete named section or selector from a SKILL_INCOMPLETE receipt. Follow its section index until all required instructions are read. For a linked document, keep the SAME file_path on every recovery call.",
+            },
         },
         "required": ["name"],
     },
@@ -1781,7 +1853,8 @@ def _skill_view_with_bump(args, **kw):
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
     result = skill_view(
-        name, file_path=args.get("file_path"), task_id=kw.get("task_id")
+        name, file_path=args.get("file_path"), task_id=kw.get("task_id"),
+        section=args.get("section"),
     )
     try:
         parsed = json.loads(result)
@@ -1800,6 +1873,11 @@ def _skill_view_with_bump(args, **kw):
         pass
     return result
 
+
+from tools.oversized_result_formatters import register_formatter
+from tools.skill_delivery import _skill_view_incomplete_result
+
+register_formatter("skill_view", _skill_view_incomplete_result)
 
 registry.register(
     name="skill_view",

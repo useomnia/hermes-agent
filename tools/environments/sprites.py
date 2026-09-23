@@ -1,6 +1,7 @@
 """Omnio toolbox Sprite execution environment."""
 
 import base64
+import codecs
 import http.client
 import json
 import logging
@@ -11,11 +12,16 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from tools.environments.base import BaseEnvironment, _ThreadedProcessHandle
-from tools.environments.file_sync import FileSyncManager, iter_sprites_sync_files
+from tools.environments.file_sync import (
+    FileSyncManager, SPRITES_CACHE_FILE_MAX_BYTES, SPRITES_CACHE_ROOT, iter_sprites_cache_files,
+    iter_sprites_sync_files,
+)
 from tools.file_operations import (
     PatchResult,
     ReadResult,
@@ -35,8 +41,25 @@ _MAX_SKILL_FILE_BYTES = 2 * 1024 * 1024
 _MAX_SKILL_BATCH_FILES = 200
 _MAX_SKILL_BATCH_BYTES = 16 * 1024 * 1024
 _MAX_FILE_CONTENT_BYTES = 2 * 1024 * 1024
+# Whole-file text reads above the JSON cap go through the raw stream up to
+# this ceiling (matches the largest stdout recovery artifact); larger files
+# must be paged with read_file offset/limit.
+_MAX_RAW_TEXT_READ_BYTES = 5 * 1024 * 1024
 _EXEC_PREDISPATCH_RETRY_DELAYS_SECONDS = (2.0, 4.0)
 _EXEC_RETRY_MIN_REQUEST_BUDGET_SECONDS = 1.0
+# Cache artifacts with these suffixes are text the model or a worker wrote;
+# they are secret-redacted before they land on the Toolbox.
+_REDACTED_CACHE_SUFFIXES = frozenset({
+    ".txt", ".log", ".json", ".md", ".csv", ".html", ".htm", ".xml", ".yaml", ".yml",
+})
+
+
+def _is_toolbox_cache_path(path: str) -> bool:
+    """True for paths inside the projected harness cache on the Toolbox."""
+    return path == SPRITES_CACHE_ROOT or path.startswith(SPRITES_CACHE_ROOT + "/")
+
+
+_STREAM_CHUNK_BYTES = 1024 * 1024
 
 
 def _expand_toolbox_home(path: str) -> str:
@@ -253,6 +276,16 @@ class SpritesEnvironment(BaseEnvironment):
             delete_fn=self._sprites_delete,
             bulk_upload_fn=self._sprites_bulk_upload,
         )
+        # The harness cache set (web pages, screenshots, worker artifacts,
+        # stdout recovery, ...) is projected under SPRITES_CACHE_ROOT so the
+        # paths `to_agent_visible_cache_path` publishes are readable on the
+        # Toolbox. Synced before every command and before reads under it.
+        self._cache_sync_lock = threading.Lock()
+        self._cache_sync_manager = FileSyncManager(
+            get_files_fn=iter_sprites_cache_files,
+            upload_fn=self._upload_cache_file,
+            delete_fn=self._delete_cache_files,
+        )
         self._sync_manager.sync(force=True)
         self.init_session()
 
@@ -266,6 +299,7 @@ class SpritesEnvironment(BaseEnvironment):
         retry_exec_predispatch: bool = False,
         retry_deadline_seconds: float | None = None,
         cancel_event: threading.Event | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         data = None
         headers = {
@@ -275,6 +309,8 @@ class SpritesEnvironment(BaseEnvironment):
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
+        if request_id is not None:
+            headers["X-Request-Id"] = request_id
 
         retry_count = 0
         retry_deadline = (
@@ -405,6 +441,7 @@ class SpritesEnvironment(BaseEnvironment):
         if max_bytes < 1:
             raise ValueError("max_bytes must be positive")
         path = _canonicalize_toolbox_path(path)
+        self.sync_projected_path(path)
         query = urllib.parse.urlencode({"path": path})
         request = urllib.request.Request(
             f"{self.toolbox_url}/files?{query}",
@@ -434,21 +471,65 @@ class SpritesEnvironment(BaseEnvironment):
                 f"Toolbox API /files is unreachable: {exc}"
             ) from exc
 
+    def stream_file_bytes(
+        self, path: str, *, chunk_size: int = _STREAM_CHUNK_BYTES
+    ) -> Iterator[bytes]:
+        """Yield a Toolbox file's raw bytes in bounded chunks.
+
+        The raw ``GET /files`` route streams any size; consuming it in chunks
+        keeps memory bounded to the caller's window, which is what lets file
+        tools page through text the JSON read refuses as too large.
+        """
+        path = _canonicalize_toolbox_path(path)
+        self.sync_projected_path(path)
+        query = urllib.parse.urlencode({"path": path})
+        request = urllib.request.Request(
+            f"{self.toolbox_url}/files?{query}",
+            headers={
+                "Authorization": f"Bearer {self.bearer_token}",
+                "X-Omnio-Brand": self.brand,
+            },
+            method="GET",
+        )
+        try:
+            with _URL_OPENER.open(request, timeout=self.timeout) as response:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        return
+                    yield chunk
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(_MAX_ERROR_BYTES).decode("utf-8", errors="replace")
+            raise SpritesToolboxError(
+                f"Toolbox API /files failed with HTTP {exc.code}: "
+                f"{detail or exc.reason}",
+                detail=detail or str(exc.reason),
+                http_status=exc.code,
+            ) from exc
+        except (OSError, http.client.HTTPException) as exc:
+            raise SpritesToolboxError(
+                f"Toolbox API /files is unreachable: {exc}"
+            ) from exc
+
     def get_temp_dir(self) -> str:
         return "/tmp/.hermes-session"
 
     def write_file_content(self, path: str, content: str) -> bool:
-        """Write one UTF-8 file through `/files`, within its 2 MiB request cap."""
-        content_size = len(content.encode("utf-8"))
-        if content_size > _MAX_FILE_CONTENT_BYTES:
-            raise SpritesToolboxError(
-                f"Toolbox API /files write content exceeded "
-                f"{_MAX_FILE_CONTENT_BYTES} bytes ({content_size} bytes)"
-            )
-
+        """Write UTF-8 content, using atomic raw upload above the JSON limit."""
         path = _canonicalize_toolbox_path(path)
         if _is_write_denied(path):
             raise SpritesToolboxError(f"Write denied: {path} is a protected path")
+
+        data = content.encode("utf-8")
+        if len(data) > SPRITES_CACHE_FILE_MAX_BYTES:
+            raise SpritesToolboxError(
+                f"Toolbox API /files write content exceeded "
+                f"{SPRITES_CACHE_FILE_MAX_BYTES} bytes ({len(data)} bytes)"
+            )
+
+        if len(data) > _MAX_FILE_CONTENT_BYTES:
+            self._write_raw_artifact(path, data)
+            return True
 
         response = self.file_request(
             {
@@ -519,8 +600,87 @@ class SpritesEnvironment(BaseEnvironment):
                 )
             self.file_request({"operation": "deleteSkills", "path": remote_path, "missingOk": True})
 
+    def _upload_cache_file(self, host_path: str, remote_path: str) -> None:
+        """Project one harness cache file onto the Toolbox.
+
+        Text artifacts (worker transcripts, stored pages, stdout recovery) are
+        secret-redacted first: the Toolbox is readable by model-authored code,
+        and these files carry exactly the data that tends to hold keys. Media
+        crosses byte-for-byte through the raw endpoint.
+        """
+        remote_path = _canonicalize_toolbox_path(remote_path)
+        if not _is_toolbox_cache_path(remote_path):
+            raise SpritesToolboxError("Refused artifact outside the Toolbox cache")
+        source = Path(host_path)
+        if source.is_symlink() or not source.is_file():
+            raise SpritesToolboxError(f"Refused non-file cache artifact: {host_path}")
+        data = source.read_bytes()
+        if source.suffix.lower() in _REDACTED_CACHE_SUFFIXES:
+            from tools.delegation_live_log import _redact
+
+            data = _redact(data.decode("utf-8", errors="replace")).encode("utf-8")
+        self._write_raw_artifact(remote_path, data)
+
+    def _write_raw_artifact(self, path: str, data: bytes) -> None:
+        """The atomic raw-file endpoint: binary-safe, no JSON write cap."""
+        query = urllib.parse.urlencode({
+            "path": path, "overwrite": "true", "maxBytes": len(data),
+        })
+        request = urllib.request.Request(
+            f"{self.toolbox_url}/files?{query}", data=data, method="PUT",
+            headers={"Authorization": f"Bearer {self.bearer_token}",
+                     "X-Omnio-Brand": self.brand,
+                     "Content-Type": "application/octet-stream"},
+        )
+        try:
+            with _URL_OPENER.open(request, timeout=self.timeout) as response:
+                result = json.loads(response.read(_MAX_RESPONSE_BYTES + 1))
+            if result.get("bytesWritten") != len(data):
+                raise SpritesToolboxError("Artifact transfer was incomplete")
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            raise SpritesToolboxError("Artifact transfer failed") from exc
+
+    def _delete_cache_files(self, paths: list[str]) -> None:
+        for path in paths:
+            path = _canonicalize_toolbox_path(path)
+            if not _is_toolbox_cache_path(path):
+                raise SpritesToolboxError("Refused artifact outside the Toolbox cache")
+            result = self.file_request({"operation": "delete", "path": path, "missingOk": True})
+            if result.get("error"):
+                raise SpritesToolboxError("Artifact removal failed")
+
+    def sync_cache_files(self, *, raise_on_error: bool = True) -> None:
+        """Push new or changed harness cache files to the Toolbox now.
+
+        Forced (not rate-limited): callers invoke it right before a read under
+        :data:`SPRITES_CACHE_ROOT`, where a stale copy would be a wrong answer.
+        """
+        manager = getattr(self, "_cache_sync_manager", None)
+        if manager is not None:
+            with self._cache_sync_lock:
+                manager.sync(force=True, raise_on_error=raise_on_error)
+
+    def sync_skill_files(self) -> None:
+        """Refresh helper files before use, including inside the sync throttle.
+
+        The manager still uploads only changed files. Serialize its state with
+        other projection work and propagate failure rather than executing an
+        old helper after an unsuccessful transfer.
+        """
+        with self._cache_sync_lock:
+            self._sync_manager.sync(force=True, raise_on_error=True)
+
+    def sync_projected_path(self, path: str) -> None:
+        """Refresh host-owned projections before a Toolbox file consumer."""
+        path = _canonicalize_toolbox_path(path)
+        if path == "/skills" or path.startswith("/skills/"):
+            self.sync_skill_files()
+        elif _is_toolbox_cache_path(path):
+            self.sync_cache_files()
+
     def _before_execute(self) -> None:
-        self._sync_manager.sync()
+        self.sync_skill_files()
+        self.sync_cache_files(raise_on_error=False)
 
     def _run_bash(
         self,
@@ -533,6 +693,7 @@ class SpritesEnvironment(BaseEnvironment):
     ):
         request_cwd = cwd or self.cwd
         cancel_event = threading.Event()
+        request_id = str(uuid.uuid4())
 
         def exec_fn() -> tuple[str, int]:
             response = self._request_json(
@@ -548,6 +709,7 @@ class SpritesEnvironment(BaseEnvironment):
                 retry_exec_predispatch=True,
                 retry_deadline_seconds=timeout,
                 cancel_event=cancel_event,
+                request_id=request_id,
             )
             output = response.get("output", "")
             exit_code = response.get("returncode", response.get("exitCode", 0))
@@ -563,7 +725,24 @@ class SpritesEnvironment(BaseEnvironment):
                 )
             return (str(output), int(exit_code))
 
-        return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel_event.set)
+        def cancel_fn() -> None:
+            cancel_event.set()
+            try:
+                self._request_json(
+                    "/exec/cancel",
+                    timeout=5,
+                    request_id=request_id,
+                )
+            except SpritesToolboxError:
+                # Toolbox cancellation is additive. Older paired runtimes do
+                # not expose the endpoint, so preserve the historical local
+                # interrupt while the fleet rolls forward.
+                logger.debug(
+                    "Toolbox exec cancellation endpoint unavailable",
+                    exc_info=True,
+                )
+
+        return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel_fn)
 
     def _run_bash_with_cwd(
         self,
@@ -628,6 +807,11 @@ class SpritesFileOperations(ShellFileOperations):
             if isinstance(value, str) and value.startswith("~"):
                 payload[key] = self._expand_path(value)
         try:
+            read_path = _canonicalize_toolbox_path(str(payload.get("path", "")))
+            if (payload.get("operation") in {"read", "readRaw", "search", "stat"}
+                    and (read_path == "/skills" or read_path.startswith("/skills/")
+                         or _is_toolbox_cache_path(read_path))):
+                self.env.sync_projected_path(read_path)
             return self.env.file_request(payload)
         except SpritesToolboxError as error:
             operation = str(payload.get("operation", "unknown"))
@@ -662,6 +846,8 @@ class SpritesFileOperations(ShellFileOperations):
             {"operation": "read", "path": path, "offset": offset, "limit": limit}
         )
         if error := response.get("error"):
+            if str(error).startswith("File too large"):
+                return self._read_large_text_page(path, offset, limit)
             return ReadResult(error=str(error), similar_files=response.get("similarFiles", []))
         content = str(response.get("content", ""))
         if not response.get("lineNumbered", False):
@@ -679,10 +865,110 @@ class SpritesFileOperations(ShellFileOperations):
     def read_file_raw(self, path: str) -> ReadResult:
         response = self._files({"operation": "readRaw", "path": path})
         if error := response.get("error"):
+            if str(error).startswith("File too large"):
+                # The JSON read caps at the Toolbox's 2 MiB request size. Text
+                # artifacts above it (a stdout recovery file, a long worker
+                # transcript) are still whole-readable through the bounded raw
+                # stream; beyond that ceiling the caller must page with
+                # read_file offset/limit.
+                return self._read_large_text(path)
             return ReadResult(error=str(error), similar_files=response.get("similarFiles", []))
         content = str(response.get("content", ""))
         content, _ = _strip_bom(content)
         return ReadResult(content=content, file_size=int(response.get("fileSize", 0)))
+
+    def _read_large_text_page(self, path: str, offset: int, limit: int) -> ReadResult:
+        """Page a text file the Toolbox's JSON ``read`` refuses as too large.
+
+        Same window semantics and hint text as the Toolbox's own paged read,
+        computed from the raw stream one chunk at a time: only the requested
+        window is held in memory, so a file of any size pages, and the
+        ``offset/limit`` recipe the whole-read error gives out always works.
+        """
+        from tools.tool_output_limits import get_max_line_length
+
+        expanded = self._expand_path(path)
+        start = max(1, offset)
+        end = start + limit - 1
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        window: list[str] = []
+        pending = ""
+        # Retain only the displayable prefix, including room for a BOM and
+        # one over-limit character so _add_line_numbers marks truncation.
+        # A minified document must not grow this buffer to the file's size.
+        prefix_limit = get_max_line_length() + 2
+        line_no = 0
+        size = 0
+
+        def take(line: str) -> None:
+            nonlocal line_no
+            line_no += 1
+            if start <= line_no <= end:
+                window.append(line.rstrip("\r"))
+
+        try:
+            for chunk in self.env.stream_file_bytes(expanded):
+                size += len(chunk)
+                pieces = decoder.decode(chunk).split("\n")
+                for piece in pieces[:-1]:
+                    take(pending + piece[:prefix_limit - len(pending)])
+                    pending = ""
+                pending += pieces[-1][:prefix_limit - len(pending)]
+            pending += decoder.decode(b"", final=True)[:prefix_limit - len(pending)]
+            if pending:
+                take(pending)
+        except SpritesToolboxError as error:
+            return ReadResult(
+                error=render_sprites_toolbox_error(
+                    error, service="file tools", action="file read",
+                    context=f"path {expanded!r}",
+                )
+            )
+        total = line_no
+        if start > total:
+            return ReadResult(
+                error=f"Offset {start} is beyond the end of the file ({total} lines): {expanded}",
+                total_lines=total, file_size=size,
+            )
+        if start == 1 and window:
+            window[0], _ = _strip_bom(window[0])
+        shown_end = min(end, total)
+        truncated = total > shown_end
+        return ReadResult(
+            content=self._add_line_numbers("\n".join(window), start),
+            total_lines=total,
+            file_size=size,
+            truncated=truncated,
+            hint=f"Use offset={shown_end + 1} to continue reading" if truncated else None,
+        )
+
+    def _read_large_text(self, path: str) -> ReadResult:
+        """Whole-file text read through the raw stream, bounded by
+        ``_MAX_RAW_TEXT_READ_BYTES``; larger files are paged instead."""
+        expanded = self._expand_path(path)
+        chunks: list[bytes] = []
+        size = 0
+        try:
+            for chunk in self.env.stream_file_bytes(expanded):
+                size += len(chunk)
+                if size > _MAX_RAW_TEXT_READ_BYTES:
+                    return ReadResult(
+                        error=(
+                            f"File exceeds {_MAX_RAW_TEXT_READ_BYTES} bytes: {expanded}. "
+                            "Use read_file with offset/limit to page through it."
+                        )
+                    )
+                chunks.append(chunk)
+        except SpritesToolboxError as error:
+            return ReadResult(
+                error=render_sprites_toolbox_error(
+                    error, service="file tools", action="file read",
+                    context=f"path {expanded!r}",
+                )
+            )
+        data = b"".join(chunks)
+        content, _ = _strip_bom(data.decode("utf-8", errors="replace"))
+        return ReadResult(content=content, file_size=len(data))
 
     def write_file(self, path: str, content: str) -> WriteResult:
         path = self._expand_path(path)

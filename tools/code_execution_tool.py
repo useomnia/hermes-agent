@@ -47,6 +47,7 @@ import uuid
 _IS_WINDOWS = platform.system() == "Windows"
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.thread_scoped_output import thread_scoped_silence
 from tools.thread_context import propagate_context_to_thread
 
 # Availability gate.  On Windows we fall back to loopback TCP for the
@@ -114,6 +115,7 @@ DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
+MAX_SPILLED_STDOUT_BYTES = 5_000_000
 
 
 def _assemble_stdout_result(
@@ -152,13 +154,110 @@ def _assemble_stdout_result(
     if truncated:
         metadata["warning"] = (
             "execute_code stdout was truncated; the script did run, but only "
-            "the captured head/tail output is included. Re-run only with "
-            "narrower output if the omitted data is required."
+            "the captured head/tail output is included."
         )
     return stdout_text, metadata
 
 
-def _truncate_stdout_text(stdout_text: str) -> Tuple[str, Dict[str, Any]]:
+def _sanitize_stdout(stdout_text: str) -> str:
+    from agent.redact import redact_sensitive_text
+    from tools.ansi_strip import strip_ansi
+
+    return redact_sensitive_text(strip_ansi(stdout_text), code_file=True)
+
+
+def _spill_full_stdout(stdout_text: str, *, env=None) -> str:
+    """Save recovery output where this execution's file tools can read it.
+
+    Adapted from upstream #97043. Local execution and Sprites use the host
+    cache and its existing publisher. Other remote executions pass their
+    environment so recovery does not rely on cache mounts or path translation.
+    Callers sanitize and bound the text before any disk or transport write.
+    """
+    if env is not None:
+        publish = getattr(env, "write_output_artifact", None)
+        if callable(publish):
+            return publish(stdout_text)
+        path = f"{_env_temp_dir(env)}/stdout_{uuid.uuid4().hex}.txt"
+        _ship_file_to_remote(env, path, stdout_text)
+        return path
+
+    from hermes_constants import get_hermes_dir, get_hermes_home
+
+    spill_dir = get_hermes_dir("cache/exec", "exec_spill")
+    # Refuse links in the cache path before mkdir can follow them. The profile
+    # root itself remains the caller's configured location.
+    home = get_hermes_home()
+    for component in (spill_dir, *spill_dir.parents):
+        if component == home:
+            break
+        if component.is_symlink():
+            raise OSError("stdout cache contains a symlink")
+    spill_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Exclusive, unpredictable names avoid overwriting a prior artifact or
+    # following a pre-existing file symlink. mkstemp creates private files.
+    fd, path = tempfile.mkstemp(prefix="stdout_", suffix=".txt", dir=spill_dir)
+    with os.fdopen(fd, "w", encoding="utf-8") as output:
+        output.write(stdout_text)
+    from tools.credential_files import publish_cache_path
+
+    return publish_cache_path(path)
+
+
+def _add_stdout_spill(metadata: Dict[str, Any], captured: bytes, *,
+                      total_bytes: int, env=None) -> None:
+    """Attach best-effort recovery without changing the execution outcome."""
+    if not metadata["stdout_truncated"]:
+        return
+    try:
+        bounded = captured[:MAX_SPILLED_STDOUT_BYTES]
+        partial = total_bytes > len(bounded)
+        if partial:
+            # A cut credential may no longer match the redactor. Keep complete
+            # lines when capture stopped at the storage ceiling.
+            bounded = bounded[:bounded.rfind(b"\n") + 1]
+        sanitized = _sanitize_stdout(bounded.decode("utf-8", errors="replace"))
+        data = sanitized.encode("utf-8")
+        if len(data) > MAX_SPILLED_STDOUT_BYTES:
+            partial = True
+        marker = "\n[OUTPUT CAPTURE LIMIT: this artifact is partial.]\n" if partial else ""
+        budget = MAX_SPILLED_STDOUT_BYTES - len(marker.encode("utf-8"))
+        text = data[:budget].decode("utf-8", errors="ignore")
+        if not text:
+            raise OSError("No complete output fits in the recovery artifact")
+        path = _spill_full_stdout(text + marker, env=env)
+        if not isinstance(path, str) or not path:
+            raise OSError("Backend did not return an output artifact path")
+        metadata["stdout_spill_path"] = path
+        metadata["stdout_spill_truncated"] = partial
+        qualifier = "A partial copy of captured stdout" if partial else "Captured stdout"
+        metadata["warning"] += (
+            f" {qualifier} was saved to {path}. Inspect this artifact before "
+            "requesting the same data again; do not repeat successful calls "
+            "solely to recover omitted output."
+        )
+        if partial:
+            metadata["warning"] += (
+                " The artifact is incomplete: missing records remain unknown, "
+                "and whole-document JSON parsing may fail. Inspect the captured "
+                "content before choosing a targeted follow-up; never replay "
+                "side-effecting actions to reconstruct output."
+            )
+        else:
+            metadata["warning"] += (
+                " For JSON, use Python to load the saved file and print only "
+                "the keys or records you need; line paging cannot split a "
+                "single-line JSON document. For text, search or read bounded ranges."
+            )
+    except Exception:
+        logger.debug("Could not publish execute_code stdout recovery", exc_info=True)
+        metadata["warning"] += (
+            " The recovery artifact is unavailable. Do not repeat commands "
+            "with side effects just to recover output."
+        )
+
+
+def _truncate_stdout_text(stdout_text: str, *, env=None) -> Tuple[str, Dict[str, Any]]:
     """Cap a complete stdout string by bytes using the same head/tail policy."""
     stdout_bytes = stdout_text.encode("utf-8", errors="replace")
     if len(stdout_bytes) <= MAX_STDOUT_BYTES:
@@ -166,11 +265,13 @@ def _truncate_stdout_text(stdout_text: str) -> Tuple[str, Dict[str, Any]]:
 
     head_bytes = int(MAX_STDOUT_BYTES * 0.4)
     tail_bytes = MAX_STDOUT_BYTES - head_bytes
-    return _assemble_stdout_result(
+    text, metadata = _assemble_stdout_result(
         stdout_bytes[:head_bytes],
         stdout_bytes[-tail_bytes:],
         total_bytes=len(stdout_bytes),
     )
+    _add_stdout_spill(metadata, stdout_bytes, total_bytes=len(stdout_bytes), env=env)
+    return text, metadata
 
 # Environment variable scrubbing rules (shared between the local + remote
 # backends).  Secret-substring block is applied first; anything left must
@@ -731,6 +832,8 @@ def _call(tool_name, args):
         pass
 
     result = json.loads(raw)
+    if isinstance(result, dict) and result.get("_rpc_transport_error"):
+        raise RuntimeError(result["_rpc_transport_error"])
     if isinstance(result, str):
         try:
             result = json.loads(result)
@@ -848,17 +951,10 @@ def _rpc_server_loop(
                 # Suppress stdout/stderr from internal tool handlers so
                 # their status prints don't leak into the CLI spinner.
                 try:
-                    _real_stdout, _real_stderr = sys.stdout, sys.stderr
-                    devnull = open(os.devnull, "w", encoding="utf-8")
-                    try:
-                        sys.stdout = devnull
-                        sys.stderr = devnull
+                    with thread_scoped_silence():
                         result = handle_function_call(
                             tool_name, tool_args, task_id=task_id
                         )
-                    finally:
-                        sys.stdout, sys.stderr = _real_stdout, _real_stderr
-                        devnull.close()
                 except Exception as exc:
                     logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
                     result = tool_error(str(exc))
@@ -1005,6 +1101,14 @@ def _get_or_create_env(task_id: str):
 _SHIP_CHUNK_CHARS = 24_000
 
 
+def _checked_remote_execute(env, command: str, *, timeout: int = 30) -> dict:
+    """A nonzero shell exit must never count as successful response delivery."""
+    result = env.execute(command, cwd="/", timeout=timeout)
+    if result.get("returncode", 1) != 0:
+        raise RuntimeError("Remote file operation failed")
+    return result
+
+
 def _ship_file_to_remote(env, remote_path: str, content: str) -> None:
     """Write *content* to *remote_path* on the remote environment.
 
@@ -1031,18 +1135,14 @@ def _ship_file_to_remote(env, remote_path: str, content: str) -> None:
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     quoted_remote_path = shlex.quote(remote_path)
     quoted_b64_path = shlex.quote(f"{remote_path}.b64")
+    # Truncate staging even for an empty response and on every delivery retry.
+    _checked_remote_execute(env, f": > {quoted_b64_path}")
     for index in range(0, len(encoded), _SHIP_CHUNK_CHARS):
         chunk = encoded[index:index + _SHIP_CHUNK_CHARS]
-        redirect = ">" if index == 0 else ">>"
-        env.execute(
-            f"printf %s '{chunk}' {redirect} {quoted_b64_path}",
-            cwd="/",
-            timeout=30,
-        )
-    env.execute(
+        _checked_remote_execute(env, f"printf %s '{chunk}' >> {quoted_b64_path}")
+    _checked_remote_execute(
+        env,
         f"base64 -d < {quoted_b64_path} > {quoted_remote_path} && rm -f {quoted_b64_path}",
-        cwd="/",
-        timeout=30,
     )
 
 
@@ -1174,6 +1274,7 @@ def _rpc_poll_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    delivery_errors: Optional[list] = None,
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -1186,6 +1287,10 @@ def _rpc_poll_loop(
     poll_interval = 0.1  # 100 ms
 
     quoted_rpc_dir = shlex.quote(rpc_dir)
+    # A request is executed once for this RPC lifetime. Keep its result even
+    # after publication: a failed unlink or a stale listing cannot replay it.
+    completed = {}
+    delivery_attempts = {}
     while not stop_event.is_set():
         try:
             # List pending request files (skip .tmp partials)
@@ -1244,70 +1349,80 @@ def _rpc_poll_loop(
                 res_file = f"{rpc_dir}/res_{seq_str}"
                 quoted_res_file = shlex.quote(res_file)
 
-                # Enforce allow-list
-                if tool_name not in allowed_tools:
-                    available = ", ".join(sorted(allowed_tools))
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool '{tool_name}' is not available in execute_code. "
-                            f"Available: {available}"
-                        )
-                    })
-                # Enforce tool call limit
-                elif tool_call_counter[0] >= max_tool_calls:
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool call limit reached ({max_tool_calls}). "
-                            "No more tool calls allowed in this execution."
-                        )
-                    })
+                if req_file in completed:
+                    tool_result = completed[req_file]
                 else:
-                    # Strip forbidden terminal parameters
-                    if tool_name == "terminal" and isinstance(tool_args, dict):
-                        for param in _TERMINAL_BLOCKED_PARAMS:
-                            tool_args.pop(param, None)
-
-                    # Dispatch through the standard tool handler
-                    try:
-                        _real_stdout, _real_stderr = sys.stdout, sys.stderr
-                        devnull = open(os.devnull, "w", encoding="utf-8")
-                        try:
-                            sys.stdout = devnull
-                            sys.stderr = devnull
-                            tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
+                    # Enforce allow-list
+                    if tool_name not in allowed_tools:
+                        available = ", ".join(sorted(allowed_tools))
+                        tool_result = json.dumps({
+                            "error": (
+                                f"Tool '{tool_name}' is not available in execute_code. "
+                                f"Available: {available}"
                             )
-                        finally:
-                            sys.stdout, sys.stderr = _real_stdout, _real_stderr
-                            devnull.close()
-                    except Exception as exc:
-                        logger.error("Tool call failed in remote sandbox: %s",
-                                     exc, exc_info=True)
-                        tool_result = tool_error(str(exc))
+                        })
+                    # Enforce tool call limit
+                    elif tool_call_counter[0] >= max_tool_calls:
+                        tool_result = json.dumps({
+                            "error": (
+                                f"Tool call limit reached ({max_tool_calls}). "
+                                "No more tool calls allowed in this execution."
+                            )
+                        })
+                    else:
+                        # Strip forbidden terminal parameters
+                        if tool_name == "terminal" and isinstance(tool_args, dict):
+                            for param in _TERMINAL_BLOCKED_PARAMS:
+                                tool_args.pop(param, None)
 
-                    tool_call_counter[0] += 1
-                    call_duration = time.monotonic() - call_start
-                    tool_call_log.append({
-                        "tool": tool_name,
-                        "args_preview": str(tool_args)[:80],
-                        "duration": round(call_duration, 2),
-                    })
+                        # Dispatch through the standard tool handler
+                        try:
+                            with thread_scoped_silence():
+                                tool_result = handle_function_call(
+                                    tool_name, tool_args, task_id=task_id
+                                )
+                        except Exception as exc:
+                            logger.error("Tool call failed in remote sandbox: %s",
+                                         exc, exc_info=True)
+                            tool_result = tool_error(str(exc))
 
-                # Write response atomically (tmp + rename).
-                # Use echo piping (not stdin_data) because Modal doesn't
-                # reliably deliver stdin to chained commands.
-                encoded_result = base64.b64encode(
-                    tool_result.encode("utf-8")
-                ).decode("ascii")
-                env.execute(
-                    f"echo '{encoded_result}' | base64 -d > {quoted_res_file}.tmp"
-                    f" && mv {quoted_res_file}.tmp {quoted_res_file}",
-                    cwd="/",
-                    timeout=60,
-                )
+                        tool_call_counter[0] += 1
+                        call_duration = time.monotonic() - call_start
+                        tool_call_log.append({
+                            "tool": tool_name,
+                            "args_preview": str(tool_args)[:80],
+                            "duration": round(call_duration, 2),
+                        })
 
-                # Remove the request file
-                env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                    completed[req_file] = tool_result
+
+                try:
+                    _ship_file_to_remote(env, res_file + ".tmp", tool_result)
+                    _checked_remote_execute(
+                        env, f"mv {quoted_res_file}.tmp {quoted_res_file}"
+                    )
+                except Exception:
+                    attempts = delivery_attempts.get(req_file, 0) + 1
+                    delivery_attempts[req_file] = attempts
+                    if attempts < 3:
+                        continue
+                    message = "RPC result delivery failed; the tool already ran and was not repeated."
+                    if delivery_errors is not None:
+                        delivery_errors.append(message)
+                    logger.warning("Remote RPC response delivery failed after %d attempts", attempts)
+                    # A small receipt can still cross a size-limited transport.
+                    # The generated client raises instead of mistaking it for data.
+                    completed[req_file] = json.dumps({"_rpc_transport_error": message})
+                    try:
+                        _ship_file_to_remote(env, res_file + ".tmp", completed[req_file])
+                        _checked_remote_execute(env, f"mv {quoted_res_file}.tmp {quoted_res_file}")
+                    except Exception:
+                        # The transport is unavailable even for an error receipt.
+                        # End polling; the bounded script execution reports the
+                        # recorded infrastructure failure, without another dispatch.
+                        return
+
+                _checked_remote_execute(env, f"rm -f {quoted_req_file}", timeout=5)
 
         except Exception as e:
             if not stop_event.is_set():
@@ -1344,6 +1459,7 @@ def _execute_remote(
     quoted_sandbox_dir = shlex.quote(sandbox_dir)
     quoted_rpc_dir = shlex.quote(f"{sandbox_dir}/rpc")
 
+    delivery_errors: list = []
     tool_call_log: list = []
     tool_call_counter = [0]
     exec_start = time.monotonic()
@@ -1397,7 +1513,7 @@ def _execute_remote(
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event, rpc_token,
+                sandbox_tools, stop_event, rpc_token, delivery_errors,
             ),
             daemon=True,
         )
@@ -1482,7 +1598,12 @@ def _execute_remote(
 
     # --- Post-process output (same as local path) ---
 
-    stdout_text, stdout_metadata = _truncate_stdout_text(stdout_text)
+    # Sprites publishes via the shared cache projection. Keep #114's direct
+    # transfer for all other remote backends, including already-warm containers
+    # that may have been created before the stdout cache directory existed.
+    stdout_text, stdout_metadata = _truncate_stdout_text(
+        stdout_text, env=None if env_type == "sprites" else env,
+    )
 
     # Strip ANSI escape sequences
     from tools.ansi_strip import strip_ansi
@@ -1533,6 +1654,9 @@ def _execute_remote(
         result["status"] = "error"
         result["error"] = f"Script exited with code {exit_code}"
 
+    if delivery_errors:
+        result["status"] = "error"
+        result["error"] = delivery_errors[-1]
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1804,6 +1928,7 @@ def execute_code(
                 logger.debug("Error reading process output: %s", e, exc_info=True)
 
         stdout_total_bytes = [0]  # mutable ref for total bytes seen
+        stdout_recovery = bytearray()
 
         def _drain_head_tail(pipe, head_chunks, tail_chunks, head_bytes, tail_bytes, total_ref):
             """Drain stdout keeping both head and tail data."""
@@ -1817,6 +1942,11 @@ def execute_code(
                     if not data:
                         break
                     total_ref[0] += len(data)
+                    # Retain the middle before the head/tail display discards
+                    # it. Memory stays bounded even for an infinite writer.
+                    remaining = MAX_SPILLED_STDOUT_BYTES - len(stdout_recovery)
+                    if remaining > 0:
+                        stdout_recovery.extend(data[:remaining])
                     # Fill head buffer first
                     if head_collected < head_bytes:
                         keep = min(len(data), head_bytes - head_collected)
@@ -1894,6 +2024,10 @@ def execute_code(
         stdout_text, stdout_metadata = _assemble_stdout_result(
             b"".join(stdout_head_chunks),
             b"".join(stdout_tail_chunks),
+            total_bytes=stdout_total_bytes[0],
+        )
+        _add_stdout_spill(
+            stdout_metadata, bytes(stdout_recovery),
             total_bytes=stdout_total_bytes[0],
         )
 
@@ -2286,6 +2420,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     # knows their names (from the tools array or the bridge catalog) and can read
     # their parameters off the generated stub or via tool_describe.
     mcp_tools = sorted(name for name in enabled_sandbox_tools if _is_mcp_tool(name))
+    parallel_read_guidance = ""
     if mcp_tools:
         count = (
             "the MCP tool" if len(mcp_tools) == 1 else f"all {len(mcp_tools)} MCP tools"
@@ -2300,6 +2435,10 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
             "to run one tool over many inputs: the per-call results stay in the script "
             "instead of filling your context, so you can fetch across a whole list and "
             "print only what you concluded."
+        )
+        parallel_read_guidance = (
+            " For several independent read-only MCP calls, emit normal tool calls "
+            "so the runtime can parallelize them."
         )
 
     # Build example import list from enabled tools
@@ -2326,7 +2465,12 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         f"{_timeout_s // 60}-minute" if _timeout_s % 60 == 0 else f"{_timeout_s}s"
     )
     limits_note = (
-        f"{_timeout_note} timeout, {MAX_STDOUT_BYTES // 1000}KB stdout cap, "
+        f"{_timeout_note} timeout, {MAX_STDOUT_BYTES // 1000}KB inline stdout head/tail "
+        f"(larger captured output is saved to a recovery artifact, up to "
+        f"{MAX_SPILLED_STDOUT_BYTES // 1_000_000}MB; inspect the returned path "
+        f"instead of repeating successful calls. Parse saved JSON to select "
+        f"needed fields, or search/page text; check stdout_spill_truncated "
+        f"before claiming complete coverage), "
         f"max {_max_calls} tool calls per script"
     )
 
@@ -2366,6 +2510,9 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
 
     description = (
         "Run a Python script that can call your tools programmatically. "
+        "Use this for programmatic processing, control flow, or context reduction "
+        "across tool calls — not as a latency optimization."
+        f"{parallel_read_guidance} "
         "Use this when you need 3+ tool calls with processing logic between them, "
         "need to filter/reduce large tool outputs before they enter your context, "
         "need conditional branching (if X then Y else Z), or need to loop "

@@ -25,7 +25,7 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 
-import { _electron, type ElectronApplication, type Page } from '@playwright/test'
+import { _electron, expect, type ElectronApplication, type Page } from '@playwright/test'
 
 import { startMockServer, type MockServerOptions } from './mock-server'
 import { installErrorBannerGuard } from './test'
@@ -573,6 +573,46 @@ export async function setupPackagedApp(): Promise<PackagedAppFixture> {
 }
 
 // ─── Wait helpers ──────────────────────────────────────────────────────
+
+/**
+ * Approve the pending terminal command through the rendered approval bar.
+ *
+ * The held background-process scenarios intentionally keep the command alive
+ * with a bounded sentinel loop. That compound command is surfaced by Hermes'
+ * command guard for manual approval, so those tests must resolve the approval
+ * before observing the process state. Waiting for either the approval bar or
+ * the running-state selector keeps this synchronization event-driven across
+ * environments where the optional Tirith guard is unavailable. When the
+ * approval bar is present, this exercises the same user action as the desktop
+ * UI instead of changing approval policy in the mock backend.
+ */
+export async function approvePendingCommand(
+  page: Page,
+  runningSelector: string,
+  timeoutMs = 15_000,
+): Promise<void> {
+  const event = await page.waitForFunction(
+    (selector) => {
+      if (document.querySelector('[data-slot="tool-approval-inline"] button, [data-slot="tool-approval-actions"] button')) {
+        return 'approval'
+      }
+
+      return document.querySelector(selector) ? 'running' : false
+    },
+    runningSelector,
+    { timeout: timeoutMs },
+  )
+
+  if ((await event.jsonValue()) !== 'approval') {
+    return
+  }
+
+  const runButton = page.getByRole('button', { name: /^Run(?:\s|$)/ }).first()
+
+  await expect(runButton, 'pending terminal approval should be actionable').toBeVisible({ timeout: timeoutMs })
+  await runButton.click()
+  await expect(runButton, 'terminal approval should resolve after Run').toBeHidden({ timeout: timeoutMs })
+}
 
 /**
  * Wait for the desktop app to finish booting and show the main chat UI.

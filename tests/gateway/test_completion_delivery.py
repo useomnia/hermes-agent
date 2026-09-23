@@ -96,6 +96,150 @@ def _stop_after_sleeps(monkeypatch, runner, count):
     monkeypatch.setattr(asyncio, "sleep", _bounded_sleep)
 
 
+def test_managed_process_completions_keep_distinct_origin_turns(monkeypatch):
+    import gateway.wake as wake_module
+
+    deliver = AsyncMock()
+    monkeypatch.setattr(wake_module, "deliver_wake", deliver)
+    adapter = SimpleNamespace(supports_async_delivery=False)
+    runner = _runner(adapter)
+    runner.adapters = {Platform.API_SERVER: adapter}
+    events = []
+    for index in range(2):
+        event = _completion_event(started_at=123.5, session_id=f"proc_{index}")
+        event.update(
+            session_key=f"run_execution_{index}",
+            platform="api_server",
+            chat_type="",
+            chat_id=f"conversation-{index}",
+            origin_session_id=f"conversation-{index}",
+            origin_turn_id=f"turn-{index}",
+        )
+        events.append(event)
+
+    async def exercise():
+        await asyncio.gather(*(
+            runner._deliver_completion_notification("done", dict(event))
+            for event in events
+        ))
+        # A watcher/queue replay keeps its original key; a new incarnation
+        # of the same process ID is a different completion.
+        await runner._deliver_completion_notification("done", dict(events[0]))
+        await runner._deliver_completion_notification(
+            "done again", {**events[0], "started_at": 456.5},
+        )
+
+    asyncio.run(exercise())
+
+    assert deliver.await_count == 3
+    calls = [call.kwargs for call in deliver.await_args_list]
+    assert {call["delegation_id"] for call in calls} == {
+        "process:proc_0:123.5", "process:proc_1:123.5", "process:proc_0:456.5",
+    }
+    for call in calls:
+        index = 1 if "proc_1" in call["delegation_id"] else 0
+        assert call["session_id"] == f"conversation-{index}"
+        assert call["origin_turn_id"] == f"turn-{index}"
+        assert call["subagent_ids"] == []
+
+
+def test_legacy_managed_completion_prefers_explicit_api_chat_id(monkeypatch):
+    import gateway.wake as wake_module
+
+    deliver = AsyncMock()
+    monkeypatch.setattr(wake_module, "deliver_wake", deliver)
+    adapter = SimpleNamespace(supports_async_delivery=False)
+    runner = _runner(adapter)
+    runner.adapters = {Platform.API_SERVER: adapter}
+    event = _completion_event(started_at=123.5)
+    event.update(
+        session_key="run_opaque_execution", platform="api_server",
+        chat_type="", chat_id="raw-conversation",
+    )
+
+    assert asyncio.run(runner._deliver_completion_notification("done", event)) is True
+
+    assert deliver.await_args.kwargs["session_id"] == "raw-conversation"
+    assert deliver.await_args.kwargs["origin_turn_id"] == ""
+
+
+@pytest.mark.parametrize("watcher_first", [False, True])
+def test_managed_queue_and_watcher_share_process_origin_and_wake_key(
+    monkeypatch, isolated_registry, watcher_first,
+):
+    import gateway.wake as wake_module
+
+    deliver = AsyncMock()
+    monkeypatch.setattr(wake_module, "deliver_wake", deliver)
+    adapter = SimpleNamespace(supports_async_delivery=False)
+    runner = _runner(adapter)
+    runner.adapters = {Platform.API_SERVER: adapter}
+    runner._load_background_notifications_mode = lambda: "result"
+    session = ProcessSession(
+        id="proc_managed", command="echo done", task_id="run_execution",
+        started_at=123.5, session_key="run_execution", notify_on_complete=True,
+        watcher_platform="api_server", watcher_chat_id="raw-conversation",
+        origin_session_id="raw-conversation", origin_turn_id="turn-origin",
+        exited=True, exit_code=0, output_buffer="done\n",
+    )
+    isolated_registry._running[session.id] = session
+    isolated_registry._move_to_finished(session)
+    queued = isolated_registry.completion_queue.get_nowait()
+    watcher = {
+        "session_id": session.id, "check_interval": 0,
+        "session_key": session.session_key, "platform": session.watcher_platform,
+        "chat_id": session.watcher_chat_id, "notify_on_complete": True,
+        # A legacy descriptor can recover origins from its ProcessSession.
+    }
+
+    async def instant_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+
+    async def exercise():
+        if watcher_first:
+            await runner._run_process_watcher(watcher)
+        await runner._deliver_completion_notification("done", queued)
+        if not watcher_first:
+            await runner._run_process_watcher(watcher)
+
+    asyncio.run(exercise())
+
+    deliver.assert_awaited_once()
+    call = deliver.await_args.kwargs
+    assert call["session_id"] == "raw-conversation"
+    assert call["origin_turn_id"] == "turn-origin"
+    assert call["delegation_id"] == "process:proc_managed:123.5"
+
+
+def test_watch_matches_do_not_reuse_the_process_completion_hook(monkeypatch):
+    import gateway.wake as wake_module
+
+    deliver = AsyncMock()
+    monkeypatch.setattr(wake_module, "deliver_wake", deliver)
+    adapter = SimpleNamespace(supports_async_delivery=False)
+    runner = _runner(adapter)
+    runner.adapters = {Platform.API_SERVER: adapter}
+    event = _completion_event(started_at=123.5)
+    event.update(
+        type="watch_match", platform="api_server", chat_id="raw-conversation",
+        origin_session_id="raw-conversation", origin_turn_id="turn-origin",
+    )
+
+    async def exercise():
+        await runner._inject_watch_notification("first match", dict(event))
+        await runner._inject_watch_notification("second match", dict(event))
+
+    asyncio.run(exercise())
+
+    assert deliver.await_count == 2
+    for call in deliver.await_args_list:
+        assert call.kwargs["session_id"] == "raw-conversation"
+        assert call.kwargs["origin_turn_id"] == ""
+        assert call.kwargs["delegation_id"] == ""
+
+
 def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registry):
     """Byte-identical queue replays produce one turn in one gateway lifecycle."""
     isolated = queue.Queue()
@@ -692,3 +836,83 @@ def test_autonomous_completion_redacts_real_command_and_output_secrets(monkeypat
     delivered = adapter.handle_message.await_args.args[0]
     assert secret not in delivered.text
     assert "HOME=/home/user" in delivered.text
+
+
+def _barrier_adapter(active):
+    """Stand-in for the API server's handover-barrier signal."""
+    return SimpleNamespace(quiescence_barrier_active=lambda: active)
+
+
+def test_turn_consumed_events_stay_queued_without_a_handover_barrier(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_completion_event(started_at=1.0))
+
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    runner.adapters[Platform.API_SERVER] = _barrier_adapter(False)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert isolated.qsize() == 1
+
+
+def test_handover_barrier_drops_turn_consumed_events_instead_of_requeueing(
+    monkeypatch, isolated_registry,
+):
+    """A fenced gateway admits no turn, so nothing can ever drain these.
+
+    Left queued they are counted as writer work by the quiescence proof and
+    hold the handover open forever (the phantom-writer wedge of 2026-09-07/08).
+    """
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_completion_event(started_at=1.0))
+    isolated.put({**_completion_event(started_at=2.0, session_id="proc_watch"), "type": "watch_match"})
+
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    runner.adapters[Platform.API_SERVER] = _barrier_adapter(True)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert isolated.empty()
+
+
+def test_handover_barrier_leaves_failed_async_delivery_to_durable_replay(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_async_event("deleg_fenced"))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=RuntimeError("fenced")))
+    runner = _runner(adapter)
+    runner.adapters[Platform.API_SERVER] = _barrier_adapter(True)
+    _stop_after_sleeps(monkeypatch, runner, count=3)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    # One attempt, then the in-memory copy is released to the durable row.
+    assert adapter.handle_message.await_count == 1
+    assert isolated.empty()
+
+
+def test_failed_async_delivery_is_still_requeued_without_a_barrier(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_async_event("deleg_open"))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=RuntimeError("temporary")))
+    runner = _runner(adapter)
+    runner.adapters[Platform.API_SERVER] = _barrier_adapter(False)
+    _stop_after_sleeps(monkeypatch, runner, count=3)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert adapter.handle_message.await_count == 2
+    assert isolated.qsize() == 1

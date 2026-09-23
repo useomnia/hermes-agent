@@ -6546,7 +6546,7 @@ class TestCompressionFallbackContextFilter:
     def test_configured_chain_passes_through_unknown_context(self, monkeypatch):
         """When get_model_context_length returns None (cannot probe),
         the candidate is NOT filtered — the existing behaviour of using
-        the default 256K fallback in the resolver chain is preserved."""
+        the default 1M fallback in the resolver chain is preserved."""
         from agent.auxiliary_client import _try_configured_fallback_chain
 
         unknown_client = MagicMock(name="unknown_client")

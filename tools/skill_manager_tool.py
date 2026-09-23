@@ -661,6 +661,11 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
                 continue
             if skill_md.parent.name == name:
                 return {"path": skill_md.parent}
+            # Upstream #98099: accept the categorized identifier advertised
+            # by skill_view. Match against each owning root, including external
+            # catalogs, without resolving through a different skill's symlink.
+            if skill_md.parent.relative_to(skills_dir).as_posix() == name:
+                return {"path": skill_md.parent}
     return None
 
 

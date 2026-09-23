@@ -306,6 +306,12 @@ async def _self_post_chat_completion(
     headers = {
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,
+        # Force quiescence blocks new external turns but lets a completion
+        # already emitted by an admitted child finish its internal wake while
+        # the gateway proves that no writer remains. The API server accepts
+        # this marker only during that transient proof and only with the API
+        # key above; it is never a post-latch admission bypass.
+        "X-Hermes-Internal-Wake": "1",
     }
     payload = {
         "model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),

@@ -35,6 +35,7 @@ from tools.budget_config import (
     BudgetConfig,
     DEFAULT_BUDGET,
 )
+from tools.oversized_result_formatters import format_oversized_result
 
 logger = logging.getLogger(__name__)
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
@@ -104,7 +105,7 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     Environments with a first-class file-write capability avoid command-string
     and stdin transport limits. Other backends retain the existing exec + stdin
     path, which avoids Linux's per-argument ceiling on local and SSH backends.
-    A capability may reject content above its API's file-size limit; callers
+    A capability may reject content above its artifact-size limit; callers
     then keep the in-context preview rather than silently truncating the file.
     """
     write_file_content = getattr(env, "write_file_content", None)
@@ -149,6 +150,7 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
+    formatter_name: str | None = None,
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -178,6 +180,7 @@ def maybe_persist_tool_result(
     storage_dir = _resolve_storage_dir(env)
     remote_path = f"{storage_dir}/{_safe_result_filename(tool_use_id)}"
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
+    custom = format_oversized_result(content, formatter_name or tool_name)
 
     if env is not None:
         try:
@@ -186,7 +189,9 @@ def maybe_persist_tool_result(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,
                 )
-                return _build_persisted_message(preview, has_more, len(content), remote_path)
+                return custom if custom is not None else _build_persisted_message(
+                    preview, has_more, len(content), remote_path
+                )
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
 
@@ -194,6 +199,8 @@ def maybe_persist_tool_result(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
         tool_name, len(content),
     )
+    if custom is not None:
+        return custom
     return (
         f"{preview}\n\n"
         f"[Truncated: tool response was {len(content):,} chars. "
@@ -242,6 +249,7 @@ def enforce_turn_budget(
             env=env,
             config=config,
             threshold=0,
+            formatter_name=msg.get("name") or msg.get("tool_name"),
         )
         if replacement != content:
             total_size -= size
