@@ -399,7 +399,7 @@ else:
     print(f"OK {N}/{N}")
 '''
 
-        def slow_mock(function_name, function_args, task_id=None, user_task=None):
+        def slow_mock(function_name, function_args, task_id=None, user_task=None, **kwargs):
             import time as _t
             if function_name == "terminal":
                 _t.sleep(0.05)  # ensure requests overlap on the socket
@@ -408,7 +408,7 @@ else:
                 out = cmd[5:] if cmd.startswith("echo ") else f"mock: {cmd}"
                 return json.dumps({"output": out, "exit_code": 0})
             return _mock_handle_function_call(
-                function_name, function_args, task_id=task_id, user_task=user_task
+                function_name, function_args, task_id=task_id, user_task=user_task, **kwargs
             )
 
         with patch("model_tools.handle_function_call", side_effect=slow_mock):
