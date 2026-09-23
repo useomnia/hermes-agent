@@ -856,7 +856,7 @@ class TestRunEvents:
         notices = []
 
         def broken_summary_output(*args, **kwargs):
-            if args and "Reached maximum iterations" in str(args[0]):
+            if args and str(args[0]).startswith("⚠️  Reached maximum iterations ("):
                 notices.append(str(args[0]))
                 raise ValueError("I/O operation on closed file")
             return real_print(*args, **kwargs)
