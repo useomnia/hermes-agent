@@ -17,6 +17,9 @@ Usage in tools:
 import logging
 import os
 import threading
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,62 @@ if _DEBUG_INTERRUPT:
 # Set of thread idents that have been interrupted.
 _interrupted_threads: set[int] = set()
 _lock = threading.Lock()
+
+_execution_scope: ContextVar["ToolExecutionScope | None"] = ContextVar(
+    "tool_execution_scope", default=None
+)
+
+
+class ToolExecutionScope:
+    """Fence nested dispatch when its owning script stops or expires.
+
+    Created on the script's execution thread, then shared with its RPC worker.
+    Admission is the boundary after which an external call may already be in
+    flight; cancellation never claims to roll that operation back.
+    """
+
+    def __init__(self, stop_event: threading.Event):
+        self._stop = stop_event
+        self._owner = threading.get_ident()
+        self._parent = _execution_scope.get()
+        self._deadline: float | None = None
+        self._lock = threading.RLock()
+
+    def start(self, timeout: float) -> None:
+        with self._lock:
+            self._deadline = time.monotonic() + timeout
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._stop.set()
+
+    def is_cancelled(self) -> bool:
+        with self._lock:
+            with _lock:
+                interrupted = self._owner in _interrupted_threads
+            return (
+                self._stop.is_set()
+                or interrupted
+                or (self._deadline is not None and time.monotonic() >= self._deadline)
+                or (self._parent is not None and self._parent.is_cancelled())
+            )
+
+    def admit(self) -> bool:
+        with self._lock:
+            return not self.is_cancelled()
+
+
+def current_execution_scope() -> ToolExecutionScope | None:
+    return _execution_scope.get()
+
+
+@contextmanager
+def bind_execution_scope(scope: ToolExecutionScope):
+    token = _execution_scope.set(scope)
+    try:
+        yield
+    finally:
+        _execution_scope.reset(token)
 
 
 def set_interrupt(active: bool, thread_id: int | None = None) -> None:
@@ -67,7 +126,9 @@ def is_interrupted() -> bool:
     """
     tid = threading.current_thread().ident
     with _lock:
-        return tid in _interrupted_threads
+        interrupted = tid in _interrupted_threads
+    scope = _execution_scope.get()
+    return interrupted or (scope is not None and scope.is_cancelled())
 
 
 def clear_current_thread_interrupt() -> None:

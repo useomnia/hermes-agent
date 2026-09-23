@@ -49,7 +49,7 @@ from tools.code_execution_tool import (
 )
 
 
-def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
+def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None, **kwargs):
     """Mock dispatcher that returns canned responses for each tool."""
     if function_name == "terminal":
         cmd = function_args.get("command", "")
