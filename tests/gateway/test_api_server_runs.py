@@ -824,6 +824,7 @@ class TestRunEvents:
         monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
         monkeypatch.setattr("run_agent.OpenAI", MagicMock())
         agents = []
+        summaries_started = threading.Barrier(2)
 
         def create_agent(**_kwargs):
             agent = AIAgent(
@@ -832,13 +833,21 @@ class TestRunEvents:
                 max_iterations=0, quiet_mode=True, skip_context_files=True, skip_memory=True,
             )
             agent.client = MagicMock()
-            agent.client.chat.completions.create.return_value = SimpleNamespace(
+            response = SimpleNamespace(
                 choices=[SimpleNamespace(
                     message=SimpleNamespace(content="Budget summary", tool_calls=None),
                     finish_reason="stop",
                 )],
                 usage=None,
             )
+            overlap = len(agents) < 2
+
+            def summarize(**_request):
+                if overlap:
+                    summaries_started.wait(timeout=10)
+                return response
+
+            agent.client.chat.completions.create.side_effect = summarize
             agents.append(agent)
             return agent
 
