@@ -305,6 +305,7 @@ Returns a machine-readable description of the API server's stable surface for ex
     "chat_completions": true,
     "responses_api": true,
     "run_submission": true,
+    "run_slash_commands": true,
     "run_structured_output": true,
     "structured_output": true,
     "run_status": true,
@@ -414,6 +415,21 @@ Runs accept a simple `input` string and optional `session_id`, `instructions`,
 `conversation_history`, `previous_response_id`, or `interaction_policy`. When
 `session_id` is provided, Hermes surfaces it in the run status so external UIs
 can correlate runs with their own conversation IDs.
+
+Runs support the same slash-command expansion as Chat Completions. Send
+`{"input": "/skill-name review this report"}` to load the installed skill's
+instructions before the agent starts, without relying on the model to request
+them. Commands can also appear within prose, such as
+`{"input": "Please load /skill-name and review this report"}`.
+
+Hermes expands the first command it can load, preserving the surrounding text
+as the instruction. Skill bundles and `/learn` use the same expansion rules.
+Unknown commands, commands that cannot be loaded, and non-string message
+content pass through unchanged. Expansion applies to the current user message;
+conversation history is preserved. Replaying a `turn_id` returns the existing
+run without loading the skill again. Clients can check
+`features.run_slash_commands` in `/v1/capabilities` before using this behavior;
+older servers do not advertise the flag.
 
 For structured output, use the Responses-style `text.format` contract:
 
