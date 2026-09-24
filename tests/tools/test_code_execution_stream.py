@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from tools.code_execution_stream import StreamDispatcher
-from tools.code_execution_tool import _NestedToolDispatcher
+from tools.code_execution_tool import _NestedToolDispatcher, _open_remote_code_rpc
 from tools.interrupt import ToolExecutionScope
 
 
@@ -253,3 +253,55 @@ def test_oversized_result_reports_error_without_losing_other_calls():
         assert not stream.errors
     finally:
         stream.close()
+
+
+@pytest.mark.parametrize("policy", [{}, {"enabled": False}, {"enabled": "true"}, {"enabled": 1}])
+def test_optional_channel_requires_an_explicit_boolean_rollout(policy):
+    from tools.environments.sprites import SpritesEnvironment
+
+    env = SpritesEnvironment.__new__(SpritesEnvironment)
+    requests = []
+    env._request_json = lambda path, **kw: requests.append(path) or policy
+    assert env.open_code_rpc("private", optional=True) is None
+    assert requests == ["/code/rpc-policy"]
+
+
+@pytest.mark.parametrize("transport", ["file", "auto"])
+def test_compatible_transport_for_an_environment_without_stream_capability(transport):
+    assert _open_remote_code_rpc(object(), "private", transport) == ("file", None, None)
+
+
+@pytest.mark.parametrize("error", [ConnectionError, TimeoutError, ValueError])
+def test_auto_fallback_is_confined_to_channel_setup(error):
+    class Environment:
+        def open_code_rpc(self, token, **kwargs):
+            raise error("unavailable")
+
+    assert _open_remote_code_rpc(Environment(), "private", "auto") == ("file", None, None)
+    with pytest.raises(error):
+        _open_remote_code_rpc(Environment(), "private", "stream")
+
+
+def test_auto_transport_opens_one_channel_when_rollout_and_capability_allow_it():
+    calls = []
+    connection = object()
+
+    class Environment:
+        def open_code_rpc(self, token, **kwargs):
+            calls.append((token, kwargs))
+            return connection, "/tmp/code-rpc-owned/rpc.sock"
+
+    assert _open_remote_code_rpc(Environment(), "private", "auto") == (
+        "stream", connection, "/tmp/code-rpc-owned/rpc.sock",
+    )
+    assert calls == [("private", {"optional": True})]
+
+
+def test_explicit_stream_rejects_an_unsupported_environment():
+    with pytest.raises(ValueError, match="compatible Toolbox"):
+        _open_remote_code_rpc(object(), "private", "stream")
+
+
+def test_invalid_transport_fails_before_channel_setup():
+    with pytest.raises(ValueError, match="rpc_transport"):
+        _open_remote_code_rpc(object(), "private", "invalid")

@@ -1410,6 +1410,28 @@ def _rpc_poll_loop(
             stop_event.wait(poll_interval)
 
 
+def _open_remote_code_rpc(env, token, transport):
+    """Select transport before staging a script; never retry executed work."""
+    if transport not in {"file", "stream", "auto"}:
+        raise ValueError("rpc_transport must be file, stream or auto")
+    if transport == "file":
+        return "file", None, None
+    opener = getattr(env, "open_code_rpc", None)
+    if transport == "stream":
+        if not callable(opener):
+            raise ValueError("Stream RPC requires a compatible Toolbox environment")
+        connection, path = opener(token)
+        return "stream", connection, path
+    if callable(opener):
+        try:
+            opened = opener(token, optional=True)
+            if opened is not None:
+                return "stream", *opened
+        except Exception as exc:
+            logger.info("execute_code stream unavailable before execution: %s", type(exc).__name__)
+    return "file", None, None
+
+
 def _execute_remote(
     code: str,
     task_id: Optional[str],
@@ -1480,14 +1502,9 @@ def _execute_remote(
         )
 
         rpc_token = secrets.token_urlsafe(32)
-        transport = _cfg.get("rpc_transport", "file")
-        if transport not in {"file", "stream"}:
-            raise ValueError("rpc_transport must be file or stream")
-        if transport == "stream":
-            opener = getattr(env, "open_code_rpc", None)
-            if not callable(opener):
-                raise ValueError("Stream RPC requires a compatible Toolbox environment")
-            connection, socket_path = opener(rpc_token)
+        transport, connection, socket_path = _open_remote_code_rpc(
+            env, rpc_token, _cfg.get("rpc_transport", "file"),
+        )
 
         # Generate and ship files
         tools_src = generate_hermes_tools_module(
