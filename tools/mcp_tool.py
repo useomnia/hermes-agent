@@ -1935,7 +1935,7 @@ class MCPServerTask:
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "_pending_call_context",
+        "_pending_call_context", "_http_tool_call_guard",
         "_parallel_read_enabled", "_parallel_read_limit",
         "_parallel_read_gate", "_parallel_read_semaphore",
         "_lifecycle_started_at", "_last_tool_call_at",
@@ -1947,6 +1947,7 @@ class MCPServerTask:
     def __init__(self, name: str):
         self.name = name
         self.session: Optional[Any] = None
+        self._http_tool_call_guard = (None, None)
         self.tool_timeout: float = _DEFAULT_TOOL_TIMEOUT
         self._task: Optional[asyncio.Task] = None
         self._ready = asyncio.Event()
@@ -2166,6 +2167,7 @@ class MCPServerTask:
         """Mark a stdio session dormant before its transport finishes closing."""
         self._recycled_reason = reason
         self.session = None
+        self._http_tool_call_guard = (None, None)
 
     # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
 
@@ -3065,6 +3067,9 @@ class MCPServerTask:
             # matching the SDK's own create_mcp_http_client defaults.
             import httpx
 
+            from tools.mcp_http_guard import HTTPToolCallGuard
+
+            call_guard = HTTPToolCallGuard()
             _original_url = httpx.URL(url)
 
             async def _strip_auth_on_cross_origin_redirect(response):
@@ -3081,7 +3086,9 @@ class MCPServerTask:
                 "follow_redirects": True,
                 "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                 "verify": ssl_verify,
-                "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
+                "event_hooks": {"response": [
+                    _strip_auth_on_cross_origin_redirect, call_guard.observe_response,
+                ]},
             }
             if headers:
                 client_kwargs["headers"] = headers
@@ -3104,6 +3111,7 @@ class MCPServerTask:
                                     session.initialize(), timeout=float(connect_timeout)
                                 )
                             self.session = session
+                            self._http_tool_call_guard = (session, call_guard)
                             await self._discover_tools()
                             self._ready.set()
                             # Session is live again: clear any breaker state from
@@ -3318,6 +3326,7 @@ class MCPServerTask:
                         self.name, self._recycled_reason,
                     )
                     self.session = None
+                    self._http_tool_call_guard = (None, None)
                     await self._wait_for_lazy_reconnect()
                     if self._shutdown_event.is_set():
                         break
@@ -3380,6 +3389,7 @@ class MCPServerTask:
                 # pre-reconnect session for a fresh one and retry too early.
                 self._ready.clear()
                 self.session = None
+                self._http_tool_call_guard = (None, None)
                 continue
             except asyncio.CancelledError:
                 # Task was cancelled (shutdown, gateway restart, explicit
@@ -3392,9 +3402,11 @@ class MCPServerTask:
                 # correctly to asyncio's task machinery and ``shutdown()``'s
                 # ``await self._task`` completes. See #9930.
                 self.session = None
+                self._http_tool_call_guard = (None, None)
                 raise
             except Exception as exc:
                 self.session = None
+                self._http_tool_call_guard = (None, None)
                 # Unwrap anyio TaskGroup wrappers first: str(exc) on a
                 # BaseExceptionGroup is "unhandled errors in a TaskGroup
                 # (N sub-exceptions)" — useless in logs, and it hides the
@@ -3606,6 +3618,7 @@ class MCPServerTask:
                     return
             finally:
                 self.session = None
+                self._http_tool_call_guard = (None, None)
 
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
@@ -3655,6 +3668,7 @@ class MCPServerTask:
             self._pending_refresh_tasks.clear()
         self._deregister_tools()
         self.session = None
+        self._http_tool_call_guard = (None, None)
 
     def _deregister_tools(self) -> None:
         """Drop this server's tools from the global registry (idempotent).
@@ -4868,7 +4882,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         call_kwargs["meta"] = {
                             "omnia/originTurnId": origin_turn_id,
                         }
-                    result = await server.session.call_tool(tool_name, **call_kwargs)
+                    session = server.session
+                    guard_state = getattr(server, "_http_tool_call_guard", None)
+                    guarded_session, guard = guard_state if isinstance(guard_state, tuple) else (None, None)
+                    if guarded_session is session and guard is not None:
+                        result = await guard.call(lambda: session.call_tool(tool_name, **call_kwargs))
+                    else:
+                        result = await session.call_tool(tool_name, **call_kwargs)
                 finally:
                     if not parallel_read:
                         server._pending_call_context = None
