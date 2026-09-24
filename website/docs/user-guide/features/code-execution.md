@@ -322,3 +322,35 @@ Hermes always writes the script and the auto-generated `hermes_tools.py` RPC stu
 ## Platform Support
 
 Code execution requires Unix domain sockets and is available on **Linux and macOS only**. It is automatically disabled on Windows — the agent falls back to regular sequential tool calls.
+
+## Experimental Toolbox stream transport
+
+For a compatible Omnio Toolbox, select the stream transport explicitly:
+
+```yaml
+code_execution:
+  rpc_transport: stream
+  rpc_concurrency: 8
+```
+
+The default remains `file` for remote environments. Local execution keeps its
+existing Unix socket. Stream mode requires Toolbox code RPC v1 and a paired
+Omnio proxy that forwards WebSockets; unsupported runtimes return an error
+before starting the script. Existing runtime pins are not changed by this POC.
+
+Python still executes in Toolbox isolation. A run-scoped Unix socket carries
+nested requests over one persistent, pair-authenticated connection to the
+trusted Hermes process, which owns MCP credentials and approval routing.
+
+For independent reads, use Python's `ThreadPoolExecutor`. Up to
+`rpc_concurrency` calls overlap (1–32, default 8), subject to each MCP server's
+own concurrency cap. Only tools that pass the existing trusted HTTP MCP
+parallel-read policy qualify: server opt-in, read-only annotations, and no
+sampling or elicitation. Other tools drain preceding reads and execute alone.
+Every admitted call counts against the same atomic `max_tool_calls` budget.
+
+Only the final script output enters model context. Closing or interrupting the
+script cancels the channel and prevents new dispatch; already-admitted external
+operations cannot be rolled back. A broken channel is not retried or replayed.
+Requests are limited to 1 MiB and responses to 16 MiB; local calls wait at most
+five minutes and remain subject to the owning script's shorter deadline.
