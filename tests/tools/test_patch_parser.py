@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from tools.patch_parser import (
     OperationType,
     apply_v4a_operations,
@@ -427,12 +429,13 @@ class TestValidationPhase:
         assert result.success is True
         assert file_ops.written == "anchor\nvalue = 2\n"
 
-    def test_patch_with_only_context_hunks_reports_no_changes(self):
-        patch = """\
+    @pytest.mark.parametrize("hunk", [" anchor", "-anchor\n+anchor"])
+    def test_patch_with_only_unchanged_hunks_reports_no_changes(self, hunk):
+        patch = f"""\
 *** Begin Patch
 *** Update File: a.py
 @@ anchor @@
- anchor
+{hunk}
 *** End Patch"""
         ops, err = parse_v4a_patch(patch)
         assert err is None

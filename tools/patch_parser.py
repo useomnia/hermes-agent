@@ -267,11 +267,10 @@ def _validate_operations(
             simulated = read_result.content
             for hunk_index, hunk in enumerate(op.hunks, start=1):
                 search_lines = [l.content for l in hunk.lines if l.prefix in {' ', '-'}]
-                removed_lines = [l.content for l in hunk.lines if l.prefix == '-']
-                added_lines = [l.content for l in hunk.lines if l.prefix == '+']
-                if not removed_lines and not added_lines:
-                    # Models occasionally emit inert anchor hunks between real
-                    # changes. Ignore them without poisoning the atomic patch.
+                replace_lines = [l.content for l in hunk.lines if l.prefix in {' ', '+'}]
+                if search_lines == replace_lines:
+                    # Match apply's no-op handling for both context-only hunks
+                    # and identical -/+ lines, without counting either as a change.
                     continue
                 real_change_count += 1
                 if not search_lines:
@@ -292,16 +291,7 @@ def _validate_operations(
                     continue
 
                 search_pattern = '\n'.join(search_lines)
-                replace_lines = [l.content for l in hunk.lines if l.prefix in {' ', '+'}]
                 replacement = '\n'.join(replace_lines)
-
-                if search_lines == replace_lines:
-                    # Degenerate hunk whose -/+ lines are identical: the apply
-                    # phase skips it as a no-op, so validation must not fail it
-                    # — fuzzy_find_and_replace would reject the identical
-                    # search/replacement with old_string/new_string guidance
-                    # that has no meaning in V4A patch mode.
-                    continue
 
                 new_simulated, count, _strategy, match_error = fuzzy_find_and_replace(
                     simulated, search_pattern, replacement, replace_all=False
@@ -344,7 +334,7 @@ def _validate_operations(
         # ADD: parent directory creation handled by write_file; no pre-check needed.
 
     if not errors and real_change_count == 0:
-        errors.append("Patch contains no changes (only context lines were provided)")
+        errors.append("Patch contains no changes (all hunks are unchanged)")
 
     return errors
 
