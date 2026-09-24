@@ -888,6 +888,16 @@ class _NestedToolDispatcher:
                 return json.dumps({"status": "interrupted", "error": "Script execution ended."})
             call_id = f"nested_{self.namespace}_{self.counter[0]}"
             self.counter[0] += 1
+            # Cancellation may flush usage before a slow external operation
+            # returns. Publish admission while holding the same budget lock;
+            # queued and rejected calls never reach this entry.
+            entry = {
+                "tool": tool_name,
+                "tool_call_id": call_id,
+                "args_preview": str(tool_args)[:80],
+                "duration": 0.0,
+            }
+            self.log.append(entry)
         if tool_name == "terminal" and isinstance(tool_args, dict):
             for param in _TERMINAL_BLOCKED_PARAMS:
                 tool_args.pop(param, None)
@@ -901,12 +911,7 @@ class _NestedToolDispatcher:
         except Exception as exc:
             logger.error("Nested tool call failed (tool_call_id=%s)", call_id, exc_info=True)
             result = tool_error(str(exc))
-        self.log.append({
-            "tool": tool_name,
-            "tool_call_id": call_id,
-            "args_preview": str(tool_args)[:80],
-            "duration": round(time.monotonic() - started, 2),
-        })
+        entry["duration"] = round(time.monotonic() - started, 2)
         return result
 
 
@@ -1179,9 +1184,10 @@ def _env_temp_dir(env: Any) -> str:
 def _inner_tool_counts(tool_call_log: list) -> Dict[str, int]:
     """Count executed calls per tool name from the RPC log.
 
-    ``tool_call_log`` is appended to only AFTER a call clears the allow-list and
-    the call-count limit and has been dispatched, so this counts executions, not
-    attempts. A call that executed and then failed still counts — it consumed
+    ``tool_call_log`` is appended to only AFTER a call clears the allow-list,
+    cancellation fence and call-count limit. It is recorded before invoking the
+    handler, so cancellation cannot lose an already-admitted in-flight call.
+    A call that executed and then failed still counts — it consumed
     whatever the provider charges for, which is the same trade-off the message-
     row counting downstream already makes.
     """

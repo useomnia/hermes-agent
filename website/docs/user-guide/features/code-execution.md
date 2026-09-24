@@ -323,7 +323,7 @@ Hermes always writes the script and the auto-generated `hermes_tools.py` RPC stu
 
 Code execution requires Unix domain sockets and is available on **Linux and macOS only**. It is automatically disabled on Windows — the agent falls back to regular sequential tool calls.
 
-## Experimental Toolbox stream transport
+## Toolbox stream transport
 
 For a compatible Omnio Toolbox, select the stream transport explicitly:
 
@@ -336,7 +336,14 @@ code_execution:
 The default remains `file` for remote environments. Local execution keeps its
 existing Unix socket. Stream mode requires Toolbox code RPC v1 and a paired
 Omnio proxy that forwards WebSockets; unsupported runtimes return an error
-before starting the script. Existing runtime pins are not changed by this POC.
+before starting the script. Existing runtime pins are not changed automatically.
+
+Paired Omnio installations can set `rpc_transport: auto`. The proxy must opt the
+owner into streaming and Toolbox must advertise RPC v1. Missing, disabled,
+malformed, or unavailable policy/capability responses select file transport
+before the script starts. This supports mixed runtime versions. Once a script
+starts on a stream, connection failure is reported without fallback or replay.
+Explicit `stream` bypasses rollout negotiation for controlled verification.
 
 Python still executes in Toolbox isolation. A run-scoped Unix socket carries
 nested requests over one persistent, pair-authenticated connection to the
