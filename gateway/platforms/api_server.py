@@ -5648,8 +5648,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
-                from tools.tool_approval import is_gated_tool
-
                 _started_tool_call_ids.discard(tool_call_id)
                 completed = {
                     "tool": function_name,
@@ -5685,42 +5683,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         "presented",
                         "no_response",
                     }
-                elif is_gated_tool(function_name):
-                    try:
-                        from tools.tool_approval import consume_tool_approval_decision
-
-                        decision = consume_tool_approval_decision(
-                            tool_approval_surface_key, tool_call_id
-                        )
-                    except Exception:
-                        decision = None
-                    if decision is not None:
-                        completed.setdefault("interaction", {})["answered"] = decision
-                    if (
-                        isinstance(parsed, dict)
-                        and parsed.get("status") == "approval_no_response"
-                    ):
-                        try:
-                            from tools.tool_approval import (
-                                consume_tool_approval_completion_reason,
-                            )
-
-                            completion_reason = consume_tool_approval_completion_reason(
-                                tool_approval_surface_key, tool_call_id
-                            )
-                        except Exception:
-                            completion_reason = None
-                        if completion_reason == "expired":
-                            completed.setdefault("interaction", {})["timed_out"] = True
-                            interrupt_message = (
-                                "awaiting user approval (tool approval timed out)"
-                            )
-                        else:
-                            interrupt_message = (
-                                "awaiting user approval "
-                                "(tool approval ended without response)"
-                            )
-                        turn_ending = True
                 elif function_name == "todo":
                     todos = parsed.get("todos") if isinstance(parsed, dict) else None
                     if isinstance(todos, list):
@@ -5769,6 +5731,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     _stream_q.put_nowait(("__tool_progress__", event))
                 except Exception:
                     pass
+                self._interrupt_for_expired_tool_approval(agent_ref[0], event)
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -8522,6 +8485,23 @@ class APIServerAdapter(BasePlatformAdapter):
             failure_reason="log_cap_exceeded",
         )
 
+    @staticmethod
+    def _interrupt_for_expired_tool_approval(agent, event: Dict[str, Any]) -> None:
+        interaction = event.get("interaction")
+        if (
+            agent is None
+            or not isinstance(interaction, dict)
+            or interaction.get("timed_out") is not True
+        ):
+            return
+        try:
+            agent.interrupt("awaiting user approval (tool approval timed out)")
+        except Exception:
+            logger.warning(
+                "[api_server] failed to interrupt expired tool approval "
+                "(tool_call_id=%s)", event.get("toolCallId"), exc_info=True,
+            )
+
     def _make_run_custom_event_callback(
         self,
         emitter: TurnEventEmitter,
@@ -8595,6 +8575,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 return
             raw_call_id = kwargs.get("toolCallId") or kwargs.get("tool_call_id")
             if not isinstance(raw_call_id, str) or not raw_call_id:
+                if isinstance(kwargs.get("interaction"), dict) and kwargs["interaction"].get("kind") == "approval":
+                    raise ValueError("Approval interaction requires a tool-call ID")
                 return
             interaction = kwargs.get("interaction")
             answered = kwargs.get("answered", missing)
@@ -8622,6 +8604,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 except RuntimeError:
                     pass
                 return
+            if completed or answered is not missing or timed_out is not missing:
+                return
             if not isinstance(interaction, dict):
                 return
 
@@ -8633,7 +8617,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     _redact_response_extension_value(interaction),
                 )
             except RuntimeError:
-                pass
+                interaction_tool_call_ids.discard(raw_call_id)
+                raise
 
         return _callback
 
@@ -9484,6 +9469,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_name=str(tool_name or ""),
                 **event,
             )
+            self._interrupt_for_expired_tool_approval(
+                self._active_run_agents.get(run_id), event
+            )
 
         def _emit_tool_end(
             tool_call_id: str,
@@ -9505,7 +9493,6 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_call_id, tool_name, function_args, function_result
         ) -> None:
             projected_todos: Optional[List[Dict[str, Any]]] = None
-            approval_timed_out = False
             user_input_turn_ending = False
             normalized_tool_call_id = str(tool_call_id or "")
             normalized_tool_name = str(tool_name or "")
@@ -9566,50 +9553,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         loop.call_soon_threadsafe(_emit_user_input_completed, fields)
                     except RuntimeError:
                         pass
-            elif normalized_tool_name not in _CUSTOM_TOOL_INPUT_KEYS:
-                try:
-                    from tools.tool_approval import (
-                        consume_tool_approval_completion_reason,
-                        consume_tool_approval_decision,
-                        is_gated_tool,
-                    )
-
-                    if is_gated_tool(normalized_tool_name):
-                        completion: Dict[str, Any] = {}
-                        decision = consume_tool_approval_decision(
-                            tool_approval_surface_key,
-                            normalized_tool_call_id,
-                        )
-                        if decision is not None:
-                            completion["answered"] = decision
-                            completion["timedOut"] = False
-                        if (
-                            isinstance(parsed_result, dict)
-                            and parsed_result.get("status") == "approval_no_response"
-                        ):
-                            reason = consume_tool_approval_completion_reason(
-                                tool_approval_surface_key,
-                                normalized_tool_call_id,
-                            )
-                            if reason == "expired":
-                                completion["timedOut"] = True
-                                approval_timed_out = True
-                            completion["completed"] = True
-                        if completion:
-                            event_cb(
-                                "tool.progress",
-                                tool_name=normalized_tool_name,
-                                toolCallId=normalized_tool_call_id,
-                                **completion,
-                            )
-                except Exception:
-                    pass
-            if approval_timed_out or user_input_turn_ending:
-                interrupt_message = (
-                    "awaiting user approval (tool approval timed out)"
-                    if approval_timed_out
-                    else "awaiting user interaction (request_user_input)"
-                )
+            if user_input_turn_ending:
+                interrupt_message = "awaiting user interaction (request_user_input)"
                 agent = self._active_run_agents.get(run_id)
                 if agent is not None:
                     try:
