@@ -71,7 +71,7 @@ async def _submit(client, input_value, **options):
     "message",
     [
         "/review-report Report ID: report-123",
-        "Load /review-report Report ID: report-123",
+        " \t\n/review-report\nReport ID: report-123",
         [{"role": "user", "content": "/review-report Report ID: report-123"}],
     ],
 )
@@ -114,6 +114,48 @@ async def test_unrecognized_run_input_is_preserved(runtime, message):
         _, received = await _submit(client, message)
 
     assert received["user_message"] == message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_list", [False, True])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "I want to change the /review-report flow to also check completed issues.",
+        "Load /review-report Report ID: report-123",
+        "Some context first\n/review-report\nReport ID: report-123",
+        "Tell me about /review-report",
+        " \tI want to change /review-report\nKeep my wording intact.  ",
+        "> /review-report Report ID: report-123",
+        "```\n/review-report\n```",
+        "/unknown-skill then /review-report Report ID: report-123",
+        "/ /review-report",
+        "Explain /learn before I use it",
+    ],
+)
+async def test_run_preserves_skill_references(runtime, message, message_list):
+    app, _ = runtime
+    input_value = [{"role": "user", "content": message}] if message_list else message
+    async with TestClient(
+        TestServer(app), headers={"Authorization": "Bearer test-key"}
+    ) as client:
+        _, received = await _submit(client, input_value)
+
+    assert received["user_message"] == message
+
+
+@pytest.mark.asyncio
+async def test_run_keeps_later_skill_reference_in_leading_skill_instruction(runtime):
+    app, _ = runtime
+    instruction = "Compare these instructions with /review-report-custom"
+    async with TestClient(
+        TestServer(app), headers={"Authorization": "Bearer test-key"}
+    ) as client:
+        _, received = await _submit(client, f"/review-report {instruction}")
+
+    assert "REPORT PROCEDURE" in received["user_message"]
+    assert "CUSTOM PROCEDURE" not in received["user_message"]
+    assert instruction in received["user_message"]
 
 
 @pytest.mark.asyncio

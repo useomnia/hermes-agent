@@ -5346,27 +5346,18 @@ class APIServerAdapter(BasePlatformAdapter):
     def _maybe_expand_slash_command(
         self, user_message: Any, session_id: str
     ) -> Optional[str]:
+        """Expand only a leading command; inline skill references stay prose."""
         if not isinstance(user_message, str):
             return None
-        for command, instruction in self._slash_command_candidates(user_message):
-            expanded = self._expand_slash_command(command, instruction, session_id)
-            if expanded is not None:
-                return expanded
-        return None
-
-    @staticmethod
-    def _slash_command_candidates(text: str) -> list[tuple[str, str]]:
-        candidates = []
-        for match in re.finditer(r"(?<!\S)/(\S+)", text):
-            before = text[: match.start()]
-            after = text[match.end() :]
-            instruction = (
-                (before + after.lstrip()).strip()
-                if before.strip()
-                else after.strip()
-            )
-            candidates.append((match.group(1), instruction))
-        return candidates
+        text = user_message.lstrip()
+        if not text.startswith("/"):
+            return None
+        parts = text.split(None, 1)
+        command = parts[0][1:]
+        if not command or "/" in command:
+            return None
+        instruction = parts[1].strip() if len(parts) > 1 else ""
+        return self._expand_slash_command(command, instruction, session_id)
 
     def _expand_slash_command(
         self, command: str, user_instruction: str, session_id: str

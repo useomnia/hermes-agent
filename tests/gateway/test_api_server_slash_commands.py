@@ -1,7 +1,7 @@
-"""Unit tests for ``/skill-name`` slash-command expansion on /v1/chat/completions.
+"""Shared slash-command expansion for runs and Chat Completions.
 
 The OpenAI chat path honors slash commands like every other Hermes surface: a
-recognized ``/<command> [instruction]`` is expanded into its skill-invocation
+leading ``/<command> [instruction]`` is expanded into its skill-invocation
 payload before the agent runs, while anything else (a path, a question about
 ``/etc``, an unknown command) passes through untouched.  These tests exercise
 ``APIServerAdapter._maybe_expand_slash_command`` directly — it carries no
@@ -10,6 +10,8 @@ functions it imports lazily are patched at their source modules.
 """
 
 from unittest.mock import patch
+
+import pytest
 
 from gateway.platforms.api_server import APIServerAdapter
 
@@ -109,66 +111,58 @@ class TestSkillExpansion:
         resolve.assert_called_once_with("site_audit")
 
 
-class TestMidMessageExpansion:
-    def test_mid_sentence_skill_expands_with_surrounding_prose_as_instruction(self):
-        patches = _patch_skills(skill_key="/site-audit", skill_msg="X", bundle_key=None)
-        with patches[0], patches[1], patches[2], patches[3] as build:
-            out = _adapter()._maybe_expand_slash_command(
-                "please /site-audit the pricing page", SESSION_ID
-            )
-        assert out == "X"
-        build.assert_called_once_with("/site-audit", "please the pricing page", task_id=SESSION_ID)
-
-    def test_command_on_its_own_line_expands_and_keeps_other_lines(self):
-        patches = _patch_skills(skill_key="/site-audit", skill_msg="X", bundle_key=None)
-        with patches[0], patches[1], patches[2], patches[3] as build:
-            out = _adapter()._maybe_expand_slash_command(
-                "some context first\n/site-audit\non example.com", SESSION_ID
-            )
-        assert out == "X"
-        build.assert_called_once_with(
-            "/site-audit", "some context first\non example.com", task_id=SESSION_ID
+class TestCommandPosition:
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "I want to change the /site-audit flow to check more pages",
+            "please /site-audit the pricing page",
+            "some context first\n/site-audit\non example.com",
+            "audit my site /site-audit",
+            "> /site-audit example.com",
+            "```\n/site-audit example.com\n```",
+            "/ /site-audit example.com",
+            "/Users/pablo/notes /site-audit example.com",
+        ],
+    )
+    def test_reference_does_not_resolve_or_load_commands(self, message):
+        patches = _patch_skills(
+            skill_key="/site-audit",
+            skill_msg="SKILL PAYLOAD",
+            bundle_key="/site-audit",
+            bundle_result=("BUNDLE PAYLOAD", ["site-audit"], []),
         )
-
-    def test_command_at_end_of_message_uses_preceding_text_as_instruction(self):
-        patches = _patch_skills(skill_key="/site-audit", skill_msg="X", bundle_key=None)
-        with patches[0], patches[1], patches[2], patches[3] as build:
-            out = _adapter()._maybe_expand_slash_command("audit my site /site-audit", SESSION_ID)
-        assert out == "X"
-        build.assert_called_once_with("/site-audit", "audit my site", task_id=SESSION_ID)
-
-    def test_unconfirmed_mid_message_token_passes_through(self):
-        # Prose mentioning a path-like token (the /brand folder) must not expand.
-        patches = _patch_skills(skill_key=None, bundle_key=None)
-        with patches[0], patches[1], patches[2], patches[3]:
-            out = _adapter()._maybe_expand_slash_command(
-                "put the report in /brand please", SESSION_ID
-            )
+        with (
+            patches[0] as resolve_bundle,
+            patches[1] as build_bundle,
+            patches[2] as resolve_skill,
+            patches[3] as build_skill,
+        ):
+            out = _adapter()._maybe_expand_slash_command(message, SESSION_ID)
         assert out is None
+        resolve_bundle.assert_not_called()
+        resolve_skill.assert_not_called()
+        build_bundle.assert_not_called()
+        build_skill.assert_not_called()
 
-    def test_confirmed_candidate_wins_over_earlier_unconfirmed_tokens(self):
-        # An unconfirmed token (/brand) is skipped and the later confirmed one
-        # expands; the unconfirmed token stays in the instruction as raw text.
+    def test_unknown_leading_command_does_not_invoke_a_later_skill(self):
         with (
             patch("agent.skill_bundles.resolve_bundle_command_key", return_value=None),
             patch(
                 "agent.skill_commands.resolve_skill_command_key",
                 side_effect=[None, "/site-audit"],
-            ),
+            ) as resolve,
             patch("agent.skill_commands.build_skill_invocation_message", return_value="X") as build,
         ):
             out = _adapter()._maybe_expand_slash_command(
-                "read /brand first then /site-audit example.com", SESSION_ID
+                "/unknown first then /site-audit example.com", SESSION_ID
             )
-        assert out == "X"
-        build.assert_called_once_with(
-            "/site-audit", "read /brand first then example.com", task_id=SESSION_ID
-        )
+        assert out is None
+        resolve.assert_called_once_with("unknown")
+        build.assert_not_called()
 
     def test_first_of_two_confirmed_commands_wins(self):
-        # One command per message: the FIRST confirmed one runs (matching the
-        # composer, which refuses a second chip, and slash-command convention);
-        # the later command survives only as raw text in the instruction.
+        # Later skill references remain part of the leading skill's instruction.
         with (
             patch("agent.skill_bundles.resolve_bundle_command_key", return_value=None),
             patch("agent.skill_commands.resolve_skill_command_key", side_effect=["/site-audit"]) as resolve,
@@ -183,13 +177,13 @@ class TestMidMessageExpansion:
             "/site-audit", "example.com then /create-pdf it", task_id=SESSION_ID
         )
 
-    def test_mid_message_learn_is_rewritten(self):
+    def test_mid_message_learn_is_not_rewritten(self):
         with patch("agent.learn_prompt.build_learn_prompt", return_value="LEARN PROMPT") as build:
             out = _adapter()._maybe_expand_slash_command(
                 "read the docs then /learn how deploys work", SESSION_ID
             )
-        assert out == "LEARN PROMPT"
-        build.assert_called_once_with("read the docs then how deploys work")
+        assert out is None
+        build.assert_not_called()
 
     def test_slash_inside_a_word_is_not_a_candidate(self):
         # "w/e" and URLs contain slashes but no whitespace-delimited "/token".
