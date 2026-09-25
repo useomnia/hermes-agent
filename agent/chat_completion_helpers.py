@@ -1047,7 +1047,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
+    """Build the request using the same catalog ceiling as truncation recovery."""
+    from agent.output_budget import apply_output_budget
+
+    return apply_output_budget(agent, _build_api_kwargs_for_mode(agent, api_messages))
+
+
+def _build_api_kwargs_for_mode(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
+    from agent.output_budget import model_output_limit
     tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
@@ -1136,6 +1144,9 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
                     getattr(agent, "log_prefix", ""), exc,
                 )
 
+        ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
+        if ephemeral_out is not None:
+            agent._ephemeral_max_output_tokens = None
         return _ct.build_kwargs(
             model=agent.model,
             messages=_msgs_for_codex,
@@ -1143,7 +1154,8 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             reasoning_config=agent.reasoning_config,
             session_id=getattr(agent, "session_id", None),
             base_url=agent.base_url,
-            max_tokens=agent.max_tokens,
+            max_tokens=ephemeral_out if ephemeral_out is not None else (
+                agent.max_tokens if agent.max_tokens is not None else model_output_limit(agent)),
             timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
             is_github_responses=is_github_responses,
@@ -1251,7 +1263,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             tools=tools_for_api,
             base_url=agent.base_url,
             timeout=agent._resolved_api_call_timeout(),
-            max_tokens=agent.max_tokens,
+            max_tokens=agent.max_tokens if agent.max_tokens is not None else model_output_limit(agent),
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
             reasoning_config=agent.reasoning_config,
@@ -1285,7 +1297,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         tools=tools_for_api,
         base_url=agent.base_url,
         timeout=agent._resolved_api_call_timeout(),
-        max_tokens=agent.max_tokens,
+        max_tokens=agent.max_tokens if agent.max_tokens is not None else model_output_limit(agent),
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
         reasoning_config=agent.reasoning_config,

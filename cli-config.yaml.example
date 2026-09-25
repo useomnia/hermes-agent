@@ -66,10 +66,10 @@ model:
   #
   # max_tokens: OUTPUT cap — maximum tokens the model may generate per response.
   #   Unrelated to how long your conversation history can be.
-  #   The OpenAI-standard name "max_tokens" is a misnomer; Anthropic's native
-  #   API has since renamed it "max_output_tokens" for clarity.
-  #   Leave unset to use the model's native output ceiling (recommended).
-  #   Set only if you want to deliberately limit individual response length.
+  #   OpenAI-compatible requests use the active route's catalog output ceiling
+  #   when unset; unavailable metadata leaves the provider default unchanged.
+  #   Explicit lower limits are preserved, including during truncation retries.
+  #   Native adapters retain their protocol-specific defaults.
   #
 # max_tokens: 8192
 
