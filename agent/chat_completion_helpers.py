@@ -1050,7 +1050,8 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the request using the same catalog ceiling as truncation recovery."""
     from agent.output_budget import apply_output_budget
 
-    return apply_output_budget(agent, _build_api_kwargs_for_mode(agent, api_messages))
+    recovery_cap = getattr(agent, "_ephemeral_max_output_tokens", None)
+    return apply_output_budget(agent, _build_api_kwargs_for_mode(agent, api_messages), recovery_cap=recovery_cap)
 
 
 def _build_api_kwargs_for_mode(agent, api_messages: list) -> dict:

@@ -68,7 +68,8 @@ model:
   #   Unrelated to how long your conversation history can be.
   #   OpenAI-compatible requests use the active route's catalog output ceiling
   #   when unset; unavailable metadata leaves the provider default unchanged.
-  #   Explicit lower limits are preserved, including during truncation retries.
+  #   An explicit cap sets the first request's budget. Truncation retries may
+  #   double it within the known model ceiling and remaining context.
   #   Native adapters retain their protocol-specific defaults.
   #
 # max_tokens: 8192

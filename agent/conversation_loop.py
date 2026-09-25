@@ -2886,8 +2886,8 @@ def run_conversation(
                                         f"retrying API call "
                                         f"({truncated_tool_call_retries}/4)..."
                                     )
-                                # Grow within a published ceiling; preserve caller
-                                # budgets and an unknown provider-owned default.
+                                # Double the failed request within a published
+                                # ceiling; keep an unknown provider default unchanged.
                                 from agent.output_budget import boosted_output_cap
                                 agent._ephemeral_max_output_tokens = boosted_output_cap(
                                     agent, agent._requested_output_cap_from_api_kwargs(api_kwargs),
