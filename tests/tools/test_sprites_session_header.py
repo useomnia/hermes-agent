@@ -141,3 +141,18 @@ def test_hooks_should_keep_the_service_token(hook_requests):
     _in_session(SESSION, lambda: file_tools._handle_fetch_file({"path": "~/report.csv"}))
 
     assert hook_requests[0]["x-omnio-service-token"] == "svc-token"
+
+
+def test_exec_should_name_the_calling_session(toolbox_requests):
+    # Exec runs on a worker thread; the session must survive the thread hop.
+    env = _environment()
+    env.cwd = "/home"
+
+    def run():
+        handle = env._run_bash("true", timeout=5)
+        handle._done.wait(5)
+
+    _in_session(SESSION, run)
+
+    exec_headers = [headers for headers in toolbox_requests if "x-request-id" in headers]
+    assert exec_headers[0]["x-hermes-session-id"] == SESSION
