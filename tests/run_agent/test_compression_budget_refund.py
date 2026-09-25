@@ -23,7 +23,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.conversation_loop import _should_rearm_compression_budget
 from run_agent import AIAgent
 
 
@@ -34,6 +33,8 @@ from run_agent import AIAgent
 
 class TestRearmDecision:
     def test_provider_confirmed_recovery_rearms(self):
+        from agent.conversation_loop import _should_rearm_compression_budget
+
         assert _should_rearm_compression_budget(
             2,
             completed_compaction_pending=True,
@@ -55,12 +56,31 @@ class TestRearmDecision:
     def test_unverified_or_pressured_response_keeps_budget_burned(
         self, attempts, pending, prompt_tokens, threshold_tokens
     ):
+        from agent.conversation_loop import _should_rearm_compression_budget
+
         assert not _should_rearm_compression_budget(
             attempts,
             completed_compaction_pending=pending,
             prompt_tokens=prompt_tokens,
             threshold_tokens=threshold_tokens,
         )
+
+    @pytest.mark.parametrize(
+        ("pending", "prompt_tokens", "expected"),
+        [(True, 7_999, True), (False, 7_999, False), (True, 0, False), (True, 10_000, False)],
+    )
+    def test_fallback_reset_still_requires_verified_recovery_to_clear_block(
+        self, pending, prompt_tokens, expected
+    ):
+        from agent.conversation_loop import _should_rearm_compression_budget
+
+        assert _should_rearm_compression_budget(
+            0,
+            completed_compaction_pending=pending,
+            prompt_tokens=prompt_tokens,
+            threshold_tokens=10_000,
+            preflight_blocked=True,
+        ) is expected
 
 
 # ---------------------------------------------------------------------------

@@ -122,6 +122,7 @@ def _should_rearm_compression_budget(
     completed_compaction_pending: bool,
     prompt_tokens: int,
     threshold_tokens: int,
+    preflight_blocked: bool = False,
 ) -> bool:
     """Return True after a provider proves a completed compaction worked.
 
@@ -129,9 +130,11 @@ def _should_rearm_compression_budget(
     below the threshold while the provider-visible prompt remains too large.
     Require the completed-compaction latch plus a positive, normalized prompt
     count below the threshold from the next successful provider response.
+    A fallback may already have reset the counter while leaving the preflight
+    block armed; that block needs the same verified recovery before clearing.
     """
     return bool(
-        compression_attempts
+        (compression_attempts or preflight_blocked)
         and completed_compaction_pending
         and threshold_tokens > 0
         and 0 < prompt_tokens < threshold_tokens
@@ -3076,6 +3079,7 @@ def run_conversation(
                         completed_compaction_pending=_completed_compaction_pending,
                         prompt_tokens=prompt_tokens,
                         threshold_tokens=_compression_threshold,
+                        preflight_blocked=_preflight_compression_blocked,
                     ):
                         logger.info(
                             "Compression budget rearmed after provider-confirmed "
