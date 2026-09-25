@@ -1200,6 +1200,8 @@ stt:
 code_execution:
   timeout: 300         # Max seconds per script before kill (default: 300 = 5 min)
   max_tool_calls: 50   # Max RPC tool calls per execution (default: 50)
+  rpc_transport: file # Remote RPC: file (default), auto (capability detection), or strict stream
+  rpc_concurrency: 8  # Stream only: bounded parallel MCP reads (1-32); other tools stay serial
 
 # =============================================================================
 # Subagent Delegation

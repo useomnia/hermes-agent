@@ -1441,10 +1441,22 @@ def handle_function_call(
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 
+            from tools.interrupt import current_execution_scope
+
+            execution = current_execution_scope()
+
+            def _admitted_dispatch(next_args: Dict[str, Any]) -> Any:
+                if execution is not None and not execution.admit():
+                    return json.dumps({
+                        "status": "interrupted",
+                        "error": "Script execution ended before this tool could run.",
+                    })
+                return _dispatch(next_args)
+
             result = run_tool_execution_middleware(
                 function_name,
                 function_args,
-                _dispatch,
+                _admitted_dispatch,
                 original_args=_tool_original_args,
                 task_id=task_id or "",
                 session_id=session_id or "",

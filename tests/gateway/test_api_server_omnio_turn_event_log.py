@@ -1950,13 +1950,11 @@ async def test_gated_tool_progress_emits_correlated_interaction_extensions() -> 
                     "approval": {"detail": f"nested {secret}"},
                 },
             })
-            callbacks["tool_progress_callback"](
-                "tool.progress",
-                "mcp__crm__write",
-                None,
-                None,
-                interaction={"kind": "approval"},
-            )
+            with pytest.raises(ValueError, match="tool-call ID"):
+                callbacks["tool_progress_callback"](
+                    "tool.progress", "mcp__crm__write", None, None,
+                    interaction={"kind": "approval"},
+                )
             callbacks["tool_progress_callback"](
                 "tool.progress",
                 "mcp__crm__write",
@@ -1964,6 +1962,10 @@ async def test_gated_tool_progress_emits_correlated_interaction_extensions() -> 
                 None,
                 toolCallId="missing-interaction",
             )
+            registered["callback"]({
+                "tool": "mcp__crm__write", "toolCallId": "call-gated",
+                "completed": True, "interaction": {'answered': 'once', 'timed_out': False},
+            })
             callbacks["tool_complete_callback"](
                 "call-gated",
                 "mcp__crm__write",
@@ -1983,6 +1985,10 @@ async def test_gated_tool_progress_emits_correlated_interaction_extensions() -> 
                     "question": "Approve another write?",
                     "options": ["once", "deny"],
                 },
+            })
+            registered["callback"]({
+                "tool": "mcp__crm__write", "toolCallId": "call-timeout",
+                "completed": True, "interaction": {'timed_out': True},
             })
             callbacks["tool_complete_callback"](
                 "call-timeout",
@@ -2024,15 +2030,6 @@ async def test_gated_tool_progress_emits_correlated_interaction_extensions() -> 
         patch(
             "tools.tool_approval.unregister_tool_approval_notify",
             unregister_notify,
-        ),
-        patch("tools.tool_approval.is_gated_tool", return_value=True),
-        patch(
-            "tools.tool_approval.consume_tool_approval_decision",
-            side_effect=["once", None],
-        ),
-        patch(
-            "tools.tool_approval.consume_tool_approval_completion_reason",
-            return_value="expired",
         ),
     ):
         started, events = await _run_without_http_server(
@@ -2536,8 +2533,10 @@ async def test_multiplex_profiles_isolate_tool_approval_session_grants(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("nested", [False, True])
 async def test_tool_approval_timeout_interrupts_the_turn_before_another_iteration(
     monkeypatch: pytest.MonkeyPatch,
+    nested: bool,
 ) -> None:
     adapter = _make_adapter()
     session_id = "conversation-approval-timeout"
@@ -2553,18 +2552,17 @@ async def test_tool_approval_timeout_interrupts_the_turn_before_another_iteratio
 
         def run(**_kwargs: Any) -> Dict[str, Any]:
             nonlocal continued_after_timeout
-            callbacks["tool_start_callback"]("call-timeout", tool_name, {})
+            if not nested:
+                callbacks["tool_start_callback"]("call-timeout", tool_name, {})
             guard_result = tool_approval.maybe_require_tool_approval(
                 tool_name,
                 "call-timeout",
                 {},
             )
-            callbacks["tool_complete_callback"](
-                "call-timeout",
-                tool_name,
-                {},
-                guard_result,
-            )
+            if not nested:
+                callbacks["tool_complete_callback"](
+                    "call-timeout", tool_name, {}, guard_result,
+                )
             continued_after_timeout = not interrupted.is_set()
             return {
                 "final_response": "",
@@ -2602,6 +2600,13 @@ async def test_tool_approval_timeout_interrupts_the_turn_before_another_iteratio
             and event.get("tool_call_id") == "call-timeout"
         )
         assert completed["timed_out"] is True
+        opened = [event for event in events if event["type"] == "response.omnio.interaction"]
+        assert len(opened) == 1
+        assert opened[0]["tool_call_id"] == completed["tool_call_id"]
+        assert opened[0]["sequence_number"] < completed["sequence_number"]
+        assert sum(event["type"] == "response.omnio.interaction_completed" for event in events) == 1
+        if nested:
+            assert not any(event.get("item", {}).get("call_id") == "call-timeout" for event in events)
         assert events[-1]["type"] == "response.incomplete"
     finally:
         tool_approval.clear_session(session_id)
@@ -2748,6 +2753,10 @@ async def test_cancelled_gated_tool_closes_interaction_without_timeout() -> None
                     "options": ["once", "deny"],
                 },
             })
+            registered["callback"]({
+                "tool": "mcp__crm__write", "toolCallId": "call-cancelled",
+                "completed": True, "interaction": {"timed_out": False},
+            })
             callbacks["tool_complete_callback"](
                 "call-cancelled",
                 "mcp__crm__write",
@@ -2765,15 +2774,6 @@ async def test_cancelled_gated_tool_closes_interaction_without_timeout() -> None
             side_effect=register_notify,
         ),
         patch("tools.tool_approval.unregister_tool_approval_notify"),
-        patch("tools.tool_approval.is_gated_tool", return_value=True),
-        patch(
-            "tools.tool_approval.consume_tool_approval_decision",
-            return_value=None,
-        ),
-        patch(
-            "tools.tool_approval.consume_tool_approval_completion_reason",
-            return_value="cancelled",
-        ),
     ):
         _, events = await _run_without_http_server(
             adapter,
@@ -2793,7 +2793,7 @@ async def test_cancelled_gated_tool_closes_interaction_without_timeout() -> None
         and event.get("tool_call_id") == "call-cancelled"
     )
     assert "choice" not in completed
-    assert "timed_out" not in completed
+    assert completed["timed_out"] is False
     call_done = next(
         event
         for event in events

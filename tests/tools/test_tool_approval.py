@@ -92,6 +92,8 @@ def _resolving_notify(scope):
     unblocks in-thread — exercises the full block→resolve path without a thread."""
 
     def cb(event):
+        if event.get("completed"):
+            return
         resolve_tool_approval(SESSION, event["interaction"]["approval"]["tool"], scope)
 
     return cb
@@ -217,15 +219,15 @@ class TestMaybeRequireToolApproval:
 
     def test_should_fail_closed_on_timeout(self, monkeypatch):
         monkeypatch.setenv("OMNIO_TOOL_APPROVAL_TIMEOUT", "0")
-        register_tool_approval_notify(SESSION, lambda event: None)  # never resolves
+        events = []
+        register_tool_approval_notify(SESSION, events.append)  # never resolves
         result = maybe_require_tool_approval(GATED, "call-1")
         assert result is not None
         # A genuine timeout with a real interactive surface IS turn-ending.
         assert json.loads(result)["status"] == "approval_no_response"
         assert isinstance(result, ToolApprovalDenial)
-        assert (
-            consume_tool_approval_completion_reason(SESSION, "call-1") == "expired"
-        )
+        assert events[-1]["interaction"]["timed_out"] is True
+        assert consume_tool_approval_completion_reason(SESSION, "call-1") is None
 
     def test_notify_raising_is_a_plumbing_error_not_a_user_timeout(self):
         # The notify callback raising means the card was never actually shown
@@ -244,7 +246,7 @@ class TestMaybeRequireToolApproval:
         captured = {}
         register_tool_approval_notify(
             SESSION,
-            lambda event: (
+            lambda event: None if event.get("completed") else (
                 captured.update(event),
                 resolve_tool_approval(SESSION, GATED, "once"),
             ),
@@ -267,6 +269,8 @@ class TestCreditApproval:
         captured = {}
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.update(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once")
 
@@ -291,6 +295,8 @@ class TestCreditApproval:
         captured = {}
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.update(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once")
 
@@ -320,6 +326,8 @@ class TestCreditApproval:
         captured = {}
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.update(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once")
 
@@ -355,6 +363,8 @@ class TestCreditApproval:
         captured = {}
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.update(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once")
 
@@ -386,6 +396,8 @@ class TestCreditApproval:
         )
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.update(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once")
 
@@ -417,6 +429,8 @@ class TestCreditApproval:
         prompts = []
 
         def notify(event):
+            if event.get("completed"):
+                return
             prompts.append(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once")
 
@@ -426,11 +440,15 @@ class TestCreditApproval:
 
     @pytest.mark.parametrize("scope", ["session", "always"])
     def test_should_treat_standing_scope_resolutions_as_once(self, scope):
-        notify = _resolving_notify(scope)
-        notify_token = register_tool_approval_notify(SESSION, notify)
+        events = []
+        resolve = _resolving_notify(scope)
+        notify_token = register_tool_approval_notify(
+            SESSION, lambda event: (events.append(event), resolve(event))
+        )
         assert maybe_require_tool_approval(CREDIT_GATED, "call-credit") is None
 
-        assert consume_tool_approval_decision(SESSION, "call-credit") == "once"
+        assert events[-1]["interaction"]["answered"] == "once"
+        assert consume_tool_approval_decision(SESSION, "call-credit") is None
         assert is_tool_approved(SESSION, CREDIT_GATED) is False
         assert is_always_approved(CREDIT_GATED) is False
 
@@ -490,6 +508,8 @@ class TestCreditApprovalDispatch:
             return json.dumps({"success": True})
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.update(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once", "call-credit")
 
@@ -1002,6 +1022,8 @@ class TestConcurrentApproval:
         captured: list[str] = []
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.append(event["interaction"]["approval"]["tool_call_id"])
             if len(captured) == 2:
                 both_blocked.set()
@@ -1042,7 +1064,8 @@ class TestInterruptRelease:
     def test_interrupt_releases_a_blocked_wait_and_denies(self):
         result: dict[str, object] = {}
         blocked = threading.Event()
-        register_tool_approval_notify(SESSION, lambda event: blocked.set())
+        events = []
+        register_tool_approval_notify(SESSION, lambda event: (events.append(event), blocked.set()))
 
         def worker():
             set_current_session_key(
@@ -1064,10 +1087,9 @@ class TestInterruptRelease:
             assert result["choice"] is not None, (
                 "interrupted wait fails closed (denial)"
             )
-            assert (
-                consume_tool_approval_completion_reason(SESSION, "call-1")
-                == "cancelled"
-            )
+            assert events[-1]["completed"] is True
+            assert events[-1]["interaction"]["timed_out"] is False
+            assert consume_tool_approval_completion_reason(SESSION, "call-1") is None
         finally:
             set_interrupt(False, thread.ident)
 

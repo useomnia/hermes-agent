@@ -398,30 +398,22 @@ def finalize_turn(
     else:
         logger.info(_diag_msg, *_diag_args)
 
-    # File-mutation verifier footer.
-    # If one or more ``write_file`` / ``patch`` calls failed during this
-    # turn and were never superseded by a successful write to the same
-    # path, append an advisory footer to the assistant response.  This
-    # catches the specific case — reported by Ben Eng (#15524-adjacent)
-    # — where a model issues a batch of parallel patches, half of them
-    # fail with "Could not find old_string", and the model summarises
-    # the turn claiming every file was edited.  The user then has to
-    # manually run ``git status`` to catch the lie.  With this footer
-    # the truth is surfaced on every turn, so over-claiming is
-    # structurally impossible past the model.
-    #
-    # Gate: only applied when a real text response exists for this
-    # turn and the user didn't interrupt.  Empty/interrupted turns
-    # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted:
-        try:
-            _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
-            if _failed and agent._file_mutation_verifier_enabled():
-                footer = agent._format_file_mutation_failure_footer(_failed)
-                if footer:
-                    final_response = final_response.rstrip() + "\n\n" + footer
-        except Exception as _ver_err:
-            logger.debug("file-mutation verifier footer failed: %s", _ver_err)
+    # Display settings suppress the advisory, never the diagnostic evidence.
+    # Log unresolved attempts even when an empty/interrupted turn has no footer.
+    try:
+        _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
+        for path, info in _failed.items():
+            logger.warning(
+                "Unresolved file mutation: session=%s tool=%s path=%r error=%r",
+                agent.session_id or "none", info.get("tool") or "patch",
+                path, info.get("error_preview") or "",
+            )
+        if _failed and final_response and not interrupted and agent._file_mutation_verifier_enabled():
+            footer = agent._format_file_mutation_failure_footer(_failed)
+            if footer:
+                final_response = final_response.rstrip() + "\n\n" + footer
+    except Exception as _ver_err:
+        logger.debug("file-mutation verifier reporting failed: %s", _ver_err)
 
     # Turn-completion explainer.
     # When a turn ends abnormally after substantive work — empty content

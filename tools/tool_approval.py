@@ -307,6 +307,8 @@ def await_tool_approval(
     function_name: str,
     interaction_event: dict,
     tool_call_id: str = "",
+    *,
+    publish_completion: bool = False,
 ) -> Optional[str]:
     """Surface the approval card and block until the user resolves it.
 
@@ -318,12 +320,23 @@ def await_tool_approval(
     fail closed (not execute the write) for both ``None`` and ``_NO_SURFACE`` —
     the two are kept distinct only so it can pick the right (turn-ending vs not)
     denial status.
+
+    The shared gate requests ``publish_completion`` so the same surface that
+    published the card also receives its terminal event. Low-level callers can
+    retain ownership of completion and consume the decision/reason themselves.
     """
+    notified_surface: Callable[[dict], None] | None = None
+
     def notify(cb: Callable[[dict], None] | None) -> None:
+        nonlocal notified_surface
         if cb is None:
             raise RuntimeError("tool-approval surface has no notify callback")
         cb(interaction_event)
+        notified_surface = cb
 
+    from tools.interrupt import current_execution_scope
+
+    execution = current_execution_scope()
     try:
         result, reason = _wait_registry.wait(
             session_key,
@@ -332,6 +345,7 @@ def await_tool_approval(
             "waiting for tool approval",
             payload=function_name,
             on_parked=notify,
+            cancelled=execution.is_cancelled if execution is not None else None,
         )
     except Exception:
         # The notify callback raising is a plumbing malfunction (e.g. the chat
@@ -344,6 +358,10 @@ def await_tool_approval(
         return _NO_SURFACE
     if reason == "no_surface":
         return _NO_SURFACE
+    if publish_completion:
+        _complete_tool_approval(
+            session_key, function_name, tool_call_id, notified_surface,
+        )
     return result
 
 
@@ -679,6 +697,11 @@ def maybe_require_tool_approval(
     """
     if not is_gated_tool(function_name):
         return None
+    from tools.interrupt import current_execution_scope
+
+    execution = current_execution_scope()
+    if execution is not None and not tool_call_id:
+        return _denial_result(None, status="approval_error")
     credits_descriptor = mcp_tool_credits_meta(function_name)
     grant_session_key = get_current_tool_approval_session_key()
     surface_key = get_current_tool_approval_surface_key()
@@ -725,7 +748,8 @@ def maybe_require_tool_approval(
     }
 
     choice = await_tool_approval(
-        surface_key, function_name, interaction_event, tool_call_id or ""
+        surface_key, function_name, interaction_event, tool_call_id or "",
+        publish_completion=True,
     )
     if choice in ("session", "always"):
         # resolve_tool_approval already recorded the grant; proceed.
@@ -742,3 +766,29 @@ def maybe_require_tool_approval(
     # An unresolved wait with a real surface — timeout or interrupt (choice is
     # None) — fails closed and ends the turn via "approval_no_response".
     return _denial_result(None)
+
+
+def _complete_tool_approval(
+    surface_key: str,
+    function_name: str,
+    tool_call_id: str,
+    notify: Callable[[dict], None] | None,
+) -> None:
+    """Close the approval itself, including calls without a top-level tool item."""
+    decision = consume_tool_approval_decision(surface_key, tool_call_id)
+    reason = consume_tool_approval_completion_reason(surface_key, tool_call_id)
+    if notify is None:
+        return
+    interaction: dict[str, object] = {"timed_out": reason == "expired"}
+    if decision is not None:
+        interaction["answered"] = decision
+    try:
+        notify({
+            "tool": function_name,
+            "toolCallId": tool_call_id,
+            "status": "completed",
+            "completed": True,
+            "interaction": interaction,
+        })
+    except Exception:
+        logger.warning("tool-approval completion notify failed", exc_info=True)

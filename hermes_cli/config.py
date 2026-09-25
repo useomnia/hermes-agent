@@ -3041,6 +3041,9 @@ DEFAULT_CONFIG = {
 
     # execute_code settings — controls the tool used for programmatic tool calls.
     "code_execution": {
+        # Stream RPC is an explicit opt-in for compatible paired Toolboxes.
+        "rpc_transport": "file",
+        "rpc_concurrency": 8,
         # Execution mode:
         #   project (default) — scripts run in the session's working directory
         #     with the active virtualenv/conda env's python, so project deps
