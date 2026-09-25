@@ -381,6 +381,19 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def current_session_id() -> str | None:
+    """The session bound to *this* context, or ``None``.
+
+    Unlike :func:`get_session_env`, this never falls back to ``os.environ``:
+    that mirror is process-global and names whichever concurrent session ran
+    last, so a caller that routes work by session must not inherit it.
+    """
+    value = _SESSION_ID.get()
+    if value is _UNSET or not isinstance(value, str) or not value:
+        return None
+    return value
+
+
 def declare_stateless_channel() -> None:
     """Declare that this session cannot receive an async background completion.
 
