@@ -2482,8 +2482,15 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
             "print only what you concluded."
         )
         parallel_read_guidance = (
-            " For several independent read-only MCP calls, emit normal tool calls "
-            "so the runtime can parallelize them."
+            " For a small set of independent reads whose full results you need, "
+            "emit normal tool calls together. For a batch you will process inside "
+            "a script, use concurrent.futures.ThreadPoolExecutor(max_workers=8) "
+            "for independent read-only MCP calls. A plain loop is sequential. "
+            "The runtime enforces eligibility and concurrency limits; unsupported "
+            "tools or backends may serialize calls. Keep dependent reads in order "
+            "and keep writes, approval-gated actions, and tools with unknown side "
+            "effects out of the pool. Reduce concurrency if throttled and respect "
+            "the service's retry guidance."
         )
 
     # Build example import list from enabled tools
@@ -2556,7 +2563,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     description = (
         "Run a Python script that can call your tools programmatically. "
         "Use this for programmatic processing, control flow, or context reduction "
-        "across tool calls — not as a latency optimization."
+        "across tool calls."
         f"{parallel_read_guidance} "
         "Use this when you need 3+ tool calls with processing logic between them, "
         "need to filter/reduce large tool outputs before they enter your context, "
