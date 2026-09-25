@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 from hermes_constants import MAX_TODO_ITEMS
 
 
-TURN_EVENT_LOG_API_VERSION = 3
+TURN_EVENT_LOG_API_VERSION = 4
 DEFAULT_RUN_LOG_CAP_BYTES = 8 * 1024 * 1024
 DEFAULT_TERMINAL_RETENTION_SECONDS = 5 * 60
 DEFAULT_TOMBSTONE_LIMIT = 1000
@@ -880,18 +880,22 @@ class TurnEventEmitter:
             started_at=started_at,
         )
 
-    def semantic_tool_done(self, source_call_id: str) -> None:
+    def semantic_tool_done(
+        self, source_call_id: str, *, success: Optional[bool] = None
+    ) -> None:
         state = self._semantic_tool_calls.pop(source_call_id, None)
         if state is None:
             return
-        self.omnio_event(
-            "response.omnio.tool_progress",
-            source_call_id=source_call_id,
-            tool=state["tool"],
-            status="completed",
-            started_at=state["started_at"],
-            completed_at=self.clock(),
-        )
+        fields: Dict[str, Any] = {
+            "source_call_id": source_call_id,
+            "tool": state["tool"],
+            "status": "completed",
+            "started_at": state["started_at"],
+            "completed_at": self.clock(),
+        }
+        if isinstance(success, bool):
+            fields["success"] = success
+        self.omnio_event("response.omnio.tool_progress", **fields)
 
     def task_list(self, todos: list) -> None:
         """Emit the bounded canonical todo snapshot without exposing its result."""
