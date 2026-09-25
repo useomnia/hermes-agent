@@ -2915,18 +2915,13 @@ def run_conversation(
                                         f"retrying API call "
                                         f"({truncated_tool_call_retries}/4)..."
                                     )
-                                # Boost max_tokens on each retry so the model has
-                                # more room to complete the tool-call JSON. A
-                                # network stall doesn't need a bigger budget, but
-                                # a genuine output-cap truncation does, and the
-                                # boost is harmless for the stall case.
-                                _tc_boost_base = agent.max_tokens if agent.max_tokens else 4096
-                                _tc_boost = _tc_boost_base * (2 ** truncated_tool_call_retries)
-                                _tc_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
-                                if _tc_requested_cap is not None:
-                                    _tc_boost = max(_tc_boost, _tc_requested_cap)
-                                _tc_boost_cap = max(32768, _tc_requested_cap or 0)
-                                agent._ephemeral_max_output_tokens = min(_tc_boost, _tc_boost_cap)
+                                # Double the failed request within a published
+                                # ceiling; keep an unknown provider default unchanged.
+                                from agent.output_budget import boosted_output_cap
+                                agent._ephemeral_max_output_tokens = boosted_output_cap(
+                                    agent, agent._requested_output_cap_from_api_kwargs(api_kwargs),
+                                    truncated_tool_call_retries,
+                                )
                                 # Don't append the broken response to messages;
                                 # just re-run the same API call from the current
                                 # message state, giving the model another chance.
@@ -5408,20 +5403,12 @@ def run_conversation(
             continue
 
         if _retry.restart_with_length_continuation:
-            # Progressively boost the output token budget on each retry.
-            # Retry 1 → 2× base, retry 2 → 4× base, retry 3 → 8× base,
-            # retry 4 → 16× base, then cap at 32 768.
-            # Applies to all providers via _ephemeral_max_output_tokens.
-            # If the original request already used a larger provider/model
-            # default budget, keep that floor so continuation retries do
-            # not accidentally downshift to a much smaller cap.
-            _boost_base = agent.max_tokens if agent.max_tokens else 4096
-            _boost = _boost_base * (2 ** length_continue_retries)
-            _requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
-            if _requested_cap is not None:
-                _boost = max(_boost, _requested_cap)
-            _boost_cap = max(32768, _requested_cap or 0)
-            agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
+            # Use the same catalog/caller budget policy as the initial request.
+            from agent.output_budget import boosted_output_cap
+            agent._ephemeral_max_output_tokens = boosted_output_cap(
+                agent, agent._requested_output_cap_from_api_kwargs(api_kwargs),
+                length_continue_retries,
+            )
             continue
 
         # Guard: if all retries exhausted without a successful response
