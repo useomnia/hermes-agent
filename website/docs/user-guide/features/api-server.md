@@ -419,13 +419,15 @@ can correlate runs with their own conversation IDs.
 Runs support the same slash-command expansion as Chat Completions. Send
 `{"input": "/skill-name review this report"}` to load the installed skill's
 instructions before the agent starts, without relying on the model to request
-them. Commands can also appear within prose, such as
-`{"input": "Please load /skill-name and review this report"}`.
+them. The command must be the first token of the message; leading whitespace
+is allowed. Inline references such as
+`{"input": "I want to change the /skill-name workflow"}` pass through unchanged.
 
-Hermes expands the first command it can load, preserving the surrounding text
-as the instruction. Skill bundles and `/learn` use the same expansion rules.
+Hermes expands the leading command, preserving the trailing text as the
+instruction. Skill bundles and `/learn` use the same expansion rules.
 Unknown commands, commands that cannot be loaded, and non-string message
-content pass through unchanged. Expansion applies to the current user message;
+content pass through unchanged; Hermes does not scan for a later command.
+Expansion applies to the current user message;
 conversation history is preserved. Replaying a `turn_id` returns the existing
 run without loading the skill again. Clients can check
 `features.run_slash_commands` in `/v1/capabilities` before using this behavior;
