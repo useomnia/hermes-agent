@@ -269,3 +269,44 @@ class TestExecuteCodeAccountsInnerCalls(unittest.TestCase):
         )
         self.assertNotEqual(result["status"], "success")
         self.assertEqual(self._recorded(), {"terminal": 1})
+
+
+def test_cancelled_stream_accounts_an_inflight_call_before_its_result(monkeypatch, tmp_path):
+    """An external operation already started must survive the script's early flush."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    import model_tools
+    from tools.code_execution_tool import _NestedToolDispatcher
+    from tools.interrupt import ToolExecutionScope
+
+    started = threading.Event()
+    release = threading.Event()
+    scope = ToolExecutionScope(threading.Event())
+    calls, counter = [], [0]
+    db = SessionDB(db_path=tmp_path / "usage.db")
+
+    def operation(*args, **kwargs):
+        started.set()
+        assert release.wait(10)
+        return '{}'
+
+    monkeypatch.setattr(model_tools, "handle_function_call", operation)
+    monkeypatch.setattr("hermes_state.SessionDB", lambda: db)
+    dispatcher = _NestedToolDispatcher("task", calls, counter, 5, frozenset({"web_search"}), scope)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(dispatcher.dispatch, "web_search", {})
+            try:
+                assert started.wait(5)
+                scope.cancel()
+                with _active_session(SESSION_ID):
+                    _flush_inner_tool_usage(calls)
+                assert db.read_tool_usage(SESSION_ID) == {"web_search": 1}
+                assert json.loads(dispatcher.dispatch("web_search", {}))["status"] == "interrupted"
+                assert counter[0] == 1
+            finally:
+                release.set()
+                future.result(timeout=5)
+        assert db.read_tool_usage(SESSION_ID) == {"web_search": 1}
+    finally:
+        db.close()

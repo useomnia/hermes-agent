@@ -436,6 +436,34 @@ class SpritesEnvironment(BaseEnvironment):
         """Send a file operation to the toolbox Sprite."""
         return self._request_json("/files", payload)
 
+    def open_code_rpc(self, token: str):
+        """Open one authenticated channel bound to this environment's Brand."""
+        from websockets.sync.client import connect
+
+        capability = self._request_json("/code/capabilities", method="GET")
+        if capability.get("rpc") != 1:
+            raise SpritesToolboxError("Toolbox does not support code RPC v1")
+        url = self.toolbox_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        connection = connect(
+            f"{url}/code/rpc",
+            additional_headers={
+                "Authorization": f"Bearer {self.bearer_token}",
+                "X-Omnio-Brand": self.brand,
+            },
+            open_timeout=10, close_timeout=2, max_size=16 * 1024 * 1024,
+            proxy=None,
+        )
+        try:
+            connection.send(json.dumps({"token": token}))
+            ready = json.loads(connection.recv(timeout=15))
+            path = ready.get("socket", "")
+            if ready.get("type") != "ready" or not isinstance(path, str) or not path.startswith("/tmp/code-rpc-"):
+                raise SpritesToolboxError("Toolbox returned invalid code RPC readiness")
+            return connection, path
+        except Exception:
+            connection.close()
+            raise
+
     def read_file_bytes(self, path: str, *, max_bytes: int) -> bytes:
         """Read at most ``max_bytes`` from a Toolbox file as raw bytes."""
         if max_bytes < 1:

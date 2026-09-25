@@ -608,7 +608,10 @@ def generate_hermes_tools_module(enabled_tools: List[str],
                 stub_functions.append(source)
                 export_names.append(tool_name)
 
-    if transport == "file":
+    if transport == "stream":
+        from tools.code_execution_stream import STREAM_HEADER
+        header = STREAM_HEADER + _COMMON_HELPERS + _RESULT_DECODER
+    elif transport == "file":
         header = _FILE_TRANSPORT_HEADER
     else:
         header = _UDS_TRANSPORT_HEADER
@@ -863,6 +866,7 @@ class _NestedToolDispatcher:
         self.allowed_tools = allowed_tools
         self.execution = execution
         self.namespace = uuid.uuid4().hex
+        self._lock = threading.Lock()
 
     def dispatch(self, tool_name: str, tool_args: dict) -> str:
         from model_tools import handle_function_call
@@ -874,18 +878,30 @@ class _NestedToolDispatcher:
                 f"Tool '{tool_name}' is not available in execute_code. "
                 f"Available: {available}"
             )})
-        if self.counter[0] >= self.limit:
-            return json.dumps({"error": (
-                f"Tool call limit reached ({self.limit}). "
-                "No more tool calls allowed in this execution."
-            )})
-        if self.execution.is_cancelled():
-            return json.dumps({"status": "interrupted", "error": "Script execution ended."})
+        with self._lock:
+            if self.counter[0] >= self.limit:
+                return json.dumps({"error": (
+                    f"Tool call limit reached ({self.limit}). "
+                    "No more tool calls allowed in this execution."
+                )})
+            if self.execution.is_cancelled():
+                return json.dumps({"status": "interrupted", "error": "Script execution ended."})
+            call_id = f"nested_{self.namespace}_{self.counter[0]}"
+            self.counter[0] += 1
+            # Cancellation may flush usage before a slow external operation
+            # returns. Publish admission while holding the same budget lock;
+            # queued and rejected calls never reach this entry.
+            entry = {
+                "tool": tool_name,
+                "tool_call_id": call_id,
+                "args_preview": str(tool_args)[:80],
+                "duration": 0.0,
+            }
+            self.log.append(entry)
         if tool_name == "terminal" and isinstance(tool_args, dict):
             for param in _TERMINAL_BLOCKED_PARAMS:
                 tool_args.pop(param, None)
 
-        call_id = f"nested_{self.namespace}_{self.counter[0]}"
         started = time.monotonic()
         try:
             with bind_execution_scope(self.execution), thread_scoped_silence():
@@ -895,13 +911,7 @@ class _NestedToolDispatcher:
         except Exception as exc:
             logger.error("Nested tool call failed (tool_call_id=%s)", call_id, exc_info=True)
             result = tool_error(str(exc))
-        self.counter[0] += 1
-        self.log.append({
-            "tool": tool_name,
-            "tool_call_id": call_id,
-            "args_preview": str(tool_args)[:80],
-            "duration": round(time.monotonic() - started, 2),
-        })
+        entry["duration"] = round(time.monotonic() - started, 2)
         return result
 
 
@@ -1174,9 +1184,10 @@ def _env_temp_dir(env: Any) -> str:
 def _inner_tool_counts(tool_call_log: list) -> Dict[str, int]:
     """Count executed calls per tool name from the RPC log.
 
-    ``tool_call_log`` is appended to only AFTER a call clears the allow-list and
-    the call-count limit and has been dispatched, so this counts executions, not
-    attempts. A call that executed and then failed still counts — it consumed
+    ``tool_call_log`` is appended to only AFTER a call clears the allow-list,
+    cancellation fence and call-count limit. It is recorded before invoking the
+    handler, so cancellation cannot lose an already-admitted in-flight call.
+    A call that executed and then failed still counts — it consumed
     whatever the provider charges for, which is the same trade-off the message-
     row counting downstream already makes.
     """
@@ -1405,16 +1416,37 @@ def _rpc_poll_loop(
             stop_event.wait(poll_interval)
 
 
+def _open_remote_code_rpc(env, token, transport):
+    """Select transport before staging a script; never retry executed work."""
+    if transport not in {"file", "stream", "auto"}:
+        raise ValueError("rpc_transport must be file, stream or auto")
+    if transport == "file":
+        return "file", None, None
+    opener = getattr(env, "open_code_rpc", None)
+    if transport == "stream":
+        if not callable(opener):
+            raise ValueError("Stream RPC requires a compatible Toolbox environment")
+        connection, path = opener(token)
+        return "stream", connection, path
+    if callable(opener):
+        try:
+            opened = opener(token)
+            if opened is not None:
+                return "stream", *opened
+        except Exception as exc:
+            logger.info("execute_code stream unavailable before execution: %s", type(exc).__name__)
+    return "file", None, None
+
+
 def _execute_remote(
     code: str,
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
 ) -> str:
-    """Run a script on the remote terminal backend via file-based RPC.
+    """Run a script remotely with transport selected before execution.
 
-    The script and the generated hermes_tools.py module are shipped to
-    the remote environment, and tool calls are proxied through a polling
-    thread that communicates via request/response files.
+    Tool calls cross an authenticated stream when supported, or use
+    request/response files when file transport is selected.
     """
 
     _cfg = _load_config()
@@ -1441,6 +1473,8 @@ def _execute_remote(
 
     execution = ToolExecutionScope(stop_event)
     rpc_thread = None
+    stream = None
+    connection = None
 
     try:
         # Verify Python is available on the remote
@@ -1473,10 +1507,13 @@ def _execute_remote(
         )
 
         rpc_token = secrets.token_urlsafe(32)
+        transport, connection, socket_path = _open_remote_code_rpc(
+            env, rpc_token, _cfg.get("rpc_transport", "file"),
+        )
 
         # Generate and ship files
         tools_src = generate_hermes_tools_module(
-            list(sandbox_tools), transport="file",
+            list(sandbox_tools), transport=transport,
         )
         _ship_file_to_remote(env, f"{sandbox_dir}/{_sandbox_module_name()}.py", tools_src)
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
@@ -1484,16 +1521,30 @@ def _execute_remote(
         # Wrapped so the thread inherits the turn's approval context + callbacks
         # (see tools.thread_context) — else sandbox RPC tool calls lose approval
         # routing (#33057).
-        rpc_thread = threading.Thread(
-            target=propagate_context_to_thread(_rpc_poll_loop),
-            args=(
-                env, f"{sandbox_dir}/rpc", effective_task_id,
-                tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event, rpc_token, delivery_errors, execution,
-            ),
-            daemon=True,
-        )
-        rpc_thread.start()
+        if transport == "stream":
+            from tools.code_execution_stream import StreamDispatcher
+            from tools.mcp_tool import is_mcp_tool_parallel_read_safe
+            dispatcher = _NestedToolDispatcher(
+                effective_task_id, tool_call_log, tool_call_counter,
+                max_tool_calls, sandbox_tools, execution,
+            )
+            stream = StreamDispatcher(
+                connection, dispatcher.dispatch, execution,
+                concurrency=_cfg.get("rpc_concurrency", 8),
+                read_safe=is_mcp_tool_parallel_read_safe,
+            )
+            stream.start()
+        else:
+            rpc_thread = threading.Thread(
+                target=propagate_context_to_thread(_rpc_poll_loop),
+                args=(
+                    env, f"{sandbox_dir}/rpc", effective_task_id,
+                    tool_call_log, tool_call_counter, max_tool_calls,
+                    sandbox_tools, stop_event, rpc_token, delivery_errors, execution,
+                ),
+                daemon=True,
+            )
+            rpc_thread.start()
 
         # Build environment variable prefix for the script. PYTHONPATH carries the
         # staging dir so `from hermes_tools import ...` resolves even when the
@@ -1505,6 +1556,8 @@ def _execute_remote(
             f"PYTHONPATH={quoted_sandbox_dir} "
             f"PYTHONDONTWRITEBYTECODE=1"
         )
+        if transport == "stream":
+            env_prefix += f" HERMES_RPC_SOCKET={shlex.quote(socket_path)}"
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
         if tz:
             env_prefix += f" TZ={shlex.quote(tz)}"
@@ -1524,10 +1577,12 @@ def _execute_remote(
         logger.info("Executing code on %s backend (task %s)...",
                      env_type, effective_task_id[:8])
         execution.start(timeout)
-        script_result = env.execute(
-            f"{cd_prefix}{env_prefix} python3 {quoted_script_path}",
-            timeout=timeout,
-        )
+        from tools.interrupt import bind_execution_scope
+        with bind_execution_scope(execution):
+            script_result = env.execute(
+                f"{cd_prefix}{env_prefix} python3 {quoted_script_path}",
+                timeout=timeout,
+            )
 
         stdout_text = script_result.get("output", "") or ""
         exit_code = script_result.get("returncode", -1)
@@ -1556,6 +1611,11 @@ def _execute_remote(
     finally:
         # Stop the polling thread
         execution.cancel()
+        if stream is not None:
+            stream.close()
+            delivery_errors.extend(stream.errors)
+        elif connection is not None:
+            connection.close()
         if rpc_thread is not None:
             rpc_thread.join(timeout=5)
 
