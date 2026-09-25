@@ -170,6 +170,50 @@ def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
     return fresh
 
 
+def _template_visible_role(message: Any) -> Optional[str]:
+    """Role as counted by strict chat-template alternation checks.
+
+    Mistral-family templates (Devstral, Mistral Small 3.x, Magistral)
+    enforce user/assistant alternation at render time but EXEMPT the tool
+    flow from the check: ``tool`` results and assistant messages carrying
+    ``tool_calls`` are skipped. A summary role chosen against the *literal*
+    neighbouring roles can therefore still violate alternation as the
+    template sees it. The canonical failure: the protected head ends
+    ``[user, assistant(tool_calls), tool]``, so the literal last role is
+    ``tool`` and the summary is pinned to ``role="user"`` -- but the last
+    role the template counts is ``user``, the template sees user -> user,
+    and llama.cpp / Mistral-hosted backends reject the ENTIRE request with
+    a Jinja alternation error (HTTP 500). Because the summary persists in
+    the stored conversation, every retry replays the same poisoned history
+    and the session is unrecoverable.
+
+    Returns ``None`` for messages the alternation check skips.
+    """
+    if not isinstance(message, dict):
+        return None
+    role = message.get("role")
+    if role == "tool":
+        return None
+    if role == "assistant" and message.get("tool_calls"):
+        return None
+    return role
+
+
+def _last_template_visible_role(messages: List[Dict[str, Any]]) -> Optional[str]:
+    """Last role a strict alternation template would count in *messages*.
+
+    ``None`` when every row is template-exempt (tool flow only).
+    """
+    return next(
+        (
+            role
+            for role in (_template_visible_role(m) for m in reversed(messages))
+            if role is not None
+        ),
+        None,
+    )
+
+
 def _strip_persistence_markers(messages: List[Dict[str, Any]]) -> None:
     """Enforce the compaction invariant: no assembled message carries a
     session-store persistence marker.
@@ -207,6 +251,22 @@ _SUMMARY_END_MARKER = (
 # at the start of the message, so _is_context_summary_content must look past it.
 _MERGED_PRIOR_CONTEXT_HEADER = "[PRIOR CONTEXT — for reference only; not a new message]"
 _MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
+
+# Prefixes the copy of a still-running user task that compaction re-states after
+# the handoff boundary (#100818). A cron run's only user turn is the job prompt
+# in the protected head, so compaction leaves it BEFORE the summary — and
+# SUMMARY_PREFIX tells the model to do nothing when no user message follows.
+# Set on a compaction carrier when the in-flight task was merged onto it (the
+# carrier ends the list, so a standalone user row would break alternation).
+# conversation_compression._ensure_compressed_has_user_turn treats it as
+# "intent present" so it does not insert a second copy of the same request.
+_INFLIGHT_REPLAY_MERGED_KEY = "_inflight_replay_merged"
+
+_INFLIGHT_TASK_REPLAY_HEADER = (
+    "[STILL IN PROGRESS — this is the active request, restated after the "
+    "compaction boundary because it was not finished yet. Continue it; do not "
+    "start over.]"
+)
 
 # Handoff prefixes that shipped in earlier releases. A summary persisted under
 # one of these can be inherited into a resumed lineage (#35344); when it is
@@ -788,6 +848,21 @@ def _content_text_for_contains(content: Any) -> str:
                     parts.append(text)
         return "\n".join(part for part in parts if part)
     return str(content)
+
+
+def _is_text_only_content(content: Any) -> bool:
+    """Whether the active request can be restated without losing a content part."""
+    if isinstance(content, str):
+        return True
+    return isinstance(content, list) and all(
+        isinstance(part, str)
+        or (
+            isinstance(part, dict)
+            and part.get("type") in {"text", "input_text"}
+            and isinstance(part.get("text"), str)
+        )
+        for part in content
+    )
 
 
 def _append_text_to_content(content: Any, text: str, *, prepend: bool = False) -> Any:
@@ -4281,8 +4356,43 @@ This compaction should PRIORITISE preserving all information related to the focu
         #    when call_id != id (Codex Responses API format), re-exposing orphans.
         missing_results = surviving_call_ids - result_call_ids
         if missing_results:
+            # --- In-flight tool chain protection (issue #79278) -------------
+            # A strip here must distinguish a *pending* tool_call (the model's
+            # live request whose result the executor has not yet appended) from
+            # an *orphaned* call (one whose result was summarized/truncated away
+            # and can never come back).  Compression can fire mid-chain: the
+            # model emits `assistant(tool_calls)`, and tool_executor.py only
+            # appends the matching `role="tool"` result AFTER it runs the call.
+            # In that window `messages[-1]` is an assistant tool_call whose id
+            # is (not yet) in result_call_ids.  Any tool result would be
+            # appended *after* this message (tool_executor.py), so if it is the
+            # final message its calls are, by construction, all still pending.
+            # Stripping it as an orphan would delete the live request; when the
+            # executor later appends the real result, repair_message_sequence
+            # would drop it as an unmatched orphan and the completed side
+            # effect — and the model's final synthesis built on it — would be
+            # lost.  We therefore preserve the trailing in-flight call verbatim;
+            # only genuinely orphaned calls in the *discarded* region are
+            # stripped.
+            trailing_inflight: Optional[Dict[str, Any]] = None
+            # Walk back over any trailing tool results first: with a
+            # multi-call batch the executor appends results one at a time, so
+            # a snapshot taken between appends looks like
+            # ``[..., assistant(c1,c2,c3), tool(c1)]`` — the chain is still
+            # in flight even though the last message is a tool result. The
+            # last NON-tool message is the live request in both shapes.
+            idx = len(messages) - 1
+            while idx >= 0 and messages[idx].get("role") == "tool":
+                idx -= 1
+            if idx >= 0 and messages[idx].get("role") == "assistant":
+                trailing_inflight = messages[idx]
+            # -----------------------------------------------------------------
             for msg in messages:
                 if msg.get("role") != "assistant":
+                    continue
+                if msg is trailing_inflight:
+                    # Live request, not an orphan — the executor appends its
+                    # result(s) after compress() returns.
                     continue
                 tcs = msg.get("tool_calls")
                 if not tcs:
@@ -4620,6 +4730,185 @@ This compaction should PRIORITISE preserving all information related to the focu
             return max(pair_end, head_end + 1)
         return adjusted
 
+    @classmethod
+    def _has_merged_inflight_replay(cls, message: Any) -> bool:
+        """Recognize the active request on a handoff, including after DB reload.
+
+        SessionDB and cold-history restore preserve content but not private
+        in-memory flags. The explicit replay after the summary end marker is
+        authoritative; a request quoted inside the historical summary is not.
+        """
+        if not isinstance(message, dict):
+            return False
+        if message.get(_INFLIGHT_REPLAY_MERGED_KEY):
+            return True
+        if not cls._is_context_summary_message(message):
+            return False
+        text = _content_text_for_contains(message.get("content"))
+        _, boundary, remainder = text.partition(_SUMMARY_END_MARKER)
+        return bool(
+            boundary
+            and remainder.lstrip().startswith(_INFLIGHT_TASK_REPLAY_HEADER)
+            and remainder.lstrip()[len(_INFLIGHT_TASK_REPLAY_HEADER):].strip()
+        )
+
+    @classmethod
+    def _find_inflight_user_task(
+        cls, messages: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Return the user turn that is still awaiting completion, or ``None``.
+
+        Scans the WHOLE transcript, not just the compressible region: a cron
+        run's only user turn is the job prompt sitting in the protected head
+        (``protect_first_n`` keeps system + first user), which is exactly the
+        turn ``_find_last_user_message_idx`` cannot see (#100818).
+
+        A turn is in-flight when the transcript does not already end with a
+        completed assistant reply — i.e. a text-bearing assistant message with
+        no pending ``tool_calls``.  A trailing ``tool`` result or an assistant
+        message that still has ``tool_calls`` outstanding means the run was
+        interrupted mid-task and the instruction is still owed an answer.
+
+        Handoff carriers and synthetic scaffolding rows are excluded via the
+        same filter pair as ``_find_last_user_message_idx``, so an idle session
+        whose only user-role row is an inherited summary yields ``None`` and is
+        never re-animated (#80622).
+        """
+        from agent.conversation_compression import _is_real_user_message
+
+        last_user_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            # _is_real_user_message also rejects metadata-flagged scaffolding
+            # (_todo_snapshot_synthetic, recovery nudges, ...) that
+            # _is_actionable_user_turn cannot see.
+            if cls._is_actionable_user_turn(msg) and _is_real_user_message(msg):
+                last_user_idx = i
+                break
+            if cls._has_merged_inflight_replay(msg):
+                # A previous cycle merged the live request onto this summary
+                # carrier; it is the only copy left, so it is still the task.
+                last_user_idx = i
+                break
+        if last_user_idx < 0:
+            return None
+
+        for msg in reversed(messages[last_user_idx + 1:]):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                # Trailing tool result (or anything else): still mid-task.
+                break
+            if msg.get("tool_calls"):
+                break
+            if _content_text_for_contains(msg.get("content")).strip():
+                # Final answer already delivered — replaying the ask would
+                # hand the model finished work as a fresh instruction.
+                return None
+            # Empty assistant row (a bare reasoning/stub turn): keep looking.
+        return messages[last_user_idx]
+
+    def _reappend_inflight_user_task(
+        self,
+        compressed: List[Dict[str, Any]],
+        inflight: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Restate an unfinished user task after the compaction handoff.
+
+        ``SUMMARY_PREFIX`` instructs the model to act only on a user message
+        that appears AFTER the summary, and to do nothing when none does.  When
+        the single in-flight instruction lived in the protected head, the
+        assembled transcript orders it before the handoff and the run ends in a
+        ``[SILENT]`` no-op that the scheduler records as success (#100818).
+
+        Re-append a copy of that turn after the surviving tail so the prefix's
+        "latest user message" pointer resolves to it again.  If the transcript
+        already ends on a template-visible user row, appending a second one
+        would break user/assistant alternation, so the restatement is merged
+        onto the handoff carrier instead — after ``_SUMMARY_END_MARKER``, which
+        is the boundary the prefix's rule is written against.
+        """
+        if inflight is None or not compressed:
+            return compressed
+
+        carrier_idx = -1
+        for idx in range(len(compressed) - 1, -1, -1):
+            if self._is_context_summary_message(compressed[idx]):
+                carrier_idx = idx
+                break
+        if carrier_idx < 0:
+            # No handoff was emitted — nothing reordered the instruction.
+            return compressed
+
+        for msg in compressed[carrier_idx + 1:]:
+            if self._is_actionable_user_turn(
+                msg
+            ) and not self._is_synthetic_compression_user_turn(msg):
+                # A real request already follows the summary.
+                return compressed
+
+        carrier = compressed[carrier_idx]
+        carrier_text = _content_text_for_contains(carrier.get("content"))
+        if _SUMMARY_END_MARKER not in carrier_text:
+            return compressed
+        if carrier_text.split(_SUMMARY_END_MARKER, 1)[1].strip():
+            # The _force_user_leading layout keeps the live request on the
+            # carrier itself, after the marker. Already actionable.
+            return compressed
+
+        task_text = _content_text_for_contains(inflight.get("content")).strip()
+        if _INFLIGHT_TASK_REPLAY_HEADER in task_text:
+            # Already a restatement from an earlier compaction (standalone row
+            # or merged onto a carrier): take the text after the header so a
+            # task that survives >1 cycle never stacks headers or drags the
+            # old summary along.
+            task_text = task_text.rsplit(_INFLIGHT_TASK_REPLAY_HEADER, 1)[1].strip()
+        if not task_text:
+            return compressed
+
+        if not self.quiet_mode:
+            logger.info(
+                "Re-appending the in-flight user task after the compaction "
+                "handoff so it stays actionable (#100818)"
+            )
+
+        last_visible_role = _last_template_visible_role(compressed)
+        if self._has_merged_inflight_replay(inflight):
+            # Never copy a summary carrier (metadata would mark the replay
+            # synthetic): restate as a plain user row.
+            replay = {"role": "user", "content": task_text}
+        else:
+            replay = _fresh_compaction_message_copy(inflight)
+        if isinstance(replay.get("content"), str):
+            # Plain text: rebuild from the header-stripped task text so a
+            # task surviving several compactions never stacks headers.
+            replay["content"] = _INFLIGHT_TASK_REPLAY_HEADER + "\n" + task_text
+        else:
+            # Multimodal parts: keep them, prepend the header text part.
+            replay["content"] = _append_text_to_content(
+                replay.get("content"),
+                _INFLIGHT_TASK_REPLAY_HEADER + "\n",
+                prepend=True,
+            )
+        drop_stale_api_content(replay)
+
+        if last_visible_role == "user":
+            # Alternation is judged on template-visible rows only (tool_calls /
+            # tool rows are exempt), so a user-pinned summary followed by a
+            # tool tail still "ends on user": a standalone user row would break
+            # the Mistral-style pre-flight check (#58753). Merge onto the
+            # carrier instead and flag it — the carrier's own metadata marks it
+            # synthetic, and without the flag _ensure_compressed_has_user_turn
+            # would insert a second copy of the same request.
+            carrier["content"] = _append_text_to_content(
+                carrier.get("content"),
+                "\n\n" + _INFLIGHT_TASK_REPLAY_HEADER + "\n" + task_text,
+            )
+            carrier[_INFLIGHT_REPLAY_MERGED_KEY] = True
+            drop_stale_api_content(carrier)
+            return compressed
+
+        compressed.append(replay)
+        return compressed
+
     def _ensure_last_n_user_messages_in_tail(
         self,
         messages: List[Dict[str, Any]],
@@ -4711,26 +5000,14 @@ This compaction should PRIORITISE preserving all information related to the focu
         return idx
 
     def _find_tail_cut_by_tokens(
-        self, messages: List[Dict[str, Any]], head_end: int,
-        token_budget: int | None = None,
+        self, messages: List[Dict[str, Any]], head_end: int, token_budget: int | None = None,
+        *, allow_split_turn: bool = True,
     ) -> int:
-        """Walk backward from the end of messages, accumulating tokens until
-        the budget is reached. Returns the index where the tail starts.
-
-        ``token_budget`` defaults to ``self.tail_token_budget`` which is
-        derived from ``summary_target_ratio * context_length``, so it
-        scales automatically with the model's context window.
-
-        Token budget is the primary criterion.  A bounded message-count floor
-        keeps a short run of recent turns verbatim even when the budget is
-        exhausted, but the budget is allowed to exceed by up to 1.5x to avoid
-        cutting inside an oversized message (tool output, file read, etc.). If
-        even that floor exceeds 1.5x the budget, the cut is placed right after
-        the head so compression still runs.
-
-        Never cuts inside a tool_call/result group.  Always ensures the most
-        recent user message is in the tail (see ``_ensure_last_user_message_in_tail``).
-        """
+        """Walk backward accumulating tokens until the budget; return the tail start index.
+        The walk targets a 1.5x soft ceiling while keeping a bounded message-count floor.
+        Required anchors and atomic tool groups may exceed it; tool groups are never split.
+        ``allow_split_turn`` lets batch/manual compaction summarize older tool work inside
+        an oversized active turn; callers that require complete exchanges can disable it."""
         if token_budget is None:
             token_budget = self.tail_token_budget
         n = len(messages)
@@ -4800,37 +5077,62 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Align to avoid splitting tool groups
         cut_idx = self._align_boundary_backward(messages, cut_idx)
+        # Anchors below keep the most recent user turn (active task, #10896) and the latest visible
+        # assistant reply (#29824) in the tail; each only walks the cut backward, so chaining them is
+        # normally monotonic. One bounded exception: when a single in-progress turn alone exceeds the
+        # soft ceiling, anchoring its opening request retains the whole turn and blows the budget by
+        # design — then the clean tool-group boundary above wins and that request rides the handoff
+        # (#80449). The N-user promise (#70250) is never relaxed.
+        last_user_idx = self._find_last_user_message_idx(messages, head_end)
+        user_anchored_cut = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
+        split_oversized_turn = False
+        # ``user_anchored_cut < cut_idx`` means the anchor found a real user turn strictly inside the
+        # compressible region (see ``_ensure_last_user_message_in_tail``), so ``last_user_idx`` is a
+        # valid index into that region from here on.
+        if (
+            allow_split_turn
+            and user_anchored_cut < cut_idx
+            # The handoff can restate text, but cannot replace an audio, image,
+            # or unknown structured input with its text-only projection.
+            and _is_text_only_content(messages[last_user_idx].get("content"))
+            # A single oversized user message is indivisible and must stay verbatim in the tail; this
+            # exception is only for aggregate turn growth after a normally sized opening request.
+            and _estimate_msg_budget_tokens(messages[last_user_idx]) <= soft_ceiling
+            and len(_content_text_for_contains(messages[last_user_idx].get("content")).strip())
+            <= _ACTIVE_TASK_MAX_CHARS
+            # Only split when there is real turn body to summarize: if the oversized weight is the
+            # active turn's own newest group, the pre-anchor cut retains it anyway, so taking the
+            # active request out of the tail buys no reclaim and loses the #10896 anchor.
+            and any(messages[i].get("tool_calls") for i in range(last_user_idx, cut_idx))
+            # ...and only when the anchored region really is over the ceiling: a short transcript
+            # (whole session under the budget) anchors for free, so the exception must not fire.
+            # Use the same per-message accounting as this fork's backward walk.
+            and sum(
+                _estimate_msg_budget_tokens(message) for message in messages[user_anchored_cut:]
+            ) > soft_ceiling
+        ):
+            split_oversized_turn = True
+            if not self.quiet_mode:
+                logger.debug(
+                    "Active turn exceeds protected-tail soft ceiling; keeping tool-group-aligned "
+                    "mid-turn cut at index %d instead of anchoring user message %d (#80449)",
+                    cut_idx, last_user_idx,
+                )
+        else:
+            cut_idx = user_anchored_cut
+        # An older visible assistant reply can precede the active user turn; under the split above,
+        # pulling back to it would undo the bounded exception.
+        if not split_oversized_turn:
+            cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
 
-        # Ensure the most recent user message is always in the tail so the
-        # active task is never lost to compression (fixes #10896).
-        cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
-
-        # Ensure the most recent assistant message is always in the tail
-        # so the previously-visible reply isn't silently rolled into the
-        # ``[CONTEXT COMPACTION — REFERENCE ONLY]`` block (fixes #29824).
-        # Each anchor only walks ``cut_idx`` backward, so chaining them is
-        # monotonic — the tail can only grow, never shrink.
-        cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
-
-        # Extend to the last N actionable user messages when configured
-        # (compression.min_tail_user_messages > 1).  This prevents the
-        # token-budget tail from consuming recent turns when large tool
-        # outputs fill the budget.  The anchor only walks ``cut_idx``
-        # backward (monotonic — the tail can only grow, never shrink), and
-        # a user message is a clean boundary, so the forward re-alignment
-        # below remains a no-op for the anchored index.  Gated at the call
-        # site so the default (1) path is byte-identical to the historical
-        # single-anchor pipeline — the single-user anchor already ran above,
-        # and re-invoking it here could re-trigger the causal-coupling
-        # forward push (#22523) after the assistant anchor adjusted the cut.
-        # getattr-guarded: bare ``ContextCompressor.__new__`` test doubles
-        # (and plugin engines) skip __init__, so the attribute may be absent
-        # (see the compression-path test-double pitfall).
+        # Optional multi-user anchor; n<=1 is gated here (not delegated): re-running the single-user anchor after
+        # the assistant anchor could re-trigger its forward turn-pair push. Runs even under the split: the
+        # N-user promise (#70250) is a user-facing setting and must outrank the budget, so it pulls the cut
+        # back to the Nth user turn — which is why the split only ever relaxes the single-user anchor.
+        # getattr: plugin engines and __new__ doubles skip __init__.
         _min_tail_users = getattr(self, "min_tail_user_messages", 1)
         if isinstance(_min_tail_users, int) and not isinstance(_min_tail_users, bool) and _min_tail_users > 1:
-            cut_idx = self._ensure_last_n_user_messages_in_tail(
-                messages, cut_idx, head_end, _min_tail_users,
-            )
+            cut_idx = self._ensure_last_n_user_messages_in_tail(messages, cut_idx, head_end, _min_tail_users)
 
         # The floor guarantees forward progress — compression must always claim
         # at least one message or the caller's compress_start >= compress_end
@@ -5327,8 +5629,31 @@ This compaction should PRIORITISE preserving all information related to the focu
         # last_head_role reads the assembled (post-strip) head; first_tail_role
         # reads the assembled (post-strip) tail_messages — a stripped stale
         # handoff must not influence alternation-safe role selection.
-        last_head_role = compressed[-1].get("role", "user") if compressed else "user"
-        first_tail_role = tail_messages[0].get("role", "user") if tail_messages else None
+        # Both are TEMPLATE-VISIBLE roles (``_template_visible_role``), not the
+        # literal list neighbours: strict Mistral-style templates skip tool
+        # results and assistant tool-call messages when enforcing
+        # user/assistant alternation, so the summary must alternate against
+        # the nearest message the template actually counts. Selecting against
+        # the literal neighbour (previously ``compressed[-1]``) emitted the
+        # summary as role="user" behind a ``[user, assistant(tool_calls),
+        # tool]`` head — which every Mistral-strict backend rejects with a
+        # Jinja alternation 500, permanently poisoning the session.
+        last_head_role: Optional[str] = "user"
+        if compressed:
+            # A head with only tool flow has no template-visible role.
+            last_head_role = _last_template_visible_role(compressed)
+        first_tail_role = None
+        if tail_messages:
+            first_tail_role = next(
+                (
+                    role
+                    for role in (
+                        _template_visible_role(m) for m in tail_messages
+                    )
+                    if role is not None
+                ),
+                None,
+            )
         # When the only protected head message is the system prompt, the
         # summary becomes the first *visible* message in the API request
         # (most adapters — Anthropic, Bedrock — send the system prompt as
@@ -5362,9 +5687,15 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
             if not _user_survives:
                 _force_user_leading = True
-        # Pick a role that avoids consecutive same-role with both neighbors.
-        # Priority: avoid colliding with head (already committed), then tail.
-        if last_head_role in {"assistant", "tool"} or _force_user_leading:
+        # Pick a role that alternates with both template-visible neighbors.
+        # Priority: alternate against the head (already committed), then tail.
+        # ``None`` (all-exempt head) means the summary opens the visible
+        # sequence, which strict templates require to start with "user".
+        if (
+            last_head_role is None
+            or last_head_role in {"assistant", "tool"}
+            or _force_user_leading
+        ):
             summary_role = "user"
         else:
             summary_role = "assistant"
@@ -5372,7 +5703,14 @@ This compaction should PRIORITISE preserving all information related to the focu
         # collide with the head, flip it.
         if first_tail_role is not None and summary_role == first_tail_role:
             flipped = "assistant" if summary_role == "user" else "user"
-            if flipped != last_head_role and not _force_user_leading:
+            # ``last_head_role is None`` (all-exempt head) pins the summary to
+            # "user" above; flipping to "assistant" would make the visible
+            # sequence open with "assistant", which strict templates reject.
+            if (
+                flipped != last_head_role
+                and last_head_role is not None
+                and not _force_user_leading
+            ):
                 summary_role = flipped
             else:
                 # Both roles would create consecutive same-role messages
@@ -5449,9 +5787,20 @@ This compaction should PRIORITISE preserving all information related to the focu
                 _merge_summary_into_tail = False
             compressed.append(msg)
 
-        self.compression_count += 1
-
+        # The assembled list can order the only live instruction BEFORE the
+        # handoff (single-prompt cron shape: the job prompt is pinned in the
+        # protected head). SUMMARY_PREFIX reads that as "no user message after
+        # the summary → do nothing", so restate it past the boundary (#100818).
+        # Run BEFORE the in-flight re-append: the sanitizer's trailing-in-flight
+        # exemption (#79278) walks back from the list end, and a replay user row
+        # sitting there would make a genuinely pending assistant(tool_calls) look
+        # orphaned and get its calls stripped.
         compressed = self._sanitize_tool_pairs(compressed)
+        compressed = self._reappend_inflight_user_task(
+            compressed, self._find_inflight_user_task(messages)
+        )
+
+        self.compression_count += 1
 
         # Replace image parts in all compressed messages before the newest
         # image-bearing user turn with a short text placeholder. Without

@@ -98,3 +98,37 @@ def test_snapshot_should_skip_multimodal_retained_content():
         project_compaction(snapshot, redact=lambda text: text, bound=_bounded_utf8)
         is None
     )
+
+
+def test_snapshot_emitter_skips_a_replayed_request_absent_from_durable_tail():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from agent.conversation_compression import _emit_compaction_snapshot
+
+    callback = Mock()
+    agent = SimpleNamespace(session_id="s", tool_progress_callback=callback)
+    original = [{"role": "user", "content": "request"}]
+    original += [{"role": "assistant", "content": f"step {i}"} for i in range(10)]
+    compressed = [_summary(), original[-1], {"role": "user", "content": "restated request"}]
+    _emit_compaction_snapshot(agent, compressed, original, committed=True)
+    # The existing wire format references an unchanged prefix and suffix.
+    # A new replay row has no durable counterpart; old proxies retain the full
+    # history when no verified manifest is available, avoiding lost messages.
+    callback.assert_not_called()
+
+
+def test_snapshot_emitter_keeps_a_request_restated_inside_the_summary():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from agent.conversation_compression import _emit_compaction_snapshot
+
+    callback = Mock()
+    agent = SimpleNamespace(session_id="s", tool_progress_callback=callback)
+    original = [{"role": "user", "content": "request"}]
+    original += [{"role": "assistant", "content": f"step {i}"} for i in range(10)]
+    compressed = [_summary("[CONTEXT COMPACTION] summary\n[summary ends]\nrequest"), original[-1]]
+    _emit_compaction_snapshot(agent, compressed, original, committed=True)
+    callback.assert_called_once()
+    snapshot = callback.call_args.kwargs["snapshot"]
+    assert snapshot["retained_tail_messages"] == [original[-1]]
+    assert snapshot["summary"] == compressed[0]["content"]
