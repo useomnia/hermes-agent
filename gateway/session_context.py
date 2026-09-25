@@ -37,6 +37,8 @@ needs to replace the import + call site:
 """
 
 from contextvars import ContextVar
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
@@ -392,6 +394,24 @@ def current_session_id() -> str | None:
     if value is _UNSET or not isinstance(value, str) or not value:
         return None
     return value
+
+
+@contextmanager
+def bound_session_id(session_id: str | None) -> Iterator[None]:
+    """Bind ``session_id`` as the calling session for this context only.
+
+    For work that runs on a fresh thread, which starts with empty ContextVars.
+    Unlike :func:`set_current_session_id`, the process-wide ``os.environ``
+    mirror is left alone, so concurrent sessions are not clobbered.
+    """
+    if not session_id:
+        yield
+        return
+    token = _SESSION_ID.set(session_id)
+    try:
+        yield
+    finally:
+        _SESSION_ID.reset(token)
 
 
 def declare_stateless_channel() -> None:
