@@ -4716,6 +4716,28 @@ This compaction should PRIORITISE preserving all information related to the focu
         return adjusted
 
     @classmethod
+    def _has_merged_inflight_replay(cls, message: Any) -> bool:
+        """Recognize the active request on a handoff, including after DB reload.
+
+        SessionDB and cold-history restore preserve content but not private
+        in-memory flags. The explicit replay after the summary end marker is
+        authoritative; a request quoted inside the historical summary is not.
+        """
+        if not isinstance(message, dict):
+            return False
+        if message.get(_INFLIGHT_REPLAY_MERGED_KEY):
+            return True
+        if not cls._is_context_summary_message(message):
+            return False
+        text = _content_text_for_contains(message.get("content"))
+        _, boundary, remainder = text.partition(_SUMMARY_END_MARKER)
+        return bool(
+            boundary
+            and remainder.lstrip().startswith(_INFLIGHT_TASK_REPLAY_HEADER)
+            and remainder.lstrip()[len(_INFLIGHT_TASK_REPLAY_HEADER):].strip()
+        )
+
+    @classmethod
     def _find_inflight_user_task(
         cls, messages: List[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
@@ -4748,7 +4770,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             if cls._is_actionable_user_turn(msg) and _is_real_user_message(msg):
                 last_user_idx = i
                 break
-            if isinstance(msg, dict) and msg.get(_INFLIGHT_REPLAY_MERGED_KEY):
+            if cls._has_merged_inflight_replay(msg):
                 # A previous cycle merged the live request onto this summary
                 # carrier; it is the only copy left, so it is still the task.
                 last_user_idx = i
@@ -4834,13 +4856,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
 
         last_visible_role = _last_template_visible_role(compressed)
-        if inflight.get(_INFLIGHT_REPLAY_MERGED_KEY):
+        if self._has_merged_inflight_replay(inflight):
             # Never copy a summary carrier (metadata would mark the replay
             # synthetic): restate as a plain user row.
             replay = {"role": "user", "content": task_text}
         else:
             replay = _fresh_compaction_message_copy(inflight)
-        replay.pop(_COMPACTION_TAIL_MARKER, None)
         if isinstance(replay.get("content"), str):
             # Plain text: rebuild from the header-stripped task text so a
             # task surviving several compactions never stacks headers.
@@ -4968,10 +4989,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         *, allow_split_turn: bool = True,
     ) -> int:
         """Walk backward accumulating tokens until the budget; return the tail start index.
-        Optional rows are bounded by a 1.5x soft ceiling. Required last-user/last-assistant (and
-        multi-user) anchors and their atomic tool groups may exceed it; tool groups are never split.
-        ``allow_split_turn`` is disabled by rolling micro-compaction, which consumes complete
-        exchanges only; batch/manual compaction enables it so an oversized active turn can progress."""
+        The walk targets a 1.5x soft ceiling while keeping a bounded message-count floor.
+        Required anchors and atomic tool groups may exceed it; tool groups are never split.
+        ``allow_split_turn`` lets batch/manual compaction summarize older tool work inside
+        an oversized active turn; callers that require complete exchanges can disable it."""
         if token_budget is None:
             token_budget = self.tail_token_budget
         n = len(messages)
@@ -5601,20 +5622,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Jinja alternation 500, permanently poisoning the session.
         last_head_role: Optional[str] = "user"
         if compressed:
-            last_head_role = next(
-                (
-                    role
-                    for role in (
-                        _template_visible_role(m) for m in reversed(compressed)
-                    )
-                    if role is not None
-                ),
-                # Head holds only template-exempt messages: the summary will
-                # be the first message the template counts, and the sequence
-                # must open with "user" (handled below alongside the forced
-                # cases).
-                None,
-            )
+            # A head with only tool flow has no template-visible role.
+            last_head_role = _last_template_visible_role(compressed)
         first_tail_role = None
         if tail_messages:
             first_tail_role = next(

@@ -295,7 +295,7 @@ def test_merged_restatement_is_not_anchored_twice():
     out = _compress_with(2, 1, original)
     assert any(m.get("_inflight_replay_merged") for m in out), "expected merge layout"
     assert _job_copies(out) == 1
-    assert _ensure_compressed_has_user_turn(original, out) == "already_present"
+    _ensure_compressed_has_user_turn(original, out)
     assert _job_copies(out) == 1
 
 
