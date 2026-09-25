@@ -436,14 +436,10 @@ class SpritesEnvironment(BaseEnvironment):
         """Send a file operation to the toolbox Sprite."""
         return self._request_json("/files", payload)
 
-    def open_code_rpc(self, token: str, *, optional: bool = False):
+    def open_code_rpc(self, token: str):
         """Open one authenticated channel bound to this environment's Brand."""
         from websockets.sync.client import connect
 
-        if optional:
-            policy = self._request_json("/code/rpc-policy", method="GET")
-            if policy.get("enabled") is not True:
-                return None
         capability = self._request_json("/code/capabilities", method="GET")
         if capability.get("rpc") != 1:
             raise SpritesToolboxError("Toolbox does not support code RPC v1")

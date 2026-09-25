@@ -1430,7 +1430,7 @@ def _open_remote_code_rpc(env, token, transport):
         return "stream", connection, path
     if callable(opener):
         try:
-            opened = opener(token, optional=True)
+            opened = opener(token)
             if opened is not None:
                 return "stream", *opened
         except Exception as exc:
@@ -1443,11 +1443,10 @@ def _execute_remote(
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
 ) -> str:
-    """Run a script on the remote terminal backend via file-based RPC.
+    """Run a script remotely with transport selected before execution.
 
-    The script and the generated hermes_tools.py module are shipped to
-    the remote environment, and tool calls are proxied through a polling
-    thread that communicates via request/response files.
+    Tool calls cross an authenticated stream when supported, or use
+    request/response files when file transport is selected.
     """
 
     _cfg = _load_config()

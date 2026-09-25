@@ -204,8 +204,9 @@ def test_duplicate_request_cannot_dispatch_twice():
         stream.close()
 
 
+@pytest.mark.parametrize("transport", ["auto", "stream"])
 def test_stream_capability_negotiation_uses_get_and_keeps_pair_auth_trusted(
-    monkeypatch,
+    monkeypatch, transport,
 ):
     import websockets.sync.client
     from tools.environments.sprites import SpritesEnvironment
@@ -226,7 +227,8 @@ def test_stream_capability_negotiation_uses_get_and_keeps_pair_auth_trusted(
         "connect",
         lambda url, **kw: opened.append((url, kw)) or connection,
     )
-    result, path = env.open_code_rpc("run-token")
+    selected, result, path = _open_remote_code_rpc(env, "run-token", transport)
+    assert selected == "stream"
     assert requests == [("/code/capabilities", {"method": "GET"})]
     assert opened[0][0] == "ws://127.0.0.1:8643/internal/toolbox/code/rpc"
     assert opened[0][1]["additional_headers"] == {
@@ -255,15 +257,15 @@ def test_oversized_result_reports_error_without_losing_other_calls():
         stream.close()
 
 
-@pytest.mark.parametrize("policy", [{}, {"enabled": False}, {"enabled": "true"}, {"enabled": 1}])
-def test_optional_channel_requires_an_explicit_boolean_rollout(policy):
+@pytest.mark.parametrize("capability", [{}, {"rpc": 0}, {"rpc": 2}, {"rpc": "1"}])
+def test_auto_channel_falls_back_when_the_toolbox_capability_is_unavailable(capability):
     from tools.environments.sprites import SpritesEnvironment
 
     env = SpritesEnvironment.__new__(SpritesEnvironment)
     requests = []
-    env._request_json = lambda path, **kw: requests.append(path) or policy
-    assert env.open_code_rpc("private", optional=True) is None
-    assert requests == ["/code/rpc-policy"]
+    env._request_json = lambda path, **kw: requests.append(path) or capability
+    assert _open_remote_code_rpc(env, "private", "auto") == ("file", None, None)
+    assert requests == ["/code/capabilities"]
 
 
 @pytest.mark.parametrize("transport", ["file", "auto"])
@@ -282,7 +284,7 @@ def test_auto_fallback_is_confined_to_channel_setup(error):
         _open_remote_code_rpc(Environment(), "private", "stream")
 
 
-def test_auto_transport_opens_one_channel_when_rollout_and_capability_allow_it():
+def test_auto_transport_opens_one_channel_when_capability_is_available():
     calls = []
     connection = object()
 
@@ -294,7 +296,7 @@ def test_auto_transport_opens_one_channel_when_rollout_and_capability_allow_it()
     assert _open_remote_code_rpc(Environment(), "private", "auto") == (
         "stream", connection, "/tmp/code-rpc-owned/rpc.sock",
     )
-    assert calls == [("private", {"optional": True})]
+    assert calls == [("private", {})]
 
 
 def test_explicit_stream_rejects_an_unsupported_environment():
