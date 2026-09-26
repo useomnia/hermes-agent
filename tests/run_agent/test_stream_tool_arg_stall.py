@@ -154,6 +154,85 @@ class TestToolArgumentStallWatchdog:
         assert "Tool call arguments stalled" not in caplog.text
 
 
+class TestRunawayToolArguments:
+    LOOP = "The prompt list continues with the same line again and again. " * 20
+
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+    @patch("run_agent.AIAgent._replace_primary_openai_client")
+    @patch("run_agent.AIAgent._abort_request_openai_client")
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_should_reconnect_when_streamed_arguments_degenerate_into_repetition(
+        self, mock_close, mock_create, mock_abort, mock_replace, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "30")
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        loop = self.LOOP
+
+        class RunawayArguments:
+            response = SimpleNamespace(headers={})
+
+            def __iter__(self):
+                yield _make_stream_chunk(tool_calls=[_write_file_call('{"path":"/tmp/a.md","content":"')])
+                # Growing arguments keep both stall detectors quiet.
+                for _ in range(200):
+                    time.sleep(0.005)
+                    yield _make_stream_chunk(tool_calls=[_write_file_call(loop, tc_id=None)])
+                raise httpx.RemoteProtocolError("peer closed connection")
+
+        complete = '{"path":"/tmp/a.md","content":"# Prompts"}'
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [
+            RunawayArguments(),
+            _Stream(
+                [
+                    _make_stream_chunk(tool_calls=[_write_file_call(complete, tc_id="call_2")]),
+                    _make_stream_chunk(finish_reason="tool_calls", model="test/model"),
+                ]
+            ),
+        ]
+        mock_create.return_value = mock_client
+        agent = _make_agent()
+
+        with caplog.at_level(logging.WARNING):
+            response = agent._interruptible_streaming_api_call({})
+
+        assert mock_abort.called
+        assert "arguments degenerated into repetition" in caplog.text
+        assert response.choices[0].message.tool_calls[0].function.arguments == complete
+
+    @patch("run_agent.AIAgent._abort_request_openai_client")
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_should_keep_streaming_large_varied_arguments(
+        self, mock_close, mock_create, mock_abort, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "30")
+        rows = [f"row {i}: value {i * 7919 % 104729}, label item-{i:05d}\\n" for i in range(1500)]
+
+        class LargeVariedArguments:
+            response = SimpleNamespace(headers={})
+
+            def __iter__(self):
+                yield _make_stream_chunk(tool_calls=[_write_file_call('{"path":"/tmp/a.csv","content":"')])
+                for row in rows:
+                    yield _make_stream_chunk(tool_calls=[_write_file_call(row, tc_id=None)])
+                yield _make_stream_chunk(tool_calls=[_write_file_call('"}', tc_id=None)])
+                yield _make_stream_chunk(finish_reason="tool_calls", model="test/model")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [LargeVariedArguments()]
+        mock_create.return_value = mock_client
+        agent = _make_agent()
+
+        with caplog.at_level(logging.WARNING):
+            response = agent._interruptible_streaming_api_call({})
+
+        assert not mock_abort.called
+        assert "degenerated into repetition" not in caplog.text
+        assert len(response.choices[0].message.tool_calls[0].function.arguments) > 32_000
+
+
 class TestSlowOrTruncatedStreamDiagnostics:
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
@@ -183,7 +262,8 @@ class TestSlowOrTruncatedStreamDiagnostics:
 
         assert "Stream attempt truncated: finish_reason=length" in caplog.text
         assert "completion_tokens=4000 reasoning_tokens=3900" in caplog.text
-        assert "tools=['write_file']" in caplog.text
+        assert "write_file(" in caplog.text
+        assert "tail=" in caplog.text
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")

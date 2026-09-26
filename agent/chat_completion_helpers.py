@@ -34,6 +34,7 @@ from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint, is_openrouter_preset_model
 from agent.message_content import flatten_message_text
+from agent.repetition_guard import is_repetition_dominated
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_surrogates,
@@ -299,6 +300,27 @@ def _check_stale_giveup(agent) -> None:
             "avoid an indefinite stall. Switch models or start a new "
             "session, then retry."
         )
+
+
+# A tool call's streamed arguments are checked for a repetition loop once they
+# pass this size, and again after every further step of growth.  Degenerate
+# loops run until the output cap, so catching them early saves minutes.
+_TOOL_ARG_RUNAWAY_MIN_CHARS = 32_000
+_TOOL_ARG_RUNAWAY_STEP_CHARS = 16_000
+
+
+def _flag_runaway_tool_arguments(progress: dict, idx, entry: dict) -> None:
+    """Mark the stream when a tool call's growing arguments are a repetition loop."""
+    arguments = entry["function"]["arguments"]
+    size = len(arguments)
+    if size < _TOOL_ARG_RUNAWAY_MIN_CHARS:
+        return
+    checked = progress["checked"]
+    if size - checked.get(idx, 0) < _TOOL_ARG_RUNAWAY_STEP_CHARS:
+        return
+    checked[idx] = size
+    if is_repetition_dominated(arguments):
+        progress["runaway"] = (entry["function"]["name"] or "?", size)
 
 
 # A completed attempt slower than this is logged with its diagnostics, so a
@@ -2761,7 +2783,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # call or more argument text), ``None`` while no tool call is open.  A
     # provider can keep delivering chunks while a tool call's arguments stop
     # growing, which the chunk-based stale detector cannot see.
-    tool_arg_progress = {"t": None}
+    tool_arg_progress = {"t": None, "runaway": None, "checked": {}}
     # Stale-stream patience, shared between the httpx socket read timeout
     # (built in ``_call_chat_completions`` below) and the stale-stream detector
     # (computed further down, before the worker thread starts).  Initialized
@@ -2918,7 +2940,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Reset stale-stream timer so the detector measures from this
         # attempt's start, not a previous attempt's last chunk.
         last_chunk_time["t"] = time.time()
-        tool_arg_progress["t"] = None
+        tool_arg_progress.update(t=None, runaway=None, checked={})
         agent._touch_activity("waiting for provider response (streaming)")
         # Initialize per-attempt stream diagnostics so the retry block can
         # reach for them after the stream dies.  Lives on
@@ -3151,6 +3173,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         if tc_delta.function.arguments:
                             entry["function"]["arguments"] += tc_delta.function.arguments
                             tool_arg_progress["t"] = time.time()
+                            _flag_runaway_tool_arguments(tool_arg_progress, idx, entry)
                     extra = getattr(tc_delta, "extra_content", None)
                     if extra is None and hasattr(tc_delta, "model_extra"):
                         extra = (tc_delta.model_extra if isinstance(tc_delta.model_extra, dict) else {}).get("extra_content")
@@ -3189,6 +3212,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if chunk.choices[0].finish_reason:
                 finish_reason = chunk.choices[0].finish_reason
                 tool_arg_progress["t"] = None
+                tool_arg_progress["runaway"] = None
 
             # Usage in the final chunk
             if hasattr(chunk, "usage") and chunk.usage:
@@ -3240,7 +3264,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         _log_slow_or_truncated_stream(
             agent, _diag, finish_reason, usage_obj, has_truncated_tool_args,
-            [tool_calls_acc[i]["function"]["name"] or "?" for i in sorted(tool_calls_acc)],
+            [
+                f'{tool_calls_acc[i]["function"]["name"] or "?"}'
+                f'({len(tool_calls_acc[i]["function"]["arguments"])} chars,'
+                f' tail={tool_calls_acc[i]["function"]["arguments"][-120:]!r})'
+                for i in sorted(tool_calls_acc)
+            ],
         )
 
         # Zero-chunk guard: stream yielded nothing usable — a provider/upstream
@@ -3957,9 +3986,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _tool_arg_last is not None
             and time.time() - _tool_arg_last > _tool_arg_stall_timeout
         )
-        if _stale_elapsed > _stream_stale_timeout or _tool_arg_stalled:
+        _tool_arg_runaway = tool_arg_progress["runaway"]
+        if (
+            _stale_elapsed > _stream_stale_timeout
+            or _tool_arg_stalled
+            or (_tool_arg_runaway is not None and _tool_arg_stall_timeout != float("inf"))
+        ):
             _est_ctx = estimate_request_context_tokens(api_kwargs)
-            if _tool_arg_stalled:
+            if _tool_arg_runaway is not None:
+                _stale_elapsed = time.time() - last_chunk_time["t"]
+                logger.warning(
+                    "Tool call '%s' arguments degenerated into repetition (%s chars) while "
+                    "streaming. model=%s context=~%s tokens diag=%s. Killing connection.",
+                    _tool_arg_runaway[0], f"{_tool_arg_runaway[1]:,}",
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                    agent._stream_diag_summary(request_client_holder.get("diag")),
+                )
+            elif _tool_arg_stalled:
                 _stale_elapsed = time.time() - _tool_arg_last
                 logger.warning(
                     "Tool call arguments stalled for %.0fs (threshold %.0fs) while the "
@@ -4014,7 +4057,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Reset the timers so we don't kill repeatedly while
             # the inner thread processes the closure.
             last_chunk_time["t"] = time.time()
-            tool_arg_progress["t"] = None
+            tool_arg_progress.update(t=None, runaway=None)
             agent._emit_wait_notice(
                 f"⚠ no output from provider for {int(_stale_elapsed)}s — "
                 f"reconnecting..."
