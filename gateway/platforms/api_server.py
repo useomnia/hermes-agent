@@ -188,6 +188,79 @@ def _complete_brand_setup_succeeded(function_result: Any) -> bool:
     )
 
 
+TURN_CONTINUATION_API_VERSION = 1
+_CONTINUATION_APPROVAL_SCOPES = frozenset({"once", "session", "always", "deny"})
+_CONTINUATION_INTERRUPTED_RESULT = json.dumps(
+    {
+        "status": "interrupted",
+        "note": (
+            "This call was interrupted before its result was recorded. It may or "
+            "may not have taken effect: check the current state before repeating it."
+        ),
+    },
+    ensure_ascii=False,
+)
+
+
+def _parse_continuation(value: Any) -> Optional[Dict[str, Any]]:
+    """Parse a ``/v1/runs`` continuation, returning its closing step (or None).
+
+    A continuation runs the agent from the session's saved history with no
+    user message. Its optional ``close`` finishes an unfinished tool-call
+    block first: ``interrupted`` closes every unresolved call, ``answer`` gives
+    a timed-out question its answer, and ``approval`` applies a late decision.
+    """
+    if not isinstance(value, dict) or not set(value) <= {"close"}:
+        raise ValueError("continuation may only contain 'close'")
+    close = value.get("close")
+    if close is None:
+        return None
+    if not isinstance(close, dict):
+        raise ValueError("continuation.close must be an object")
+    kind = close.get("kind")
+    if kind == "interrupted":
+        if set(close) != {"kind"}:
+            raise ValueError("an interrupted close takes no other fields")
+        return {"kind": kind}
+    tool_call_id = close.get("tool_call_id")
+    if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+        raise ValueError("continuation.close.tool_call_id must be a non-empty string")
+    if kind == "answer":
+        if not set(close) <= {"kind", "tool_call_id", "response", "ag_ui_state"}:
+            raise ValueError("unexpected field in an answer close")
+        response = close.get("response")
+        if not isinstance(response, str):
+            raise ValueError("continuation.close.response must be a string")
+        shared_state = close.get("ag_ui_state")
+        if shared_state is not None and not isinstance(shared_state, dict):
+            raise ValueError("continuation.close.ag_ui_state must be an object")
+        # Same result shape the interaction plugin returns for a live answer.
+        result: Dict[str, Any] = {"status": "answered", "response": response}
+        if shared_state is not None:
+            result["ag_ui_state"] = shared_state
+        return {
+            "kind": kind,
+            "tool_call_id": tool_call_id,
+            "content": json.dumps(result, ensure_ascii=False),
+        }
+    if kind == "approval":
+        if not set(close) <= {"kind", "tool_call_id", "scope"}:
+            raise ValueError("unexpected field in an approval close")
+        scope = close.get("scope")
+        if scope not in _CONTINUATION_APPROVAL_SCOPES:
+            raise ValueError("continuation.close.scope must be once, session, always or deny")
+        from tools.tool_approval import _denial_result
+
+        return {
+            "kind": kind,
+            "tool_call_id": tool_call_id,
+            "scope": scope,
+            # A late deny leaves the model the same result a live deny does.
+            "content": str(_denial_result("deny")) if scope == "deny" else None,
+        }
+    raise ValueError("continuation.close.kind must be interrupted, answer or approval")
+
+
 def _parse_managed_run_identity(value: Any) -> ManagedRunIdentity:
     """Parse the strict v1 managed identity shared by all managed run routes."""
     if not isinstance(value, dict) or set(value) != _MANAGED_RUN_IDENTITY_KEYS:
@@ -3007,6 +3080,49 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return None
 
+    def _selected_run_api_mode(
+        self,
+        *,
+        session_id: Optional[str],
+        gateway_session_key: Optional[str],
+        requested_model: Optional[str],
+        requested_provider: Optional[str],
+        route: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Resolve enough of the selected runtime to gate continuation mode."""
+        session_override = self._session_model_override_for(
+            gateway_session_key or session_id
+        )
+        if isinstance(session_override, dict):
+            mode = _clean_request_string(session_override.get("api_mode"))
+            if mode:
+                return mode
+        provider = (
+            _clean_request_string(route.get("provider"))
+            if isinstance(route, dict)
+            else None
+        ) or _clean_request_string(requested_provider)
+        target_model = (
+            _clean_request_string(route.get("model"))
+            if isinstance(route, dict)
+            else None
+        ) or _clean_request_string(requested_model)
+        try:
+            if provider:
+                runtime = _resolve_request_runtime_agent_kwargs(
+                    provider, target_model=target_model
+                )
+            else:
+                from gateway.run import _resolve_runtime_agent_kwargs
+
+                runtime = _resolve_runtime_agent_kwargs() or {}
+            return _clean_request_string(runtime.get("api_mode"))
+        except Exception:
+            # Agent construction remains the authoritative error surface for
+            # provider/auth failures. This preflight only rejects a known
+            # incompatible transport before the closing step writes history.
+            return None
+
     def _create_agent(
         self,
         ephemeral_system_prompt: Optional[str] = None,
@@ -4256,6 +4372,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "platform": "hermes-agent",
             "model": self._model_name,
             "turn_event_log_api_version": TURN_EVENT_LOG_API_VERSION,
+            # No-user continuation on /v1/runs (``input: null`` + ``continuation``).
+            "turn_continuation_api_version": TURN_CONTINUATION_API_VERSION,
             "auth": {
                 "type": "bearer",
                 "required": bool(self._api_key),
@@ -4584,6 +4702,113 @@ class APIServerAdapter(BasePlatformAdapter):
         if not session:
             return None, web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
         return session, None
+
+    async def _apply_continuation_close(
+        self,
+        session_id: str,
+        close: Optional[Dict[str, Any]],
+        grant_session_key: str,
+    ) -> tuple[Optional["web.Response"], Optional[str], List[Dict[str, Any]]]:
+        """Make the session's tail resumable before a continuation loads it.
+
+        Returns ``(error_response, instructions_note, closed)``. ``closed``
+        lists each call the closing step finished, for the run's first event.
+        The note is run-scoped guidance for a late approval whose gated call
+        ran nested inside ``execute_code``: that call has no entry of its own
+        in history, so the decision reaches the model as instructions for this
+        run instead of as the call's result, and is never persisted.
+        """
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return (
+                web.json_response(
+                    _openai_error(
+                        "Session database unavailable for continuation",
+                        code="session_db_unavailable",
+                    ),
+                    status=503,
+                ),
+                None,
+                [],
+            )
+        from tools.tool_approval import record_late_approval, take_expired_approval
+
+        def _is_interaction_tool(name: str) -> bool:
+            return name == "request_user_input"
+
+        def _close(step: Optional[Dict[str, Any]]):
+            return db.close_continuation_tail(
+                session_id,
+                step,
+                interrupted_content=_CONTINUATION_INTERRUPTED_RESULT,
+                is_interaction_tool=_is_interaction_tool,
+            )
+
+        status, info = await asyncio.to_thread(_close, close)
+        note: Optional[str] = None
+        # A gated call nested inside execute_code has no call of its own in
+        # history; the gate remembered what it asked when the wait expired.
+        expired = (
+            take_expired_approval(grant_session_key, close["tool_call_id"])
+            if status == "not_found"
+            and info.get("reason") == "unknown_call"
+            and close is not None
+            and close.get("kind") == "approval"
+            else None
+        )
+        if expired is not None:
+            nested_name, nested_arguments = expired
+            status, info = await asyncio.to_thread(_close, None)
+            if status == "ok":
+                readable = nested_name
+                if close["scope"] == "deny":
+                    note = (
+                        f"[Omnia: After its approval request had timed out, the user "
+                        f"declined `{readable}`. It was NOT performed; do not perform it.]"
+                    )
+                else:
+                    record_late_approval(
+                        grant_session_key,
+                        nested_name,
+                        nested_arguments,
+                        close["scope"],
+                    )
+                    note = (
+                        f"[Omnia: After its approval request had timed out, the user "
+                        f"approved `{readable}`. It has NOT run yet. If it is still "
+                        f"needed, call it again with the same arguments; it will not "
+                        f"ask for approval again.]"
+                    )
+        if status == "ok":
+            closed: List[Dict[str, Any]] = []
+            target_id = close.get("tool_call_id") if isinstance(close, dict) else None
+            closed_ids = list(info.get("closed") or [])
+            if note is not None and target_id is not None:
+                closed_ids.append(target_id)
+            for call_id in closed_ids:
+                entry: Dict[str, Any] = {"tool_call_id": call_id, "kind": "interrupted"}
+                if call_id == target_id and close.get("kind") == "answer":
+                    entry = {**entry, "kind": "answer", "choice": close["content"]}
+                elif call_id == target_id and close.get("kind") == "approval":
+                    entry = {**entry, "kind": "approval", "choice": close["scope"]}
+                closed.append(entry)
+            return None, note, closed
+        code = {
+            "not_resumable": "continuation_not_resumable",
+            "not_found": "continuation_call_not_found",
+            "conflict": "continuation_conflict",
+        }.get(status, "continuation_not_resumable")
+        return (
+            web.json_response(
+                _openai_error(
+                    f"Session cannot be continued ({info.get('reason', status)})",
+                    code=code,
+                ),
+                status=409,
+            ),
+            None,
+            [],
+        )
 
     async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
         db = await self._ensure_session_db_async()
@@ -8508,6 +8733,22 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
     @staticmethod
+    def _leave_interaction_open(agent, tool_call_id: Any) -> None:
+        """Keep a timed-out interaction's call unresolved in SessionDB.
+
+        The live sentinel still ends the run, but it is not the call's real
+        result: a late answer or decision closes the call through a no-user
+        continuation, which needs the call dangling at rest.
+        """
+        if agent is None or not isinstance(tool_call_id, str) or not tool_call_id:
+            return
+        pending = getattr(agent, "_omnio_skip_persist_tool_call_ids", None)
+        if not isinstance(pending, set):
+            pending = set()
+            agent._omnio_skip_persist_tool_call_ids = pending
+        pending.add(tool_call_id)
+
+    @staticmethod
     def _interrupt_for_expired_tool_approval(agent, event: Dict[str, Any]) -> None:
         interaction = event.get("interaction")
         if (
@@ -8516,6 +8757,7 @@ class APIServerAdapter(BasePlatformAdapter):
             or interaction.get("timed_out") is not True
         ):
             return
+        APIServerAdapter._leave_interaction_open(agent, event.get("toolCallId"))
         try:
             agent.interrupt("awaiting user approval (tool approval timed out)")
         except Exception:
@@ -8827,22 +9069,44 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         raw_input = body.get("input")
-        if not raw_input:
-            return web.json_response(_openai_error("Missing 'input' field"), status=400)
+        continuation = "continuation" in body
+        continuation_close: Optional[Dict[str, Any]] = None
+        if continuation:
+            if raw_input not in (None, "", []):
+                return web.json_response(
+                    _openai_error(
+                        "A continuation adds no user input",
+                        code="invalid_continuation",
+                    ),
+                    status=400,
+                )
+            try:
+                continuation_close = _parse_continuation(body["continuation"])
+            except ValueError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code="invalid_continuation"),
+                    status=400,
+                )
+            user_message = ""
+        else:
+            if not raw_input:
+                return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
-        user_message = (
-            raw_input
-            if isinstance(raw_input, str)
-            else (
-                raw_input[-1].get("content", "")
-                if isinstance(raw_input, list)
-                and raw_input
-                and isinstance(raw_input[-1], dict)
-                else ""
+            user_message = (
+                raw_input
+                if isinstance(raw_input, str)
+                else (
+                    raw_input[-1].get("content", "")
+                    if isinstance(raw_input, list)
+                    and raw_input
+                    and isinstance(raw_input[-1], dict)
+                    else ""
+                )
             )
-        )
-        if not user_message:
-            return web.json_response(_openai_error("No user message found in input"), status=400)
+            if not user_message:
+                return web.json_response(
+                    _openai_error("No user message found in input"), status=400
+                )
 
         text_format, text_format_error = _response_format_from_text_format(
             body.get("text")
@@ -8960,6 +9224,90 @@ class APIServerAdapter(BasePlatformAdapter):
                         code="invalid_managed_run_identity",
                     ),
                     status=400,
+                )
+
+        continuation_note: Optional[str] = None
+        continuation_closed: List[Dict[str, Any]] = []
+        if continuation:
+            # A continuation resumes durable SessionDB history, so it needs the
+            # authoritative session, and a turn_id so its closing step and run
+            # admission are both keyed to one Omnia Turn.
+            if turn_id is None or explicit_session_id is None or not self._api_key:
+                return web.json_response(
+                    _openai_error(
+                        "continuations require turn_id and session_id on an "
+                        "authenticated gateway",
+                        code="invalid_continuation",
+                    ),
+                    status=400,
+                )
+            continuation_overrides = _request_agent_overrides(
+                body, virtual_model=self._model_name
+            )
+            if self._selected_run_api_mode(
+                session_id=explicit_session_id,
+                gateway_session_key=gateway_session_key,
+                requested_model=continuation_overrides.get("requested_model"),
+                requested_provider=continuation_overrides.get("requested_provider"),
+                route=self._resolve_route(body.get("model")),
+            ) == "codex_app_server":
+                return web.json_response(
+                    _openai_error(
+                        "codex_app_server cannot consume continuation history",
+                        code="invalid_continuation",
+                    ),
+                    status=400,
+                )
+            request_profile = self._effective_request_profile()
+            # A retried continuation whose Turn is already reserved replays
+            # that run; its tail may have moved on since, so it must not be
+            # closed again.
+            store = self._run_idempotency_store_for_profile(request_profile)
+            try:
+                if managed_identity is not None:
+                    already_reserved = await asyncio.to_thread(
+                        store.reconcile_managed,
+                        turn_id=turn_id,
+                        session_id=explicit_session_id,
+                        owner_profile=request_profile,
+                        identity=managed_identity,
+                    )
+                else:
+                    already_reserved = await asyncio.to_thread(store.get, turn_id)
+                    if already_reserved is not None and (
+                        already_reserved.session_id != explicit_session_id
+                        or already_reserved.managed_submission_id is not None
+                    ):
+                        raise RunIdempotencyMismatch(
+                            "turn_id is reserved for a different run"
+                        )
+            except RunIdempotencyMismatch:
+                return web.json_response(
+                    _openai_error(
+                        "turn_id was already used with different request semantics",
+                        code="managed_run_identity_conflict",
+                    ),
+                    status=409,
+                )
+            if already_reserved is None:
+                (
+                    close_error,
+                    continuation_note,
+                    continuation_closed,
+                ) = await self._apply_continuation_close(
+                    explicit_session_id,
+                    continuation_close,
+                    self._scoped_tool_approval_session_key(
+                        explicit_session_id, request_profile
+                    ),
+                )
+                if close_error is not None:
+                    return close_error
+            if continuation_note:
+                instructions = (
+                    f"{instructions}\n\n{continuation_note}"
+                    if isinstance(instructions, str) and instructions
+                    else continuation_note
                 )
 
         # With an authenticated gateway key, SessionDB is authoritative for an
@@ -9193,6 +9541,30 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=503,
             )
         emitter = TurnEventEmitter(self._turn_event_logs, run_id, session_id)
+        if continuation_closed:
+            # The closing step belongs to this Turn: its first events say which
+            # earlier calls it finished, so a client can settle their cards.
+            emitter.omnio_event(
+                "response.omnio.continuation",
+                closed=[
+                    {"tool_call_id": item["tool_call_id"], "kind": item["kind"]}
+                    for item in continuation_closed
+                ],
+            )
+            for item in continuation_closed:
+                if item["kind"] == "interrupted":
+                    continue
+                choice = item["choice"]
+                if item["kind"] == "answer":
+                    try:
+                        choice = json.loads(choice).get("response", "")
+                    except (TypeError, ValueError, AttributeError):
+                        choice = ""
+                emitter.omnio_event(
+                    "response.omnio.interaction_completed",
+                    tool_call_id=item["tool_call_id"],
+                    choice=_redact_response_extension_value(choice),
+                )
 
         # Compatibility-only queue shadow. New subscribers and event producers
         # use _turn_event_logs exclusively.
@@ -9575,10 +9947,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     # leaves it open and answerable.
                     if reason == "expired":
                         completion_fields = {"timed_out": True}
+                        # The late answer closes this call through a
+                        # continuation, so its sentinel must not become the
+                        # call's durable result.
+                        self._leave_interaction_open(
+                            self._active_run_agents.get(run_id),
+                            normalized_tool_call_id,
+                        )
                 # The question is now waiting on the chat, not on this run: the
-                # card stays answerable and a late answer arrives as the next
-                # Turn's user message, so the run must end instead of letting
-                # the agent keep working without the answer.
+                # card stays answerable and a late answer closes the call
+                # through a continuation, so the run must end instead of
+                # letting the agent keep working without the answer.
                 user_input_turn_ending = status in {"presented", "no_response"}
                 if completion_fields is not None:
                     fields = {
@@ -9897,8 +10276,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                     "messages": [],
                                 }
                             else:
-                                expanded_message = self._maybe_expand_slash_command(
-                                    user_message, effective_task_id
+                                expanded_message = (
+                                    None
+                                    if continuation
+                                    else self._maybe_expand_slash_command(
+                                        user_message, effective_task_id
+                                    )
                                 )
                                 r = agent.run_conversation(
                                     user_message=(
@@ -9908,6 +10291,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     ),
                                     conversation_history=conversation_history,
                                     task_id=effective_task_id,
+                                    **({"continuation": True} if continuation else {}),
                                 )
                         finally:
                             try:
@@ -9999,17 +10383,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     isinstance(result, dict) and result.get("response_previewed")
                 )
                 streamed_final_block = "".join(current_message_text_parts)
-                if final_response and not streamed_final_block and not response_previewed:
-                    _emit_text(final_response, from_stream=False)
-                elif (
-                    not response_previewed
-                    and final_response.startswith(streamed_final_block)
-                    and len(final_response) > len(streamed_final_block)
-                ):
-                    _emit_text(
-                        final_response[len(streamed_final_block):],
-                        from_stream=False,
-                    )
+                # A failed run's final_response is its error summary, not a
+                # reply: it travels in response.failed and must not become an
+                # assistant message a client reads as the Turn's answer.
+                run_failed = bool(isinstance(result, dict) and result.get("failed"))
+                if not run_failed:
+                    if final_response and not streamed_final_block and not response_previewed:
+                        _emit_text(final_response, from_stream=False)
+                    elif (
+                        not response_previewed
+                        and final_response.startswith(streamed_final_block)
+                        and len(final_response) > len(streamed_final_block)
+                    ):
+                        _emit_text(
+                            final_response[len(streamed_final_block):],
+                            from_stream=False,
+                        )
 
                 # Close out calls that started live but never got a
                 # completion event (e.g. abandoned on interrupt/timeout).
@@ -10023,7 +10412,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 was_interrupted = bool(
                     isinstance(result, dict) and result.get("interrupted")
                 )
-                run_failed = bool(isinstance(result, dict) and result.get("failed"))
 
                 def _close_log_cap_exceeded() -> None:
                     error_msg = "Turn event log exceeded the 8 MiB cap"

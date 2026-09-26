@@ -6681,6 +6681,174 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def close_continuation_tail(
+        self,
+        session_id: str,
+        close: Optional[Dict[str, Any]],
+        *,
+        interrupted_content: str,
+        is_interaction_tool: Callable[[str], bool],
+    ) -> tuple[str, Dict[str, Any]]:
+        """Make a session's durable tail resumable for a no-user continuation.
+
+        A continuation runs the agent from the saved history without adding a
+        user message, so the tail must be one a provider can answer: the
+        user's own message (nothing ran yet), or an assistant tool-call block
+        whose calls all have results. ``close`` supplies what finishes an
+        unfinished block, in one ``BEGIN IMMEDIATE`` transaction with the
+        checks:
+
+        - ``None``: nothing to close; any unresolved call is refused.
+        - ``{"kind": "interrupted"}``: every unresolved call gets
+          ``interrupted_content``; a call that may already have run is never
+          re-executed.
+        - ``{"kind": "answer", "tool_call_id", "content"}``: the unresolved
+          interaction call receives ``content`` as its result.
+        - ``{"kind": "approval", "tool_call_id", "scope", "content"}``: a
+          ``deny`` records ``content`` as the gated call's result; any other
+          scope stores a durable grant on the assistant row so the
+          continuation re-dispatches exactly that call.
+
+        Unresolved siblings of an answered or approved call are closed as
+        interrupted. Replaying the same closing step is idempotent; a
+        different decision for an already-closed call is a conflict.
+
+        Returns ``("ok" | "not_resumable" | "not_found" | "conflict", info)``.
+        """
+        kind = close.get("kind") if isinstance(close, dict) else None
+        target_id = close.get("tool_call_id") if isinstance(close, dict) else None
+        stored_interrupted = self._encode_content(interrupted_content)
+
+        def _calls(raw: Any) -> List[Dict[str, Any]]:
+            if not raw:
+                return []
+            try:
+                value = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError):
+                return []
+            if not isinstance(value, list):
+                return []
+            return [call for call in value if isinstance(call, dict)]
+
+        def _call_name(call: Dict[str, Any]) -> Optional[str]:
+            function = call.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+            return name if isinstance(name, str) and name else None
+
+        def _append_tool(conn, call_id: str, name: Optional[str], content: Any) -> None:
+            conn.execute(
+                "INSERT INTO messages "
+                "(session_id, role, content, tool_call_id, tool_name, "
+                "timestamp, observed, active) VALUES (?, 'tool', ?, ?, ?, ?, 0, 1)",
+                (session_id, content, call_id, _scrub_surrogates(name), time.time()),
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                (session_id,),
+            )
+
+        def _do(conn):
+            rows = conn.execute(
+                "SELECT id, role, content, tool_call_id, tool_calls, display_metadata "
+                "FROM messages WHERE session_id = ? AND active = 1 "
+                "AND role IN ('user', 'assistant', 'tool') ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            if not rows:
+                return "not_resumable", {"reason": "empty_session"}
+            assistant_idx = next(
+                (
+                    idx
+                    for idx in range(len(rows) - 1, -1, -1)
+                    if rows[idx]["role"] != "tool"
+                ),
+                None,
+            )
+            if assistant_idx is None:
+                return "not_resumable", {"reason": "orphan_tool_results"}
+            anchor = rows[assistant_idx]
+            if anchor["role"] == "user":
+                if assistant_idx != len(rows) - 1:
+                    return "not_resumable", {"reason": "orphan_tool_results"}
+                if kind not in (None, "interrupted"):
+                    return "not_found", {"reason": "no_pending_call"}
+                return "ok", {"tail": "user", "closed": []}
+            calls = _calls(anchor["tool_calls"])
+            if not calls:
+                return "not_resumable", {"reason": "final_assistant_message"}
+            call_ids = [call.get("id") for call in calls if isinstance(call.get("id"), str)]
+            results = {
+                row["tool_call_id"]: row
+                for row in rows[assistant_idx + 1:]
+                if row["tool_call_id"] in call_ids
+            }
+            if len(results) != len(rows) - assistant_idx - 1:
+                return "not_resumable", {"reason": "foreign_tool_results"}
+            unresolved = [call for call in calls if call.get("id") not in results]
+            metadata = self._decode_display_metadata(anchor["display_metadata"]) or {}
+            grants = metadata.get("_omnio_resolved_approvals")
+            if not isinstance(grants, dict):
+                grants = {}
+
+            target = None
+            if kind in ("answer", "approval"):
+                target = next((call for call in calls if call.get("id") == target_id), None)
+                target_name = _call_name(target) if target is not None else None
+                if target is None or target_name is None:
+                    return "not_found", {"reason": "unknown_call"}
+                interaction = is_interaction_tool(target_name)
+                if (kind == "answer") != interaction:
+                    return "not_found", {"reason": "wrong_call_kind"}
+                grants_call = kind == "approval" and close.get("scope") != "deny"
+                existing = results.get(target_id)
+                if grants_call and target_id in grants:
+                    # The grant may already have been consumed: the approved
+                    # call then has its real result, which is not a conflict.
+                    same = grants[target_id].get("scope") == close.get("scope")
+                    return ("ok" if same else "conflict"), {"replayed": True}
+                if existing is not None:
+                    same = not grants_call and existing["content"] == self._encode_content(
+                        close.get("content")
+                    )
+                    return ("ok" if same else "conflict"), {"replayed": True}
+            elif kind not in (None, "interrupted"):
+                return "not_found", {"reason": "unknown_close_kind"}
+            elif kind is None and unresolved:
+                return "not_resumable", {"reason": "unresolved_calls"}
+
+            closed: List[str] = []
+            for call in unresolved:
+                call_id = call["id"]
+                if target is not None and call_id == target_id:
+                    if kind == "approval" and close.get("scope") != "deny":
+                        raw_arguments = (call.get("function") or {}).get("arguments")
+                        grants[call_id] = {
+                            "scope": close.get("scope"),
+                            "tool_name": _call_name(call),
+                            "arguments": (
+                                raw_arguments if isinstance(raw_arguments, str) else "{}"
+                            ),
+                        }
+                        metadata["_omnio_resolved_approvals"] = grants
+                        conn.execute(
+                            "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                            (self._encode_display_metadata(metadata), anchor["id"]),
+                        )
+                    else:
+                        _append_tool(
+                            conn,
+                            call_id,
+                            _call_name(call),
+                            self._encode_content(close.get("content")),
+                        )
+                    closed.append(call_id)
+                    continue
+                _append_tool(conn, call_id, _call_name(call), stored_interrupted)
+                closed.append(call_id)
+            return "ok", {"tail": "tool_calls", "closed": closed}
+
+        return self._execute_write(_do)
+
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
         display_metadata: Optional[Dict[str, Any]] = None,
