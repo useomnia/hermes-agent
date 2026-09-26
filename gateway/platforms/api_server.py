@@ -9239,12 +9239,13 @@ class APIServerAdapter(BasePlatformAdapter):
         continuation_closed: List[Dict[str, Any]] = []
         if continuation:
             # A continuation resumes durable SessionDB history, so it needs the
-            # authoritative session, and a managed identity so its closing step
-            # and run admission are both keyed to one Omnia Turn.
-            if managed_identity is None or not self._api_key:
+            # authoritative session, and a turn_id so its closing step and run
+            # admission are both keyed to one Omnia Turn.
+            if turn_id is None or explicit_session_id is None or not self._api_key:
                 return web.json_response(
                     _openai_error(
-                        "continuations require a managed run on an authenticated gateway",
+                        "continuations require turn_id and session_id on an "
+                        "authenticated gateway",
                         code="invalid_continuation",
                     ),
                     status=400,
@@ -9270,16 +9271,25 @@ class APIServerAdapter(BasePlatformAdapter):
             # A retried continuation whose Turn is already reserved replays
             # that run; its tail may have moved on since, so it must not be
             # closed again.
+            store = self._run_idempotency_store_for_profile(request_profile)
             try:
-                already_reserved = await asyncio.to_thread(
-                    self._run_idempotency_store_for_profile(
-                        request_profile
-                    ).reconcile_managed,
-                    turn_id=turn_id,
-                    session_id=explicit_session_id,
-                    owner_profile=request_profile,
-                    identity=managed_identity,
-                )
+                if managed_identity is not None:
+                    already_reserved = await asyncio.to_thread(
+                        store.reconcile_managed,
+                        turn_id=turn_id,
+                        session_id=explicit_session_id,
+                        owner_profile=request_profile,
+                        identity=managed_identity,
+                    )
+                else:
+                    already_reserved = await asyncio.to_thread(store.get, turn_id)
+                    if already_reserved is not None and (
+                        already_reserved.session_id != explicit_session_id
+                        or already_reserved.managed_submission_id is not None
+                    ):
+                        raise RunIdempotencyMismatch(
+                            "turn_id is reserved for a different run"
+                        )
             except RunIdempotencyMismatch:
                 return web.json_response(
                     _openai_error(

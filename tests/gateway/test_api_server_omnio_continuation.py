@@ -148,7 +148,7 @@ async def test_capabilities_advertise_continuation(adapter):
 
 
 @pytest.mark.asyncio
-async def test_continuation_requires_a_managed_run(adapter):
+async def test_continuation_requires_a_turn_and_session(adapter):
     async with TestClient(TestServer(_app(adapter))) as client:
         response = await client.post(
             "/v1/runs",
@@ -404,3 +404,28 @@ async def test_the_closing_step_is_the_runs_first_event(adapter, db):
     ]
     assert omnio[1]["type"] == "response.omnio.interaction_completed"
     assert (omnio[1]["tool_call_id"], omnio[1]["choice"]) == ("q1", "Blue")
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_continuation_is_keyed_by_turn_id(adapter, db):
+    """The Omnio proxy identifies runs by turn_id alone."""
+    db.append_message(SESSION, "user", "hello")
+    agent = _agent()
+    body = {"input": None, "continuation": {}, "turn_id": "turn-plain", "session_id": SESSION}
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", return_value=agent) as create_agent:
+            first = await client.post("/v1/runs", headers=AUTH, json=body)
+            first_body = await first.json()
+            await _wait_for_run(agent)
+            db.append_message(SESSION, "assistant", "all done")
+            second = await client.post("/v1/runs", headers=AUTH, json=body)
+            second_body = await second.json()
+            other_session = await client.post(
+                "/v1/runs", headers=AUTH, json={**body, "session_id": "other"}
+            )
+
+    assert first.status == second.status == 202
+    assert second_body["run_id"] == first_body["run_id"]
+    assert second_body["idempotent"] is True
+    assert other_session.status == 409
+    create_agent.assert_called_once()
