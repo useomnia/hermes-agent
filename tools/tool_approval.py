@@ -33,6 +33,7 @@ replace or release each other, while session grants remain conversation-scoped.
 from __future__ import annotations
 
 import contextvars
+from collections import OrderedDict
 import hashlib
 import json
 import logging
@@ -108,6 +109,12 @@ _once_approved: set[tuple[str, str, str, str]] = set()
 # in history (a gated call nested inside ``execute_code``): the model's next
 # call with the same tool and arguments consumes it, whatever its id.
 _ANY_TOOL_CALL = "\x00any"
+# (session_key, tool_call_id) -> (tool name, arguments) of approvals whose wait
+# ended unanswered. A nested call never enters history, so this is the only
+# record of what the user was asked when a late decision arrives. Arguments stay
+# in-process: approval events deliberately never carry them to a client.
+_EXPIRED_APPROVALS: "OrderedDict[tuple[str, str], tuple[str, dict]]" = OrderedDict()
+_EXPIRED_APPROVALS_MAX = 256
 # Mechanical surface/wait state stays isolated from the user-input gate by this
 # module's own registry instance. The waiter payload is the gated tool name.
 _wait_registry: BlockingWaitRegistry[
@@ -938,7 +945,28 @@ def maybe_require_tool_approval(
         return _denial_result(None, status="approval_error")
     # An unresolved wait with a real surface — timeout or interrupt (choice is
     # None) — fails closed and ends the turn via "approval_no_response".
+    if tool_call_id:
+        _remember_expired_approval(grant_session_key, tool_call_id, function_name, function_args)
     return _denial_result(None)
+
+
+def _remember_expired_approval(
+    session_key: str, tool_call_id: str, function_name: str, function_args: Optional[dict]
+) -> None:
+    with _lock:
+        _EXPIRED_APPROVALS[(session_key, tool_call_id)] = (
+            function_name,
+            dict(function_args) if isinstance(function_args, dict) else {},
+        )
+        _EXPIRED_APPROVALS.move_to_end((session_key, tool_call_id))
+        while len(_EXPIRED_APPROVALS) > _EXPIRED_APPROVALS_MAX:
+            _EXPIRED_APPROVALS.popitem(last=False)
+
+
+def take_expired_approval(session_key: str, tool_call_id: str) -> Optional[tuple[str, dict]]:
+    """The tool and arguments a timed-out approval asked about, consumed once."""
+    with _lock:
+        return _EXPIRED_APPROVALS.pop((session_key, tool_call_id), None)
 
 
 def _complete_tool_approval(

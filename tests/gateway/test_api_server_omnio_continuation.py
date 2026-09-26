@@ -129,7 +129,7 @@ class TestParseContinuation:
             {"close": {"kind": "answer", "tool_call_id": "q1"}},
             {"close": {"kind": "answer", "tool_call_id": "", "response": "x"}},
             {"close": {"kind": "approval", "tool_call_id": "w1", "scope": "forever"}},
-            {"close": {"kind": "approval", "tool_call_id": "w1", "scope": "once", "tool": {"name": "x"}}},
+            {"close": {"kind": "approval", "tool_call_id": "w1", "scope": "once", "tool": {"name": "x", "arguments": {}}}},
             {"close": {"kind": "resume"}},
             {"close": None, "extra": 1},
         ],
@@ -273,29 +273,43 @@ async def test_a_different_answer_conflicts(adapter, db):
 
 
 @pytest.mark.asyncio
-async def test_late_nested_approval_grants_the_exact_call_and_tells_the_model(adapter, db):
+async def test_late_nested_approval_grants_what_the_gate_asked_and_tells_the_model(adapter, db):
     db.append_message(SESSION, "user", "write it")
     db.append_message(SESSION, "assistant", "", tool_calls=[_call("x1", "execute_code")])
     db.append_message(SESSION, "tool", "approval not granted", tool_call_id="x1", tool_name="execute_code")
+    grant_key = adapter._scoped_tool_approval_session_key(SESSION, adapter._effective_request_profile())
+    # The gate remembers a nested approval whose wait expired; its arguments
+    # never reach the client.
+    tool_approval._remember_expired_approval(grant_key, "nested_x1_0", "mcp_connectors_write", {"id": 7})
     agent = _agent()
-    tool = {"name": "mcp_connectors_write", "arguments": {"id": 7}}
     async with TestClient(TestServer(_app(adapter))) as client:
         with patch.object(adapter, "_create_agent", return_value=agent) as create_agent:
             response = await client.post(
                 "/v1/runs",
                 headers=AUTH,
-                json=_continue(
-                    {"kind": "approval", "tool_call_id": "nested_x1_0", "scope": "once", "tool": tool}
-                ),
+                json=_continue({"kind": "approval", "tool_call_id": "nested_x1_0", "scope": "once"}),
             )
             await _wait_for_run(agent)
 
     assert response.status == 202
     prompt = create_agent.call_args.kwargs["ephemeral_system_prompt"]
     assert "approved `mcp_connectors_write`" in prompt
-    grant_key = adapter._scoped_tool_approval_session_key(SESSION, adapter._effective_request_profile())
-    assert tool_approval.consume_once_approval(grant_key, "nested_new_0", tool["name"], tool["arguments"])
-    assert not tool_approval.consume_once_approval(grant_key, "nested_new_1", tool["name"], tool["arguments"])
+    assert tool_approval.consume_once_approval(grant_key, "nested_new_0", "mcp_connectors_write", {"id": 7})
+    assert not tool_approval.consume_once_approval(grant_key, "nested_new_1", "mcp_connectors_write", {"id": 7})
+    assert tool_approval.take_expired_approval(grant_key, "nested_x1_0") is None
+
+
+@pytest.mark.asyncio
+async def test_late_approval_for_an_unknown_call_is_refused(adapter, db):
+    db.append_message(SESSION, "user", "write it")
+    db.append_message(SESSION, "assistant", "all done")
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/v1/runs",
+            headers=AUTH,
+            json=_continue({"kind": "approval", "tool_call_id": "nested_gone", "scope": "once"}),
+        )
+    assert response.status == 409
 
 
 def test_expired_approval_leaves_its_call_open():
@@ -429,3 +443,14 @@ async def test_unmanaged_continuation_is_keyed_by_turn_id(adapter, db):
     assert second_body["idempotent"] is True
     assert other_session.status == 409
     create_agent.assert_called_once()
+
+
+def test_an_expired_approval_is_remembered_once_and_bounded(monkeypatch):
+    monkeypatch.setattr(tool_approval, "_EXPIRED_APPROVALS_MAX", 2)
+    tool_approval._remember_expired_approval("s", "a", "tool_a", {"x": 1})
+    tool_approval._remember_expired_approval("s", "b", "tool_b", {})
+    tool_approval._remember_expired_approval("s", "c", "tool_c", {})
+    assert tool_approval.take_expired_approval("s", "a") is None  # evicted oldest
+    assert tool_approval.take_expired_approval("s", "b") == ("tool_b", {})
+    assert tool_approval.take_expired_approval("s", "b") is None
+    assert tool_approval.take_expired_approval("other", "c") is None

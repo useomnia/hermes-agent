@@ -209,9 +209,6 @@ def _parse_continuation(value: Any) -> Optional[Dict[str, Any]]:
     user message. Its optional ``close`` finishes an unfinished tool-call
     block first: ``interrupted`` closes every unresolved call, ``answer`` gives
     a timed-out question its answer, and ``approval`` applies a late decision.
-    An approval may name its gated ``tool`` so a call that ran nested inside
-    ``execute_code`` (and so has no call of its own in history) can still be
-    granted.
     """
     if not isinstance(value, dict) or not set(value) <= {"close"}:
         raise ValueError("continuation may only contain 'close'")
@@ -247,27 +244,17 @@ def _parse_continuation(value: Any) -> Optional[Dict[str, Any]]:
             "content": json.dumps(result, ensure_ascii=False),
         }
     if kind == "approval":
-        if not set(close) <= {"kind", "tool_call_id", "scope", "tool"}:
+        if not set(close) <= {"kind", "tool_call_id", "scope"}:
             raise ValueError("unexpected field in an approval close")
         scope = close.get("scope")
         if scope not in _CONTINUATION_APPROVAL_SCOPES:
             raise ValueError("continuation.close.scope must be once, session, always or deny")
-        tool = close.get("tool")
-        if tool is not None and (
-            not isinstance(tool, dict)
-            or set(tool) != {"name", "arguments"}
-            or not isinstance(tool.get("name"), str)
-            or not tool["name"]
-            or not isinstance(tool.get("arguments"), dict)
-        ):
-            raise ValueError("continuation.close.tool must be {name, arguments}")
         from tools.tool_approval import _denial_result
 
         return {
             "kind": kind,
             "tool_call_id": tool_call_id,
             "scope": scope,
-            "tool": tool,
             # A late deny leaves the model the same result a live deny does.
             "content": str(_denial_result("deny")) if scope == "deny" else None,
         }
@@ -4744,7 +4731,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 None,
                 [],
             )
-        from tools.tool_approval import record_late_approval
+        from tools.tool_approval import record_late_approval, take_expired_approval
 
         def _is_interaction_tool(name: str) -> bool:
             return name == "request_user_input"
@@ -4759,17 +4746,21 @@ class APIServerAdapter(BasePlatformAdapter):
 
         status, info = await asyncio.to_thread(_close, close)
         note: Optional[str] = None
-        nested_tool = close.get("tool") if isinstance(close, dict) else None
-        if (
-            status == "not_found"
+        # A gated call nested inside execute_code has no call of its own in
+        # history; the gate remembered what it asked when the wait expired.
+        expired = (
+            take_expired_approval(grant_session_key, close["tool_call_id"])
+            if status == "not_found"
             and info.get("reason") == "unknown_call"
             and close is not None
             and close.get("kind") == "approval"
-            and isinstance(nested_tool, dict)
-        ):
+            else None
+        )
+        if expired is not None:
+            nested_name, nested_arguments = expired
             status, info = await asyncio.to_thread(_close, None)
             if status == "ok":
-                readable = nested_tool["name"]
+                readable = nested_name
                 if close["scope"] == "deny":
                     note = (
                         f"[Omnia: After its approval request had timed out, the user "
@@ -4778,8 +4769,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 else:
                     record_late_approval(
                         grant_session_key,
-                        nested_tool["name"],
-                        nested_tool["arguments"],
+                        nested_name,
+                        nested_arguments,
                         close["scope"],
                     )
                     note = (
