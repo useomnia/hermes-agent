@@ -34,6 +34,7 @@ from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint, is_openrouter_preset_model
 from agent.message_content import flatten_message_text
+from agent.repetition_guard import is_repetition_dominated
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_surrogates,
@@ -299,6 +300,59 @@ def _check_stale_giveup(agent) -> None:
             "avoid an indefinite stall. Switch models or start a new "
             "session, then retry."
         )
+
+
+# A tool call's streamed arguments are checked for a repetition loop once they
+# pass this size, and again after every further step of growth.  Degenerate
+# loops run until the output cap, so catching them early saves minutes.
+_TOOL_ARG_RUNAWAY_MIN_CHARS = 32_000
+_TOOL_ARG_RUNAWAY_STEP_CHARS = 16_000
+
+
+def _flag_runaway_tool_arguments(progress: dict, idx, entry: dict) -> None:
+    """Mark the stream when a tool call's growing arguments are a repetition loop."""
+    arguments = entry["function"]["arguments"]
+    size = len(arguments)
+    if size < _TOOL_ARG_RUNAWAY_MIN_CHARS:
+        return
+    checked = progress["checked"]
+    if size - checked.get(idx, 0) < _TOOL_ARG_RUNAWAY_STEP_CHARS:
+        return
+    checked[idx] = size
+    if is_repetition_dominated(arguments):
+        progress["runaway"] = (entry["function"]["name"] or "?", size)
+
+
+# A completed attempt slower than this is logged with its diagnostics, so a
+# stalled-then-finished generation leaves the same trail as a dropped one.
+_SLOW_STREAM_LOG_SECONDS = 120.0
+
+
+def _log_slow_or_truncated_stream(
+    agent, diag, finish_reason, usage_obj, truncated_tool_args: bool, tool_names
+) -> None:
+    """Record a slow or tool-truncated stream attempt with its diagnostics.
+
+    The retry machinery only sees the final attempt's usage, so this is the
+    one place a stalled attempt's finish reason and token spend survive.
+    """
+    try:
+        started = diag.get("started_at") if isinstance(diag, dict) else None
+        elapsed = time.time() - started if started else 0.0
+        if not truncated_tool_args and elapsed < _SLOW_STREAM_LOG_SECONDS:
+            return
+        completion = getattr(usage_obj, "completion_tokens", None) if usage_obj else None
+        details = getattr(usage_obj, "completion_tokens_details", None) if usage_obj else None
+        reasoning = getattr(details, "reasoning_tokens", None) if details else None
+        logger.warning(
+            "Stream attempt %s: finish_reason=%s truncated_tool_args=%s tools=%s "
+            "completion_tokens=%s reasoning_tokens=%s %s",
+            "truncated" if truncated_tool_args else "slow",
+            finish_reason, truncated_tool_args, tool_names or [],
+            completion, reasoning, agent._stream_diag_summary(diag),
+        )
+    except Exception:
+        pass
 
 
 def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
@@ -2725,6 +2779,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # poll loop uses this to detect stale connections that keep receiving
     # SSE keep-alive pings but no actual data.
     last_chunk_time = {"t": time.time()}
+    # Wall-clock timestamp of the last growth of a streaming tool call (a new
+    # call or more argument text), ``None`` while no tool call is open.  A
+    # provider can keep delivering chunks while a tool call's arguments stop
+    # growing, which the chunk-based stale detector cannot see.
+    tool_arg_progress = {"t": None, "runaway": None, "checked": {}}
     # Stale-stream patience, shared between the httpx socket read timeout
     # (built in ``_call_chat_completions`` below) and the stale-stream detector
     # (computed further down, before the worker thread starts).  Initialized
@@ -2881,6 +2940,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Reset stale-stream timer so the detector measures from this
         # attempt's start, not a previous attempt's last chunk.
         last_chunk_time["t"] = time.time()
+        tool_arg_progress.update(t=None, runaway=None, checked={})
         agent._touch_activity("waiting for provider response (streaming)")
         # Initialize per-attempt stream diagnostics so the retry block can
         # reach for them after the stream dies.  Lives on
@@ -2983,13 +3043,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     api_kwargs.get("model", "unknown"),
                 )
                 break
-            last_chunk_time["t"] = time.time()
+            _chunk_at = time.time()
+            _chunk_gap = _chunk_at - last_chunk_time["t"]
+            last_chunk_time["t"] = _chunk_at
             agent._touch_activity("receiving stream response")
 
             # Update per-attempt diagnostic counters.  Best-effort —
             # failures are swallowed so the streaming hot path is never
             # interrupted by diagnostic accounting.
             try:
+                if _diag.get("first_chunk_at") is not None:
+                    _diag["max_chunk_gap_s"] = max(float(_diag.get("max_chunk_gap_s", 0.0)), _chunk_gap)
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                 if _diag.get("first_chunk_at") is None:
                     _diag["first_chunk_at"] = last_chunk_time["t"]
@@ -3105,8 +3169,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # (matching the OpenAI Node SDK / LiteLLM /
                             # Vercel AI patterns) is immune to this.
                             entry["function"]["name"] = tc_delta.function.name
+                            tool_arg_progress["t"] = time.time()
                         if tc_delta.function.arguments:
                             entry["function"]["arguments"] += tc_delta.function.arguments
+                            tool_arg_progress["t"] = time.time()
+                            _flag_runaway_tool_arguments(tool_arg_progress, idx, entry)
                     extra = getattr(tc_delta, "extra_content", None)
                     if extra is None and hasattr(tc_delta, "model_extra"):
                         extra = (tc_delta.model_extra if isinstance(tc_delta.model_extra, dict) else {}).get("extra_content")
@@ -3144,6 +3211,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
             if chunk.choices[0].finish_reason:
                 finish_reason = chunk.choices[0].finish_reason
+                tool_arg_progress["t"] = None
+                tool_arg_progress["runaway"] = None
 
             # Usage in the final chunk
             if hasattr(chunk, "usage") and chunk.usage:
@@ -3192,6 +3261,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         arguments=arguments,
                     ),
                 ))
+
+        _log_slow_or_truncated_stream(
+            agent, _diag, finish_reason, usage_obj, has_truncated_tool_args,
+            [
+                f'{tool_calls_acc[i]["function"]["name"] or "?"}'
+                f'({len(tool_calls_acc[i]["function"]["arguments"])} chars,'
+                f' tail={tool_calls_acc[i]["function"]["arguments"][-120:]!r})'
+                for i in sorted(tool_calls_acc)
+            ],
+        )
 
         # Zero-chunk guard: stream yielded nothing usable — a provider/upstream
         # error or malformed SSE, not a legitimate empty completion. Raise so the
@@ -3847,6 +3926,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
+    # Argument text streams token by token, so a tool call that stops growing
+    # for this long has stalled even when other chunks keep the stream alive.
+    _tool_arg_stall_timeout = (
+        float("inf")
+        if _stream_stale_timeout == float("inf")
+        else env_float("HERMES_TOOL_ARG_STALL_TIMEOUT", 120.0)
+    )
 
     t = threading.Thread(target=_call, daemon=True)
     t.start()
@@ -3895,14 +3981,44 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # but delivering no real chunks.  Kill the client so the
         # inner retry loop can start a fresh connection.
         _stale_elapsed = time.time() - last_chunk_time["t"]
-        if _stale_elapsed > _stream_stale_timeout:
+        _tool_arg_last = tool_arg_progress["t"]
+        _tool_arg_stalled = (
+            _tool_arg_last is not None
+            and time.time() - _tool_arg_last > _tool_arg_stall_timeout
+        )
+        _tool_arg_runaway = tool_arg_progress["runaway"]
+        if (
+            _stale_elapsed > _stream_stale_timeout
+            or _tool_arg_stalled
+            or (_tool_arg_runaway is not None and _tool_arg_stall_timeout != float("inf"))
+        ):
             _est_ctx = estimate_request_context_tokens(api_kwargs)
-            logger.warning(
-                "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
-                "model=%s context=~%s tokens. Killing connection.",
-                _stale_elapsed, _stream_stale_timeout,
-                api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
-            )
+            if _tool_arg_runaway is not None:
+                _stale_elapsed = time.time() - last_chunk_time["t"]
+                logger.warning(
+                    "Tool call '%s' arguments degenerated into repetition (%s chars) while "
+                    "streaming. model=%s context=~%s tokens diag=%s. Killing connection.",
+                    _tool_arg_runaway[0], f"{_tool_arg_runaway[1]:,}",
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                    agent._stream_diag_summary(request_client_holder.get("diag")),
+                )
+            elif _tool_arg_stalled:
+                _stale_elapsed = time.time() - _tool_arg_last
+                logger.warning(
+                    "Tool call arguments stalled for %.0fs (threshold %.0fs) while the "
+                    "stream stayed open. model=%s context=~%s tokens diag=%s. "
+                    "Killing connection.",
+                    _stale_elapsed, _tool_arg_stall_timeout,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                    agent._stream_diag_summary(request_client_holder.get("diag")),
+                )
+            else:
+                logger.warning(
+                    "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
+                    "model=%s context=~%s tokens. Killing connection.",
+                    _stale_elapsed, _stream_stale_timeout,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                )
             agent._buffer_status(
                 f"⚠️ No response from provider for {int(_stale_elapsed)}s "
                 f"(model: {api_kwargs.get('model', 'unknown')}, "
@@ -3938,9 +4054,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # The shared client will be replaced lazily by
                 # _ensure_primary_openai_client on the next request.
                 pass
-            # Reset the timer so we don't kill repeatedly while
+            # Reset the timers so we don't kill repeatedly while
             # the inner thread processes the closure.
             last_chunk_time["t"] = time.time()
+            tool_arg_progress.update(t=None, runaway=None)
             agent._emit_wait_notice(
                 f"⚠ no output from provider for {int(_stale_elapsed)}s — "
                 f"reconnecting..."
