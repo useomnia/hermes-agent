@@ -326,3 +326,34 @@ class TestRunSingleChildTimeoutDump:
         assert result["timeout_seconds"] is None
         assert result["timed_out_after_seconds"] is None
         assert result["timeout_phase"] is None
+
+
+# ── Child session binding ─────────────────────────────────────────────
+
+class TestRunSingleChildSession:
+    """The child runs on an executor thread; its session must travel with it
+    so Toolbox calls name the child (and, through its parent, the conversation)."""
+
+    def test_child_runs_bound_to_its_own_session(self, hermes_home, monkeypatch):
+        from gateway import session_context
+        from tools import delegate_tool
+
+        monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 30.0)
+        child = _StubChild(api_call_count=1, hang_seconds=0.0)
+        child.session_id = "20260925_155840_2c2f0c"
+        seen = []
+
+        def _record(*_args, **_kwargs):
+            seen.append(session_context.current_session_id())
+            return {"final_response": "done", "completed": True, "api_calls": 1}
+
+        child.run_conversation = _record
+        parent = MagicMock()
+        parent._touch_activity = MagicMock()
+        parent._current_task_id = None
+
+        delegate_tool._run_single_child(
+            task_index=0, goal="write a file", child=child, parent_agent=parent
+        )
+
+        assert seen == ["20260925_155840_2c2f0c"]
