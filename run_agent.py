@@ -1186,6 +1186,12 @@ class AIAgent:
         stream_diag_capture_response(self, diag, http_response)
 
     @staticmethod
+    def _stream_diag_summary(diag: Optional[Dict[str, Any]]) -> str:
+        """Forwarder — see ``agent.stream_diag.stream_diag_summary``."""
+        from agent.stream_diag import stream_diag_summary
+        return stream_diag_summary(diag)
+
+    @staticmethod
     def _flatten_exception_chain(error: BaseException) -> str:
         """Forwarder — see ``agent.stream_diag.flatten_exception_chain``."""
         from agent.stream_diag import flatten_exception_chain

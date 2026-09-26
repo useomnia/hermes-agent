@@ -86,6 +86,37 @@ def stream_diag_capture_response(agent: Any, diag: Dict[str, Any], http_response
         pass
 
 
+def stream_diag_summary(diag: Optional[Dict[str, Any]], now: Optional[float] = None) -> str:
+    """One bounded ``key=value`` line describing a stream attempt so far.
+
+    Covers the numbers that tell a stalled generation from a slow one:
+    elapsed time, time to first chunk, chunk count and bytes, the longest
+    gap between chunks, and the upstream provider headers.  Best-effort —
+    an unusable diag yields ``"none"``.
+    """
+    if not isinstance(diag, dict):
+        return "none"
+    try:
+        at = time.time() if now is None else now
+        started = diag.get("started_at")
+        first = diag.get("first_chunk_at")
+        parts = [
+            f"elapsed={at - started:.1f}s" if started else "elapsed=?",
+            f"first_chunk={first - started:.1f}s" if started and first else "first_chunk=none",
+            f"chunks={int(diag.get('chunks', 0))}",
+            f"bytes={int(diag.get('bytes', 0))}",
+            f"max_gap={float(diag.get('max_chunk_gap_s', 0.0)):.1f}s",
+            f"http={diag.get('http_status')}",
+        ]
+        headers = diag.get("headers") or {}
+        for name in ("x-openrouter-id", "x-openrouter-provider", "x-openrouter-model", "x-request-id"):
+            if headers.get(name):
+                parts.append(f"{name}={headers[name]}")
+        return " ".join(parts)
+    except Exception:
+        return "none"
+
+
 def flatten_exception_chain(error: BaseException) -> str:
     """Return a compact ``Outer(msg) <- Inner(msg) <- ...`` rendering.
 
@@ -274,6 +305,7 @@ __all__ = [
     "STREAM_DIAG_HEADERS",
     "stream_diag_init",
     "stream_diag_capture_response",
+    "stream_diag_summary",
     "flatten_exception_chain",
     "log_stream_retry",
     "emit_stream_drop",
