@@ -308,6 +308,14 @@ def _check_stale_giveup(agent) -> None:
 _TOOL_ARG_RUNAWAY_MIN_CHARS = 32_000
 _TOOL_ARG_RUNAWAY_STEP_CHARS = 16_000
 
+# A tool call whose arguments end in this many characters of nothing but blank
+# text (spaces, tabs, newlines or their JSON escapes) has degenerated into a
+# whitespace loop: the model emits newline-and-indent tokens until the output
+# cap. Real arguments never carry a blank run this long, and at one or two
+# characters per chunk the repetition check above would need ~90 s to see it.
+_TOOL_ARG_BLANK_RUN_CHARS = 2_000
+_BLANK_ARG_SUFFIX = re.compile(r"(?:[ \t\r\n]|\\[nrt])*\Z")
+
 
 # How much of a tool call's arguments a kill or slow-attempt log keeps: enough of
 # the start to name the call and of the end to show what it was repeating.
@@ -328,10 +336,28 @@ def _tool_arg_sample(entry) -> str:
     )
 
 
-def _flag_runaway_tool_arguments(progress: dict, idx, entry: dict) -> None:
-    """Mark the stream when a tool call's growing arguments are a repetition loop."""
+def _flag_runaway_tool_arguments(progress: dict, idx, entry: dict, delta: str) -> None:
+    """Mark the stream when a tool call's growing arguments are a whitespace or
+    repetition loop."""
     arguments = entry["function"]["arguments"]
     size = len(arguments)
+    if progress["runaway"] is not None:
+        return
+    # Length of the blank run ending the arguments, updated from the new delta.
+    # The window keeps the two characters before it so an escape split across
+    # deltas (``\`` then ``n``) still reads as blank, and a trailing lone
+    # backslash is held back until the next delta shows what it escapes.
+    window = arguments[-(len(delta) + 2):]
+    grown = len(delta)
+    if window.endswith("\\") and not window.endswith("\\\\"):
+        window, grown = window[:-1], grown - 1
+    match = _BLANK_ARG_SUFFIX.search(window)
+    suffix = len(window) - match.start() if match else 0
+    blank = progress["blank"]
+    blank[idx] = blank.get(idx, 0) + grown if suffix >= grown else suffix
+    if blank[idx] >= _TOOL_ARG_BLANK_RUN_CHARS:
+        progress["runaway"] = (entry["function"]["name"] or "?", size, "blank whitespace")
+        return
     if size < _TOOL_ARG_RUNAWAY_MIN_CHARS:
         return
     checked = progress["checked"]
@@ -339,7 +365,7 @@ def _flag_runaway_tool_arguments(progress: dict, idx, entry: dict) -> None:
         return
     checked[idx] = size
     if is_repetition_dominated(arguments):
-        progress["runaway"] = (entry["function"]["name"] or "?", size)
+        progress["runaway"] = (entry["function"]["name"] or "?", size, "repetition")
 
 
 # A completed attempt slower than this is logged with its diagnostics, so a
@@ -2802,7 +2828,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # call or more argument text), ``None`` while no tool call is open.  A
     # provider can keep delivering chunks while a tool call's arguments stop
     # growing, which the chunk-based stale detector cannot see.
-    tool_arg_progress = {"t": None, "runaway": None, "checked": {}, "entry": None}
+    tool_arg_progress = {"t": None, "runaway": None, "checked": {}, "blank": {}, "entry": None}
     # Stale-stream patience, shared between the httpx socket read timeout
     # (built in ``_call_chat_completions`` below) and the stale-stream detector
     # (computed further down, before the worker thread starts).  Initialized
@@ -2959,7 +2985,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Reset stale-stream timer so the detector measures from this
         # attempt's start, not a previous attempt's last chunk.
         last_chunk_time["t"] = time.time()
-        tool_arg_progress.update(t=None, runaway=None, checked={}, entry=None)
+        tool_arg_progress.update(t=None, runaway=None, checked={}, blank={}, entry=None)
         agent._touch_activity("waiting for provider response (streaming)")
         # Initialize per-attempt stream diagnostics so the retry block can
         # reach for them after the stream dies.  Lives on
@@ -3198,7 +3224,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         if tc_delta.function.arguments:
                             entry["function"]["arguments"] += tc_delta.function.arguments
                             tool_arg_progress.update(t=time.time(), entry=entry)
-                            _flag_runaway_tool_arguments(tool_arg_progress, idx, entry)
+                            _flag_runaway_tool_arguments(
+                                tool_arg_progress, idx, entry, tc_delta.function.arguments
+                            )
                     extra = getattr(tc_delta, "extra_content", None)
                     if extra is None and hasattr(tc_delta, "model_extra"):
                         extra = (tc_delta.model_extra if isinstance(tc_delta.model_extra, dict) else {}).get("extra_content")
@@ -4021,9 +4049,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if _tool_arg_runaway is not None:
                 _stale_elapsed = time.time() - last_chunk_time["t"]
                 logger.warning(
-                    "Tool call '%s' arguments degenerated into repetition (%s chars) while "
+                    "Tool call '%s' arguments degenerated into %s (%s chars) while "
                     "streaming. model=%s context=~%s tokens diag=%s args=%s. Killing connection.",
-                    _tool_arg_runaway[0], f"{_tool_arg_runaway[1]:,}",
+                    _tool_arg_runaway[0], _tool_arg_runaway[2], f"{_tool_arg_runaway[1]:,}",
                     api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                     agent._stream_diag_summary(request_client_holder.get("diag")),
                     _tool_arg_sample(tool_arg_progress.get("entry")),
