@@ -236,6 +236,7 @@ def test_omnio_extension_event_types_are_explicit_and_namespaced() -> None:
     expected = {
         "response.omnio.interaction",
         "response.omnio.interaction_completed",
+        "response.omnio.continuation",
         "response.omnio.compaction",
         "response.omnio.client_event",
         "response.omnio.gen_ui",
@@ -2050,8 +2051,9 @@ async def test_gated_tool_progress_emits_correlated_interaction_extensions() -> 
     assert secret not in gated["interaction"]["question"]
     assert secret not in gated["interaction"]["approval"]["detail"]
     argument_derived = next(
-        event for event in interactions if "tool_call_id" not in event
+        event for event in interactions if event.get("tool_call_id") == "call-input"
     )
+    assert argument_derived["tool_call_id"] == "call-input"
     assert argument_derived["interaction"] == {"prompt": "Choose one"}
 
     completed = [
