@@ -10383,17 +10383,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     isinstance(result, dict) and result.get("response_previewed")
                 )
                 streamed_final_block = "".join(current_message_text_parts)
-                if final_response and not streamed_final_block and not response_previewed:
-                    _emit_text(final_response, from_stream=False)
-                elif (
-                    not response_previewed
-                    and final_response.startswith(streamed_final_block)
-                    and len(final_response) > len(streamed_final_block)
-                ):
-                    _emit_text(
-                        final_response[len(streamed_final_block):],
-                        from_stream=False,
-                    )
+                # A failed run's final_response is its error summary, not a
+                # reply: it travels in response.failed and must not become an
+                # assistant message a client reads as the Turn's answer.
+                run_failed = bool(isinstance(result, dict) and result.get("failed"))
+                if not run_failed:
+                    if final_response and not streamed_final_block and not response_previewed:
+                        _emit_text(final_response, from_stream=False)
+                    elif (
+                        not response_previewed
+                        and final_response.startswith(streamed_final_block)
+                        and len(final_response) > len(streamed_final_block)
+                    ):
+                        _emit_text(
+                            final_response[len(streamed_final_block):],
+                            from_stream=False,
+                        )
 
                 # Close out calls that started live but never got a
                 # completion event (e.g. abandoned on interrupt/timeout).
@@ -10407,7 +10412,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 was_interrupted = bool(
                     isinstance(result, dict) and result.get("interrupted")
                 )
-                run_failed = bool(isinstance(result, dict) and result.get("failed"))
 
                 def _close_log_cap_exceeded() -> None:
                     error_msg = "Turn event log exceeded the 8 MiB cap"

@@ -1012,6 +1012,40 @@ async def test_none_final_response_does_not_mask_structured_run_failure() -> Non
 
 
 @pytest.mark.asyncio
+async def test_failed_run_keeps_its_error_out_of_the_reply() -> None:
+    adapter = _make_adapter()
+    failed_result = {
+        "final_response": "HTTP 400: provider refused the request",
+        "failed": True,
+        "error": "HTTP 400: provider refused the request",
+        "messages": [],
+    }
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(
+            adapter,
+            "_create_agent",
+            return_value=_agent(lambda **_kwargs: failed_result),
+        ):
+            started = await client.post("/v1/runs", json={"input": "fail"})
+            run_id = (await started.json())["run_id"]
+            response = await client.get(f"/v1/runs/{run_id}/events")
+            events = _sse_events(await response.text())
+
+    assert not [
+        event
+        for event in events
+        if event["type"].startswith("response.output_text")
+        or (
+            event["type"] == "response.output_item.added"
+            and event.get("item", {}).get("type") == "message"
+        )
+    ]
+    assert events[-1]["type"] == "response.failed"
+    assert events[-1]["response"]["error"]["message"] == "HTTP 400: provider refused the request"
+
+
+@pytest.mark.asyncio
 async def test_successful_run_emits_file_annotations_before_terminal_with_contiguous_sequence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
