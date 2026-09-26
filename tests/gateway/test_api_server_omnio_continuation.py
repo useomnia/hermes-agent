@@ -273,6 +273,33 @@ async def test_a_different_answer_conflicts(adapter, db):
 
 
 @pytest.mark.asyncio
+async def test_late_nested_approval_closes_the_open_enclosing_script_as_interrupted(adapter, db):
+    db.append_message(SESSION, "user", "write it")
+    db.append_message(SESSION, "assistant", "", tool_calls=[_call("x1", "execute_code")])
+    grant_key = adapter._scoped_tool_approval_session_key(SESSION, adapter._effective_request_profile())
+    tool_approval._remember_expired_approval(grant_key, "nested_x1_0", "mcp_connectors_write", {"id": 7})
+    agent = _agent()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            response = await client.post(
+                "/v1/runs",
+                headers=AUTH,
+                json=_continue({"kind": "approval", "tool_call_id": "nested_x1_0", "scope": "once"}),
+            )
+            await _wait_for_run(agent)
+
+    assert response.status == 202
+    results = [
+        message
+        for message in db.get_messages(SESSION)
+        if message["role"] == "tool" and message.get("tool_call_id") == "x1"
+    ]
+    assert len(results) == 1
+    assert "interrupted" in results[0]["content"]
+    assert tool_approval.consume_once_approval(grant_key, "nested_new_0", "mcp_connectors_write", {"id": 7})
+
+
+@pytest.mark.asyncio
 async def test_late_nested_approval_grants_what_the_gate_asked_and_tells_the_model(adapter, db):
     db.append_message(SESSION, "user", "write it")
     db.append_message(SESSION, "assistant", "", tool_calls=[_call("x1", "execute_code")])

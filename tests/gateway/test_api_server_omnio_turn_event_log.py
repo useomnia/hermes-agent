@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2644,6 +2645,48 @@ async def test_tool_approval_timeout_interrupts_the_turn_before_another_iteratio
         if nested:
             assert not any(event.get("item", {}).get("call_id") == "call-timeout" for event in events)
         assert events[-1]["type"] == "response.incomplete"
+    finally:
+        tool_approval.clear_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_nested_approval_timeout_leaves_the_enclosing_call_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter()
+    session_id = "conversation-nested-approval-timeout"
+    tool_name = "mcp_connectors_TEST_WRITE"
+    built_agent: Optional[MagicMock] = None
+    tool_approval.clear_session(session_id)
+    monkeypatch.setattr(tool_approval, "_approval_timeout", lambda: 0)
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        nonlocal built_agent
+
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            callbacks["tool_start_callback"]("call-script", "execute_code", {})
+            # The start is marshalled onto the event loop; the gate runs later
+            # inside the script, as it does on a real sandbox.
+            time.sleep(0.1)
+            tool_approval.maybe_require_tool_approval(tool_name, "nested-1", {})
+            return {"final_response": "", "messages": [], "interrupted": True}
+
+        built_agent = _agent(run)
+        return built_agent
+
+    try:
+        with (
+            patch.object(adapter, "_create_agent", side_effect=build_agent),
+            patch.object(tool_approval, "is_gated_tool", return_value=True),
+            patch.object(tool_approval, "mcp_tool_has_read_only_hint", return_value=True),
+        ):
+            await _run_without_http_server(
+                adapter,
+                {"input": "run the script", "session_id": session_id},
+            )
+
+        assert built_agent is not None
+        assert built_agent._omnio_skip_persist_tool_call_ids == {"call-script"}
     finally:
         tool_approval.clear_session(session_id)
 

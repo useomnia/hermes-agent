@@ -61,7 +61,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -4758,7 +4758,9 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if expired is not None:
             nested_name, nested_arguments = expired
-            status, info = await asyncio.to_thread(_close, None)
+            # The enclosing script was cut short by the expiry and stays open;
+            # close it as interrupted so the model can decide to run it again.
+            status, info = await asyncio.to_thread(_close, {"kind": "interrupted"})
             if status == "ok":
                 readable = nested_name
                 if close["scope"] == "deny":
@@ -8749,7 +8751,15 @@ class APIServerAdapter(BasePlatformAdapter):
         pending.add(tool_call_id)
 
     @staticmethod
-    def _interrupt_for_expired_tool_approval(agent, event: Dict[str, Any]) -> None:
+    def _interrupt_for_expired_tool_approval(
+        agent, event: Dict[str, Any], enclosing_call_ids: Iterable[str] = ()
+    ) -> None:
+        """End the run on an expired approval, leaving its call open.
+
+        A gated call nested inside ``execute_code`` has no call of its own in
+        history: the call left open for the late decision is the enclosing
+        top-level call still running.
+        """
         interaction = event.get("interaction")
         if (
             agent is None
@@ -8757,7 +8767,9 @@ class APIServerAdapter(BasePlatformAdapter):
             or interaction.get("timed_out") is not True
         ):
             return
-        APIServerAdapter._leave_interaction_open(agent, event.get("toolCallId"))
+        enclosing = [call_id for call_id in enclosing_call_ids if call_id]
+        for call_id in enclosing or [event.get("toolCallId")]:
+            APIServerAdapter._leave_interaction_open(agent, call_id)
         try:
             agent.interrupt("awaiting user approval (tool approval timed out)")
         except Exception:
@@ -9875,8 +9887,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_name=str(tool_name or ""),
                 **event,
             )
+            approval_call_id = event.get("toolCallId")
             self._interrupt_for_expired_tool_approval(
-                self._active_run_agents.get(run_id), event
+                self._active_run_agents.get(run_id),
+                event,
+                ()
+                if approval_call_id in started_tool_calls
+                else [
+                    call_id
+                    for call_id in list(started_tool_calls)
+                    if call_id not in ended_tool_calls
+                ],
             )
 
         def _emit_tool_end(
