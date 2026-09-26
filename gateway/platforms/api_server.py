@@ -9955,9 +9955,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             normalized_tool_call_id,
                         )
                 # The question is now waiting on the chat, not on this run: the
-                # card stays answerable and a late answer arrives as the next
-                # Turn's user message, so the run must end instead of letting
-                # the agent keep working without the answer.
+                # card stays answerable and a late answer closes the call
+                # through a continuation, so the run must end instead of
+                # letting the agent keep working without the answer.
                 user_input_turn_ending = status in {"presented", "no_response"}
                 if completion_fields is not None:
                     fields = {
