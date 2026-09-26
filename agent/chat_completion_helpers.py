@@ -309,6 +309,25 @@ _TOOL_ARG_RUNAWAY_MIN_CHARS = 32_000
 _TOOL_ARG_RUNAWAY_STEP_CHARS = 16_000
 
 
+# How much of a tool call's arguments a kill or slow-attempt log keeps: enough of
+# the start to name the call and of the end to show what it was repeating.
+_TOOL_ARG_SAMPLE_HEAD_CHARS = 160
+_TOOL_ARG_SAMPLE_TAIL_CHARS = 600
+
+
+def _tool_arg_sample(entry) -> str:
+    """Bounded head and tail of a tool call's arguments for a diagnostic log."""
+    if not isinstance(entry, dict):
+        return "none"
+    arguments = entry["function"]["arguments"]
+    if len(arguments) <= _TOOL_ARG_SAMPLE_HEAD_CHARS + _TOOL_ARG_SAMPLE_TAIL_CHARS:
+        return repr(arguments)
+    return (
+        f"head={arguments[:_TOOL_ARG_SAMPLE_HEAD_CHARS]!r} "
+        f"tail={arguments[-_TOOL_ARG_SAMPLE_TAIL_CHARS:]!r}"
+    )
+
+
 def _flag_runaway_tool_arguments(progress: dict, idx, entry: dict) -> None:
     """Mark the stream when a tool call's growing arguments are a repetition loop."""
     arguments = entry["function"]["arguments"]
@@ -2783,7 +2802,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # call or more argument text), ``None`` while no tool call is open.  A
     # provider can keep delivering chunks while a tool call's arguments stop
     # growing, which the chunk-based stale detector cannot see.
-    tool_arg_progress = {"t": None, "runaway": None, "checked": {}}
+    tool_arg_progress = {"t": None, "runaway": None, "checked": {}, "entry": None}
     # Stale-stream patience, shared between the httpx socket read timeout
     # (built in ``_call_chat_completions`` below) and the stale-stream detector
     # (computed further down, before the worker thread starts).  Initialized
@@ -2940,7 +2959,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Reset stale-stream timer so the detector measures from this
         # attempt's start, not a previous attempt's last chunk.
         last_chunk_time["t"] = time.time()
-        tool_arg_progress.update(t=None, runaway=None, checked={})
+        tool_arg_progress.update(t=None, runaway=None, checked={}, entry=None)
         agent._touch_activity("waiting for provider response (streaming)")
         # Initialize per-attempt stream diagnostics so the retry block can
         # reach for them after the stream dies.  Lives on
@@ -3086,10 +3105,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             delta = chunk.choices[0].delta
             if hasattr(chunk, "model") and chunk.model:
                 model_name = chunk.model
+            # OpenRouter names the upstream that served the attempt only in the
+            # chunk body; the diag summary attributes a runaway to it.
+            _served_by = getattr(chunk, "provider", None)
+            if isinstance(_served_by, str) and _served_by and not _diag.get("serving_provider"):
+                _diag["serving_provider"] = _served_by.strip()[:64]
 
             # Accumulate reasoning content
             reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning_text:
+                _diag["reasoning_chars"] = int(_diag.get("reasoning_chars", 0)) + len(reasoning_text)
                 reasoning_parts.append(reasoning_text)
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
@@ -3169,10 +3194,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # (matching the OpenAI Node SDK / LiteLLM /
                             # Vercel AI patterns) is immune to this.
                             entry["function"]["name"] = tc_delta.function.name
-                            tool_arg_progress["t"] = time.time()
+                            tool_arg_progress.update(t=time.time(), entry=entry)
                         if tc_delta.function.arguments:
                             entry["function"]["arguments"] += tc_delta.function.arguments
-                            tool_arg_progress["t"] = time.time()
+                            tool_arg_progress.update(t=time.time(), entry=entry)
                             _flag_runaway_tool_arguments(tool_arg_progress, idx, entry)
                     extra = getattr(tc_delta, "extra_content", None)
                     if extra is None and hasattr(tc_delta, "model_extra"):
@@ -3267,7 +3292,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             [
                 f'{tool_calls_acc[i]["function"]["name"] or "?"}'
                 f'({len(tool_calls_acc[i]["function"]["arguments"])} chars,'
-                f' tail={tool_calls_acc[i]["function"]["arguments"][-120:]!r})'
+                f' {_tool_arg_sample(tool_calls_acc[i])})'
                 for i in sorted(tool_calls_acc)
             ],
         )
@@ -3997,20 +4022,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _stale_elapsed = time.time() - last_chunk_time["t"]
                 logger.warning(
                     "Tool call '%s' arguments degenerated into repetition (%s chars) while "
-                    "streaming. model=%s context=~%s tokens diag=%s. Killing connection.",
+                    "streaming. model=%s context=~%s tokens diag=%s args=%s. Killing connection.",
                     _tool_arg_runaway[0], f"{_tool_arg_runaway[1]:,}",
                     api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                     agent._stream_diag_summary(request_client_holder.get("diag")),
+                    _tool_arg_sample(tool_arg_progress.get("entry")),
                 )
             elif _tool_arg_stalled:
                 _stale_elapsed = time.time() - _tool_arg_last
                 logger.warning(
                     "Tool call arguments stalled for %.0fs (threshold %.0fs) while the "
-                    "stream stayed open. model=%s context=~%s tokens diag=%s. "
+                    "stream stayed open. model=%s context=~%s tokens diag=%s args=%s. "
                     "Killing connection.",
                     _stale_elapsed, _tool_arg_stall_timeout,
                     api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                     agent._stream_diag_summary(request_client_holder.get("diag")),
+                    _tool_arg_sample(tool_arg_progress.get("entry")),
                 )
             else:
                 logger.warning(
