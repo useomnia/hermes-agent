@@ -2685,11 +2685,19 @@ async def test_user_input_timeout_interrupts_the_run_and_stamps_timed_out() -> N
         built_agent = _agent(run, interrupt=lambda _message=None: interrupted.set())
         return built_agent
 
+    consumed_keys: list[str] = []
+
+    def consume_reason(key: str) -> Optional[str]:
+        # The wait is registered under the run's approval key; the conversation
+        # session id never holds a reason on /v1/runs.
+        consumed_keys.append(key)
+        return "expired" if key.startswith("run_") else None
+
     with (
         patch.object(adapter, "_create_agent", side_effect=build_agent),
         patch(
             "tools.user_input.consume_user_input_completion_reason",
-            return_value="expired",
+            side_effect=consume_reason,
         ),
     ):
         _, events = await _run_without_http_server(
@@ -2698,6 +2706,7 @@ async def test_user_input_timeout_interrupts_the_run_and_stamps_timed_out() -> N
         )
 
     assert built_agent is not None
+    assert consumed_keys and all(key.startswith("run_") for key in consumed_keys)
     built_agent.interrupt.assert_called_once_with(
         "awaiting user interaction (request_user_input)"
     )
