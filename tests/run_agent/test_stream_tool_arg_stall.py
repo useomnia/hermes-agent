@@ -90,6 +90,8 @@ class TestToolArgumentStallWatchdog:
 
         assert mock_abort.called
         assert "Tool call arguments stalled" in caplog.text
+        # The kill log shows what the stalled call had written so far.
+        assert "args='{\"path\":\"/tmp/a.md\",\"content\":\"# He'" in caplog.text
         assert response.choices[0].message.tool_calls[0].function.arguments == complete
 
     @patch("run_agent.AIAgent._abort_request_openai_client")
@@ -173,7 +175,9 @@ class TestRunawayToolArguments:
             response = SimpleNamespace(headers={})
 
             def __iter__(self):
-                yield _make_stream_chunk(tool_calls=[_write_file_call('{"path":"/tmp/a.md","content":"')])
+                first = _make_stream_chunk(tool_calls=[_write_file_call('{"path":"/tmp/a.md","content":"')])
+                first.provider = "Azure"
+                yield first
                 # Growing arguments keep both stall detectors quiet.
                 for _ in range(200):
                     time.sleep(0.005)
@@ -199,6 +203,11 @@ class TestRunawayToolArguments:
 
         assert mock_abort.called
         assert "arguments degenerated into repetition" in caplog.text
+        # The kill log names the serving upstream and shows the start of the call
+        # and the text it was repeating.
+        assert "served_by=Azure" in caplog.text
+        assert "head='{\"path\":\"/tmp/a.md\",\"content\":\"The prompt list" in caplog.text
+        assert "tail='" in caplog.text and "same line again and again. " in caplog.text.split("tail='")[1]
         assert response.choices[0].message.tool_calls[0].function.arguments == complete
 
     @patch("run_agent.AIAgent._abort_request_openai_client")
@@ -263,7 +272,7 @@ class TestSlowOrTruncatedStreamDiagnostics:
         assert "Stream attempt truncated: finish_reason=length" in caplog.text
         assert "completion_tokens=4000 reasoning_tokens=3900" in caplog.text
         assert "write_file(" in caplog.text
-        assert "tail=" in caplog.text
+        assert 'write_file(35 chars, \\\'{"path":"/tmp/a.md","content":"# He\\\')' in caplog.text
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
@@ -290,6 +299,8 @@ class TestStreamDiagSummary:
             "bytes": 9000,
             "max_chunk_gap_s": 61.25,
             "http_status": 200,
+            "reasoning_chars": 1200,
+            "serving_provider": "Azure",
             "headers": {"x-openrouter-id": "gen-1", "x-openrouter-provider": "OpenAI"},
         }
 
@@ -297,7 +308,7 @@ class TestStreamDiagSummary:
 
         assert summary == (
             "elapsed=60.0s first_chunk=2.5s chunks=42 bytes=9000 max_gap=61.2s http=200 "
-            "x-openrouter-id=gen-1 x-openrouter-provider=OpenAI"
+            "reasoning_chars=1200 served_by=Azure x-openrouter-id=gen-1 x-openrouter-provider=OpenAI"
         )
 
     def test_should_report_no_first_chunk_and_tolerate_missing_diag(self):

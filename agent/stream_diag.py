@@ -107,7 +107,10 @@ def stream_diag_summary(diag: Optional[Dict[str, Any]], now: Optional[float] = N
             f"bytes={int(diag.get('bytes', 0))}",
             f"max_gap={float(diag.get('max_chunk_gap_s', 0.0)):.1f}s",
             f"http={diag.get('http_status')}",
+            f"reasoning_chars={int(diag.get('reasoning_chars', 0))}",
         ]
+        if diag.get("serving_provider"):
+            parts.append(f"served_by={diag['serving_provider']}")
         headers = diag.get("headers") or {}
         for name in ("x-openrouter-id", "x-openrouter-provider", "x-openrouter-model", "x-request-id"):
             if headers.get(name):
