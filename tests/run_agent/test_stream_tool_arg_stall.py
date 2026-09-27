@@ -242,6 +242,120 @@ class TestRunawayToolArguments:
         assert len(response.choices[0].message.tool_calls[0].function.arguments) > 32_000
 
 
+class TestBlankWhitespaceToolArguments:
+    """The captured runaway: after real YAML the model emits newline-and-indent
+    tokens, one or two characters per chunk, until the output cap."""
+
+    def _run(self, deltas, retry_complete, monkeypatch, caplog):
+        monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "30")
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+
+        class Attempt:
+            response = SimpleNamespace(headers={})
+
+            def __iter__(self):
+                yield _make_stream_chunk(tool_calls=[_write_file_call('{"path":"/tmp/d.md","content":"brand:\\n  name: Linear')])
+                for delta in deltas:
+                    yield _make_stream_chunk(tool_calls=[_write_file_call(delta, tc_id=None)])
+                raise httpx.RemoteProtocolError("peer closed connection")
+
+        retry = _Stream([
+            _make_stream_chunk(tool_calls=[_write_file_call(retry_complete, tc_id="call_2")]),
+            _make_stream_chunk(finish_reason="tool_calls", model="test/model"),
+        ])
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [Attempt(), retry]
+        with patch("run_agent.AIAgent._create_request_openai_client", return_value=mock_client), \
+                patch("run_agent.AIAgent._close_request_openai_client"), \
+                patch("run_agent.AIAgent._abort_request_openai_client") as mock_abort, \
+                patch("run_agent.AIAgent._replace_primary_openai_client"), \
+                caplog.at_level(logging.WARNING):
+            response = _make_agent()._interruptible_streaming_api_call({})
+        return response, mock_abort
+
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+    def test_should_reconnect_within_seconds_when_arguments_turn_into_blank_indentation(self, monkeypatch, caplog):
+        complete = '{"path":"/tmp/d.md","content":"brand:\\n  name: Linear\\n"}'
+        # Paced like the captured stream: a newline token, then an indent token.
+        deltas = [d for _ in range(4000) for d in ("\\n", "    ")]
+
+        class Paced(list):
+            def __iter__(self):
+                for d in list.__iter__(self):
+                    time.sleep(0.0005)
+                    yield d
+
+        started = time.time()
+        response, mock_abort = self._run(Paced(deltas), complete, monkeypatch, caplog)
+
+        assert mock_abort.called
+        assert "arguments degenerated into blank whitespace" in caplog.text
+        # Killed on the blank run, long before the 32 KB repetition check.
+        size = int(caplog.text.split("blank whitespace (")[1].split(" chars")[0].replace(",", ""))
+        assert size < 4_000
+        assert time.time() - started < 10
+        assert response.choices[0].message.tool_calls[0].function.arguments == complete
+
+    def test_should_read_an_escape_split_across_deltas_as_blank(self):
+        from agent.chat_completion_helpers import _flag_runaway_tool_arguments
+
+        progress = {"runaway": None, "checked": {}, "blank": {}}
+        entry = {"function": {"name": "write_file", "arguments": '{"content":"x'}}
+        for _ in range(600):
+            for delta in ("\\", "n   "):
+                entry["function"]["arguments"] += delta
+                _flag_runaway_tool_arguments(progress, 0, entry, delta)
+
+        assert progress["runaway"] is not None
+        assert progress["runaway"][0] == "write_file"
+        assert progress["runaway"][2] == "blank whitespace"
+
+    def test_should_reset_the_blank_run_on_real_text(self):
+        from agent.chat_completion_helpers import _flag_runaway_tool_arguments
+
+        progress = {"runaway": None, "checked": {}, "blank": {}}
+        entry = {"function": {"name": "write_file", "arguments": '{"content":"'}}
+        for i in range(2000):
+            for delta in ("\\n", "      ", f"k{i}"):
+                entry["function"]["arguments"] += delta
+                _flag_runaway_tool_arguments(progress, 0, entry, delta)
+
+        assert progress["runaway"] is None
+        assert progress["blank"][0] == 0
+
+    @patch("run_agent.AIAgent._abort_request_openai_client")
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_should_keep_streaming_indented_content_with_blank_lines(
+        self, mock_close, mock_create, mock_abort, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "30")
+        # Deeply indented YAML with blank lines between entries: lots of
+        # whitespace, but never a long run of nothing else.
+        entry = "\\n" + "\\n".join(" " * 8 + f"- item {i}: value" for i in range(4)) + "\\n\\n\\n        "
+
+        class IndentedContent:
+            response = SimpleNamespace(headers={})
+
+            def __iter__(self):
+                yield _make_stream_chunk(tool_calls=[_write_file_call('{"path":"/tmp/d.md","content":"items:')])
+                for _ in range(600):
+                    yield _make_stream_chunk(tool_calls=[_write_file_call(entry, tc_id=None)])
+                yield _make_stream_chunk(tool_calls=[_write_file_call('"}', tc_id=None)])
+                yield _make_stream_chunk(finish_reason="tool_calls", model="test/model")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [IndentedContent()]
+        mock_create.return_value = mock_client
+
+        with caplog.at_level(logging.WARNING):
+            response = _make_agent()._interruptible_streaming_api_call({})
+
+        assert not mock_abort.called
+        assert "degenerated" not in caplog.text
+        assert len(response.choices[0].message.tool_calls[0].function.arguments) > 32_000
+
+
 class TestSlowOrTruncatedStreamDiagnostics:
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
