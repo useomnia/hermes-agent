@@ -1274,6 +1274,41 @@ def _add_model_aliases(cache: Dict[str, Dict[str, Any]], model_id: str, entry: D
         cache.setdefault(bare_model, entry)
 
 
+def get_model_output_limit(model: str, base_url: str = "", api_key: str = "", provider: str = "") -> Optional[int]:
+    """Published output ceiling for the active route; missing metadata stays unknown.
+
+    A custom endpoint's catalog must not inherit a similarly named public model's
+    limits. OpenRouter's catalog takes precedence over models.dev on its route.
+    Routing/preset suffixes are stripped only for lookup, never on the wire.
+    """
+    if not model:
+        return None
+    inferred = next((name for host, name in _URL_TO_PROVIDER.items()
+                     if base_url and base_url_host_matches(base_url, host.lstrip("."))), None)
+    effective_provider = inferred or (provider or "").strip().lower()
+    if base_url and inferred is None:
+        entry = fetch_endpoint_model_metadata(base_url, api_key=api_key).get(model) or {}
+        value = entry.get("max_completion_tokens")
+    elif effective_provider == "openrouter":
+        lookup_model = openrouter_capability_model("openrouter", model, base_url)
+        if lookup_model.startswith("@preset/"):
+            return None
+        if not lookup_model:
+            return None  # a preset-only request has no locally resolved model
+        variant_base, separator, variant = lookup_model.rpartition(":")
+        if separator and variant.lower() in {"nitro", "floor", "exacto", "online"}:
+            lookup_model = variant_base
+        entry = fetch_model_metadata().get(lookup_model) or {}
+        value = entry.get("max_completion_tokens")
+    else:
+        from agent.models_dev import get_model_capabilities
+
+        capabilities = get_model_capabilities(effective_provider, model)
+        value = capabilities.max_output_tokens if capabilities is not None else None
+    # Do not turn malformed catalog data (including bools/fractional numbers) into a cap.
+    return value if type(value) is int and value > 0 else None
+
+
 def fetch_model_metadata(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
     """Fetch model metadata from OpenRouter (cached for 1 hour)."""
     global _model_metadata_cache, _model_metadata_cache_time
@@ -1303,7 +1338,7 @@ def fetch_model_metadata(force_refresh: bool = False) -> Dict[str, Dict[str, Any
             model_id = model.get("id", "")
             entry = {
                 "context_length": model.get("context_length", 128000),
-                "max_completion_tokens": model.get("top_provider", {}).get("max_completion_tokens", 4096),
+                "max_completion_tokens": (model.get("top_provider") or {}).get("max_completion_tokens"),
                 "name": model.get("name", model_id),
                 "pricing": model.get("pricing", {}),
             }

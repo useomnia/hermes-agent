@@ -115,6 +115,32 @@ def _resolve_billable_cost_delta(
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+
+def _should_rearm_compression_budget(
+    compression_attempts: int,
+    *,
+    completed_compaction_pending: bool,
+    prompt_tokens: int,
+    threshold_tokens: int,
+    preflight_blocked: bool = False,
+) -> bool:
+    """Return True after a provider proves a completed compaction worked.
+
+    Rough estimates cannot safely rearm the anti-thrash budget: they can dip
+    below the threshold while the provider-visible prompt remains too large.
+    Require the completed-compaction latch plus a positive, normalized prompt
+    count below the threshold from the next successful provider response.
+    A fallback may already have reset the counter while leaving the preflight
+    block armed; that block needs the same verified recovery before clearing.
+    """
+    return bool(
+        (compression_attempts or preflight_blocked)
+        and completed_compaction_pending
+        and threshold_tokens > 0
+        and 0 < prompt_tokens < threshold_tokens
+    )
+
+
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
 # outer-loop error classifier to avoid retrying bugs that will fail
@@ -1174,7 +1200,10 @@ def run_conversation(
     compression_attempts = 0
     # One resolved per-turn compression attempt cap, shared by every site that
     # consumes ``compression_attempts``: the pre-API pressure gate, the
-    # overflow/413 retry handlers, and the post-tool compaction gate.
+    # overflow/413 retry handlers, and the post-tool compaction gate. The
+    # counter is a consecutive unverified/ineffective-attempt backstop: a
+    # completed compaction rearms it only after a successful provider response
+    # reports a prompt below the threshold.
     # Config-driven via compression.max_attempts (parsed + validated in
     # agent_init); default 3 preserves the prior hardcoded behavior for
     # objects without the attribute (older pickles / minimal stubs).
@@ -2886,18 +2915,13 @@ def run_conversation(
                                         f"retrying API call "
                                         f"({truncated_tool_call_retries}/4)..."
                                     )
-                                # Boost max_tokens on each retry so the model has
-                                # more room to complete the tool-call JSON. A
-                                # network stall doesn't need a bigger budget, but
-                                # a genuine output-cap truncation does, and the
-                                # boost is harmless for the stall case.
-                                _tc_boost_base = agent.max_tokens if agent.max_tokens else 4096
-                                _tc_boost = _tc_boost_base * (2 ** truncated_tool_call_retries)
-                                _tc_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
-                                if _tc_requested_cap is not None:
-                                    _tc_boost = max(_tc_boost, _tc_requested_cap)
-                                _tc_boost_cap = max(32768, _tc_requested_cap or 0)
-                                agent._ephemeral_max_output_tokens = min(_tc_boost, _tc_boost_cap)
+                                # Double the failed request within a published
+                                # ceiling; keep an unknown provider default unchanged.
+                                from agent.output_budget import boosted_output_cap
+                                agent._ephemeral_max_output_tokens = boosted_output_cap(
+                                    agent, agent._requested_output_cap_from_api_kwargs(api_kwargs),
+                                    truncated_tool_call_retries,
+                                )
                                 # Don't append the broken response to messages;
                                 # just re-run the same API call from the current
                                 # message state, giving the model another chance.
@@ -3029,7 +3053,51 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    # Capture the boundary latch before update_from_response()
+                    # consumes it. Only a real provider prompt count for the
+                    # request immediately following a completed compaction can
+                    # prove that attempt effective and rearm the shared budget.
+                    _completed_compaction_pending = bool(
+                        getattr(
+                            agent.context_compressor,
+                            "_verify_compaction_cleared_threshold",
+                            False,
+                        )
+                    )
                     agent.context_compressor.update_from_response(usage_dict)
+                    _compression_threshold = int(
+                        getattr(agent.context_compressor, "threshold_tokens", 0)
+                        or 0
+                    )
+                    if _should_rearm_compression_budget(
+                        compression_attempts,
+                        completed_compaction_pending=_completed_compaction_pending,
+                        prompt_tokens=prompt_tokens,
+                        threshold_tokens=_compression_threshold,
+                        preflight_blocked=_preflight_compression_blocked,
+                    ):
+                        logger.info(
+                            "Compression budget rearmed after provider-confirmed "
+                            "recovery: prompt=%s < threshold=%s (attempts were %s/%s)",
+                            f"{prompt_tokens:,}",
+                            f"{_compression_threshold:,}",
+                            compression_attempts,
+                            max_compression_attempts,
+                        )
+                        compression_attempts = 0
+                        # Provider-confirmed recovery also invalidates the
+                        # insufficient-progress preflight state: with the
+                        # prompt proven back below the threshold, a prior
+                        # "insufficient progress" verdict (and the stale
+                        # pressure reading it would be compared against)
+                        # describes a request shape that no longer exists.
+                        # Left armed, _preflight_compression_blocked keeps the
+                        # pre-API gate dark for the rest of the turn even
+                        # though the attempt budget was just rearmed, so a
+                        # later pressure spike would grow unchecked until the
+                        # provider's overflow handler fired.
+                        _preflight_compression_blocked = False
+                        _last_preflight_pressure = None
 
                     # Stash this response's canonical usage so the post-turn
                     # on_turn_complete() observation hook can forward it (the
@@ -5335,20 +5403,12 @@ def run_conversation(
             continue
 
         if _retry.restart_with_length_continuation:
-            # Progressively boost the output token budget on each retry.
-            # Retry 1 → 2× base, retry 2 → 4× base, retry 3 → 8× base,
-            # retry 4 → 16× base, then cap at 32 768.
-            # Applies to all providers via _ephemeral_max_output_tokens.
-            # If the original request already used a larger provider/model
-            # default budget, keep that floor so continuation retries do
-            # not accidentally downshift to a much smaller cap.
-            _boost_base = agent.max_tokens if agent.max_tokens else 4096
-            _boost = _boost_base * (2 ** length_continue_retries)
-            _requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
-            if _requested_cap is not None:
-                _boost = max(_boost, _requested_cap)
-            _boost_cap = max(32768, _requested_cap or 0)
-            agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
+            # Use the same catalog/caller budget policy as the initial request.
+            from agent.output_budget import boosted_output_cap
+            agent._ephemeral_max_output_tokens = boosted_output_cap(
+                agent, agent._requested_output_cap_from_api_kwargs(api_kwargs),
+                length_continue_retries,
+            )
             continue
 
         # Guard: if all retries exhausted without a successful response
@@ -5780,7 +5840,26 @@ def run_conversation(
                         )
                         agent._invalid_json_retries = 0
                         agent._cleanup_task_resources(effective_task_id)
-                        _final_response = "Response truncated due to output length limit"
+                        # Only call it an output-length truncation when the
+                        # model actually reported one. This branch is the
+                        # secondary detector for the case where the length
+                        # handler above was bypassed: an upstream router
+                        # rewrote finish_reason away from "length" (e.g.
+                        # OpenRouter) or a transport/stream break left the tool
+                        # arguments cut off mid-JSON after a timeout+retry. In
+                        # those cases the real cause is transport/router
+                        # corruption, not max_output_tokens — say so instead of
+                        # the misleading "output length limit" (#91717).
+                        if finish_reason == "length":
+                            _final_response = "Response truncated due to output length limit"
+                        else:
+                            _final_response = (
+                                "Tool call arguments were truncated mid-JSON, but the model "
+                                f"did not report an output-length limit (finish_reason="
+                                f"{finish_reason!r}). This usually means a transport/stream "
+                                "interruption or an upstream router rewriting finish_reason "
+                                "(e.g. OpenRouter). The tool was not executed."
+                            )
                         # Same tool-tail close as interrupt / invalid-tool
                         # exhaustion — this path never reaches finalize_turn.
                         close_interrupted_tool_sequence(messages, _final_response)
