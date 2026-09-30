@@ -258,3 +258,51 @@ def test_fetch_file_is_registered_in_the_file_toolset():
     assert tool is not None
     assert tool.toolset == "file"
     assert tool.schema["parameters"]["required"] == ["path"]
+
+
+def _store_miss(monkeypatch: pytest.MonkeyPatch) -> str:
+    error = _http_error(404, {"message": "No stored version of this path"})
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda request, timeout: (_ for _ in ()).throw(error)
+    )
+    return file_tools._handle_fetch_file({"path": "~/notes.md"})
+
+
+def test_404_points_to_an_import_where_conversation_tools_are_loaded(
+    hook_env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(file_tools, "_conversation_tools_loaded", lambda: True)
+
+    result = _store_miss(monkeypatch)
+
+    assert "import_conversation_files" in result
+
+
+def test_404_leaves_out_the_import_without_the_conversation_tools(
+    hook_env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(file_tools, "_conversation_tools_loaded", lambda: False)
+
+    result = _store_miss(monkeypatch)
+
+    assert "import_conversation_files" not in result
+
+
+def test_description_states_its_scope_where_conversation_tools_are_loaded(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(file_tools, "_conversation_tools_loaded", lambda: True)
+
+    description = file_tools._build_dynamic_fetch_file_schema()["description"]
+
+    assert description == (
+        file_tools.FETCH_FILE_SCHEMA["description"] + file_tools.FETCH_FILE_CONVERSATION_SCOPE
+    )
+
+
+def test_description_is_unchanged_without_the_conversation_tools(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(file_tools, "_conversation_tools_loaded", lambda: False)
+
+    assert file_tools._build_dynamic_fetch_file_schema() == {}
