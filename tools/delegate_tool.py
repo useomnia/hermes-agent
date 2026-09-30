@@ -2272,8 +2272,11 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from gateway.session_context import bound_session_id
 
-            with delegated_child_context():
+            # The executor thread starts with empty ContextVars: bind the child's
+            # own session so its Toolbox calls name it.
+            with delegated_child_context(), bound_session_id(getattr(child, "session_id", None)):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,

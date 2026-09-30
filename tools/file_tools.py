@@ -2194,6 +2194,25 @@ SEARCH_FILES_HOOK_ENV = "OMNIO_FILE_SEARCH_HOOK"
 _SEARCH_FILES_TIMEOUT_SECONDS = 3.0
 
 
+def _durable_hook_headers() -> dict[str, str]:
+    """Headers for the Omnio durable-file hooks.
+
+    The calling session lets the proxy resolve a conversation home path such as
+    ``~/report.csv`` to that conversation; the hooks keep Brand-wide lookups
+    when no session is bound.
+    """
+    from gateway.session_context import current_session_id
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Omnio-Service-Token": os.environ.get("OMNIO_INTERNAL_TOKEN", ""),
+    }
+    session_id = current_session_id()
+    if session_id is not None:
+        headers["X-Hermes-Session-Id"] = session_id
+    return headers
+
+
 def _durable_store_matches(pattern: str, limit: int) -> list:
     """Stored files whose path matches `pattern`, or an empty list when the
     store is not configured or cannot answer. Never raises: a search must not
@@ -2215,10 +2234,7 @@ def _durable_store_matches(pattern: str, limit: int) -> list:
     request = urllib.request.Request(
         hook_url,
         data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "X-Omnio-Service-Token": os.environ.get("OMNIO_INTERNAL_TOKEN", ""),
-        },
+        headers=_durable_hook_headers(),
         method="POST",
     )
     try:
@@ -2326,10 +2342,7 @@ def _handle_fetch_file(args, **kw):
     request = urllib.request.Request(
         hook_url,
         data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "X-Omnio-Service-Token": os.environ.get("OMNIO_INTERNAL_TOKEN", ""),
-        },
+        headers=_durable_hook_headers(),
         method="POST",
     )
     try:

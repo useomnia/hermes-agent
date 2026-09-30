@@ -24,6 +24,7 @@ from typing import IO, Callable, Protocol
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.interrupt import is_interrupted
+from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -347,7 +348,9 @@ class _ThreadedProcessHandle:
                     pass
                 self._done.set()
 
-        t = threading.Thread(target=_worker, daemon=True)
+        # The backend request runs off the tool thread, so it must carry the
+        # tool's ContextVars (the calling session, approval keys) with it.
+        t = threading.Thread(target=propagate_context_to_thread(_worker), daemon=True)
         t.start()
 
     @property
