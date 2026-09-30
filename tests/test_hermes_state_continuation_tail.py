@@ -129,6 +129,47 @@ class TestAnswer:
             {"replayed": True},
         )
 
+    def test_same_answer_replays_over_a_rebuilt_bare_result(self, db):
+        # A session rebuilt from saved history records a late answer as its bare text.
+        assistant_calls(db, _call("q1", "request_user_input"))
+        db.append_message("s1", "tool", "Yes", tool_call_id="q1", tool_name="request_user_input")
+        answer = json.dumps({"status": "answered", "response": "Yes"})
+
+        assert close(db, {"kind": "answer", "tool_call_id": "q1", "content": answer}) == (
+            "ok",
+            {"replayed": True},
+        )
+        assert tool_rows(db) == [("q1", "Yes")]
+
+    def test_same_answer_with_shared_state_replays(self, db):
+        assistant_calls(db, _call("q1", "request_user_input"))
+        close(db, {"kind": "answer", "tool_call_id": "q1", "content": json.dumps(
+            {"status": "answered", "response": "Yes"}
+        )})
+        answer = json.dumps({"status": "answered", "response": "Yes", "ag_ui_state": {"k": 1}})
+
+        assert close(db, {"kind": "answer", "tool_call_id": "q1", "content": answer})[0] == "ok"
+
+    def test_different_answer_conflicts_with_a_rebuilt_bare_result(self, db):
+        assistant_calls(db, _call("q1", "request_user_input"))
+        db.append_message("s1", "tool", "No", tool_call_id="q1", tool_name="request_user_input")
+        answer = json.dumps({"status": "answered", "response": "Yes"})
+
+        assert close(db, {"kind": "answer", "tool_call_id": "q1", "content": answer})[0] == (
+            "conflict"
+        )
+
+    def test_answer_does_not_replay_over_a_skip(self, db):
+        assistant_calls(db, _call("q1", "request_user_input"))
+        close(db, {"kind": "answer", "tool_call_id": "q1", "content": json.dumps(
+            {"status": "skipped"}
+        )})
+        answer = json.dumps({"status": "answered", "response": "Yes"})
+
+        assert close(db, {"kind": "answer", "tool_call_id": "q1", "content": answer})[0] == (
+            "conflict"
+        )
+
     def test_interrupted_question_cannot_be_answered(self, db):
         assistant_calls(db, _call("q1", "request_user_input"))
         close(db, {"kind": "interrupted"})

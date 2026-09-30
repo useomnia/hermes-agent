@@ -1883,6 +1883,30 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             handle.close()
 
 
+def _answer_response(content: Any) -> Optional[str]:
+    """The User's answer carried by a question's tool result, if it holds one.
+
+    A live or continued answer is ``{"status": "answered", "response": ...}``;
+    a session rebuilt from saved history records the bare answer text.
+    """
+    if not isinstance(content, str):
+        return None
+    try:
+        value = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return content
+    if isinstance(value, dict):
+        response = value.get("response")
+        return response if value.get("status") == "answered" and isinstance(response, str) else None
+    return content
+
+
+def _same_answer(stored: Any, content: Any) -> bool:
+    """Whether a question's recorded result and a closing answer carry the same answer."""
+    stored_answer = _answer_response(stored)
+    return stored_answer is not None and stored_answer == _answer_response(content)
+
+
 class SessionDB:
     """
     SQLite-backed session storage with FTS5 search.
@@ -6807,8 +6831,14 @@ class SessionDB:
                     same = grants[target_id].get("scope") == close.get("scope")
                     return ("ok" if same else "conflict"), {"replayed": True}
                 if existing is not None:
-                    same = not grants_call and existing["content"] == self._encode_content(
-                        close.get("content")
+                    same = not grants_call and (
+                        existing["content"] == self._encode_content(close.get("content"))
+                        or (
+                            kind == "answer"
+                            and _same_answer(
+                                self._decode_content(existing["content"]), close.get("content")
+                            )
+                        )
                     )
                     return ("ok" if same else "conflict"), {"replayed": True}
             elif kind not in (None, "interrupted"):
