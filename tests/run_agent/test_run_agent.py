@@ -6122,7 +6122,8 @@ class TestRunConversation:
 
         assert result["completed"] is False
         assert result["partial"] is True
-        assert "truncated due to output length limit" in result["error"]
+        assert "output length limit" not in result["error"]
+        assert "finish_reason='tool_calls'" in result["error"]
         mock_handle_function_call.assert_not_called()
 
     def test_truncated_tool_json_after_tool_batch_closes_tool_tail(self, agent):
