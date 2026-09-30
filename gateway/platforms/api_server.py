@@ -188,7 +188,8 @@ def _complete_brand_setup_succeeded(function_result: Any) -> bool:
     )
 
 
-TURN_CONTINUATION_API_VERSION = 1
+# 2: a late approval close may carry the gated call its host kept.
+TURN_CONTINUATION_API_VERSION = 2
 _CONTINUATION_APPROVAL_SCOPES = frozenset({"once", "session", "always", "deny"})
 _CONTINUATION_INTERRUPTED_RESULT = json.dumps(
     {
