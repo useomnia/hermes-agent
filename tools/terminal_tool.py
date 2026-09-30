@@ -702,6 +702,138 @@ def _sudo_nopasswd_works() -> bool:
         return False
 
 
+_HOME_REFERENCE = '"$HOME"'
+# A flag (``--output``, ``-o``) or a dotted/dashed key (``core.hooksPath``).
+# URLs, ``$vars``, subscripts and arithmetic never match.
+_TILDE_VALUE_PREFIX = re.compile(r"^(?:-[A-Za-z0-9_.-]*|[A-Za-z_][A-Za-z0-9_.-]*)$")
+_ASSIGNMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _expand_token_tilde_after_equals(token: str) -> str:
+    """Expand ``~`` right after a word's first ``=`` when bash would not.
+
+    Bash expands ``~`` only at the start of a word or after ``=`` in a word
+    shaped like a variable assignment, so ``--output=~/chart.png`` reaches
+    the program as a literal ``~/chart.png`` and lands in a directory named
+    ``~`` under the cwd. zsh's MAGIC_EQUAL_SUBST expands it; this applies
+    the same rule to the unquoted ``~`` directly after the first unquoted
+    ``=`` when the text before it is a flag or a key but not an assignment
+    name (bash already expands those), and only for ``~`` alone or ``~/``,
+    never ``~user``. ``"$HOME"`` is quoted because tilde expansion never
+    word-splits.
+    """
+    i = 0
+    n = len(token)
+    while i < n:
+        ch = token[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "'":
+            end = token.find("'", i + 1)
+            if end == -1:
+                return token
+            i = end + 1
+            continue
+        if ch == '"':
+            i += 1
+            while i < n and token[i] != '"':
+                i += 2 if token[i] == "\\" else 1
+            i += 1
+            continue
+        if ch == "=":
+            prefix = token[:i]
+            if not _TILDE_VALUE_PREFIX.match(prefix) or _ASSIGNMENT_NAME.match(prefix):
+                return token
+            if i + 1 < n and token[i + 1] == "~" and (i + 2 == n or token[i + 2] == "/"):
+                return token[: i + 1] + _HOME_REFERENCE + token[i + 2 :]
+            return token
+        i += 1
+    return token
+
+
+def _heredoc_delimiter(token: str) -> tuple[str, bool] | None:
+    """Return a ``<<`` redirection's delimiter and whether it strips tabs."""
+    token = token.lstrip("0123456789")
+    if not token.startswith("<<") or token.startswith("<<<"):
+        return None
+    strip_tabs = token.startswith("<<-")
+    word = token[3:] if strip_tabs else token[2:]
+    return re.sub(r"[\"'\\]", "", word), strip_tabs
+
+
+def _expand_tilde_after_equals(command: str) -> str:
+    """Apply :func:`_expand_token_tilde_after_equals` to every shell word.
+
+    Comments and heredoc bodies are copied untouched: they are text, not
+    words the shell expands.
+    """
+    out: list[str] = []
+    heredocs: list[tuple[str, bool]] = []
+    awaiting_delimiter: bool | None = None
+    word_start = True
+    i = 0
+    n = len(command)
+
+    while i < n:
+        ch = command[i]
+
+        if ch == "\n" and heredocs:
+            out.append(ch)
+            i += 1
+            for delimiter, strip_tabs in heredocs:
+                while i < n:
+                    end = command.find("\n", i)
+                    line_end = n if end == -1 else end + 1
+                    line = command[i:line_end]
+                    out.append(line)
+                    i = line_end
+                    text = line.rstrip("\n")
+                    if (text.lstrip("\t") if strip_tabs else text) == delimiter:
+                        break
+            heredocs = []
+            word_start = True
+            continue
+
+        if ch.isspace():
+            out.append(ch)
+            i += 1
+            word_start = True
+            continue
+
+        if ch == "#" and word_start:
+            end = command.find("\n", i)
+            end = n if end == -1 else end
+            out.append(command[i:end])
+            i = end
+            continue
+
+        if ch in ";|&()":
+            out.append(ch)
+            i += 1
+            word_start = True
+            continue
+
+        token, next_i = _read_shell_token(command, i)
+        if awaiting_delimiter is not None:
+            heredocs.append((re.sub(r"[\"'\\]", "", token), awaiting_delimiter))
+            awaiting_delimiter = None
+            out.append(token)
+        elif (heredoc := _heredoc_delimiter(token)) is not None:
+            delimiter, strip_tabs = heredoc
+            if delimiter:
+                heredocs.append((delimiter, strip_tabs))
+            else:
+                awaiting_delimiter = strip_tabs
+            out.append(token)
+        else:
+            out.append(_expand_token_tilde_after_equals(token))
+        word_start = False
+        i = next_i
+
+    return "".join(out)
+
+
 def _rewrite_compound_background(command: str) -> str:
     """Wrap `A && B &` (or `A || B &`) to `A && { B & }` at depth 0.
 
@@ -2455,7 +2587,9 @@ def terminal_tool(
                     "status": "blocked"
                 }, ensure_ascii=False)
 
-        # Prepare command for execution
+        # Prepare command for execution. Approval and the model-facing result
+        # keep the command as written; only the executed copy is rewritten.
+        run_command = _expand_tilde_after_equals(command)
         pty_disabled_reason = None
         effective_pty = pty
         if pty and _command_requires_pipe_stdin(command):
@@ -2507,7 +2641,7 @@ def terminal_tool(
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
-                        command=command,
+                        command=run_command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
@@ -2519,7 +2653,7 @@ def terminal_tool(
                 else:
                     proc_session = process_registry.spawn_via_env(
                         env=env,
-                        command=command,
+                        command=run_command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
@@ -2768,7 +2902,7 @@ def terminal_tool(
                 "bounded_capture": True,
             }
             try:
-                result = env.execute(command, **execute_kwargs)
+                result = env.execute(run_command, **execute_kwargs)
             except Exception as e:
                 logger.error(
                     "Execution failed - Command: %s - Error: %s: %s - "
