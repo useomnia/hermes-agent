@@ -2293,11 +2293,21 @@ async def test_concurrent_runs_legacy_resolution_is_ambiguous_without_surface_id
             second_run_id = json.loads(second_started.text)["run_id"]
             run_ids.extend((first_run_id, second_run_id))
 
+            def card_logged(run_id: str) -> bool:
+                return any(
+                    event["type"] == "response.omnio.interaction"
+                    for event in run_events(run_id)
+                )
+
+            # The waiter registers on the agent thread before its card reaches
+            # the run's event log, so wait for both.
             deadline = asyncio.get_running_loop().time() + 3
             while asyncio.get_running_loop().time() < deadline:
                 if (
                     tool_approval._wait_registry.pending_count(first_run_id) == 1
                     and tool_approval._wait_registry.pending_count(second_run_id) == 1
+                    and card_logged(first_run_id)
+                    and card_logged(second_run_id)
                 ):
                     break
                 await asyncio.sleep(0.01)
