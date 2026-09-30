@@ -202,6 +202,16 @@ _CONTINUATION_INTERRUPTED_RESULT = json.dumps(
 )
 
 
+def _pending_call(value: Any) -> Optional[Dict[str, Any]]:
+    """The call a card waits on, as ``{"tool", "arguments"}``, when well formed."""
+    if not isinstance(value, dict):
+        return None
+    tool, arguments = value.get("tool"), value.get("arguments")
+    if not isinstance(tool, str) or not tool or not isinstance(arguments, dict):
+        return None
+    return {"tool": tool, "arguments": arguments}
+
+
 def _parse_continuation(value: Any) -> Optional[Dict[str, Any]]:
     """Parse a ``/v1/runs`` continuation, returning its closing step (or None).
 
@@ -244,11 +254,18 @@ def _parse_continuation(value: Any) -> Optional[Dict[str, Any]]:
             "content": json.dumps(result, ensure_ascii=False),
         }
     if kind == "approval":
-        if not set(close) <= {"kind", "tool_call_id", "scope"}:
+        if not set(close) <= {"kind", "tool_call_id", "scope", "tool", "arguments"}:
             raise ValueError("unexpected field in an approval close")
         scope = close.get("scope")
         if scope not in _CONTINUATION_APPROVAL_SCOPES:
             raise ValueError("continuation.close.scope must be once, session, always or deny")
+        # The gated call as the host kept it while the card was open, for a
+        # session that no longer remembers what the approval asked.
+        gated = None
+        if "tool" in close or "arguments" in close:
+            gated = _pending_call({"tool": close.get("tool"), "arguments": close.get("arguments")})
+            if gated is None:
+                raise ValueError("continuation.close.tool and arguments must name the gated call")
         from tools.tool_approval import _denial_result
 
         return {
@@ -257,6 +274,7 @@ def _parse_continuation(value: Any) -> Optional[Dict[str, Any]]:
             "scope": scope,
             # A late deny leaves the model the same result a live deny does.
             "content": str(_denial_result("deny")) if scope == "deny" else None,
+            **({"gated": gated} if gated is not None else {}),
         }
     raise ValueError("continuation.close.kind must be interrupted, answer or approval")
 
@@ -4756,6 +4774,16 @@ class APIServerAdapter(BasePlatformAdapter):
             and close.get("kind") == "approval"
             else None
         )
+        if (
+            expired is None
+            and status == "not_found"
+            and info.get("reason") == "unknown_call"
+            and close is not None
+            and close.get("gated") is not None
+        ):
+            # A replacement sandbox never saw the wait expire; the host kept
+            # the gated call instead.
+            expired = (close["gated"]["tool"], close["gated"]["arguments"])
         if expired is not None:
             nested_name, nested_arguments = expired
             # The enclosing script was cut short by the expiry and stays open;
@@ -8796,7 +8824,19 @@ class APIServerAdapter(BasePlatformAdapter):
             }[name]
             emitter.omnio_event(event_type, **value)
 
-        def _emit_interaction(tool_call_id: str, interaction: Dict[str, Any]) -> None:
+        def _emit_interaction(
+            tool_call_id: str,
+            interaction: Dict[str, Any],
+            pending_call: Optional[Dict[str, Any]],
+        ) -> None:
+            # The waiting call goes first, as its own event, so a host keeps it
+            # before the card opens; it is never part of the card.
+            if pending_call is not None:
+                emitter.omnio_event(
+                    "response.omnio.pending_call",
+                    tool_call_id=tool_call_id,
+                    **pending_call,
+                )
             emitter.omnio_event(
                 "response.omnio.interaction",
                 interaction=interaction,
@@ -8886,11 +8926,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 return
 
             interaction_tool_call_ids.add(raw_call_id)
+            pending_call = _pending_call(kwargs.get("pending_call"))
             try:
                 loop.call_soon_threadsafe(
                     _emit_interaction,
                     raw_call_id,
                     _redact_response_extension_value(interaction),
+                    pending_call,
                 )
             except RuntimeError:
                 interaction_tool_call_ids.discard(raw_call_id)

@@ -236,6 +236,7 @@ async def test_capabilities_stamp_turn_event_log_without_changing_legacy_boolean
 def test_omnio_extension_event_types_are_explicit_and_namespaced() -> None:
     expected = {
         "response.omnio.interaction",
+        "response.omnio.pending_call",
         "response.omnio.interaction_completed",
         "response.omnio.continuation",
         "response.omnio.compaction",
@@ -2594,7 +2595,7 @@ async def test_tool_approval_timeout_interrupts_the_turn_before_another_iteratio
             guard_result = tool_approval.maybe_require_tool_approval(
                 tool_name,
                 "call-timeout",
-                {},
+                {"record": 7},
             )
             if not nested:
                 callbacks["tool_complete_callback"](
@@ -2642,6 +2643,14 @@ async def test_tool_approval_timeout_interrupts_the_turn_before_another_iteratio
         assert opened[0]["tool_call_id"] == completed["tool_call_id"]
         assert opened[0]["sequence_number"] < completed["sequence_number"]
         assert sum(event["type"] == "response.omnio.interaction_completed" for event in events) == 1
+        # The gated call travels once, just before its card, and never inside it.
+        pending = [event for event in events if event["type"] == "response.omnio.pending_call"]
+        assert len(pending) == 1
+        assert pending[0]["tool_call_id"] == "call-timeout"
+        assert pending[0]["tool"] == tool_name
+        assert pending[0]["arguments"] == {"record": 7}
+        assert pending[0]["sequence_number"] == opened[0]["sequence_number"] - 1
+        assert "record" not in json.dumps(opened[0])
         if nested:
             assert not any(event.get("item", {}).get("call_id") == "call-timeout" for event in events)
         assert events[-1]["type"] == "response.incomplete"

@@ -52,6 +52,9 @@ CUSTOM_TOOL_INPUT_KEYS = {
 
 OMNIO_EXTENSION_EVENT_TYPES = frozenset({
     "response.omnio.interaction",
+    # The call an approval card waits on, emitted just before the card, for a
+    # host that keeps it while the card is open. Never part of the card.
+    "response.omnio.pending_call",
     "response.omnio.interaction_completed",
     # First event of a no-user continuation: the unfinished calls it closed.
     "response.omnio.continuation",

@@ -925,6 +925,13 @@ def maybe_require_tool_approval(
             "options": list(options),
             "approval": approval,
         },
+        # The call waiting on this decision, so a host that keeps it while the
+        # card is open can rebuild exactly this call on another sandbox. It
+        # never travels inside the card itself.
+        "pending_call": {
+            "tool": function_name,
+            "arguments": dict(function_args) if isinstance(function_args, dict) else {},
+        },
     }
 
     choice = await_tool_approval(
