@@ -53,6 +53,8 @@ CUSTOM_TOOL_INPUT_KEYS = {
 OMNIO_EXTENSION_EVENT_TYPES = frozenset({
     "response.omnio.interaction",
     "response.omnio.interaction_completed",
+    # First event of a no-user continuation: the unfinished calls it closed.
+    "response.omnio.continuation",
     "response.omnio.compaction",
     "response.omnio.client_event",
     "response.omnio.gen_ui",
@@ -808,7 +810,11 @@ class TurnEventEmitter:
         if client_projection_withheld(name, arguments):
             return
         extension_type, payload_key = _TOOL_EXTENSION_EVENTS[name]
-        self.omnio_event(extension_type, **{payload_key: arguments})
+        self.omnio_event(
+            extension_type,
+            tool_call_id=call_id,
+            **{payload_key: arguments},
+        )
 
     def function_call_done(self, call_id: str) -> None:
         state = self._function_calls.pop(call_id, None)

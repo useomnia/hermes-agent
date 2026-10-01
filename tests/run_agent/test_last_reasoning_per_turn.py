@@ -8,21 +8,11 @@ rather than the final-answer assistant step.
 """
 from __future__ import annotations
 
+from agent.turn_finalizer import _extract_last_reasoning
 
-def _extract_last_reasoning(messages):
-    """Replica of the extraction loop in run_agent.py (~line 13867).
 
-    Tests pin the loop's behaviour so that refactors can't silently
-    regress the per-turn semantic.
-    """
-    last_reasoning = None
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            break
-        if msg.get("role") == "assistant" and msg.get("reasoning"):
-            last_reasoning = msg["reasoning"]
-            break
-    return last_reasoning
+def _normal_turn_reasoning(messages):
+    return _extract_last_reasoning(messages, continuation=False)
 
 
 def test_simple_turn_reasoning_present():
@@ -30,7 +20,7 @@ def test_simple_turn_reasoning_present():
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "hi", "reasoning": "greeting the user"},
     ]
-    assert _extract_last_reasoning(messages) == "greeting the user"
+    assert _normal_turn_reasoning(messages) == "greeting the user"
 
 
 def test_simple_turn_no_reasoning():
@@ -38,7 +28,7 @@ def test_simple_turn_no_reasoning():
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "hi", "reasoning": None},
     ]
-    assert _extract_last_reasoning(messages) is None
+    assert _normal_turn_reasoning(messages) is None
 
 
 def test_tool_call_turn_reasoning_on_tool_call_step():
@@ -58,7 +48,7 @@ def test_tool_call_turn_reasoning_on_tool_call_step():
         {"role": "tool", "tool_call_id": "c1", "content": "3 matches"},
         {"role": "assistant", "content": "Found 3 matches", "reasoning": None},
     ]
-    assert _extract_last_reasoning(messages) == "I should use search_files"
+    assert _normal_turn_reasoning(messages) == "I should use search_files"
 
 
 def test_no_stale_reasoning_across_turns():
@@ -75,7 +65,7 @@ def test_no_stale_reasoning_across_turns():
         {"role": "user", "content": "thanks"},
         {"role": "assistant", "content": "You're welcome!", "reasoning": None},
     ]
-    assert _extract_last_reasoning(messages) is None
+    assert _normal_turn_reasoning(messages) is None
 
 
 def test_tool_call_turn_picks_latest_reasoning_within_turn():
@@ -96,7 +86,7 @@ def test_tool_call_turn_picks_latest_reasoning_within_turn():
         {"role": "assistant", "content": "Here's the summary",
          "reasoning": "synthesized view of results"},
     ]
-    assert _extract_last_reasoning(messages) == "synthesized view of results"
+    assert _normal_turn_reasoning(messages) == "synthesized view of results"
 
 
 def test_empty_string_reasoning_treated_as_missing():
@@ -104,4 +94,64 @@ def test_empty_string_reasoning_treated_as_missing():
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hello", "reasoning": ""},
     ]
-    assert _extract_last_reasoning(messages) is None
+    assert _normal_turn_reasoning(messages) is None
+
+
+def test_continuation_does_not_leak_reasoning_across_tool_tail():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "reasoning from the suspended interaction",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": {
+                    "name": "request_user_input",
+                    "arguments": "{}",
+                },
+            }],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "answered"},
+        {"role": "assistant", "content": "continued", "reasoning": None},
+    ]
+
+    assert _extract_last_reasoning(
+        messages,
+        continuation=True,
+        continuation_boundary_tool_call_ids={"c1"},
+    ) is None
+
+
+def test_continuation_keeps_reasoning_from_new_same_turn_tool_step():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "reasoning from the suspended interaction",
+            "tool_calls": [{
+                "id": "old",
+                "type": "function",
+                "function": {"name": "request_user_input", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "old", "content": "answered"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "new continuation reasoning",
+            "tool_calls": [{
+                "id": "new",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "new", "content": "file"},
+        {"role": "assistant", "content": "continued", "reasoning": None},
+    ]
+
+    assert _extract_last_reasoning(
+        messages,
+        continuation=True,
+        continuation_boundary_tool_call_ids={"old"},
+    ) == "new continuation reasoning"
