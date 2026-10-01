@@ -121,10 +121,34 @@ class TestParseContinuation:
         )
         assert close["content"] is None
 
+    def test_approval_carries_the_gated_call_the_host_kept(self):
+        close = _parse_continuation(
+            {
+                "close": {
+                    "kind": "approval",
+                    "tool_call_id": "nested_x1_0",
+                    "scope": "once",
+                    "tool": "mcp_connectors_write",
+                    "arguments": {"id": 7},
+                }
+            }
+        )
+        assert close["gated"] == {"tool": "mcp_connectors_write", "arguments": {"id": 7}}
+
+    def test_approval_without_a_gated_call_carries_none(self):
+        close = _parse_continuation(
+            {"close": {"kind": "approval", "tool_call_id": "w1", "scope": "once"}}
+        )
+        assert "gated" not in close
+
     @pytest.mark.parametrize(
         "value",
         [
             [],
+            {"close": {"kind": "approval", "tool_call_id": "w1", "scope": "once", "tool": "x"}},
+            {"close": {"kind": "approval", "tool_call_id": "w1", "scope": "once", "arguments": {}}},
+            {"close": {"kind": "approval", "tool_call_id": "w1", "scope": "once", "tool": "", "arguments": {}}},
+            {"close": {"kind": "approval", "tool_call_id": "w1", "scope": "once", "tool": "x", "arguments": []}},
             {"close": {"kind": "interrupted", "tool_call_id": "x"}},
             {"close": {"kind": "answer", "tool_call_id": "q1"}},
             {"close": {"kind": "answer", "tool_call_id": "", "response": "x"}},
@@ -324,6 +348,69 @@ async def test_late_nested_approval_grants_what_the_gate_asked_and_tells_the_mod
     assert tool_approval.consume_once_approval(grant_key, "nested_new_0", "mcp_connectors_write", {"id": 7})
     assert not tool_approval.consume_once_approval(grant_key, "nested_new_1", "mcp_connectors_write", {"id": 7})
     assert tool_approval.take_expired_approval(grant_key, "nested_x1_0") is None
+
+
+@pytest.mark.asyncio
+async def test_late_nested_approval_uses_the_kept_call_on_a_sandbox_that_never_saw_it_expire(
+    adapter, db
+):
+    # A replacement sandbox rebuilt the session: the enclosing script is closed
+    # and the gate never remembered the expiry, so only the host's copy remains.
+    db.append_message(SESSION, "user", "write it")
+    db.append_message(SESSION, "assistant", "", tool_calls=[_call("x1", "execute_code")])
+    db.append_message(SESSION, "tool", "timed out", tool_call_id="x1", tool_name="execute_code")
+    grant_key = adapter._scoped_tool_approval_session_key(SESSION, adapter._effective_request_profile())
+    agent = _agent()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", return_value=agent) as create_agent:
+            response = await client.post(
+                "/v1/runs",
+                headers=AUTH,
+                json=_continue(
+                    {
+                        "kind": "approval",
+                        "tool_call_id": "nested_x1_0",
+                        "scope": "once",
+                        "tool": "mcp_connectors_write",
+                        "arguments": {"id": 7},
+                    }
+                ),
+            )
+            await _wait_for_run(agent)
+
+    assert response.status == 202
+    prompt = create_agent.call_args.kwargs["ephemeral_system_prompt"]
+    assert "approved `mcp_connectors_write`" in prompt
+    assert tool_approval.consume_once_approval(grant_key, "nested_new_0", "mcp_connectors_write", {"id": 7})
+
+
+@pytest.mark.asyncio
+async def test_late_nested_deny_uses_the_kept_call_without_granting_it(adapter, db):
+    db.append_message(SESSION, "user", "write it")
+    db.append_message(SESSION, "assistant", "", tool_calls=[_call("x1", "execute_code")])
+    db.append_message(SESSION, "tool", "timed out", tool_call_id="x1", tool_name="execute_code")
+    grant_key = adapter._scoped_tool_approval_session_key(SESSION, adapter._effective_request_profile())
+    agent = _agent()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", return_value=agent) as create_agent:
+            response = await client.post(
+                "/v1/runs",
+                headers=AUTH,
+                json=_continue(
+                    {
+                        "kind": "approval",
+                        "tool_call_id": "nested_x1_0",
+                        "scope": "deny",
+                        "tool": "mcp_connectors_write",
+                        "arguments": {"id": 7},
+                    }
+                ),
+            )
+            await _wait_for_run(agent)
+
+    assert response.status == 202
+    assert "declined `mcp_connectors_write`" in create_agent.call_args.kwargs["ephemeral_system_prompt"]
+    assert not tool_approval.consume_once_approval(grant_key, "nested_new_0", "mcp_connectors_write", {"id": 7})
 
 
 @pytest.mark.asyncio
