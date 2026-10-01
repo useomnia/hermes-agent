@@ -5,7 +5,9 @@ stop growing, so the chunk-based stale detector never fires and the turn
 waits minutes before the attempt ends truncated. The argument watchdog
 reconnects instead, and slow or truncated attempts leave diagnostics.
 """
+import json
 import logging
+import random
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -240,6 +242,97 @@ class TestRunawayToolArguments:
         assert not mock_abort.called
         assert "degenerated into repetition" not in caplog.text
         assert len(response.choices[0].message.tool_calls[0].function.arguments) > 32_000
+
+
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+    @patch("run_agent.AIAgent._replace_primary_openai_client")
+    @patch("run_agent.AIAgent._abort_request_openai_client")
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_should_reconnect_when_arguments_cycle_through_a_few_lines(
+        self, mock_close, mock_create, mock_abort, mock_replace, monkeypatch, caplog
+    ):
+        # The captured write_file loop: three fixed lines and a rotating closing line,
+        # so no exact repeat recurs and only the line-cycle check can see it.
+        monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "30")
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        # An irregular choice, as captured: a fixed rotation would be an exact period.
+        rng = random.Random(1)
+        closings = ["Complete.", "Final status: complete.", "Closeout.", "Launch.", "Done."]
+
+        class CyclingArguments:
+            response = SimpleNamespace(headers={})
+
+            def __iter__(self):
+                yield _make_stream_chunk(
+                    tool_calls=[_write_file_call('{"path":"/tmp/c.md","content":"# Launch checklist\\n')]
+                )
+                for _ in range(4_000):
+                    time.sleep(0.001)
+                    unit = f"\\n\\n**End.**\\n\\n**Bluebell**\\n\\n**14 May**\\n\\n**{rng.choice(closings)}**"
+                    yield _make_stream_chunk(tool_calls=[_write_file_call(unit, tc_id=None)])
+                raise httpx.RemoteProtocolError("peer closed connection")
+
+        complete = '{"path":"/tmp/c.md","content":"# Launch checklist"}'
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [
+            CyclingArguments(),
+            _Stream(
+                [
+                    _make_stream_chunk(tool_calls=[_write_file_call(complete, tc_id="call_2")]),
+                    _make_stream_chunk(finish_reason="tool_calls", model="test/model"),
+                ]
+            ),
+        ]
+        mock_create.return_value = mock_client
+        agent = _make_agent()
+
+        with caplog.at_level(logging.WARNING):
+            response = agent._interruptible_streaming_api_call({})
+
+        assert mock_abort.called
+        assert "arguments degenerated into repeated lines" in caplog.text
+        # Caught at the first checks past 32 KB, not at the output cap.
+        size = int(caplog.text.split("repeated lines (")[1].split(" chars")[0].replace(",", ""))
+        assert size <= 48_000 + 100
+        assert response.choices[0].message.tool_calls[0].function.arguments == complete
+
+    @patch("run_agent.AIAgent._abort_request_openai_client")
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_should_keep_streaming_a_large_pretty_printed_json_array(
+        self, mock_close, mock_create, mock_abort, monkeypatch, caplog
+    ):
+        # Pretty-printed JSON repeats its structural lines more than any other real
+        # file shape we measured, yet keeps about a fifth of its lines distinct.
+        monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "30")
+        body = json.dumps(
+            [{"id": i, "name": f"item {i}", "tags": ["a", "b"], "active": True} for i in range(1_500)], indent=2
+        )
+        escaped = json.dumps(body)[1:-1]
+        pieces = [escaped[i : i + 400] for i in range(0, len(escaped), 400)]
+
+        class PrettyJsonArguments:
+            response = SimpleNamespace(headers={})
+
+            def __iter__(self):
+                yield _make_stream_chunk(tool_calls=[_write_file_call('{"path":"/tmp/items.json","content":"')])
+                for piece in pieces:
+                    yield _make_stream_chunk(tool_calls=[_write_file_call(piece, tc_id=None)])
+                yield _make_stream_chunk(tool_calls=[_write_file_call('"}', tc_id=None)])
+                yield _make_stream_chunk(finish_reason="tool_calls", model="test/model")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [PrettyJsonArguments()]
+        mock_create.return_value = mock_client
+        agent = _make_agent()
+
+        with caplog.at_level(logging.WARNING):
+            response = agent._interruptible_streaming_api_call({})
+
+        assert not mock_abort.called
+        assert "degenerated into" not in caplog.text
+        assert json.loads(response.choices[0].message.tool_calls[0].function.arguments)["content"] == body
 
 
 class TestBlankWhitespaceToolArguments:
