@@ -34,7 +34,7 @@ from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint, is_openrouter_preset_model
 from agent.message_content import flatten_message_text
-from agent.repetition_guard import is_repetition_dominated
+from agent.repetition_guard import is_line_cycle, is_repetition_dominated
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_surrogates,
@@ -307,6 +307,8 @@ def _check_stale_giveup(agent) -> None:
 # loops run until the output cap, so catching them early saves minutes.
 _TOOL_ARG_RUNAWAY_MIN_CHARS = 32_000
 _TOOL_ARG_RUNAWAY_STEP_CHARS = 16_000
+# The line-cycle check reads only this much of the newest arguments, so its cost stays flat.
+_TOOL_ARG_LINE_CYCLE_TAIL_CHARS = 32_000
 
 # A tool call whose arguments end in this many characters of nothing but blank
 # text (spaces, tabs, newlines or their JSON escapes) has degenerated into a
@@ -337,8 +339,8 @@ def _tool_arg_sample(entry) -> str:
 
 
 def _flag_runaway_tool_arguments(progress: dict, idx, entry: dict, delta: str) -> None:
-    """Mark the stream when a tool call's growing arguments are a whitespace or
-    repetition loop."""
+    """Mark the stream when a tool call's growing arguments are a whitespace,
+    repetition or line-cycle loop."""
     arguments = entry["function"]["arguments"]
     size = len(arguments)
     if progress["runaway"] is not None:
@@ -366,6 +368,8 @@ def _flag_runaway_tool_arguments(progress: dict, idx, entry: dict, delta: str) -
     checked[idx] = size
     if is_repetition_dominated(arguments):
         progress["runaway"] = (entry["function"]["name"] or "?", size, "repetition")
+    elif is_line_cycle(arguments[-_TOOL_ARG_LINE_CYCLE_TAIL_CHARS:]):
+        progress["runaway"] = (entry["function"]["name"] or "?", size, "repeated lines")
 
 
 # A completed attempt slower than this is logged with its diagnostics, so a
