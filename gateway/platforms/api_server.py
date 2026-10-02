@@ -997,6 +997,30 @@ def _ag_ui_state_prefill(body: Dict[str, Any]) -> tuple[Optional[List[Dict[str, 
     return [{"role": "user", "content": content}], None
 
 
+def _submitted_interaction_state(response: str) -> Optional[Dict[str, Any]]:
+    """Only the versioned answer envelope can submit component state."""
+    try:
+        envelope = json.loads(response)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(envelope, dict) or envelope.get("_omnio_interaction_answer") != 1:
+        return None
+    _, error = _ag_ui_state_prefill(envelope)
+    if error is not None:
+        raise ValueError("Invalid submitted component state")
+    return envelope.get("ag_ui_state")
+
+
+def _emit_submitted_state(emitter: TurnEventEmitter, submission_id: str, state: Any) -> None:
+    if state is not None:
+        emitter.omnio_event(
+            "response.omnio.shared_state",
+            version=1,
+            submission_id=submission_id,
+            state=_redact_response_extension_value(state),
+        )
+
+
 def check_api_server_requirements() -> bool:
     """Check if API server dependencies are available."""
     return AIOHTTP_AVAILABLE
@@ -9616,6 +9640,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=503,
             )
         emitter = TurnEventEmitter(self._turn_event_logs, run_id, session_id)
+        _emit_submitted_state(emitter, f"{run_id}:input", body.get("ag_ui_state"))
         if continuation_closed or continuation_note:
             # The closing step belongs to this Turn: its first events say which
             # earlier calls it finished, so a client can settle their cards.
@@ -11232,6 +11257,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise ValueError("Missing toolCallId")
             if not isinstance(response, str) or action not in {"answer", "skip", "supersede"}:
                 raise ValueError("Invalid response or action")
+            _submitted_interaction_state(response)
         except (ValueError, TypeError):
             return web.json_response({"error": "invalid_user_input"}, status=400)
         try:
@@ -11267,6 +11293,7 @@ class APIServerAdapter(BasePlatformAdapter):
     ) -> Dict[str, Any]:
         from tools.user_input import resolve_user_input
 
+        submitted_state = _submitted_interaction_state(response)
         resolutions = self._user_input_resolutions.setdefault(run_id, {})
         previous = resolutions.get(call_id)
         if previous is not None:
@@ -11284,6 +11311,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._set_run_status(run_id, "stopping", last_event="run.stopping")
             log = self._turn_event_logs.get_log(run_id)
             emitter = TurnEventEmitter(self._turn_event_logs, run_id, log.session_id)
+            _emit_submitted_state(emitter, f"{run_id}:answer:{call_id}", submitted_state)
             emitter.omnio_event(
                 "response.omnio.interaction_completed",
                 tool_call_id=call_id,

@@ -61,6 +61,7 @@ OMNIO_EXTENSION_EVENT_TYPES = frozenset({
     "response.omnio.compaction",
     "response.omnio.client_event",
     "response.omnio.gen_ui",
+    "response.omnio.shared_state",
     "response.omnio.task_list",
     "response.omnio.warmup",
     # Native replacements for surfaces carried by the former CUSTOM set.

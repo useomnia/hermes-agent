@@ -581,7 +581,15 @@ async def test_runs_shared_state_is_ephemeral_prefill(adapter, db, continuation)
         with patch.object(adapter, "_create_agent", return_value=agent) as create_agent:
             response = await client.post("/v1/runs", headers=AUTH, json=body)
             await _wait_for_run(agent)
+            run_id = (await response.json())["run_id"]
+            stream = await client.get(f"/v1/runs/{run_id}/events?after=0", headers=AUTH)
+            events = _sse_events(await stream.text())
     assert response.status == 202
+    submissions = [e for e in events if e.get("type") == "response.omnio.shared_state"]
+    assert len(submissions) == 1
+    assert submissions[0]["state"] == body["ag_ui_state"]
+    assert submissions[0]["version"] == 1
+    assert submissions[0]["submission_id"] == f"{run_id}:input"
     options = create_agent.call_args.kwargs
     assert options["ephemeral_system_prompt"] is None
     assert options["prefill_before_current_user"] is True

@@ -6,6 +6,14 @@ On a typed run it precedes the current user input. On a continuation it follows
 the closed history, preserving the earlier cached prefix. It stays at that
 boundary throughout the run.
 
+Accepted state also emits `response.omnio.shared_state` (version 1) into the
+Turn event log, with a stable `submission_id` and recursively redacted `state`.
+New runs emit it after admission; live answers emit it before releasing the
+waiting call. Rejected actions and idempotent replays produce no extra event.
+This event is UI replay metadata for Omnia's durable projection, not SessionDB
+prose. Browsers restore submitted snapshots and later proposals in event order;
+unfinished edits are never autosaved. Older consumers ignore the new event.
+
 Continuation API version 3 adds optional `continuation.notes`: up to 20 nonempty
 strings, each at most 10,000 characters. Clients must inspect
 `turn_continuation_api_version` before sending this field to older gateways.

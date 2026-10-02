@@ -327,6 +327,36 @@ async def test_exact_resolution_projects_only_the_answer_from_shared_state(adapt
         assert result["answer"] == envelope
         conflict = await client.post(url, json={"toolCallId": "call-1", "response": "different"}, headers=headers)
         assert (await conflict.json())["choice"] == "Continue"
+        replay = await client.post(url, json={"toolCallId": "call-1", "response": envelope}, headers=headers)
+        assert (await replay.json())["replayed"] is True
+    frames = adapter._turn_event_logs.get_log(run_id).frames_after(0)
+    events = [json.loads(frame.frame.decode().split("data: ", 1)[1]) for frame in frames]
+    assert [event["type"] for event in events] == [
+        "response.omnio.shared_state", "response.omnio.interaction_completed",
+    ]
+    assert events[0]["state"] == {"selection": "A"}
+    assert events[0]["submission_id"] == f"{run_id}:answer:call-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", [None, [], "bad", {"text": "x" * 17000}])
+async def test_exact_resolution_rejects_invalid_state_without_releasing(adapter, exact_run, state):
+    import json
+
+    run_id, _ = exact_run
+    waiter, _ = _park_exact(run_id)
+    envelope = json.dumps({"_omnio_interaction_answer": 1, "response": "Continue", "ag_ui_state": state})
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        response = await client.post(
+            f"/v1/runs/{run_id}/user-input",
+            json={"toolCallId": "call-1", "response": envelope},
+            headers={"X-Hermes-Session-Id": SESSION},
+        )
+        assert response.status == 400
+        assert user_input._wait_registry.pending_count(run_id) == 1
+        assert adapter._turn_event_logs.get_log(run_id).frames_after(0) == []
+    user_input.clear_session(run_id)
+    waiter.join(timeout=3)
 
 
 @pytest.mark.asyncio
