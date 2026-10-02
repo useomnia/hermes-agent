@@ -50,7 +50,7 @@ def run(monkeypatch):
 
     monkeypatch.setattr("run_agent.handle_function_call", _dispatch)
 
-    def _run(history):
+    def _run(history, prefill=None):
         agent = AIAgent(
             model="test-model",
             api_key="test-key",
@@ -61,6 +61,8 @@ def run(monkeypatch):
             skip_memory=True,
         )
         agent._disable_streaming = True
+        agent.prefill_messages = prefill or []
+        agent._prefill_before_current_user = True
         result = agent.run_conversation("", conversation_history=history, continuation=True)
         return result, completions.requests, dispatched
 
@@ -120,3 +122,39 @@ def test_a_mismatched_grant_never_dispatches(run):
     _result, _requests, dispatched = run(history)
 
     assert dispatched == []
+
+
+@pytest.mark.parametrize("already_ran", [False, True])
+def test_approved_call_result_precedes_deferred_notes(run, already_ran):
+    from agent.context_notes import context_note_message
+
+    history = [
+        {"role": "user", "content": "write it"},
+        {"role": "assistant", "content": "", "tool_calls": [_call("w1", "mcp_write")],
+         "display_metadata": {
+             "_omnio_resolved_approvals": {"w1": {"scope": "once", "tool_name": "mcp_write", "arguments": "{}"}},
+             "_omnio_continuation_notes": {"turn-1": {"deferred": True, "notes": ["Project: alpha"]}},
+         }},
+    ]
+    if already_ran:
+        history.append({"role": "tool", "tool_call_id": "w1", "content": "written"})
+    _, requests, dispatched = run(history)
+    assert dispatched == ([] if already_ran else ["mcp_write"])
+    messages = [message for message in requests[0] if message["role"] != "system"]
+    assert [message["role"] for message in messages] == ["user", "assistant", "tool", "user"]
+    assert messages[-1]["content"] == context_note_message("Project: alpha")["content"]
+
+
+
+def test_continuation_shared_state_follows_closed_history_without_persisting(run):
+    history = [
+        {"role": "user", "content": "research this"},
+        {"role": "assistant", "content": "", "tool_calls": [_call("c1", "web_search")]},
+        {"role": "tool", "tool_call_id": "c1", "content": "results"},
+    ]
+    state = {"role": "user", "content": "<ag-ui-shared-state>edited</ag-ui-shared-state>"}
+    result, requests, _ = run(history, [state])
+    sent = [message for message in requests[0] if message["role"] != "system"]
+    assert [message["role"] for message in sent] == ["user", "assistant", "tool", "user"]
+    assert sent[-1]["content"] == state["content"]
+    assert all(message.get("content") != state["content"] for message in result["messages"])
