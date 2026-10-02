@@ -629,6 +629,7 @@ def test_check_fn_false_when_no_cdp_url(monkeypatch):
     import tools.browser_tool as bt
 
     monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
+    monkeypatch.setattr(bt, "_is_browser_use_cli_mode", lambda: False)
     monkeypatch.setattr(bt, "_get_cdp_override_raw", lambda: "")
     assert browser_cdp_tool._browser_cdp_check() is False
 
@@ -638,6 +639,7 @@ def test_check_fn_true_when_cdp_url_set(monkeypatch):
     import tools.browser_tool as bt
 
     monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
+    monkeypatch.setattr(bt, "_is_browser_use_cli_mode", lambda: False)
     # The gate reads the CONFIGURED override; it must not depend on a discovery
     # probe, whose answer at registration says nothing about call time.
     monkeypatch.setattr(
@@ -654,10 +656,23 @@ def test_check_fn_does_not_probe_network(monkeypatch):
         raise AssertionError("availability check must not perform network I/O")
 
     monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
+    monkeypatch.setattr(bt, "_is_browser_use_cli_mode", lambda: False)
     monkeypatch.setattr(bt.requests, "get", fail_network_probe)
     monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
 
     assert browser_cdp_tool._browser_cdp_check() is True
+
+
+def test_check_fn_false_when_browser_use_owns_surface(monkeypatch):
+    """A configured CDP URL must not expose the legacy CDP escape hatch."""
+    import tools.browser_tool as bt
+
+    monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
+    monkeypatch.setattr(bt, "_is_browser_use_cli_mode", lambda: True)
+    monkeypatch.setattr(
+        bt, "_get_cdp_override_raw", lambda: "ws://localhost:9222/devtools/browser/x"
+    )
+    assert browser_cdp_tool._browser_cdp_check() is False
 
 
 def test_check_fn_false_when_browser_requirements_fail(monkeypatch):

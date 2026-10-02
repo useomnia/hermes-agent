@@ -301,17 +301,8 @@ class BrowserUseBrowserProvider(BrowserProvider):
                 "Emergency cleanup failed for Browser Use session %s: %s", session_id, e
             )
 
-    def get_setup_schema(self) -> Dict[str, Any]:
-        return {
-            "name": "Browser Use",
-            "badge": "paid",
-            "tag": "Cloud browser with remote execution",
-            "env_vars": [
-                {
-                    "key": "BROWSER_USE_API_KEY",
-                    "prompt": "Browser Use API key",
-                    "url": "https://browser-use.com",
-                },
-            ],
-            "post_setup": "agent_browser",
-        }
+    def get_setup_schema(self) -> Optional[Dict[str, Any]]:
+        # Browser Use is the local CLI/runtime surface. Omnio attaches it to
+        # Toolbox Chrome through the conversation-scoped CDP relay; do not add
+        # a direct Browser Use cloud/API-key picker row from this provider.
+        return None

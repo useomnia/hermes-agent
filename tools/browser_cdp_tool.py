@@ -706,12 +706,17 @@ def _browser_cdp_check() -> bool:
     try:
         from tools.browser_tool import (  # type: ignore[import-not-found]
             _get_cdp_override_raw,
-            check_browser_requirements,
+            _check_legacy_browser_requirements,
         )
     except ImportError as exc:  # pragma: no cover — defensive
         logger.debug("browser_cdp check: browser_tool import failed: %s", exc)
         return False
-    if not check_browser_requirements():
+    # Browser Use CLI is the single browser surface in Omnio.  Raw CDP is a
+    # legacy escape hatch over the agent-browser daemon and must not remain
+    # visible merely because a CDP URL happens to be configured.  Keep this
+    # gate in the same helper as browser_* so Browser Use provisioning drift
+    # cannot silently restore a mixed surface.
+    if not _check_legacy_browser_requirements():
         return False
     # Whether the tool is OFFERED depends only on an override being configured.
     # Probing the endpoint here would stall tool registration whenever the
