@@ -188,8 +188,8 @@ def _complete_brand_setup_succeeded(function_result: Any) -> bool:
     )
 
 
-# 2: a late approval close may carry the gated call its host kept.
-TURN_CONTINUATION_API_VERSION = 2
+# 3: continuations carry durable application notes after their closing results.
+TURN_CONTINUATION_API_VERSION = 3
 _CONTINUATION_APPROVAL_SCOPES = frozenset({"once", "session", "always", "deny"})
 _CONTINUATION_INTERRUPTED_RESULT = json.dumps(
     {
@@ -221,8 +221,11 @@ def _parse_continuation(value: Any) -> Optional[Dict[str, Any]]:
     block first: ``interrupted`` closes every unresolved call, ``answer`` gives
     a timed-out question its answer, and ``approval`` applies a late decision.
     """
-    if not isinstance(value, dict) or not set(value) <= {"close"}:
-        raise ValueError("continuation may only contain 'close'")
+    if not isinstance(value, dict) or not set(value) <= {"close", "notes"}:
+        raise ValueError("continuation may only contain 'close' and 'notes'")
+    from agent.context_notes import parse_context_notes
+
+    parse_context_notes(value.get("notes", []))
     close = value.get("close")
     if close is None:
         return None
@@ -992,6 +995,30 @@ def _ag_ui_state_prefill(body: Dict[str, Any]) -> tuple[Optional[List[Dict[str, 
         f"<ag-ui-shared-state>{serialized}</ag-ui-shared-state>"
     )
     return [{"role": "user", "content": content}], None
+
+
+def _submitted_interaction_state(response: str) -> Optional[Dict[str, Any]]:
+    """Only the versioned answer envelope can submit component state."""
+    try:
+        envelope = json.loads(response)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(envelope, dict) or envelope.get("_omnio_interaction_answer") != 1:
+        return None
+    _, error = _ag_ui_state_prefill(envelope)
+    if error is not None:
+        raise ValueError("Invalid submitted component state")
+    return envelope.get("ag_ui_state")
+
+
+def _emit_submitted_state(emitter: TurnEventEmitter, submission_id: str, state: Any) -> None:
+    if state is not None:
+        emitter.omnio_event(
+            "response.omnio.shared_state",
+            version=1,
+            submission_id=submission_id,
+            state=_redact_response_extension_value(state),
+        )
 
 
 def check_api_server_requirements() -> bool:
@@ -4413,6 +4440,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "run_ag_ui_state": True,
+                "run_continuation_notes": True,
                 "run_slash_commands": True,
                 "run_structured_output": True,
                 "run_compaction_snapshots": True,
@@ -4727,15 +4756,17 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: str,
         close: Optional[Dict[str, Any]],
         grant_session_key: str,
+        *,
+        notes: Optional[List[str]] = None,
+        continuation_id: Optional[str] = None,
     ) -> tuple[Optional["web.Response"], Optional[str], List[Dict[str, Any]]]:
         """Make the session's tail resumable before a continuation loads it.
 
-        Returns ``(error_response, instructions_note, closed)``. ``closed``
+        Returns ``(error_response, generated_note, closed)``. ``closed``
         lists each call the closing step finished, for the run's first event.
-        The note is run-scoped guidance for a late approval whose gated call
+        The note is a durable fact for a late approval whose gated call
         ran nested inside ``execute_code``: that call has no entry of its own
-        in history, so the decision reaches the model as instructions for this
-        run instead of as the call's result, and is never persisted.
+        in history. It follows the enclosing call's result in a user message.
         """
         db = await self._ensure_session_db_async()
         if db is None:
@@ -4755,12 +4786,17 @@ class APIServerAdapter(BasePlatformAdapter):
         def _is_interaction_tool(name: str) -> bool:
             return name == "request_user_input"
 
-        def _close(step: Optional[Dict[str, Any]]):
+        request_key = json.dumps({"close": close, "notes": notes or []}, sort_keys=True, ensure_ascii=False)
+
+        def _close(step: Optional[Dict[str, Any]], generated_note: Optional[str] = None):
             return db.close_continuation_tail(
                 session_id,
                 step,
                 interrupted_content=_CONTINUATION_INTERRUPTED_RESULT,
                 is_interaction_tool=_is_interaction_tool,
+                notes=[*(notes or []), *([generated_note] if generated_note else [])],
+                continuation_id=continuation_id,
+                request_key=request_key,
             )
 
         status, info = await asyncio.to_thread(_close, close)
@@ -4789,28 +4825,34 @@ class APIServerAdapter(BasePlatformAdapter):
             nested_name, nested_arguments = expired
             # The enclosing script was cut short by the expiry and stays open;
             # close it as interrupted so the model can decide to run it again.
-            status, info = await asyncio.to_thread(_close, {"kind": "interrupted"})
+            if close["scope"] == "deny":
+                note = (
+                    f"After its approval request timed out, the user declined `{nested_name}`. "
+                    "It was not performed."
+                )
+            else:
+                note = (
+                    f"After its approval request timed out, the user approved `{nested_name}`. "
+                    "It has not run yet. The approval applies to the same arguments if the call is still needed."
+                )
+            status, info = await asyncio.to_thread(_close, {"kind": "interrupted"}, note)
             if status == "ok":
-                readable = nested_name
-                if close["scope"] == "deny":
-                    note = (
-                        f"[Omnia: After its approval request had timed out, the user "
-                        f"declined `{readable}`. It was NOT performed; do not perform it.]"
-                    )
-                else:
+                if close["scope"] != "deny":
                     record_late_approval(
                         grant_session_key,
                         nested_name,
                         nested_arguments,
                         close["scope"],
                     )
-                    note = (
-                        f"[Omnia: After its approval request had timed out, the user "
-                        f"approved `{readable}`. It has NOT run yet. If it is still "
-                        f"needed, call it again with the same arguments; it will not "
-                        f"ask for approval again.]"
-                    )
         if status == "ok":
+            saved_notes = info.get("notes") or []
+            if len(saved_notes) > len(notes or []):
+                note = saved_notes[-1]
+                if info.get("replayed") and close and close.get("scope") != "deny" and close.get("gated"):
+                    record_late_approval(
+                        grant_session_key, close["gated"]["tool"],
+                        close["gated"]["arguments"], close["scope"],
+                    )
             closed: List[Dict[str, Any]] = []
             target_id = close.get("tool_call_id") if isinstance(close, dict) else None
             closed_ids = list(info.get("closed") or [])
@@ -9126,6 +9168,7 @@ class APIServerAdapter(BasePlatformAdapter):
         raw_input = body.get("input")
         continuation = "continuation" in body
         continuation_close: Optional[Dict[str, Any]] = None
+        continuation_notes: List[str] = []
         if continuation:
             if raw_input not in (None, "", []):
                 return web.json_response(
@@ -9137,6 +9180,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             try:
                 continuation_close = _parse_continuation(body["continuation"])
+                continuation_notes = body["continuation"].get("notes", [])
             except ValueError as exc:
                 return web.json_response(
                     _openai_error(str(exc), code="invalid_continuation"),
@@ -9162,6 +9206,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(
                     _openai_error("No user message found in input"), status=400
                 )
+
+        ag_ui_prefill, ag_ui_error = _ag_ui_state_prefill(body)
+        if ag_ui_error is not None:
+            return ag_ui_error
 
         text_format, text_format_error = _response_format_from_text_format(
             body.get("text")
@@ -9355,15 +9403,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._scoped_tool_approval_session_key(
                         explicit_session_id, request_profile
                     ),
+                    notes=continuation_notes,
+                    continuation_id=turn_id,
                 )
                 if close_error is not None:
                     return close_error
-            if continuation_note:
-                instructions = (
-                    f"{instructions}\n\n{continuation_note}"
-                    if isinstance(instructions, str) and instructions
-                    else continuation_note
-                )
 
         # With an authenticated gateway key, SessionDB is authoritative for an
         # explicit session_id and stale body history is ignored. Keyless
@@ -9596,11 +9640,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=503,
             )
         emitter = TurnEventEmitter(self._turn_event_logs, run_id, session_id)
-        if continuation_closed:
+        _emit_submitted_state(emitter, f"{run_id}:input", body.get("ag_ui_state"))
+        if continuation_closed or continuation_note:
             # The closing step belongs to this Turn: its first events say which
             # earlier calls it finished, so a client can settle their cards.
             emitter.omnio_event(
                 "response.omnio.continuation",
+                **({"notes": [continuation_note]} if continuation_note else {}),
                 closed=[
                     {"tool_call_id": item["tool_call_id"], "kind": item["kind"]}
                     for item in continuation_closed
@@ -10152,6 +10198,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     with self._profile_scope(request_profile):
                         return self._create_agent(
                             ephemeral_system_prompt=ephemeral_system_prompt,
+                            prefill_messages=ag_ui_prefill,
+                            prefill_before_current_user=True,
                             session_id=session_id,
                             stream_delta_callback=_text_cb,
                             reasoning_callback=_reasoning_cb,
@@ -11209,6 +11257,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise ValueError("Missing toolCallId")
             if not isinstance(response, str) or action not in {"answer", "skip", "supersede"}:
                 raise ValueError("Invalid response or action")
+            _submitted_interaction_state(response)
         except (ValueError, TypeError):
             return web.json_response({"error": "invalid_user_input"}, status=400)
         try:
@@ -11244,6 +11293,7 @@ class APIServerAdapter(BasePlatformAdapter):
     ) -> Dict[str, Any]:
         from tools.user_input import resolve_user_input
 
+        submitted_state = _submitted_interaction_state(response)
         resolutions = self._user_input_resolutions.setdefault(run_id, {})
         previous = resolutions.get(call_id)
         if previous is not None:
@@ -11261,6 +11311,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._set_run_status(run_id, "stopping", last_event="run.stopping")
             log = self._turn_event_logs.get_log(run_id)
             emitter = TurnEventEmitter(self._turn_event_logs, run_id, log.session_id)
+            _emit_submitted_state(emitter, f"{run_id}:answer:{call_id}", submitted_state)
             emitter.omnio_event(
                 "response.omnio.interaction_completed",
                 tool_call_id=call_id,

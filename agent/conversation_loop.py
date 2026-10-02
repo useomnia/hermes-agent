@@ -1280,6 +1280,28 @@ def run_conversation(
                 agent._execute_tool_calls(
                     SimpleNamespace(tool_calls=pending_calls), messages, effective_task_id
                 )
+            # Notes are durable on the call block while an approved call is
+            # pending. They enter model history only after every result exists.
+            resolved_ids = {
+                message.get("tool_call_id")
+                for message in messages[_assistant_idx + 1:]
+                if message.get("role") == "tool"
+            }
+            if _continuation_boundary_tool_call_ids <= resolved_ids:
+                from agent.context_notes import context_note_message
+
+                receipts = (_metadata or {}).get("_omnio_continuation_notes", {})
+                pending_notes = [note for receipt in receipts.values() if receipt.get("deferred")
+                                 for note in receipt["notes"]]
+                if pending_notes:
+                    messages.extend(context_note_message(note) for note in pending_notes)
+                    agent._persist_session(messages, conversation_history)
+
+    # A no-user continuation has no current user boundary. Keep its transient
+    # state after the closed history, never before an old user request (which
+    # would invalidate the cached history prefix). Follow the anchor as this
+    # run grows; if compaction removes it, use the new complete tail.
+    _continuation_prefill_anchor = messages[-1] if continuation and messages else None
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -1689,6 +1711,12 @@ def run_conversation(
             api_messages,
             agent.prefill_messages,
             before_current_user=getattr(agent, "_prefill_before_current_user", False),
+            at_index=(
+                next((idx + 1 for idx, message in enumerate(messages)
+                      if message is _continuation_prefill_anchor), len(messages))
+                + int(bool(effective_system))
+                if continuation else None
+            ),
         )
 
         # Per-turn context selection hook (additive, no-op by default).

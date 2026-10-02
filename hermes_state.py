@@ -6712,6 +6712,9 @@ class SessionDB:
         *,
         interrupted_content: str,
         is_interaction_tool: Callable[[str], bool],
+        notes: Optional[List[str]] = None,
+        continuation_id: Optional[str] = None,
+        request_key: Optional[str] = None,
     ) -> tuple[str, Dict[str, Any]]:
         """Make a session's durable tail resumable for a no-user continuation.
 
@@ -6742,6 +6745,44 @@ class SessionDB:
         kind = close.get("kind") if isinstance(close, dict) else None
         target_id = close.get("tool_call_id") if isinstance(close, dict) else None
         stored_interrupted = self._encode_content(interrupted_content)
+        notes = list(notes or [])
+        if notes and not continuation_id:
+            raise ValueError("continuation_id is required when carrying notes")
+        request_key = request_key or json.dumps(
+            {"close": close, "notes": notes}, sort_keys=True, ensure_ascii=False
+        )
+
+        def _with_notes(conn, anchor, info, *, deferred=False):
+            if not notes:
+                return "ok", info
+            from agent.context_notes import context_note_message
+
+            info = {**info, "notes": notes}
+            metadata = self._decode_display_metadata(anchor["display_metadata"]) or {}
+            receipts = metadata.setdefault("_omnio_continuation_notes", {})
+            receipts[continuation_id] = {
+                "request_key": request_key,
+                "notes": notes,
+                "deferred": deferred,
+                "info": info,
+            }
+            conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                (self._encode_display_metadata(metadata), anchor["id"]),
+            )
+            if not deferred:
+                for note in notes:
+                    conn.execute(
+                        "INSERT INTO messages "
+                        "(session_id, role, content, timestamp, observed, active, display_kind) "
+                        "VALUES (?, 'user', ?, ?, 0, 1, 'context_note')",
+                        (session_id, self._encode_content(context_note_message(note)["content"]), time.time()),
+                    )
+                conn.execute(
+                    "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
+                    (len(notes), session_id),
+                )
+            return "ok", info
 
         def _calls(raw: Any) -> List[Dict[str, Any]]:
             if not raw:
@@ -6780,6 +6821,14 @@ class SessionDB:
             ).fetchall()
             if not rows:
                 return "not_resumable", {"reason": "empty_session"}
+            if continuation_id:
+                for row in reversed(rows):
+                    metadata = self._decode_display_metadata(row["display_metadata"]) or {}
+                    receipt = (metadata.get("_omnio_continuation_notes") or {}).get(continuation_id)
+                    if receipt is not None:
+                        if receipt.get("request_key") != request_key:
+                            return "conflict", {"reason": "continuation_notes_changed"}
+                        return "ok", {**receipt["info"], "replayed": True}
             assistant_idx = next(
                 (
                     idx
@@ -6796,7 +6845,7 @@ class SessionDB:
                     return "not_resumable", {"reason": "orphan_tool_results"}
                 if kind not in (None, "interrupted"):
                     return "not_found", {"reason": "no_pending_call"}
-                return "ok", {"tail": "user", "closed": []}
+                return _with_notes(conn, anchor, {"tail": "user", "closed": []})
             calls = _calls(anchor["tool_calls"])
             if not calls:
                 return "not_resumable", {"reason": "final_assistant_message"}
@@ -6829,7 +6878,9 @@ class SessionDB:
                     # The grant may already have been consumed: the approved
                     # call then has its real result, which is not a conflict.
                     same = grants[target_id].get("scope") == close.get("scope")
-                    return ("ok" if same else "conflict"), {"replayed": True}
+                    if not same:
+                        return "conflict", {"replayed": True}
+                    return _with_notes(conn, anchor, {"replayed": True}, deferred=existing is None)
                 if existing is not None:
                     same = not grants_call and (
                         existing["content"] == self._encode_content(close.get("content"))
@@ -6840,7 +6891,9 @@ class SessionDB:
                             )
                         )
                     )
-                    return ("ok" if same else "conflict"), {"replayed": True}
+                    if not same:
+                        return "conflict", {"replayed": True}
+                    return _with_notes(conn, anchor, {"replayed": True})
             elif kind not in (None, "interrupted"):
                 return "not_found", {"reason": "unknown_close_kind"}
             elif kind is None and unresolved:
@@ -6875,7 +6928,15 @@ class SessionDB:
                     continue
                 _append_tool(conn, call_id, _call_name(call), stored_interrupted)
                 closed.append(call_id)
-            return "ok", {"tail": "tool_calls", "closed": closed}
+            # Read the metadata after granting approval so adding notes cannot
+            # overwrite the durable grant written in this transaction.
+            anchor = conn.execute(
+                "SELECT id, display_metadata FROM messages WHERE id = ?", (anchor["id"],)
+            ).fetchone()
+            return _with_notes(
+                conn, anchor, {"tail": "tool_calls", "closed": closed},
+                deferred=kind == "approval" and close.get("scope") != "deny",
+            )
 
         return self._execute_write(_do)
 

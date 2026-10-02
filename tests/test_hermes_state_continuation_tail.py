@@ -25,12 +25,13 @@ def db(tmp_path):
     session_db.close()
 
 
-def close(db, step):
+def close(db, step, **kwargs):
     return db.close_continuation_tail(
         "s1",
         step,
         interrupted_content=INTERRUPTED,
         is_interaction_tool=_is_interaction,
+        **kwargs,
     )
 
 
@@ -238,3 +239,60 @@ class TestApproval:
             db, {"kind": "approval", "tool_call_id": "q1", "scope": "once", "content": None}
         )
         assert (status, info["reason"]) == ("not_found", "wrong_call_kind")
+
+
+class TestContextNotes:
+    @pytest.mark.parametrize("tail", ["user", "answered", "interrupted", "denied", "resolved"])
+    def test_notes_follow_the_closed_tail(self, db, tail):
+        from agent.context_notes import context_note_message
+
+        step = None
+        if tail == "user":
+            db.append_message("s1", "user", "hello")
+        else:
+            assistant_calls(db, _call("c1", "request_user_input" if tail == "answered" else "mcp_write"))
+            if tail == "answered":
+                step = {"kind": "answer", "tool_call_id": "c1", "content": "yes"}
+            elif tail == "denied":
+                step = {"kind": "approval", "tool_call_id": "c1", "scope": "deny", "content": "denied"}
+            elif tail == "interrupted":
+                step = {"kind": "interrupted"}
+            else:
+                db.append_message("s1", "tool", "done", tool_call_id="c1")
+
+        status, _ = close(db, step, notes=["Project: alpha", "File edited"], continuation_id="turn-1")
+        assert status == "ok"
+        rows = db.get_messages_as_conversation("s1")
+        assert [{"role": row["role"], "content": row["content"]} for row in rows[-2:]] == [
+            context_note_message("Project: alpha"), context_note_message("File edited")
+        ]
+        assert rows[-3]["role"] == ("user" if tail == "user" else "tool")
+
+    def test_notes_replay_once_before_run_admission(self, db):
+        assistant_calls(db, _call("q1", "request_user_input"))
+        step = {"kind": "answer", "tool_call_id": "q1", "content": "yes"}
+        for _ in range(2):
+            assert close(db, step, notes=["Project: alpha"], continuation_id="turn-1")[0] == "ok"
+        assert len(db.get_messages_as_conversation("s1")) == 4
+
+    def test_changed_notes_conflict_without_appending(self, db):
+        db.append_message("s1", "user", "hello")
+        close(db, None, notes=["alpha"], continuation_id="turn-1")
+        assert close(db, None, notes=["beta"], continuation_id="turn-1")[0] == "conflict"
+        assert len(db.get_messages_as_conversation("s1")) == 2
+
+    def test_approval_defers_notes_without_overwriting_its_grant(self, db):
+        assistant_calls(db, _call("w1", "mcp_write"))
+        step = {"kind": "approval", "tool_call_id": "w1", "scope": "once", "content": None}
+        assert close(db, step, notes=["Project: alpha"], continuation_id="turn-1")[0] == "ok"
+        rows = db.get_messages_as_conversation("s1")
+        assert [row["role"] for row in rows] == ["user", "assistant"]
+        metadata = rows[-1]["display_metadata"]
+        assert metadata["_omnio_resolved_approvals"]["w1"]["scope"] == "once"
+        assert metadata["_omnio_continuation_notes"]["turn-1"]["deferred"] is True
+
+    def test_rejected_close_does_not_save_notes(self, db):
+        assistant_calls(db, _call("q1", "request_user_input"))
+        assert close(db, {"kind": "answer", "tool_call_id": "unknown", "content": "yes"},
+                     notes=["alpha"], continuation_id="turn-1")[0] == "not_found"
+        assert len(db.get_messages_as_conversation("s1")) == 2

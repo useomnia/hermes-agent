@@ -33,6 +33,7 @@ def insert_ephemeral_messages(
     ephemeral_messages: list[dict[str, Any]],
     *,
     before_current_user: bool = False,
+    at_index: int | None = None,
 ) -> list[dict[str, Any]]:
     """Return API messages with non-persistent context inserted at the requested boundary.
 
@@ -44,7 +45,9 @@ def insert_ephemeral_messages(
     if not ephemeral_messages:
         return result
 
-    if before_current_user:
+    if at_index is not None:
+        insert_at = min(max(at_index, 0), len(result))
+    elif before_current_user:
         # Insert immediately before the latest user message so current-turn
         # context is adjacent to the request it describes.
         insert_at = next(
