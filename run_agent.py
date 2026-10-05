@@ -2987,12 +2987,14 @@ class AIAgent:
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
 
-    def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
+    def clear_interrupt(self, *, preserve_redirect: bool = False, preserve_steer: bool = False) -> bool:
         """Clear the interrupt request and per-thread tool signal.
 
         ``preserve_redirect`` is used only by the conversation loop after it
         intentionally cancels a model request to rebuild that same logical
         turn. Public hard-stop paths keep the default and clear everything.
+        ``preserve_steer`` lets run exits hand undelivered input back while
+        keeping a concurrently accepted steer available to the gateway.
         """
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:
@@ -3030,14 +3032,13 @@ class AIAgent:
                     _set_interrupt(False, _wtid)
                 except Exception:
                     pass
-        # A hard interrupt supersedes any pending /steer — the steer was
-        # meant for the agent's next tool-call iteration, which will no
-        # longer happen. Drop it instead of surprising the user with a
-        # late injection on the post-interrupt turn.
-        _steer_lock = getattr(self, "_pending_steer_lock", None)
-        if _steer_lock is not None:
-            with _steer_lock:
-                self._pending_steer = None
+        # Run exits hand pending steers back before resetting interruption; a
+        # concurrently accepted steer remains available to the gateway's drain.
+        if not preserve_steer:
+            _steer_lock = getattr(self, "_pending_steer_lock", None)
+            if _steer_lock is not None:
+                with _steer_lock:
+                    self._pending_steer = None
         return True
 
     def steer(self, text: str) -> bool:

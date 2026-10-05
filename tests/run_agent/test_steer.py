@@ -11,6 +11,7 @@ import pytest
 
 from agent.prompt_builder import STEER_MARKER_OPEN, format_steer_marker
 from run_agent import AIAgent
+from tests.run_agent.test_run_agent import agent as loop_agent, _mock_response
 
 
 def _bare_agent() -> AIAgent:
@@ -509,3 +510,153 @@ class TestSteerCommandRegistry:
 
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-v"])
+
+
+@pytest.fixture
+def steering_loop(loop_agent):
+    loop_agent._disable_streaming = True
+    loop_agent._cached_system_prompt = "You are helpful."
+    loop_agent._use_prompt_caching = False
+    loop_agent.tool_delay = 0
+    loop_agent.compression_enabled = False
+    loop_agent.save_trajectories = False
+    return loop_agent
+
+
+def _tool_response():
+    from types import SimpleNamespace
+    call = SimpleNamespace(id="steer-call", type="function", function=SimpleNamespace(name="web_search", arguments='{"query":"logs"}'))
+    return _mock_response(content=None, finish_reason="tool_calls", tool_calls=[call])
+
+
+@pytest.mark.parametrize("boundary", ["during_tool", "after_delivery", "pre_call_drain", "request_preparation"])
+def test_should_hand_back_steer_when_stop_precedes_model_dispatch(steering_loop, monkeypatch, boundary):
+    agent = steering_loop
+    requests = []
+
+    def model_call(kwargs):
+        requests.append(kwargs)
+        return _tool_response()
+
+    def tool(*args, **kwargs):
+        if boundary != "pre_call_drain":
+            agent.steer("preserve this")
+        if boundary == "during_tool":
+            agent.interrupt()
+        return "logs"
+
+    if boundary == "after_delivery":
+        apply = agent._apply_pending_steer_to_tool_results
+        def stopped_after_delivery(messages, num_tool_msgs):
+            apply(messages, num_tool_msgs)
+            if messages and messages[-1]["role"] == "user" and "preserve this" in messages[-1]["content"]:
+                agent.interrupt()
+        monkeypatch.setattr(agent, "_apply_pending_steer_to_tool_results", stopped_after_delivery)
+    elif boundary == "pre_call_drain":
+        def stop_before_drain(iteration, tools):
+            if iteration == 2:
+                agent.steer("preserve this")
+                agent.interrupt()
+        agent.step_callback = stop_before_drain
+    elif boundary == "request_preparation":
+        def stop_during_preparation(agent, kwargs, request_id):
+            if any(STEER_MARKER_OPEN in str(m.get("content")) for m in kwargs["messages"]):
+                agent.interrupt()
+        monkeypatch.setattr("agent.chat_completion_helpers.log_openrouter_request_reasoning", stop_during_preparation)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", model_call)
+    monkeypatch.setattr("run_agent.handle_function_call", tool)
+    result = agent.run_conversation("check logs")
+    assert result["interrupted"] is True
+    assert result["pending_steer"] == "preserve this"
+    assert len(requests) == 1
+    assert not any(STEER_MARKER_OPEN in str(m.get("content")) for m in result["messages"])
+
+
+def test_should_consume_normal_tool_steer_once(steering_loop, monkeypatch):
+    agent = steering_loop
+    requests = []
+    def model_call(kwargs):
+        requests.append([dict(m) for m in kwargs["messages"]])
+        return _tool_response() if len(requests) == 1 else _mock_response(content="done")
+    def tool(*args, **kwargs):
+        agent.steer("check auth too")
+        return "logs"
+    monkeypatch.setattr(agent, "_interruptible_api_call", model_call)
+    monkeypatch.setattr("run_agent.handle_function_call", tool)
+    result = agent.run_conversation("check logs")
+    assert result["completed"] is True
+    assert "pending_steer" not in result
+    assert sum(str(m.get("content") or "").strip() == format_steer_marker("check auth too").strip() for m in requests[-1]) == 1
+
+
+def test_should_not_recover_steer_when_submitted_request_is_cancelled_without_output(steering_loop, monkeypatch):
+    agent = steering_loop
+    calls = []
+    def model_call(kwargs):
+        calls.append([dict(m) for m in kwargs["messages"]])
+        if len(calls) == 1:
+            return _tool_response()
+        agent.interrupt()
+        raise InterruptedError("cancelled")
+    def tool(*args, **kwargs):
+        agent.steer("already submitted")
+        return "logs"
+    monkeypatch.setattr(agent, "_interruptible_api_call", model_call)
+    monkeypatch.setattr("run_agent.handle_function_call", tool)
+    result = agent.run_conversation("check logs")
+    assert result["interrupted"] is True
+    assert "pending_steer" not in result
+    assert any(str(m.get("content") or "").strip() == format_steer_marker("already submitted").strip() for m in calls[-1])
+
+
+@pytest.mark.parametrize("boundary", ["error_handler", "error_backoff", "invalid_response_backoff"])
+def test_should_hand_back_steer_when_stop_interrupts_retry(steering_loop, monkeypatch, boundary):
+    import httpx
+    agent = steering_loop
+    def stop():
+        agent.steer("retry steer")
+        agent.interrupt()
+    def model_call(kwargs):
+        if boundary == "error_handler":
+            stop()
+        if boundary == "invalid_response_backoff":
+            response = _mock_response(content=None)
+            response.choices = []
+            return response
+        raise httpx.ConnectError("unavailable")
+    monkeypatch.setattr(agent, "_interruptible_api_call", model_call)
+    monkeypatch.setattr("agent.conversation_loop.jittered_backoff", lambda *a, **k: 1)
+    monkeypatch.setattr("agent.conversation_loop.time.sleep", lambda _: stop())
+    result = agent.run_conversation("check logs")
+    assert result["interrupted"] is True
+    assert result["pending_steer"] == "retry steer"
+    assert agent._drain_pending_steer() is None
+
+
+def test_should_preserve_concurrent_steer_when_clearing_run_interrupt():
+    agent = _bare_agent()
+    agent.steer("late steer")
+    agent._interrupt_requested = True
+    agent.clear_interrupt(preserve_steer=True)
+    assert agent._interrupt_requested is False
+    assert agent._drain_pending_steer() == "late steer"
+
+
+def test_should_requeue_before_a_newer_concurrent_steer():
+    from agent.agent_runtime_helpers import _requeue_pending_steer
+    agent = _bare_agent()
+    agent.steer("newer")
+    _requeue_pending_steer(agent, "older")
+    assert agent._drain_pending_steer() == "older\nnewer"
+
+
+def test_should_deliver_when_redirect_keeps_the_turn_running():
+    agent = _bare_agent()
+    agent.steer("soft steer")
+    agent._interrupt_requested = True
+    agent._pending_redirect = "redirect"
+    messages = [{"role": "tool", "content": "output", "tool_call_id": "a"}]
+    agent._apply_pending_steer_to_tool_results(messages, 1)
+    assert messages[-1]["content"] == format_steer_marker("soft steer")
+    assert agent._drain_pending_steer() is None

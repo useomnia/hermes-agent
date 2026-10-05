@@ -94,9 +94,11 @@ class _StubAgent:
         return False
 
     def _drain_pending_steer(self):
-        return None
+        text = getattr(self, "_pending_steer", None)
+        self._pending_steer = None
+        return text
 
-    def clear_interrupt(self):
+    def clear_interrupt(self, *, preserve_steer=False):
         pass
 
     def _sync_external_memory_for_turn(self, **k):
@@ -196,3 +198,23 @@ def test_interrupt_without_tool_tail_adds_nothing():
     _finalize(agent, messages, interrupted=True, final_response="partial reply")
     assert len(messages) == before
     assert messages[-1]["role"] == "assistant"
+
+
+@pytest.mark.parametrize("tail", ["owned", "submitted", "answered", "ordinary", "modified"])
+def test_should_recover_only_exact_runtime_owned_unsubmitted_tail(tail):
+    from agent.prompt_builder import format_steer_marker
+    agent = _StubAgent()
+    row = {"role": "user", "content": format_steer_marker("saved steer")}
+    messages = _interrupted_tool_tail() + [row]
+    agent._unsubmitted_steers = [] if tail in {"ordinary", "submitted"} else [(row, "saved steer")]
+    if tail == "answered":
+        messages.append({"role": "assistant", "content": "done"})
+    elif tail == "modified":
+        row["content"] += " ordinary text"
+    result = _finalize(agent, messages, interrupted=True)
+    if tail == "owned":
+        assert result["pending_steer"] == "saved steer"
+        assert row not in agent.persisted_messages
+    else:
+        assert "pending_steer" not in result
+        assert row in agent.persisted_messages
