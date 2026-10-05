@@ -1,17 +1,4 @@
-"""Regression test for #48879.
-
-When a turn is interrupted via ``/stop`` right after a tool completes — but
-before the assistant streams any final text — the transcript tail is a raw
-``tool`` message. Persisting that tail unmodified means the next user message
-lands as ``... tool → user``, a role-alternation violation that strict
-providers (Gemini, Claude) react to by hallucinating a continuation of the
-user's message before transitioning into the assistant persona.
-
-``finalize_turn`` closes the tool-call sequence on interrupt by appending a
-synthetic ``assistant`` message before persistence. ``final_response`` is
-typically empty on an interrupt, so the placeholder text is used rather than
-an empty-content assistant turn.
-"""
+"""Interruptions preserve real transcript rows; run status carries diagnostics."""
 
 import pytest
 
@@ -139,41 +126,26 @@ def _finalize(agent, messages, *, interrupted, final_response=None):
     )
 
 
-def _assert_no_tool_then_user(messages):
-    for i in range(len(messages) - 1):
-        if messages[i].get("role") == "tool":
-            assert messages[i + 1].get("role") != "user", (
-                f"role-alternation violation: tool → user at index {i}"
-            )
-
-
-def test_interrupt_after_tool_closes_sequence_with_placeholder():
+@pytest.mark.parametrize("diagnostic", [None, "", "Operation interrupted during retry (attempt 2/3)."])
+def test_interrupt_preserves_tool_tail_without_fabricating_completion(diagnostic):
     agent = _StubAgent()
     messages = _interrupted_tool_tail()
-    _finalize(agent, messages, interrupted=True, final_response=None)
+    expected = [dict(m) for m in messages]
+    result = _finalize(agent, messages, interrupted=True, final_response=diagnostic)
 
-    # Tail must now be an assistant message, not a raw tool result.
-    assert messages[-1]["role"] == "assistant"
-    # Empty final_response falls back to the explicit placeholder rather
-    # than persisting an empty-content assistant turn.
-    assert messages[-1]["content"] == "Operation interrupted."
-
-    # The persisted snapshot is alternation-safe: appending a new user
-    # message would follow an assistant, not an orphan tool.
-    assert agent.persisted_messages is not None
-    assert agent.persisted_messages[-1]["role"] == "assistant"
-    follow_on = agent.persisted_messages + [{"role": "user", "content": "forget it"}]
-    _assert_no_tool_then_user(follow_on)
+    assert messages == expected
+    assert agent.persisted_messages == expected
+    assert result["interrupted"] is True
+    assert result["completed"] is False
+    assert result["final_response"] == diagnostic
 
 
-def test_interrupt_after_tool_keeps_delivered_text_when_present():
+def test_completed_recovery_still_persists_real_final_response():
     agent = _StubAgent()
     messages = _interrupted_tool_tail()
-    _finalize(agent, messages, interrupted=True, final_response="Partial answer so far")
-
-    assert messages[-1]["role"] == "assistant"
-    # Real delivered text is preserved, not clobbered by the placeholder.
-    assert messages[-1]["content"] == "Partial answer so far"
+    result = _finalize(agent, messages, interrupted=False, final_response="The file is fixed.")
+    assert agent.persisted_messages[-1] == {"role": "assistant", "content": "The file is fixed."}
+    assert result["completed"] is True
 
 
 def test_non_interrupted_tool_tail_is_left_untouched():

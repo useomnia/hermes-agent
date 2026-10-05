@@ -247,7 +247,7 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_dropped_toolcall_nudge",
     # Omnio HITL expiry is deliberately durable as a dangling assistant
     # tool-call.  The live sentinel still unwinds the blocked turn, but its
-    # tool row (and the matching interrupt closer) must never enter state.db.
+    # sentinel tool row must never enter state.db.
     "_omnio_skip_persist",
 )
 
