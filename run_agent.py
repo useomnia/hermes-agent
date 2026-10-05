@@ -2993,6 +2993,8 @@ class AIAgent:
         ``preserve_redirect`` is used only by the conversation loop after it
         intentionally cancels a model request to rebuild that same logical
         turn. Public hard-stop paths keep the default and clear everything.
+        ``preserve_steer`` lets run exits hand undelivered input back while
+        keeping a concurrently accepted steer available to the gateway.
         """
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:

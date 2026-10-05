@@ -76,7 +76,7 @@ class FakeAgent:
     def _drain_pending_steer(self):
         return None
 
-    def clear_interrupt(self):
+    def clear_interrupt(self, *, preserve_steer=False):
         pass
 
     def _sync_external_memory_for_turn(self, **_kwargs):
