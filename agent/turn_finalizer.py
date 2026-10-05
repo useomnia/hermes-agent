@@ -297,6 +297,10 @@ def finalize_turn(
     # scaffolding has been removed. Otherwise a later user "continue" turn
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
+    if interrupted:
+        from agent.agent_runtime_helpers import recover_unsubmitted_steers
+        recover_unsubmitted_steers(agent, messages)
+
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
@@ -649,7 +653,7 @@ def finalize_turn(
         result["interrupt_message"] = agent._interrupt_message
 
     # Clear interrupt state after handling
-    agent.clear_interrupt()
+    agent.clear_interrupt(preserve_steer=True)
 
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None

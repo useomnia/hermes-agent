@@ -2289,6 +2289,11 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
+                    if agent._interrupt_requested:
+                        raise InterruptedError("Operation interrupted before model dispatch")
+                    # Calling the transport is the submission boundary, even if it
+                    # returns no response. A later Stop must not replay this input.
+                    agent._unsubmitted_steers = []
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -2589,15 +2594,18 @@ def run_conversation(
                         if agent._interrupt_requested:
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
+                            from agent.agent_runtime_helpers import take_interrupted_steer
+                            _leftover_steer = take_interrupted_steer(agent, messages)
                             close_interrupted_tool_sequence(messages, _interrupt_text)
                             agent._persist_session(messages, conversation_history)
-                            agent.clear_interrupt()
+                            agent.clear_interrupt(preserve_steer=True)
                             return {
                                 "final_response": _interrupt_text,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "interrupted": True,
+                                **({"pending_steer": _leftover_steer} if _leftover_steer else {}),
                             }
                         time.sleep(0.2)
                         # Touch activity every ~30s so the gateway's inactivity
@@ -4178,15 +4186,18 @@ def run_conversation(
                 if agent._interrupt_requested:
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
+                    from agent.agent_runtime_helpers import take_interrupted_steer
+                    _leftover_steer = take_interrupted_steer(agent, messages)
                     close_interrupted_tool_sequence(messages, _interrupt_text)
                     agent._persist_session(messages, conversation_history)
-                    agent.clear_interrupt()
+                    agent.clear_interrupt(preserve_steer=True)
                     return {
                         "final_response": _interrupt_text,
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "interrupted": True,
+                        **({"pending_steer": _leftover_steer} if _leftover_steer else {}),
                     }
                 
                 # Check for 413 payload-too-large BEFORE generic 4xx handler.
@@ -5414,15 +5425,18 @@ def run_conversation(
                     if agent._interrupt_requested:
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
+                        from agent.agent_runtime_helpers import take_interrupted_steer
+                        _leftover_steer = take_interrupted_steer(agent, messages)
                         close_interrupted_tool_sequence(messages, _interrupt_text)
                         agent._persist_session(messages, conversation_history)
-                        agent.clear_interrupt()
+                        agent.clear_interrupt(preserve_steer=True)
                         return {
                             "final_response": _interrupt_text,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "interrupted": True,
+                            **({"pending_steer": _leftover_steer} if _leftover_steer else {}),
                         }
                     time.sleep(0.2)  # Check interrupt every 200ms
                     # Touch activity every ~30s so the gateway's inactivity

@@ -3558,6 +3558,24 @@ def _requeue_pending_steer(agent, steer_text: str) -> None:
             requeue()
 
 
+def recover_unsubmitted_steers(agent, messages: list) -> None:
+    """Return only runtime-owned, exact tail rows that never entered a model call."""
+    pending = getattr(agent, "_unsubmitted_steers", [])
+    while pending:
+        row, text = pending.pop()
+        if not messages or messages[-1] is not row:
+            continue
+        if row.get("role") != "user" or row.get("content") != format_steer_marker(text):
+            continue
+        messages.pop()
+        _requeue_pending_steer(agent, text)
+
+
+def take_interrupted_steer(agent, messages: list):
+    recover_unsubmitted_steers(agent, messages)
+    return agent._drain_pending_steer()
+
+
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
     """Append a persistable user message after a complete tool-result batch."""
     if num_tool_msgs <= 0 or not messages:
@@ -3565,11 +3583,19 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     steer_text = agent._drain_pending_steer()
     if not steer_text:
         return
+    if getattr(agent, "_interrupt_requested", False) and not agent._has_pending_redirect():
+        _requeue_pending_steer(agent, steer_text)
+        return
     tail = messages[max(len(messages) - num_tool_msgs, 0):]
     if not any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in tail):
         _requeue_pending_steer(agent, steer_text)
         return
-    messages.append({"role": "user", "content": format_steer_marker(steer_text)})
+    row = {"role": "user", "content": format_steer_marker(steer_text)}
+    messages.append(row)
+    unsubmitted = getattr(agent, "_unsubmitted_steers", None)
+    if unsubmitted is None:
+        unsubmitted = agent._unsubmitted_steers = []
+    unsubmitted.append((row, steer_text))
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message: %s",
         len(steer_text),

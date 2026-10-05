@@ -1871,3 +1871,58 @@ class TestRunsProviderAuthFailure:
                 assert status["status"] == "failed"
                 assert status["error"] == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
                 assert status["last_event"] == "run.failed"
+
+
+@pytest.mark.asyncio
+async def test_should_emit_one_missed_steer_when_stop_interrupts_a_real_tool_batch(adapter):
+    from run_agent import AIAgent
+    from tests.run_agent.test_run_agent import _mock_response, _make_tool_defs
+    from agent.prompt_builder import STEER_MARKER_OPEN
+
+    with (patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")), patch("run_agent.check_toolset_requirements", return_value={}), patch("run_agent.OpenAI")):
+        agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1", quiet_mode=True, skip_context_files=True, skip_memory=True)
+    agent.client = MagicMock()
+    agent._disable_streaming = True
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent.tool_delay = 0
+    tool_running = threading.Event()
+    stop_seen = threading.Event()
+    requests = []
+    def tool(*args, **kwargs):
+        tool_running.set()
+        assert stop_seen.wait(5)
+        return "interrupted logs"
+    def model_call(kwargs):
+        requests.append(kwargs)
+        call = SimpleNamespace(id="steer-call", type="function", function=SimpleNamespace(name="web_search", arguments='{"query":"logs"}'))
+        return _mock_response(content=None, finish_reason="tool_calls", tool_calls=[call])
+    agent._interruptible_api_call = model_call
+    interrupt = agent.interrupt
+    def stop(message=None):
+        interrupt(message)
+        stop_seen.set()
+    agent.interrupt = stop
+    app = _create_runs_app(adapter)
+    with patch.object(adapter, "_create_agent", return_value=agent), patch("run_agent.handle_function_call", tool):
+        async with TestClient(TestServer(app)) as cli:
+            started = await cli.post("/v1/runs", json={"input": "check logs"})
+            run_id = (await started.json())["run_id"]
+            assert await _wait_for_thread_event(tool_running)
+            steered = await cli.post(f"/v1/runs/{run_id}/steer", json={"text": "preserve this", "mode": "steer"})
+            assert await steered.json() == {"status": "queued"}
+            stopped = await cli.post(f"/v1/runs/{run_id}/stop")
+            assert (await stopped.json())["status"] == "stopping"
+            task = adapter._active_run_tasks.get(run_id)
+            if task is not None:
+                await asyncio.wait_for(asyncio.shield(task), 5)
+            stream = await cli.get(f"/v1/runs/{run_id}/events")
+            text = await stream.text()
+    events = [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: {")]
+    missed = [event for event in events if event.get("type") == "response.omnio.steer_missed"]
+    assert len(missed) == 1
+    assert missed[0]["text"] == "preserve this"
+    assert len(requests) == 1
+    assert not any(STEER_MARKER_OPEN in str(m.get("content")) for m in requests[0]["messages"])
