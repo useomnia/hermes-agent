@@ -1162,7 +1162,7 @@ class TestPromptBuilderConstants:
 
     def test_steer_channel_note_uses_runtime_actor_and_keeps_marker_contract(self):
         assert (
-            "an out-of-band message that the runtime appends to the end of a tool result"
+            "an out-of-band message that the runtime appends after the tool-result batch as a user message"
             in STEER_CHANNEL_NOTE
         )
         assert "Hermes" not in STEER_CHANNEL_NOTE

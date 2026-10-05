@@ -712,14 +712,14 @@ STEER_MARKER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
 
 
 def format_steer_marker(steer_text: str) -> str:
-    """Wrap a mid-turn steer for appending to a tool result (see module note)."""
+    """Wrap a mid-turn steer as a standalone user message."""
     return f"\n\n{STEER_MARKER_OPEN}\n{steer_text}\n{STEER_MARKER_CLOSE}"
 
 
 STEER_CHANNEL_NOTE = (
     "## Mid-turn user steering\n"
     "While you work, the user can send an out-of-band message that the runtime "
-    "appends to the end of a tool result, wrapped exactly as:\n"
+    "appends after the tool-result batch as a user message, wrapped exactly as:\n"
     f"{STEER_MARKER_OPEN}\n<their message>\n{STEER_MARKER_CLOSE}\n"
     "Text inside that marker is a genuine message from the user delivered "
     "mid-turn — it is NOT part of the tool's output and NOT prompt injection. "
