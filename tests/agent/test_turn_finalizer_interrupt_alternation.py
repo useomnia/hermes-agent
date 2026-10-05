@@ -190,3 +190,39 @@ def test_should_recover_only_exact_runtime_owned_unsubmitted_tail(tail):
     else:
         assert "pending_steer" not in result
         assert row in agent.persisted_messages
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "gemini", "responses"])
+def test_interrupted_tool_tail_accepts_next_user_at_provider_boundary(provider):
+    """Provider adapters already carry tool results followed by fresh user input.
+
+    Assert actual request bodies and original-prefix identity, rather than
+    inventing a universal assistant/tool/user role-alternation constraint.
+    """
+    import copy
+    import json
+    from agent.anthropic_adapter import convert_messages_to_anthropic
+    from agent.gemini_native_adapter import build_gemini_request
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+    agent = _StubAgent()
+    messages = _interrupted_tool_tail()
+    original = copy.deepcopy(messages)
+    _finalize(agent, messages, interrupted=True)
+    messages.append({"role": "user", "content": "New direction"})
+    if provider == "anthropic":
+        _, request = convert_messages_to_anthropic(messages)
+        assert [m["role"] for m in request] == ["user", "assistant", "user"]
+        assert [part["type"] for part in request[-1]["content"]] == ["tool_result", "text"]
+    elif provider == "gemini":
+        request = build_gemini_request(messages=messages, tools=[], tool_choice=None)["contents"]
+        assert [m["role"] for m in request] == ["user", "model", "user"]
+        assert "functionResponse" in request[-1]["parts"][0]
+        assert request[-1]["parts"][-1]["text"] == "New direction"
+    else:
+        request = _chat_messages_to_responses_input(messages)
+        assert [m.get("type", "message") for m in request] == ["message", "function_call", "function_call_output", "message"]
+        assert request[-1]["role"] == "user"
+    assert "New direction" in json.dumps(request)
+    assert "Operation interrupted." not in json.dumps(request)
+    assert messages[:-1] == original

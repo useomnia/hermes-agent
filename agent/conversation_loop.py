@@ -5838,10 +5838,6 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Max retries (3) for invalid tool calls exceeded. Stopping as partial.", force=True)
                         agent._invalid_tool_retries = 0
                         _final_response = f"Model generated invalid tool call: {invalid_preview}"
-                        # Prior <3 retries (or an earlier successful tool batch)
-                        # leave a tool-result tail. Closing it here matches
-                        # interrupt aborts (#48879 / #52592) so the next user
-                        # turn is not tool→user for strict providers.
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _final_response,
