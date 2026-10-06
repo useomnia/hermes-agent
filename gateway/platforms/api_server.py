@@ -11385,19 +11385,28 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @_admit_api_control_request
     async def _handle_mcp_reload(self, request: "web.Request") -> "web.Response":
-        """Reconnect MCP servers and refresh their tool registry in place."""
+        """Reconnect MCP servers and refresh their tool registry in place.
+
+        An optional ``{"servers": [...]}`` body reloads only those servers and
+        reports each one's outcome; without it every server is reconnected.
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        requested, body_err = await self._requested_mcp_reload_servers(request)
+        if body_err:
+            return body_err
 
         loop = asyncio.get_running_loop()
         if self._mcp_reload_lock is None:
             self._mcp_reload_lock = asyncio.Lock()
         try:
             from tools.mcp_tool import (
+                _existing_tool_names,
                 _lock,
                 _servers,
                 discover_mcp_tools,
+                reload_mcp_servers,
                 shutdown_mcp_servers,
             )
 
@@ -11421,23 +11430,57 @@ class APIServerAdapter(BasePlatformAdapter):
                 await self._refresh_omnio_connector_toolkit_approvals()
                 with _lock:
                     old_servers = set(_servers.keys())
-                await loop.run_in_executor(None, shutdown_mcp_servers)
-                new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+                if requested is None:
+                    await loop.run_in_executor(None, shutdown_mcp_servers)
+                    new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+                    results = None
+                else:
+                    results = await loop.run_in_executor(None, reload_mcp_servers, requested)
+                    with _lock:
+                        new_tools = _existing_tool_names()
                 with _lock:
                     connected = set(_servers.keys())
         except Exception as exc:
             logger.exception("[api_server] MCP reload failed")
             return web.json_response(_openai_error(str(exc)), status=500)
 
-        return web.json_response(
-            {
-                "object": "hermes.mcp.reload",
-                "servers": sorted(connected),
-                "added": sorted(connected - old_servers),
-                "removed": sorted(old_servers - connected),
-                "tools": len(new_tools),
-            }
-        )
+        payload = {
+            "object": "hermes.mcp.reload",
+            "servers": sorted(connected),
+            "added": sorted(connected - old_servers),
+            "removed": sorted(old_servers - connected),
+            "tools": len(new_tools),
+        }
+        if results is not None:
+            payload["results"] = results
+        return web.json_response(payload)
+
+    @staticmethod
+    async def _requested_mcp_reload_servers(
+        request: "web.Request",
+    ) -> "tuple[Optional[List[str]], Optional[web.Response]]":
+        """The server names a reload body selects, or None to reload every server."""
+        if not request.can_read_body:
+            return None, None
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None, web.json_response(
+                _openai_error("Reload body must be JSON"), status=400
+            )
+        servers = body.get("servers") if isinstance(body, dict) else None
+        if servers is None and isinstance(body, dict):
+            return None, None
+        if (
+            not isinstance(servers, list)
+            or not servers
+            or not all(isinstance(name, str) and name for name in servers)
+        ):
+            return None, web.json_response(
+                _openai_error("'servers' must be a non-empty list of server names"),
+                status=400,
+            )
+        return servers, None
 
     @_admit_api_control_request
     async def _handle_skills_reload(
