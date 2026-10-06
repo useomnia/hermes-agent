@@ -387,6 +387,14 @@ def _source_column_sql(table: str, column: str) -> str:
     return quoted
 
 
+def _copy_columns_sql(table: str, columns: list[str]) -> tuple[str, str, str]:
+    """Share insertion columns and source projection across both copy modes."""
+    quoted = ", ".join(f'"{column}"' for column in columns)
+    projection = ", ".join(_source_column_sql(table, column) for column in columns)
+    placeholders = ", ".join("?" for _ in columns)
+    return quoted, projection, placeholders
+
+
 def _copy_table(
     source: sqlite3.Connection,
     destination: sqlite3.Connection,
@@ -412,9 +420,7 @@ def _copy_table(
         result["error"] = "source and destination have no compatible columns"
         return result
 
-    quoted = ", ".join(f'"{column}"' for column in columns)
-    placeholders = ", ".join("?" for _ in columns)
-    source_columns_sql = ", ".join(_source_column_sql(table, column) for column in columns)
+    quoted, source_columns_sql, placeholders = _copy_columns_sql(table, columns)
     select_sql = f'SELECT {source_columns_sql} FROM "{table}"'
     insert_prefix = "INSERT OR REPLACE" if table == "state_meta" else "INSERT"
     insert_sql = f'{insert_prefix} INTO "{table}" ({quoted}) VALUES ({placeholders})'
@@ -564,9 +570,7 @@ def _copy_table_salvage(
             result["error"] += f": {details}"
         return result
 
-    quoted = ", ".join(f'"{column}"' for column in columns)
-    placeholders = ", ".join("?" for _ in columns)
-    source_columns_sql = ", ".join(_source_column_sql(table, column) for column in columns)
+    quoted, source_columns_sql, placeholders = _copy_columns_sql(table, columns)
     select_sql = (
         f'SELECT rowid, {source_columns_sql} FROM "{table}" '
         "WHERE rowid BETWEEN ? AND ? ORDER BY rowid"
