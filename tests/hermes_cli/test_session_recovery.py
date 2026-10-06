@@ -30,6 +30,41 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+@pytest.mark.parametrize("allow_partial", [False, True])
+@pytest.mark.parametrize("origin_session_id", [None, "retained-session"])
+def test_recovery_should_preserve_legacy_delegation_origin(
+    tmp_path, allow_partial, origin_session_id,
+):
+    source = tmp_path / "legacy.db"
+    destination = tmp_path / "recovered.db"
+    work = tmp_path / "work"
+    work.mkdir()
+    legacy_schema = hermes_state.SCHEMA_SQL.replace(
+        "origin_session_id TEXT NOT NULL DEFAULT ''", "origin_session_id TEXT"
+    )
+    with sqlite3.connect(source) as connection:
+        connection.executescript(legacy_schema)
+        connection.execute(
+            "INSERT INTO async_delegations "
+            "(delegation_id, origin_session, state, dispatched_at, updated_at, origin_session_id) "
+            "VALUES ('retained', 'owner', 'completed', 1, 1, ?)",
+            (origin_session_id,),
+        )
+    database = SessionDB(db_path=source)
+    database.close()
+
+    report = recover_session_database(
+        source, destination, work_dir=work, allow_partial=allow_partial,
+    )
+
+    assert report["complete"] is True
+    assert report["source_unchanged"] is True
+    with sqlite3.connect(destination) as connection:
+        assert connection.execute(
+            "SELECT delegation_id, origin_session_id FROM async_delegations"
+        ).fetchall() == [("retained", origin_session_id or "")]
+
+
 def _make_source(path: Path) -> dict[str, int]:
     db = SessionDB(db_path=path)
     try:
