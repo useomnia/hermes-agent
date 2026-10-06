@@ -58,6 +58,36 @@ def test_registry_construction_should_not_create_state_database(tmp_path, monkey
     assert not (tmp_path / "state.db").exists()
 
 
+def test_model_tools_import_should_not_migrate_existing_ledger(tmp_path):
+    database_path = tmp_path / "state.db"
+    _seed_completion(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "ALTER TABLE async_delegations DROP COLUMN origin_session_id"
+        )
+        before = connection.execute("PRAGMA table_info(async_delegations)").fetchall()
+    environment = {
+        **os.environ,
+        "HERMES_HOME": str(tmp_path),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+    }
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import model_tools"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    with sqlite3.connect(database_path) as connection:
+        assert (
+            connection.execute("PRAGMA table_info(async_delegations)").fetchall()
+            == before
+        )
+
+
 def test_replay_should_not_create_missing_database(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
