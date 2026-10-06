@@ -1405,6 +1405,22 @@ class ProcessRegistry:
             skip_poll_observed and session_id in self._poll_observed
         )
 
+    @staticmethod
+    def _owns_event(evt: dict, session_key: str, owns_event) -> bool:
+        """Decide ownership before a consumer can suppress or deliver an event."""
+        is_async_delegation = evt.get("type") == "async_delegation"
+        evt_session_key = str(evt.get("session_key") or "")
+        evt_origin_sid = str(evt.get("origin_ui_session_id") or "")
+        requires_positive_proof = is_async_delegation or bool(evt_session_key or evt_origin_sid)
+        if owns_event is not None and requires_positive_proof:
+            try:
+                return bool(owns_event(evt))
+            except Exception:
+                return False  # A broken ownership check must never leak an event.
+        if session_key and requires_positive_proof:
+            return evt_session_key == session_key
+        return not (is_async_delegation and evt.get("restored"))
+
     def restore_completions(self) -> int:
         """Replay the launch profile's durable completions once, at first use.
 
@@ -1471,32 +1487,7 @@ class ProcessRegistry:
                 evt = self.completion_queue.get_nowait()
             except Exception:
                 break
-            # Positive-proof ownership beats bare key equality. Delegation
-            # payloads always require proof; ordinary events require it once
-            # they carry routing metadata. Ownerless ordinary events preserve
-            # legacy single-session delivery.
-            is_async_delegation = evt.get("type") == "async_delegation"
-            evt_session_key = str(evt.get("session_key") or "")
-            evt_origin_sid = str(evt.get("origin_ui_session_id") or "")
-            requires_positive_proof = is_async_delegation or bool(
-                evt_session_key or evt_origin_sid
-            )
-            if owns_event is not None and requires_positive_proof:
-                try:
-                    owned = bool(owns_event(evt))
-                except Exception:
-                    owned = False  # fail closed — never leak on a broken check
-                if not owned:
-                    requeue.append(evt)
-                    continue
-            elif session_key and requires_positive_proof:
-                if evt_session_key != session_key:
-                    requeue.append(evt)
-                    continue
-            elif is_async_delegation and evt.get("restored"):
-                # Durable restore can enqueue previous-process payloads into a
-                # fresh registry. An unfiltered legacy drain cannot prove
-                # ownership, so leave those events queued for the owner.
+            if not self._owns_event(evt, session_key, owns_event):
                 requeue.append(evt)
                 continue
             # Local consumed/observed state may suppress only events this
