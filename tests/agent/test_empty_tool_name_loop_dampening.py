@@ -277,14 +277,8 @@ def test_all_invalid_batch_still_strikes_out(agent_env):
     assert "invalid tool call" in (result.get("error") or "")
 
 
-def test_invalid_tool_exhaustion_closes_tool_tail(agent_env):
-    """Invalid-tool 3-strike partial must not leave a durable tool→user tail (#48879 class).
-
-    Retries <3 append assistant+error tool rows, so the transcript already ends
-    on ``tool`` before the exhaustion early-return. That return must close the
-    sequence (same contract as interrupt aborts) so the next user turn is not
-    ``tool → user`` for strict providers.
-    """
+def test_invalid_tool_exhaustion_preserves_tool_tail(agent_env):
+    """Retry exhaustion reports a partial outcome without fabricating an answer."""
     agent, handler = agent_env
     for _ in range(3):
         handler.response_queue.append(_tc_resp("frobnicate_xyz", "{}"))
@@ -292,10 +286,17 @@ def test_invalid_tool_exhaustion_closes_tool_tail(agent_env):
     result = agent.run_conversation("degenerate", conversation_history=[], task_id="t")
 
     assert result.get("partial", False)
+    assert result["completed"] is False
+    assert "invalid tool call" in result["error"].lower()
     msgs = result.get("messages") or []
-    assert msgs, "expected persisted conversation messages"
-    assert msgs[-1].get("role") == "assistant"
-    assert "invalid tool call" in (msgs[-1].get("content") or "").lower()
+    tool_results = [msg for msg in msgs if msg.get("role") == "tool"]
+    assert len(tool_results) == 2
+    assert msgs[-1] == tool_results[-1]
+    assert all("frobnicate_xyz" in msg["content"] for msg in tool_results)
+    assert not any(
+        msg.get("role") == "assistant" and not msg.get("tool_calls")
+        for msg in msgs
+    )
 
 
 def test_mixed_batch_invalid_call_with_broken_json_does_not_retry_turn(agent_env):
