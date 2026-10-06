@@ -2309,6 +2309,36 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 _UNSET = object()
 
 
+def _start_offline_marker_invalidation() -> "concurrent.futures.Future[bool]":
+    """Invalidate the offline quiescence marker on a worker thread."""
+    from gateway.quiescence import mark_offline_quiescence_unknown
+
+    future: "concurrent.futures.Future[bool]" = concurrent.futures.Future()
+
+    def _run() -> None:
+        try:
+            future.set_result(bool(mark_offline_quiescence_unknown()))
+        except BaseException as exc:  # noqa: BLE001 — surfaced by the awaiting start
+            future.set_exception(exc)
+
+    threading.Thread(target=_run, name="offline-marker-invalidate", daemon=True).start()
+    return future
+
+
+async def _require_offline_marker_invalidated(
+    invalidation: "Optional[concurrent.futures.Future[bool]]",
+) -> None:
+    """Fail closed unless the previous offline quiescence marker is durably invalidated.
+
+    ``None`` is a runner built without ``__init__`` (test doubles), which never
+    started an invalidation."""
+    if invalidation is not None and not await asyncio.wrap_future(invalidation):
+        raise RuntimeError(
+            "Could not durably invalidate the offline quiescence marker; "
+            "refusing to admit gateway work"
+        )
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -3377,14 +3407,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self.config = config if config is not None else load_gateway_config_for_runner()
         # Invalidate any prior clean quiescence marker before this process can
         # admit work. A cold reader must never mistake a stale marker from a
-        # previous gateway generation for proof about this one.
-        from gateway.quiescence import mark_offline_quiescence_unknown
-
-        if not mark_offline_quiescence_unknown():
-            raise RuntimeError(
-                "Could not durably invalidate the offline quiescence marker; "
-                "refusing to admit gateway work"
-            )
+        # previous gateway generation for proof about this one. The durable
+        # write (two fsyncs) overlaps the rest of the boot; ``start`` awaits it
+        # before anything that can admit work.
+        self._offline_marker_invalidation = _start_offline_marker_invalidation()
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -8224,6 +8250,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "plugin discovery failed at gateway startup", exc_info=True,
             )
         _boot_mark("plugins")
+        await _require_offline_marker_invalidated(
+            getattr(self, "_offline_marker_invalidation", None)
+        )
 
         # Register the generic relay adapter when a connector relay URL is
         # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
@@ -25105,6 +25134,11 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
     # could still take up to its timeout on a wedged disk, and these locks must
     # never be stranded. os._exit skips atexit, and the early SystemExit exit
     # paths never run _stop_impl, so release here (idempotent).
+    try:
+        from gateway.status import flush_runtime_status
+        flush_runtime_status(timeout=1.0)
+    except Exception:
+        pass
     try:
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
