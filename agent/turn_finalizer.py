@@ -229,6 +229,7 @@ def finalize_turn(
     completed = (
         final_response is not None
         and not failed
+        and not interrupted
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
@@ -310,23 +311,10 @@ def finalize_turn(
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
 
-        # When the turn was interrupted and the last message is a tool
-        # result, append a synthetic assistant message to close the
-        # tool-call sequence. Without this, the session persists a
-        # ``tool → user`` alternation that strict providers (Gemini,
-        # Claude) reject, causing them to hallucinate a continuation of
-        # the user's message on the next turn (#48879).
-        #
-        # ``_drop_trailing_empty_response_scaffolding`` only rewinds the
-        # tool tail when an empty-response scaffolding flag is present; a
-        # clean ``/stop`` interrupt after a successful tool sets no such
-        # flag, so the tool result survives as the tail and we close it
-        # here instead. On an interrupt ``final_response`` is typically
-        # empty, so fall back to an explicit placeholder rather than
-        # persisting an empty-content assistant turn.
-        if interrupted:
-            from agent.message_sanitization import close_interrupted_tool_sequence
-            close_interrupted_tool_sequence(messages, final_response)
+        # An interrupt is a run outcome, not an assistant response. Preserve the
+        # actual tool tail: tool results followed by a new user message are legal
+        # (including steering), and a fabricated assistant closer would make an
+        # unresolved Omnio interaction look durably completed.
 
         # Some recovery/fallback paths return a real final_response without
         # adding a closing assistant message to the transcript (e.g. the

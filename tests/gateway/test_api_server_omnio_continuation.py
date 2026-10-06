@@ -471,10 +471,18 @@ def test_missing_ordinary_result_keeps_the_generic_stub():
     assert stub["content"] == "[Result unavailable — see context summary above]"
 
 
-def test_timed_out_interaction_rows_are_never_saved(db):
-    from agent.message_sanitization import close_interrupted_tool_sequence
+@pytest.mark.parametrize("position", [0, 1, 2])
+@pytest.mark.asyncio
+async def test_timed_out_batch_can_accept_late_answer_at_every_position(adapter, db, position):
+    """The real persistence funnel must leave the timed-out call resumable.
+
+    Siblings before the question completed; later siblings were skipped. Neither
+    may mask the unresolved question or be lost/re-executed on continuation.
+    """
     from agent.tool_executor import _mark_omnio_timeout_tool_result
+    from agent.turn_finalizer import finalize_turn
     from run_agent import AIAgent
+    from tests.agent.test_turn_finalizer_interrupt_alternation import _StubAgent
 
     agent = object.__new__(AIAgent)
     agent._persist_disabled = False
@@ -489,17 +497,39 @@ def test_timed_out_interaction_rows_are_never_saved(db):
     agent._persist_user_message_timestamp = None
     agent._session_persist_lock = None
     agent._omnio_skip_persist_tool_call_ids = {"q1"}
-    messages = [
-        {"role": "assistant", "content": "", "tool_calls": [_call("q1", "request_user_input")]},
-        {"role": "tool", "tool_call_id": "q1", "tool_name": "request_user_input", "content": '{"status":"no_response"}'},
-    ]
-    _mark_omnio_timeout_tool_result(agent, messages[-1], "q1")
-    assert close_interrupted_tool_sequence(messages)
-
-    AIAgent._flush_messages_to_session_db(agent, messages, [])
-
+    calls = [_call("s1", "terminal"), _call("s2", "terminal")]
+    calls.insert(position, _call("q1", "request_user_input"))
+    messages = [{"role": "assistant", "content": "", "tool_calls": calls}]
+    for index, call in enumerate(calls):
+        call_id = call["id"]
+        content = ('{"status":"no_response"}' if call_id == "q1" else
+                   "completed once" if index < position else
+                   "[Tool execution skipped — terminal was not started]")
+        row = {"role": "tool", "tool_call_id": call_id,
+               "tool_name": call["function"]["name"], "content": content}
+        _mark_omnio_timeout_tool_result(agent, row, call_id)
+        messages.append(row)
+        AIAgent._flush_messages_to_session_db(agent, messages, [])
+    finalizer = _StubAgent()
+    finalizer._persist_session = lambda rows, history: AIAgent._flush_messages_to_session_db(agent, rows, [])
+    finalize_turn(finalizer, final_response=None, api_call_count=1, interrupted=True,
+                  failed=False, messages=messages, conversation_history=None,
+                  effective_task_id="task", turn_id="source", user_message="ask",
+                  original_user_message="ask", _should_review_memory=False,
+                  _turn_exit_reason="interrupted_by_user")
+    siblings = [row for row in db.get_messages(SESSION) if row["role"] == "tool"]
+    assert len(siblings) == 2
+    resumed = _agent()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", return_value=resumed):
+            response = await client.post("/v1/runs", headers=AUTH,
+                                         json=_continue({"kind": "answer", "tool_call_id": "q1", "response": "Blue"}))
+            assert response.status == 202, await response.text()
+            await _wait_for_run(resumed)
     rows = db.get_messages(SESSION)
-    assert [row["role"] for row in rows] == ["assistant"]
+    assert [row for row in rows if row["role"] == "tool" and row.get("tool_call_id") != "q1"] == siblings
+    answers = [row for row in rows if row.get("tool_call_id") == "q1"]
+    assert len(answers) == 1 and "Blue" in answers[0]["content"]
 
 
 @pytest.mark.asyncio

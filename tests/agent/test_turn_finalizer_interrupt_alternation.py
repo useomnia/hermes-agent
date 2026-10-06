@@ -1,17 +1,4 @@
-"""Regression test for #48879.
-
-When a turn is interrupted via ``/stop`` right after a tool completes — but
-before the assistant streams any final text — the transcript tail is a raw
-``tool`` message. Persisting that tail unmodified means the next user message
-lands as ``... tool → user``, a role-alternation violation that strict
-providers (Gemini, Claude) react to by hallucinating a continuation of the
-user's message before transitioning into the assistant persona.
-
-``finalize_turn`` closes the tool-call sequence on interrupt by appending a
-synthetic ``assistant`` message before persistence. ``final_response`` is
-typically empty on an interrupt, so the placeholder text is used rather than
-an empty-content assistant turn.
-"""
+"""Interruptions preserve real transcript rows; run status carries diagnostics."""
 
 import pytest
 
@@ -139,41 +126,26 @@ def _finalize(agent, messages, *, interrupted, final_response=None):
     )
 
 
-def _assert_no_tool_then_user(messages):
-    for i in range(len(messages) - 1):
-        if messages[i].get("role") == "tool":
-            assert messages[i + 1].get("role") != "user", (
-                f"role-alternation violation: tool → user at index {i}"
-            )
-
-
-def test_interrupt_after_tool_closes_sequence_with_placeholder():
+@pytest.mark.parametrize("diagnostic", [None, "", "Operation interrupted during retry (attempt 2/3)."])
+def test_interrupt_preserves_tool_tail_without_fabricating_completion(diagnostic):
     agent = _StubAgent()
     messages = _interrupted_tool_tail()
-    _finalize(agent, messages, interrupted=True, final_response=None)
+    expected = [dict(m) for m in messages]
+    result = _finalize(agent, messages, interrupted=True, final_response=diagnostic)
 
-    # Tail must now be an assistant message, not a raw tool result.
-    assert messages[-1]["role"] == "assistant"
-    # Empty final_response falls back to the explicit placeholder rather
-    # than persisting an empty-content assistant turn.
-    assert messages[-1]["content"] == "Operation interrupted."
-
-    # The persisted snapshot is alternation-safe: appending a new user
-    # message would follow an assistant, not an orphan tool.
-    assert agent.persisted_messages is not None
-    assert agent.persisted_messages[-1]["role"] == "assistant"
-    follow_on = agent.persisted_messages + [{"role": "user", "content": "forget it"}]
-    _assert_no_tool_then_user(follow_on)
+    assert messages == expected
+    assert agent.persisted_messages == expected
+    assert result["interrupted"] is True
+    assert result["completed"] is False
+    assert result["final_response"] == diagnostic
 
 
-def test_interrupt_after_tool_keeps_delivered_text_when_present():
+def test_completed_recovery_still_persists_real_final_response():
     agent = _StubAgent()
     messages = _interrupted_tool_tail()
-    _finalize(agent, messages, interrupted=True, final_response="Partial answer so far")
-
-    assert messages[-1]["role"] == "assistant"
-    # Real delivered text is preserved, not clobbered by the placeholder.
-    assert messages[-1]["content"] == "Partial answer so far"
+    result = _finalize(agent, messages, interrupted=False, final_response="The file is fixed.")
+    assert agent.persisted_messages[-1] == {"role": "assistant", "content": "The file is fixed."}
+    assert result["completed"] is True
 
 
 def test_non_interrupted_tool_tail_is_left_untouched():
@@ -218,3 +190,39 @@ def test_should_recover_only_exact_runtime_owned_unsubmitted_tail(tail):
     else:
         assert "pending_steer" not in result
         assert row in agent.persisted_messages
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "gemini", "responses"])
+def test_interrupted_tool_tail_accepts_next_user_at_provider_boundary(provider):
+    """Provider adapters already carry tool results followed by fresh user input.
+
+    Assert actual request bodies and original-prefix identity, rather than
+    inventing a universal assistant/tool/user role-alternation constraint.
+    """
+    import copy
+    import json
+    from agent.anthropic_adapter import convert_messages_to_anthropic
+    from agent.gemini_native_adapter import build_gemini_request
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+    agent = _StubAgent()
+    messages = _interrupted_tool_tail()
+    original = copy.deepcopy(messages)
+    _finalize(agent, messages, interrupted=True)
+    messages.append({"role": "user", "content": "New direction"})
+    if provider == "anthropic":
+        _, request = convert_messages_to_anthropic(messages)
+        assert [m["role"] for m in request] == ["user", "assistant", "user"]
+        assert [part["type"] for part in request[-1]["content"]] == ["tool_result", "text"]
+    elif provider == "gemini":
+        request = build_gemini_request(messages=messages, tools=[], tool_choice=None)["contents"]
+        assert [m["role"] for m in request] == ["user", "model", "user"]
+        assert "functionResponse" in request[-1]["parts"][0]
+        assert request[-1]["parts"][-1]["text"] == "New direction"
+    else:
+        request = _chat_messages_to_responses_input(messages)
+        assert [m.get("type", "message") for m in request] == ["message", "function_call", "function_call_output", "message"]
+        assert request[-1]["role"] == "user"
+    assert "New direction" in json.dumps(request)
+    assert "Operation interrupted." not in json.dumps(request)
+    assert messages[:-1] == original

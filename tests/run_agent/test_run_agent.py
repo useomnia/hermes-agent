@@ -6126,8 +6126,8 @@ class TestRunConversation:
         assert "finish_reason='tool_calls'" in result["error"]
         mock_handle_function_call.assert_not_called()
 
-    def test_truncated_tool_json_after_tool_batch_closes_tool_tail(self, agent):
-        """finish_reason=tool_calls + truncated args after a real tool must close tool→user."""
+    def test_truncated_tool_json_after_tool_batch_preserves_tool_tail(self, agent):
+        """Truncated args leave completed work intact and diagnostics outside history."""
         self._setup_agent(agent)
         agent.valid_tool_names.add("write_file")
         good_tc = _mock_tool_call(
@@ -6157,13 +6157,17 @@ class TestRunConversation:
             result = agent.run_conversation("write then truncate")
 
         assert result.get("partial") is True
+        assert result["completed"] is False
+        assert "truncated" in result["error"].lower()
         msgs = result.get("messages") or []
-        assert msgs[-1].get("role") == "assistant"
-        assert "truncated" in (msgs[-1].get("content") or "").lower()
-        assert any(isinstance(m, dict) and m.get("role") == "tool" for m in msgs)
+        tool_results = [msg for msg in msgs if msg.get("role") == "tool"]
+        assert len(tool_results) == 1
+        assert msgs[-1] == tool_results[0]
+        assert tool_results[0]["tool_call_id"] == "c_ok"
+        assert json.loads(tool_results[0]["content"]) == {"success": True}
 
-    def test_length_truncated_tool_exhaustion_after_tool_batch_closes_tool_tail(self, agent):
-        """Length-handler truncated-tool exhaustion after a tool batch must close tool→user."""
+    def test_length_truncated_tool_exhaustion_after_tool_batch_preserves_tool_tail(self, agent):
+        """Length exhaustion preserves completed work without a fabricated answer."""
         self._setup_agent(agent)
         agent.valid_tool_names.add("write_file")
         good_tc = _mock_tool_call(
@@ -6197,10 +6201,14 @@ class TestRunConversation:
             result = agent.run_conversation("write then hit length truncate")
 
         assert result.get("partial") is True
+        assert result["completed"] is False
         assert "truncated due to output length limit" in (result.get("error") or "")
         msgs = result.get("messages") or []
-        assert msgs[-1].get("role") == "assistant"
-        assert "truncated" in (msgs[-1].get("content") or "").lower()
+        tool_results = [msg for msg in msgs if msg.get("role") == "tool"]
+        assert len(tool_results) == 1
+        assert msgs[-1] == tool_results[0]
+        assert tool_results[0]["tool_call_id"] == "c_ok"
+        assert json.loads(tool_results[0]["content"]) == {"success": True}
 
     def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
         """Regression: kanban worker must signal the dispatcher when its

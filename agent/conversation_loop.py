@@ -54,7 +54,6 @@ from agent.turn_context import (
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
-    close_interrupted_tool_sequence,
     _repair_tool_call_arguments_detailed,
     insert_ephemeral_messages,
     _sanitize_messages_non_ascii,
@@ -2596,7 +2595,6 @@ def run_conversation(
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
                             from agent.agent_runtime_helpers import take_interrupted_steer
                             _leftover_steer = take_interrupted_steer(agent, messages)
-                            close_interrupted_tool_sequence(messages, _interrupt_text)
                             agent._persist_session(messages, conversation_history)
                             agent.clear_interrupt(preserve_steer=True)
                             return {
@@ -3029,10 +3027,6 @@ def run_conversation(
                                 if _is_stub_stall
                                 else "Response truncated due to output length limit"
                             )
-                            # Prior successful tool batches (or injected tool
-                            # errors) can leave a tool-result tail; this path
-                            # never reaches finalize_turn (#48879 class).
-                            close_interrupted_tool_sequence(messages, _final_response)
                             agent._persist_session(messages, conversation_history)
                             return {
                                 "final_response": _final_response,
@@ -4188,7 +4182,6 @@ def run_conversation(
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
                     from agent.agent_runtime_helpers import take_interrupted_steer
                     _leftover_steer = take_interrupted_steer(agent, messages)
-                    close_interrupted_tool_sequence(messages, _interrupt_text)
                     agent._persist_session(messages, conversation_history)
                     agent.clear_interrupt(preserve_steer=True)
                     return {
@@ -5427,7 +5420,6 @@ def run_conversation(
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
                         from agent.agent_runtime_helpers import take_interrupted_steer
                         _leftover_steer = take_interrupted_steer(agent, messages)
-                        close_interrupted_tool_sequence(messages, _interrupt_text)
                         agent._persist_session(messages, conversation_history)
                         agent.clear_interrupt(preserve_steer=True)
                         return {
@@ -5846,11 +5838,6 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Max retries (3) for invalid tool calls exceeded. Stopping as partial.", force=True)
                         agent._invalid_tool_retries = 0
                         _final_response = f"Model generated invalid tool call: {invalid_preview}"
-                        # Prior <3 retries (or an earlier successful tool batch)
-                        # leave a tool-result tail. Closing it here matches
-                        # interrupt aborts (#48879 / #52592) so the next user
-                        # turn is not tool→user for strict providers.
-                        close_interrupted_tool_sequence(messages, _final_response)
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _final_response,
@@ -5952,9 +5939,6 @@ def run_conversation(
                                 "interruption or an upstream router rewriting finish_reason "
                                 "(e.g. OpenRouter). The tool was not executed."
                             )
-                        # Same tool-tail close as interrupt / invalid-tool
-                        # exhaustion — this path never reaches finalize_turn.
-                        close_interrupted_tool_sequence(messages, _final_response)
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _final_response,
