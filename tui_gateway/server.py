@@ -11307,6 +11307,7 @@ def _notification_poller_loop(
     """
     from tools.process_registry import process_registry, format_process_notification
 
+    process_registry.restore_completions()
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):

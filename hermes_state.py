@@ -1304,7 +1304,8 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     owner_started_at INTEGER,
     task_json TEXT,
     delivery_claim TEXT,
-    delivery_claimed_at REAL
+    delivery_claimed_at REAL,
+    origin_session_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -11315,6 +11316,17 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
+
+
+def reconcile_state_schema(conn: sqlite3.Connection) -> None:
+    """Initialize raw state.db writers from the same schema as SessionDB.
+
+    Backport of upstream a6d65cdd09: delegation writers must not establish a
+    partial store or maintain a second definition of its durable tables.
+    """
+    conn.executescript(SCHEMA_SQL)
+    shim = object.__new__(SessionDB)
+    shim._reconcile_columns(conn.cursor())
 
 
 class AsyncSessionDB:

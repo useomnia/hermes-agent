@@ -8284,6 +8284,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Recover background processes from checkpoint (crash recovery)
         try:
             from tools.process_registry import process_registry
+            process_registry.restore_completions()
             recovered = process_registry.recover_from_checkpoint()
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
@@ -18708,6 +18709,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
+        _pr.restore_completions()
         while self._running:
             try:
                 # Peek the queue for async-delegation events. We must NOT

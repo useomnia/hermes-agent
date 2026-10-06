@@ -159,6 +159,8 @@ class ProcessRegistry:
         "tcsetattr: Inappropriate ioctl for device",
     )
 
+    _completions_restored = False
+
     def __init__(self):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
@@ -182,13 +184,9 @@ class ProcessRegistry:
         # gateway drain this after each agent turn to auto-trigger new turns.
         import queue as _queue_mod
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
-        # Rehydrate durable delegation completions only at registry startup.
-        # Consumers still inject them as fresh turns through this existing rail.
-        try:
-            from tools.async_delegation import restore_undelivered_completions
-            restore_undelivered_completions(self.completion_queue)
-        except Exception as exc:
-            logger.warning("Could not restore async delegation completions: %s", exc)
+        # The singleton is constructed at import. Durable recovery belongs to
+        # its first consumer, so tool discovery cannot create a partial store.
+        import tools.async_delegation  # noqa: F401
 
         # Track sessions whose completion was already consumed by the agent
         # via wait/log.  Drain loops AND gateway/tui watchers skip notifications
@@ -1407,6 +1405,28 @@ class ProcessRegistry:
             skip_poll_observed and session_id in self._poll_observed
         )
 
+    def restore_completions(self) -> int:
+        """Replay the launch profile's durable completions once, at first use.
+
+        Gateway boot and the CLI/TUI consumers opt in after session setup.
+        A secondary profile binding must not redirect this process-wide replay.
+        """
+        with self._lock:
+            if self._completions_restored:
+                return 0
+            self._completions_restored = True
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        token = set_hermes_home_override(None)
+        try:
+            from tools.async_delegation import restore_undelivered_completions
+            return restore_undelivered_completions(self.completion_queue)
+        except Exception as exc:
+            logger.warning("Could not restore async delegation completions: %s", exc)
+            return 0
+        finally:
+            reset_hermes_home_override(token)
+
     def drain_notifications(
         self,
         session_key: str = "",
@@ -1443,6 +1463,7 @@ class ProcessRegistry:
         filter is provided, ownerless async-delegation events remain
         fail-closed and require positive proof.
         """
+        self.restore_completions()
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
         while not self.completion_queue.empty():

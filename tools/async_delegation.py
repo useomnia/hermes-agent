@@ -172,47 +172,10 @@ def _connect() -> sqlite3.Connection:
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_wal_with_fallback
+    from hermes_state import apply_wal_with_fallback, reconcile_state_schema
 
     apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS async_delegations (
-            delegation_id TEXT PRIMARY KEY,
-            origin_session TEXT NOT NULL,
-            origin_ui_session_id TEXT NOT NULL DEFAULT '',
-            parent_session_id TEXT,
-            state TEXT NOT NULL,
-            dispatched_at REAL NOT NULL,
-            completed_at REAL,
-            updated_at REAL NOT NULL,
-            event_json TEXT,
-            result_json TEXT,
-            delivery_state TEXT NOT NULL DEFAULT 'pending',
-            delivery_attempts INTEGER NOT NULL DEFAULT 0,
-            delivered_at REAL,
-            owner_pid INTEGER,
-            owner_started_at INTEGER,
-            task_json TEXT,
-            delivery_claim TEXT,
-            delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
-        )"""
-    )
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
-    for name, sql_type in (
-        ("owner_pid", "INTEGER"),
-        ("owner_started_at", "INTEGER"),
-        ("task_json", "TEXT"),
-        ("delivery_claim", "TEXT"),
-        ("delivery_claimed_at", "REAL"),
-        # Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
-        # request — the wake self-post target. Without persisting it,
-        # completions recovered after a process restart are unroutable on
-        # api_server (the in-memory record that carried it is gone).
-        ("origin_session_id", "TEXT"),
-    ):
-        if name not in columns:
-            conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+    reconcile_state_schema(conn)
 
 
 @contextmanager
@@ -390,6 +353,8 @@ def restore_undelivered_completions(target_queue) -> int:
     otherwise a brand-new session adopts a dead session's delegation
     results seconds after boot (#64484).
     """
+    if not _db_path().exists():
+        return 0  # Recovery must not create a fresh ledger (#123265).
     recover_abandoned_delegations()
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
