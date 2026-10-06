@@ -1,6 +1,7 @@
 """Cold-start and opening-order regressions for the shared state database."""
 
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -18,7 +19,7 @@ def _delegation_shape(connection):
 def test_delegation_writer_should_initialize_session_cost_tables_when_store_is_fresh(
     tmp_path,
 ):
-    with sqlite3.connect(tmp_path / "state.db") as connection:
+    with closing(sqlite3.connect(tmp_path / "state.db")) as connection, connection:
         _initialize_schema(connection)
 
         cost = connection.execute(
@@ -41,13 +42,13 @@ def test_delegation_schema_should_match_canonical_shape_in_every_opening_order(
         if opener == "session":
             SessionDB(db_path=database_path).close()
         else:
-            with sqlite3.connect(database_path) as connection:
+            with closing(sqlite3.connect(database_path)) as connection, connection:
                 _initialize_schema(connection)
 
-    with sqlite3.connect(":memory:") as reference:
+    with closing(sqlite3.connect(":memory:")) as reference, reference:
         reference.executescript(SCHEMA_SQL)
         expected = _delegation_shape(reference)
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         actual = _delegation_shape(connection)
 
     assert actual == expected
@@ -59,7 +60,7 @@ def test_schema_should_preserve_legacy_delegation_when_origin_column_is_missing(
     tmp_path, opener
 ):
     database_path = tmp_path / "state.db"
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.executescript(SCHEMA_SQL)
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(async_delegations)")
@@ -77,10 +78,10 @@ def test_schema_should_preserve_legacy_delegation_when_origin_column_is_missing(
     if opener == "session":
         SessionDB(db_path=database_path).close()
     else:
-        with sqlite3.connect(database_path) as connection:
+        with closing(sqlite3.connect(database_path)) as connection, connection:
             _initialize_schema(connection)
 
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         row = connection.execute(
             "SELECT delegation_id, origin_session_id FROM async_delegations"
         ).fetchone()

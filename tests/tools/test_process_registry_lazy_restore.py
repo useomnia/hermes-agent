@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import queue
 import sqlite3
+from contextlib import closing
 import subprocess
 import sys
 import threading
@@ -22,7 +23,7 @@ def _seed_completion(database_path, delegation_id="retained"):
         "session_key": "owner",
         "status": "completed",
     }
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         async_delegation._initialize_schema(connection)
         connection.execute(
             "INSERT INTO async_delegations "
@@ -61,7 +62,7 @@ def test_registry_construction_should_not_create_state_database(tmp_path, monkey
 def test_model_tools_import_should_not_migrate_existing_ledger(tmp_path):
     database_path = tmp_path / "state.db"
     _seed_completion(database_path)
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.execute(
             "ALTER TABLE async_delegations DROP COLUMN origin_session_id"
         )
@@ -81,7 +82,7 @@ def test_model_tools_import_should_not_migrate_existing_ledger(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr[-2000:]
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         assert (
             connection.execute("PRAGMA table_info(async_delegations)").fetchall()
             == before

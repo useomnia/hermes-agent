@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from contextlib import closing
 from types import SimpleNamespace
 
 import pytest
@@ -42,7 +43,7 @@ def test_recovery_should_preserve_legacy_delegation_origin(
     legacy_schema = hermes_state.SCHEMA_SQL.replace(
         "origin_session_id TEXT NOT NULL DEFAULT ''", "origin_session_id TEXT"
     )
-    with sqlite3.connect(source) as connection:
+    with closing(sqlite3.connect(source)) as connection, connection:
         connection.executescript(legacy_schema)
         connection.execute(
             "INSERT INTO async_delegations "
@@ -59,7 +60,7 @@ def test_recovery_should_preserve_legacy_delegation_origin(
 
     assert report["complete"] is True
     assert report["source_unchanged"] is True
-    with sqlite3.connect(destination) as connection:
+    with closing(sqlite3.connect(destination)) as connection:
         assert connection.execute(
             "SELECT delegation_id, origin_session_id FROM async_delegations"
         ).fetchall() == [("retained", origin_session_id or "")]
