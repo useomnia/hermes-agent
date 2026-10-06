@@ -1636,7 +1636,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home, get_hermes_home_override
-from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
+from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, fast_safe_load, is_truthy_value
 _hermes_home = get_hermes_home()
 
 
@@ -1696,7 +1696,7 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
     try:
         import yaml as _yaml
         with open(config_path, encoding="utf-8") as f:
-            cfg = _yaml.safe_load(f) or {}
+            cfg = fast_safe_load(f) or {}
         from hermes_cli.config import _expand_env_vars
         cfg = _expand_env_vars(cfg)
         # Managed scope: keep administrator-pinned values authoritative on every
@@ -1862,7 +1862,7 @@ if _config_path.exists():
     try:
         import yaml as _yaml
         with open(_config_path, encoding="utf-8") as _f:
-            _cfg = _yaml.safe_load(_f) or {}
+            _cfg = fast_safe_load(_f) or {}
         # Expand ${ENV_VAR} references before bridging to env vars.
         from hermes_cli.config import _expand_env_vars
         _cfg = _expand_env_vars(_cfg)
@@ -2428,7 +2428,7 @@ def _try_resolve_fallback_provider() -> dict | None:
         if not cfg_path.exists():
             return None
         with open(cfg_path, encoding="utf-8") as _f:
-            cfg = _y.safe_load(_f) or {}
+            cfg = fast_safe_load(_f) or {}
         fb_list = get_fallback_chain(cfg)
         if not fb_list:
             return None
@@ -2829,7 +2829,7 @@ def _load_gateway_config() -> dict:
             if config_path.exists():
                 import yaml
                 with open(config_path, 'r', encoding='utf-8') as f:
-                    raw = yaml.safe_load(f) or {}
+                    raw = fast_safe_load(f) or {}
         except Exception:
             logger.debug("Could not load gateway config from %s", config_path)
             raw = {}
@@ -5875,7 +5875,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cfg_path = _hermes_home / "config.yaml"
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
+                    cfg = fast_safe_load(_f) or {}
                 return cfg.get("provider_routing", {}) or {}
         except Exception:
             pass
@@ -5894,7 +5894,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cfg_path = _hermes_home / "config.yaml"
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
+                    cfg = fast_safe_load(_f) or {}
                 fb = get_fallback_chain(cfg)
                 if fb:
                     return fb
@@ -5923,7 +5923,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._fallback_model = None
                 return self._fallback_model
             with open(cfg_path, encoding="utf-8") as _f:
-                cfg = _y.safe_load(_f) or {}
+                cfg = fast_safe_load(_f) or {}
         except Exception:
             # Transient failure — keep last known-good chain.
             logger.debug(
@@ -25033,7 +25033,7 @@ def main():
     if args.config:
         import yaml
         with open(args.config, encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            data = fast_safe_load(f) or {}
             config = GatewayConfig.from_dict(data)
     
     # start_gateway() performs the full graceful teardown (adapters
