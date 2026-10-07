@@ -51,7 +51,7 @@ import hmac
 import json
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from functools import wraps
+from functools import partial, wraps
 import logging
 import os
 import re
@@ -1310,6 +1310,10 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
             "code": code,
         }
     }
+
+
+def _bad_mcp_reload_body(message: str) -> "web.Response":
+    return web.json_response(_openai_error(message), status=400)
 
 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
@@ -4477,6 +4481,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "approval_events": True,
                 "omnio_blocking_interactions": True,
                 "mcp_reload": True,
+                # Named-server reloads (``{"servers": [...]}``) and their
+                # ``live`` mode, safe to request while runs are in flight.
+                "mcp_named_reload": {"apiVersion": 1, "live": True},
                 "skills_reload": True,
                 "structured_output": True,
                 "session_resources": True,
@@ -11385,19 +11392,31 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @_admit_api_control_request
     async def _handle_mcp_reload(self, request: "web.Request") -> "web.Response":
-        """Reconnect MCP servers and refresh their tool registry in place."""
+        """Reconnect MCP servers and refresh their tool registry in place.
+
+        An optional ``{"servers": [...]}`` body reloads only those servers and
+        reports each one's outcome; without it every server is reconnected.
+        ``"live": true`` (named servers only) is for a caller with runs in
+        flight: reloads that would close an open connection report
+        ``deferred`` instead of running.
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        requested, live, body_err = await self._requested_mcp_reload_servers(request)
+        if body_err:
+            return body_err
 
         loop = asyncio.get_running_loop()
         if self._mcp_reload_lock is None:
             self._mcp_reload_lock = asyncio.Lock()
         try:
             from tools.mcp_tool import (
+                _existing_tool_names,
                 _lock,
                 _servers,
                 discover_mcp_tools,
+                reload_mcp_servers,
                 shutdown_mcp_servers,
             )
 
@@ -11421,23 +11440,64 @@ class APIServerAdapter(BasePlatformAdapter):
                 await self._refresh_omnio_connector_toolkit_approvals()
                 with _lock:
                     old_servers = set(_servers.keys())
-                await loop.run_in_executor(None, shutdown_mcp_servers)
-                new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+                if requested is None:
+                    await loop.run_in_executor(None, shutdown_mcp_servers)
+                    new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+                    results = None
+                else:
+                    results = await loop.run_in_executor(
+                        None, partial(reload_mcp_servers, requested, live=live)
+                    )
+                    with _lock:
+                        new_tools = _existing_tool_names()
                 with _lock:
                     connected = set(_servers.keys())
         except Exception as exc:
             logger.exception("[api_server] MCP reload failed")
             return web.json_response(_openai_error(str(exc)), status=500)
 
-        return web.json_response(
-            {
-                "object": "hermes.mcp.reload",
-                "servers": sorted(connected),
-                "added": sorted(connected - old_servers),
-                "removed": sorted(old_servers - connected),
-                "tools": len(new_tools),
-            }
-        )
+        payload = {
+            "object": "hermes.mcp.reload",
+            "servers": sorted(connected),
+            "added": sorted(connected - old_servers),
+            "removed": sorted(old_servers - connected),
+            "tools": len(new_tools),
+        }
+        if results is not None:
+            payload["results"] = results
+        return web.json_response(payload)
+
+    @staticmethod
+    async def _requested_mcp_reload_servers(
+        request: "web.Request",
+    ) -> "tuple[Optional[List[str]], bool, Optional[web.Response]]":
+        """The server names a reload body selects (None reloads every server),
+        whether the reload is live, or the 400 a malformed body earns."""
+        if not request.can_read_body:
+            return None, False, None
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None, False, _bad_mcp_reload_body("Reload body must be JSON")
+        if not isinstance(body, dict):
+            return None, False, _bad_mcp_reload_body("Reload body must be a JSON object")
+        servers = body.get("servers")
+        live = body.get("live", False)
+        if not isinstance(live, bool):
+            return None, False, _bad_mcp_reload_body("'live' must be a boolean")
+        if servers is None:
+            if live:
+                return None, False, _bad_mcp_reload_body("A live reload must name its 'servers'")
+            return None, False, None
+        if (
+            not isinstance(servers, list)
+            or not servers
+            or not all(isinstance(name, str) and name for name in servers)
+        ):
+            return None, False, _bad_mcp_reload_body(
+                "'servers' must be a non-empty list of server names"
+            )
+        return servers, live, None
 
     @_admit_api_control_request
     async def _handle_skills_reload(

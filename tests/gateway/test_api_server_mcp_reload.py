@@ -416,3 +416,101 @@ async def test_concurrent_reloads_are_serialized(adapter, monkeypatch):
     assert state["starts"] == 2
     # ... but never at the same time.
     assert state["max"] == 1
+
+
+def _stub_targeted_reload(monkeypatch) -> dict:
+    calls = {"full": 0, "targeted": [], "live": []}
+    monkeypatch.setattr(mcp_tool, "_servers", {})
+
+    def _full_shutdown():
+        calls["full"] += 1
+
+    def _targeted(names, *, live=False):
+        calls["targeted"].append(list(names))
+        calls["live"].append(live)
+        return {name: "refreshed" for name in names}
+
+    monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", _full_shutdown)
+    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: [])
+    monkeypatch.setattr(mcp_tool, "reload_mcp_servers", _targeted)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_named_reload_reloads_only_the_named_servers(adapter, monkeypatch):
+    calls = _stub_targeted_reload(monkeypatch)
+
+    async with TestClient(TestServer(_create_app(adapter))) as cli:
+        resp = await cli.post("/v1/mcp/reload", json={"servers": ["connectors"]})
+
+    assert resp.status == 200
+    assert calls == {"full": 0, "targeted": [["connectors"]], "live": [False]}
+
+
+@pytest.mark.asyncio
+async def test_live_named_reload_asks_for_a_live_reload(adapter, monkeypatch):
+    calls = _stub_targeted_reload(monkeypatch)
+
+    async with TestClient(TestServer(_create_app(adapter))) as cli:
+        resp = await cli.post("/v1/mcp/reload", json={"servers": ["connectors"], "live": True})
+
+    assert resp.status == 200
+    assert calls == {"full": 0, "targeted": [["connectors"]], "live": [True]}
+
+
+@pytest.mark.asyncio
+async def test_named_reload_reports_each_servers_outcome(adapter, monkeypatch):
+    _stub_targeted_reload(monkeypatch)
+
+    async with TestClient(TestServer(_create_app(adapter))) as cli:
+        resp = await cli.post("/v1/mcp/reload", json={"servers": ["connectors", "omnia"]})
+        body = await resp.json()
+
+    assert body["results"] == {"connectors": "refreshed", "omnia": "refreshed"}
+
+
+@pytest.mark.asyncio
+async def test_reload_without_a_server_list_reconnects_every_server(adapter, monkeypatch):
+    calls = _stub_targeted_reload(monkeypatch)
+
+    async with TestClient(TestServer(_create_app(adapter))) as cli:
+        resp = await cli.post("/v1/mcp/reload", json={})
+        body = await resp.json()
+
+    assert (calls["full"], calls["targeted"], "results" in body) == (1, [], False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"servers": []}',
+        '{"servers": "connectors"}',
+        '{"servers": [""]}',
+        '{"servers": [1]}',
+        "not json",
+        '["connectors"]',
+        '{"servers": ["connectors"], "live": "yes"}',
+        '{"live": true}',
+    ],
+)
+async def test_malformed_server_list_is_rejected_without_reloading(adapter, monkeypatch, payload):
+    calls = _stub_targeted_reload(monkeypatch)
+
+    async with TestClient(TestServer(_create_app(adapter))) as cli:
+        resp = await cli.post(
+            "/v1/mcp/reload", data=payload, headers={"Content-Type": "application/json"}
+        )
+
+    assert (resp.status, calls["full"], calls["targeted"]) == (400, 0, [])
+
+
+@pytest.mark.asyncio
+async def test_capabilities_advertise_live_named_reloads(adapter):
+    app = _create_app(adapter)
+    app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/v1/capabilities")
+        body = await resp.json()
+
+    assert body["features"]["mcp_named_reload"] == {"apiVersion": 1, "live": True}
