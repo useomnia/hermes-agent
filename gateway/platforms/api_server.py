@@ -62,6 +62,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -11841,17 +11842,16 @@ class APIServerAdapter(BasePlatformAdapter):
     def _omnia_approval_source(
         self, *, clear_snapshot: bool
     ) -> tuple[str, str, str] | None:
-        """Register the authority and resolve a configured Omnia source.
+        """Register the grant loaders and resolve a configured Omnia source.
 
         Startup clears a prior adapter's process-global snapshot before it
-        advertises readiness. A manual MCP reload keeps the last candidates
-        until its replacement succeeds; every candidate is still revalidated
-        against Omnia at execution, so this cannot turn stale data into a grant.
+        advertises readiness. A manual MCP reload keeps the last snapshot
+        until its replacement succeeds, so a failed reload changes nothing.
         """
         try:
             from tools.omnio_approval_state import (
-                register_always_approval_authority,
                 register_always_approval_snapshot_waiter,
+                register_conversation_grant_loader,
                 replace_injected_always_approvals,
             )
             from utils import env_var_enabled
@@ -11862,10 +11862,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             return None
 
-        register_always_approval_authority(
-            self._is_omnio_connector_toolkit_approval_granted
-        )
         register_always_approval_snapshot_waiter(self._wait_for_omnio_approval_snapshot)
+        register_conversation_grant_loader(self._load_omnio_conversation_tool_approvals)
         if clear_snapshot:
             replace_injected_always_approvals([])
         if env_var_enabled(_OMNIO_DURABLE_APPROVALS_DISABLED_ENV):
@@ -11984,20 +11982,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 elapsed_ms,
             )
 
-    def _is_omnio_connector_toolkit_approval_granted(
-        self, function_name: str
-    ) -> bool:
-        """Confirm a standing connector approval against Omnia at execution."""
+    def _load_omnio_conversation_tool_approvals(
+        self,
+    ) -> tuple[list[str], list[str] | None] | None:
+        """Fetch the current conversation's "Allow for this chat" grants.
+
+        Runs on the tool worker thread at the conversation's first gated call.
+        Omnia resolves the conversation from the Turn this run belongs to.
+        Returns ``None`` when there is no Turn to ask about or Omnia does not
+        recognise it, so a later call tries again.
+        """
+        from gateway.session_context import get_session_env
         from utils import env_var_enabled
 
         if env_var_enabled(_OMNIO_DURABLE_APPROVALS_DISABLED_ENV):
-            raise RuntimeError("durable approval authority is disabled")
-
+            return [], None
         base_url = os.environ.get("OMNIA_BASE_URL", "").strip().rstrip("/")
         api_token = os.environ.get("OMNIA_API_TOKEN", "").strip()
         brand_id = os.environ.get("OMNIO_BRAND_ID", "").strip()
         if not base_url or not api_token or not brand_id:
-            raise RuntimeError("durable approval authority is unavailable")
+            return [], None
+        turn_id = (get_session_env("HERMES_ORIGIN_TURN_ID", "") or "").strip()
+        if not turn_id:
+            return None
 
         headers = {
             "Accept": "application/json",
@@ -12008,34 +12015,25 @@ class APIServerAdapter(BasePlatformAdapter):
             headers["x-vercel-protection-bypass"] = bypass
         url = (
             f"{base_url}/api/agents/omnio/connector-toolkit-approvals?"
-            f"{urlencode({'brand': brand_id})}"
+            f"{urlencode({'brand': brand_id, 'turn': turn_id})}"
         )
         request = Request(url, headers=headers, method="GET")
-        with urlopen(
-            request, timeout=_OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS
-        ) as response:
-            status = response.status
-            if not isinstance(status, int) or not 200 <= status < 300:
-                raise RuntimeError(f"omnia_status={status}")
-            payload = json.loads(response.read())
-
-        from tools.omnio_approval_state import connector_tool_slug
-
-        tools, tool_slugs = _parse_omnio_connector_toolkit_approvals(payload)
-        if function_name in tools:
-            return True
-        # Slug matching keeps a grant valid across wire-name prefix renames.
-        # Older Omnia payloads carry no toolSlugs; derive them from the names.
-        slug = connector_tool_slug(function_name)
-        if slug is None:
-            return False
-        if tool_slugs is None:
-            tool_slugs = [
-                derived
-                for derived in (connector_tool_slug(name) for name in tools)
-                if derived
-            ]
-        return slug in tool_slugs
+        try:
+            with urlopen(
+                request, timeout=_OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS
+            ) as response:
+                payload = json.loads(response.read())
+        except HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise
+        if not isinstance(payload, dict):
+            raise ValueError("approval payload must be an object")
+        conversation = payload.get("conversation")
+        if conversation is None:
+            # An Omnia without chat grants answers with standing grants only.
+            return [], None
+        return _parse_omnio_connector_toolkit_approvals(conversation)
 
     async def _fetch_omnio_connector_toolkit_approvals(
         self, *, base_url: str, api_token: str, brand_id: str

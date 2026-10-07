@@ -54,9 +54,9 @@ from tools.omnio_approval_state import (
     _injected_always_approved,
     _injected_always_approved_slugs,
     connector_tool_slug,
+    conversation_grant_loader,
     is_always_approved,
     record_always_approval as _record_always_approval_state,
-    register_always_approval_authority as _register_always_approval_authority_state,
     replace_injected_always_approvals as _replace_injected_always_approvals_state,
 )
 from utils import env_var_enabled
@@ -100,6 +100,11 @@ class ToolApprovalDenial(str):
 _lock = threading.Lock()
 # session_key -> tool names approved for the whole conversation.
 _session_approved: dict[str, set[str]] = {}
+# session_key -> connector slugs approved for the whole conversation, so a
+# durable grant survives a wire-name prefix rename like standing grants do.
+_session_approved_slugs: dict[str, set[str]] = {}
+# Conversations whose durable "Allow for this chat" grants are already loaded.
+_conversation_grants_loaded: set[str] = set()
 # (session_key, tool_call_id, tool_name, canonical args) grants consumed by
 # exactly one re-dispatch. Kept process-local like the existing session grant
 # store: the durable interaction is the dangling SessionDB tool call, not a
@@ -222,8 +227,47 @@ def is_credit_gated_tool(function_name: str) -> bool:
 
 def is_tool_approved(session_key: str, function_name: str) -> bool:
     """True when the tool is approved for the whole session (`session` scope)."""
+    _ensure_conversation_grants(session_key)
+    slug = connector_tool_slug(function_name)
     with _lock:
-        return function_name in _session_approved.get(session_key, set())
+        return function_name in _session_approved.get(session_key, set()) or (
+            slug is not None and slug in _session_approved_slugs.get(session_key, set())
+        )
+
+
+def _ensure_conversation_grants(session_key: str) -> None:
+    """Load a conversation's durable chat grants once per gateway process.
+
+    A failed or unidentifiable load is not remembered, so the next gated call
+    tries again; until then the conversation simply prompts.
+    """
+    loader = conversation_grant_loader()
+    if not session_key or loader is None:
+        return
+    with _lock:
+        if session_key in _conversation_grants_loaded:
+            return
+    try:
+        loaded = loader()
+    except Exception:
+        logger.warning(
+            "could not load chat tool approvals; prompting until they load",
+            exc_info=True,
+        )
+        return
+    if loaded is None:
+        return
+    tools, tool_slugs = loaded
+    names = {name for name in tools if connector_tool_slug(name) is not None}
+    slugs = (
+        set(tool_slugs)
+        if tool_slugs is not None
+        else {slug for slug in map(connector_tool_slug, names) if slug}
+    )
+    with _lock:
+        _session_approved.setdefault(session_key, set()).update(names)
+        _session_approved_slugs.setdefault(session_key, set()).update(slugs)
+        _conversation_grants_loaded.add(session_key)
 
 
 def record_session_approval(session_key: str, function_name: str) -> None:
@@ -387,13 +431,6 @@ def rehydrate_resolved_approval(
     else:
         record_always_approval(approval_name)
     return True
-
-
-def register_always_approval_authority(
-    cb: Callable[[str], bool] | None,
-) -> None:
-    """Set the server-authoritative checker used for standing grant candidates."""
-    _register_always_approval_authority_state(cb)
 
 
 def record_always_approval(function_name: str) -> None:
@@ -664,6 +701,8 @@ def clear_session(session_key: str) -> None:
         return
     with _lock:
         _session_approved.pop(session_key, None)
+        _session_approved_slugs.pop(session_key, None)
+        _conversation_grants_loaded.discard(session_key)
         for key in [key for key in _once_approved if key[0] == session_key]:
             _once_approved.discard(key)
         surface_keys = {
