@@ -5,11 +5,10 @@ to clear and populate the durable approval candidate snapshot while binding
 its listener; importing the full tool-approval gate there would also import
 the MCP registry and make listener readiness wait on tool discovery.
 
-The sets in this module are only candidate indexes.  A candidate is never
-enough to authorize a write: :func:`is_always_approved` always asks the
-server-authoritative callback before returning ``True``.  This keeps a warm
-gateway fail-closed when a shared Omnia grant is revoked or the authority is
-unavailable.
+The gateway owns approval state, as upstream Hermes does: Omnia's durable
+grants are loaded into these sets at gateway start and on a connector reload,
+and an in-chat "Allow always" is recorded here directly.  A grant or revoke
+made elsewhere reaches a warm gateway on its next start or reload.
 """
 
 from __future__ import annotations
@@ -43,9 +42,9 @@ def connector_tool_slug(function_name: str) -> Optional[str]:
 
 _lock = threading.Lock()
 
-# Tool names approved for every conversation on this gateway by a recent
-# in-chat click.  These local grants are a bridge until the next durable
-# snapshot refresh; replacing a snapshot clears them.
+# Tool names approved for every conversation on this gateway by an in-chat
+# click.  Omnia saves the grant before releasing the call, so the next
+# snapshot carries it too; replacing a snapshot clears these.
 _always_approved: set[str] = set()
 
 # Exact wire names injected from Omnia's durable per-toolkit grant snapshot.
@@ -55,15 +54,16 @@ _injected_always_approved: set[str] = set()
 # the exact-name index preserves grants across the native/legacy prefix rename.
 _injected_always_approved_slugs: set[str] = set()
 
-# Fresh server-authoritative check for one exact standing grant.  The callback
-# is deliberately not cached: revocation must take effect on every call in a
-# warm gateway.
-_always_approval_authority: Callable[[str], bool] | None = None
-
 # Joins the gateway's startup grant snapshot (bounded). Called on the first
 # candidate lookup instead of before every agent build, so a Turn that never
 # reaches a gated write does not wait on the snapshot fetch.
 _always_approval_snapshot_waiter: Callable[[], None] | None = None
+
+
+# Loads the current conversation's durable "Allow for this chat" grants as
+# ``(tools, slugs)``; ``None`` when the conversation cannot be identified yet.
+ConversationGrantLoader = Callable[[], Optional[tuple[list[str], Optional[list[str]]]]]
+_conversation_grant_loader: ConversationGrantLoader | None = None
 
 
 def register_always_approval_snapshot_waiter(cb: Callable[[], None] | None) -> None:
@@ -71,52 +71,31 @@ def register_always_approval_snapshot_waiter(cb: Callable[[], None] | None) -> N
     _always_approval_snapshot_waiter = cb
 
 
-def is_always_approved(function_name: str) -> bool:
-    """Return whether the authority currently grants a candidate tool.
+def register_conversation_grant_loader(cb: ConversationGrantLoader | None) -> None:
+    """Set how the current conversation's durable chat grants are loaded."""
+    global _conversation_grant_loader
+    _conversation_grant_loader = cb
 
-    Local and injected names are only candidate indexes.  Missing authority,
-    an authority exception, and any non-``True`` response all fail closed.
-    """
+
+def conversation_grant_loader() -> ConversationGrantLoader | None:
+    return _conversation_grant_loader
+
+
+def is_always_approved(function_name: str) -> bool:
+    """Return whether *function_name* holds a standing grant on this gateway."""
     waiter = _always_approval_snapshot_waiter
     if waiter is not None:
         try:
             waiter()
-        except Exception:  # noqa: BLE001 — a failed join leaves candidates fail-closed
+        except Exception:  # noqa: BLE001 — a failed join leaves the snapshot empty
             logger.debug("approval snapshot join failed", exc_info=True)
     slug = connector_tool_slug(function_name)
     with _lock:
-        candidate = (
+        return (
             function_name in _always_approved
             or function_name in _injected_always_approved
             or (slug is not None and slug in _injected_always_approved_slugs)
         )
-        authority = _always_approval_authority
-    if not candidate:
-        return False
-    if authority is None:
-        logger.warning(
-            "standing tool approval authority unavailable; prompting for %s",
-            function_name,
-        )
-        return False
-    try:
-        return authority(function_name) is True
-    except Exception:
-        logger.warning(
-            "standing tool approval check failed; prompting for %s",
-            function_name,
-            exc_info=True,
-        )
-        return False
-
-
-def register_always_approval_authority(
-    cb: Callable[[str], bool] | None,
-) -> None:
-    """Set the server-authoritative checker for standing-grant candidates."""
-    global _always_approval_authority
-    with _lock:
-        _always_approval_authority = cb
 
 
 def record_always_approval(function_name: str) -> None:
@@ -129,11 +108,11 @@ def replace_injected_always_approvals(
     function_names: list[str],
     tool_slugs: list[str] | None = None,
 ) -> None:
-    """Replace the durable Omnia candidate snapshot.
+    """Replace the durable Omnia grant snapshot.
 
-    Replacing a snapshot always clears local bridge grants.  Callers that
-    cannot load the authoritative snapshot should pass empty lists so stale
-    candidates fail closed.  Exact names are limited to connector wire names;
+    Replacing a snapshot always clears local in-chat grants.  Callers that
+    cannot load the snapshot should pass empty lists so stale grants fail
+    closed.  Exact names are limited to connector wire names;
     the API gateway cannot import the MCP registry merely to perform this
     process-global bookkeeping.
 
@@ -171,6 +150,7 @@ __all__ = [
     "connector_tool_slug",
     "is_always_approved",
     "record_always_approval",
-    "register_always_approval_authority",
+    "register_always_approval_snapshot_waiter",
+    "register_conversation_grant_loader",
     "replace_injected_always_approvals",
 ]

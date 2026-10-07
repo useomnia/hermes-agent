@@ -16,6 +16,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 import tools.mcp_tool as mcp_tool
+import tools.omnio_approval_state as omnio_approval_state
 import tools.tool_approval as tool_approval
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
@@ -54,11 +55,11 @@ def auth_adapter():
 def _clean_tool_approvals():
     tool_approval._always_approved.clear()
     tool_approval._injected_always_approved.clear()
-    tool_approval.register_always_approval_authority(None)
+    omnio_approval_state.register_conversation_grant_loader(None)
     yield
     tool_approval._always_approved.clear()
     tool_approval._injected_always_approved.clear()
-    tool_approval.register_always_approval_authority(None)
+    omnio_approval_state.register_conversation_grant_loader(None)
 
 
 def _stub_mcp_reload(monkeypatch) -> None:
@@ -137,11 +138,6 @@ async def test_reload_refreshes_injected_connector_toolkit_approvals(
         "_fetch_omnio_connector_toolkit_approvals",
         AsyncMock(return_value=(["mcp_connectors_NOTION_CREATE_NOTION_PAGE"], None)),
     )
-    monkeypatch.setattr(
-        adapter,
-        "_is_omnio_connector_toolkit_approval_granted",
-        MagicMock(return_value=True),
-    )
 
     app = _create_app(adapter)
     async with TestClient(TestServer(app)) as cli:
@@ -184,9 +180,8 @@ async def test_reload_fetch_failure_clears_injected_and_local_always(
     )
 
 
-class _AuthorityResponse:
-    def __init__(self, payload: object, status: int = 200):
-        self.status = status
+class _OmniaResponse:
+    def __init__(self, payload: object):
         self._payload = payload
 
     def __enter__(self):
@@ -201,167 +196,158 @@ class _AuthorityResponse:
         return json.dumps(self._payload).encode()
 
 
-def _configure_authority(monkeypatch) -> None:
+def _configure_omnia(monkeypatch, *, turn_id: str = "turn-1") -> None:
     monkeypatch.setenv("OMNIA_BASE_URL", "https://omnia.test")
     monkeypatch.setenv("OMNIA_API_TOKEN", "agent-token")
     monkeypatch.setenv("OMNIO_BRAND_ID", "brand-1")
+    monkeypatch.setenv("HERMES_ORIGIN_TURN_ID", turn_id)
 
 
-def _standing_candidate(tool: str) -> None:
-    tool_approval.replace_injected_always_approvals([tool])
+def test_startup_registers_the_conversation_grant_loader(adapter, monkeypatch):
+    _configure_omnia(monkeypatch)
 
+    adapter._omnia_approval_source(clear_snapshot=True)
 
-def test_authority_checks_the_exact_tool_without_a_positive_cache(adapter, monkeypatch):
-    tool = "mcp_connectors_GMAIL_SEND_EMAIL"
-    _configure_authority(monkeypatch)
-    _standing_candidate(tool)
-    responses = iter([
-        _AuthorityResponse({"tools": [tool]}),
-        _AuthorityResponse({"tools": ["mcp_connectors_GMAIL_READ_EMAIL"]}),
-    ])
-    urlopen = MagicMock(side_effect=lambda *_args, **_kwargs: next(responses))
-    monkeypatch.setattr("gateway.platforms.api_server.urlopen", urlopen)
-    tool_approval.register_always_approval_authority(
-        adapter._is_omnio_connector_toolkit_approval_granted
+    assert (
+        omnio_approval_state.conversation_grant_loader()
+        == adapter._load_omnio_conversation_tool_approvals
     )
 
-    assert tool_approval.is_always_approved(tool) is True
-    assert tool_approval.is_always_approved(tool) is False
-    assert urlopen.call_count == 2
+
+def test_conversation_grants_are_asked_for_by_the_runs_turn(adapter, monkeypatch):
+    _configure_omnia(monkeypatch, turn_id="turn-42")
+    urlopen = MagicMock(
+        return_value=_OmniaResponse(
+            {
+                "tools": [],
+                "toolSlugs": [],
+                "conversation": {
+                    "tools": ["mcp__connectors__GMAIL_SEND_EMAIL"],
+                    "toolSlugs": ["GMAIL_SEND_EMAIL"],
+                },
+            }
+        )
+    )
+    monkeypatch.setattr("gateway.platforms.api_server.urlopen", urlopen)
+
+    loaded = adapter._load_omnio_conversation_tool_approvals()
+
+    assert loaded == (["mcp__connectors__GMAIL_SEND_EMAIL"], ["GMAIL_SEND_EMAIL"])
+    request = urlopen.call_args.args[0]
+    assert "brand=brand-1" in request.full_url
+    assert "turn=turn-42" in request.full_url
+    assert request.get_header("Authorization") == "Bearer agent-token"
 
 
-def test_authority_grants_a_native_tool_from_a_legacy_names_only_payload(
+def test_saved_chat_grant_skips_the_card_after_a_gateway_restart(adapter, monkeypatch):
+    tool = "mcp__connectors__GMAIL_SEND_EMAIL"
+    _configure_omnia(monkeypatch)
+    monkeypatch.setattr(
+        "gateway.platforms.api_server.urlopen",
+        MagicMock(
+            return_value=_OmniaResponse(
+                {
+                    "tools": [],
+                    "conversation": {"tools": [tool], "toolSlugs": ["GMAIL_SEND_EMAIL"]},
+                }
+            )
+        ),
+    )
+    adapter._omnia_approval_source(clear_snapshot=True)
+
+    try:
+        assert tool_approval.is_tool_approved("restarted-session", tool) is True
+    finally:
+        tool_approval.clear_session("restarted-session")
+
+
+def test_conversation_grants_wait_for_a_turn_to_ask_about(adapter, monkeypatch):
+    _configure_omnia(monkeypatch, turn_id="")
+    urlopen = MagicMock()
+    monkeypatch.setattr("gateway.platforms.api_server.urlopen", urlopen)
+
+    assert adapter._load_omnio_conversation_tool_approvals() is None
+    urlopen.assert_not_called()
+
+
+def test_conversation_grants_retry_when_omnia_does_not_know_the_turn(
     adapter, monkeypatch
 ):
-    # Older Omnia deployments serve only legacy-prefixed names with no
-    # toolSlugs; slug derivation keeps the grant valid for native names.
-    native = "mcp__connectors__GMAIL_SEND_EMAIL"
-    _configure_authority(monkeypatch)
-    _standing_candidate("mcp_connectors_GMAIL_SEND_EMAIL")
-    monkeypatch.setattr(
-        "gateway.platforms.api_server.urlopen",
-        MagicMock(
-            return_value=_AuthorityResponse(
-                {"tools": ["mcp_connectors_GMAIL_SEND_EMAIL"]}
-            )
-        ),
-    )
-    tool_approval.register_always_approval_authority(
-        adapter._is_omnio_connector_toolkit_approval_granted
-    )
+    _configure_omnia(monkeypatch)
 
-    assert tool_approval.is_always_approved(native) is True
-
-
-def test_authority_prefers_the_slug_contract_when_served(adapter, monkeypatch):
-    native = "mcp__connectors__GMAIL_SEND_EMAIL"
-    _configure_authority(monkeypatch)
-    tool_approval.replace_injected_always_approvals([], tool_slugs=["GMAIL_SEND_EMAIL"])
-    monkeypatch.setattr(
-        "gateway.platforms.api_server.urlopen",
-        MagicMock(
-            return_value=_AuthorityResponse(
-                {"tools": [], "toolSlugs": ["GMAIL_SEND_EMAIL"]}
-            )
-        ),
-    )
-    tool_approval.register_always_approval_authority(
-        adapter._is_omnio_connector_toolkit_approval_granted
-    )
-
-    assert tool_approval.is_always_approved(native) is True
-
-
-def test_authority_served_slugs_do_not_grant_other_tools(adapter, monkeypatch):
-    native = "mcp__connectors__GMAIL_SEND_EMAIL"
-    _configure_authority(monkeypatch)
-    tool_approval.replace_injected_always_approvals([], tool_slugs=["GMAIL_SEND_EMAIL"])
-    monkeypatch.setattr(
-        "gateway.platforms.api_server.urlopen",
-        MagicMock(
-            return_value=_AuthorityResponse(
-                {"tools": [], "toolSlugs": ["NOTION_UPDATE_PAGE"]}
-            )
-        ),
-    )
-    tool_approval.register_always_approval_authority(
-        adapter._is_omnio_connector_toolkit_approval_granted
-    )
-
-    assert tool_approval.is_always_approved(native) is False
-
-
-def test_malformed_tool_slugs_fail_closed(adapter, monkeypatch):
-    tool = "mcp__connectors__GMAIL_SEND_EMAIL"
-    _configure_authority(monkeypatch)
-    _standing_candidate(tool)
-    monkeypatch.setattr(
-        "gateway.platforms.api_server.urlopen",
-        MagicMock(
-            return_value=_AuthorityResponse({"tools": [tool], "toolSlugs": "nope"})
-        ),
-    )
-    tool_approval.register_always_approval_authority(
-        adapter._is_omnio_connector_toolkit_approval_granted
-    )
-
-    assert tool_approval.is_always_approved(tool) is False
-
-
-def test_old_omnia_404_fails_closed_for_a_warm_candidate(adapter, monkeypatch):
-    tool = "mcp_connectors_GMAIL_SEND_EMAIL"
-    _configure_authority(monkeypatch)
-    _standing_candidate(tool)
-
-    def old_endpoint_404(request, **_kwargs):
+    def turn_404(request, **_kwargs):
         raise HTTPError(request.full_url, 404, "Not Found", {}, None)
 
-    monkeypatch.setattr("gateway.platforms.api_server.urlopen", old_endpoint_404)
-    tool_approval.register_always_approval_authority(
-        adapter._is_omnio_connector_toolkit_approval_granted
+    monkeypatch.setattr("gateway.platforms.api_server.urlopen", turn_404)
+
+    assert adapter._load_omnio_conversation_tool_approvals() is None
+
+
+def test_conversation_grants_are_empty_on_an_omnia_without_chat_grants(
+    adapter, monkeypatch
+):
+    _configure_omnia(monkeypatch)
+    monkeypatch.setattr(
+        "gateway.platforms.api_server.urlopen",
+        MagicMock(return_value=_OmniaResponse({"tools": [], "toolSlugs": []})),
     )
 
-    assert tool_approval.is_always_approved(tool) is False
+    assert adapter._load_omnio_conversation_tool_approvals() == ([], None)
 
 
 @pytest.mark.parametrize(
-    "response",
+    "configured",
     [
-        _AuthorityResponse({"tools": "mcp_connectors_GMAIL_SEND_EMAIL"}),
-        _AuthorityResponse({"tools": [123]}),
-        _AuthorityResponse({"granted": True}),
-        _AuthorityResponse(b"not-json"),
-        _AuthorityResponse({"tools": []}, status=503),
+        {"OMNIA_BASE_URL": ""},
+        {"OMNIA_API_TOKEN": ""},
+        {"OMNIO_BRAND_ID": ""},
+        {"OMNIO_TOOL_APPROVAL_DURABLE_DISABLED": "1"},
     ],
 )
-def test_malformed_or_non_2xx_authority_fails_closed(adapter, monkeypatch, response):
-    tool = "mcp_connectors_GMAIL_SEND_EMAIL"
-    _configure_authority(monkeypatch)
-    _standing_candidate(tool)
+def test_conversation_grants_are_empty_without_a_usable_omnia(
+    adapter, monkeypatch, configured
+):
+    _configure_omnia(monkeypatch)
+    for name, value in configured.items():
+        monkeypatch.setenv(name, value)
+    urlopen = MagicMock()
+    monkeypatch.setattr("gateway.platforms.api_server.urlopen", urlopen)
+
+    assert adapter._load_omnio_conversation_tool_approvals() == ([], None)
+    urlopen.assert_not_called()
+
+
+def test_conversation_grant_load_fails_when_omnia_errors(adapter, monkeypatch):
+    _configure_omnia(monkeypatch)
+
+    def unavailable(request, **_kwargs):
+        raise HTTPError(request.full_url, 503, "Unavailable", {}, None)
+
+    monkeypatch.setattr("gateway.platforms.api_server.urlopen", unavailable)
+
+    with pytest.raises(HTTPError):
+        adapter._load_omnio_conversation_tool_approvals()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"tools": [], "conversation": {"tools": "mcp__connectors__GMAIL_SEND_EMAIL"}},
+        {"tools": [], "conversation": {"tools": [], "toolSlugs": "nope"}},
+        {"tools": [], "conversation": []},
+        ["not-an-object"],
+        b"not-json",
+    ],
+)
+def test_malformed_conversation_grants_fail_the_load(adapter, monkeypatch, payload):
+    _configure_omnia(monkeypatch)
     monkeypatch.setattr(
         "gateway.platforms.api_server.urlopen",
-        MagicMock(return_value=response),
-    )
-    tool_approval.register_always_approval_authority(
-        adapter._is_omnio_connector_toolkit_approval_granted
+        MagicMock(return_value=_OmniaResponse(payload)),
     )
 
-    assert tool_approval.is_always_approved(tool) is False
-
-
-def test_authority_timeout_fails_closed(adapter, monkeypatch):
-    tool = "mcp_connectors_GMAIL_SEND_EMAIL"
-    _configure_authority(monkeypatch)
-    _standing_candidate(tool)
-    monkeypatch.setattr(
-        "gateway.platforms.api_server.urlopen",
-        MagicMock(side_effect=TimeoutError("authority timed out")),
-    )
-    tool_approval.register_always_approval_authority(
-        adapter._is_omnio_connector_toolkit_approval_granted
-    )
-
-    assert tool_approval.is_always_approved(tool) is False
+    with pytest.raises(ValueError):
+        adapter._load_omnio_conversation_tool_approvals()
 
 
 @pytest.mark.asyncio

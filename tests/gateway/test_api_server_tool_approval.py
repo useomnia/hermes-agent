@@ -9,6 +9,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 import tools.mcp_tool as mcp_tool
+import tools.omnio_approval_state as omnio_approval_state
 import tools.tool_approval as tool_approval
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
@@ -20,7 +21,7 @@ SIBLING = "mcp_connectors_GMAIL_SEND_EMAIL"
 
 @pytest.fixture(autouse=True)
 def _clean_approval_state():
-    tool_approval.register_always_approval_authority(None)
+    omnio_approval_state.register_conversation_grant_loader(None)
     tool_approval._session_approved.clear()
     tool_approval._always_approved.clear()
     tool_approval._injected_always_approved.clear()
@@ -30,7 +31,7 @@ def _clean_approval_state():
     mcp_tool._track_mcp_tool_read_only(GATED, False)
     mcp_tool._track_mcp_tool_read_only(SIBLING, False)
     yield
-    tool_approval.register_always_approval_authority(None)
+    omnio_approval_state.register_conversation_grant_loader(None)
     tool_approval._session_approved.clear()
     tool_approval._always_approved.clear()
     tool_approval._injected_always_approved.clear()
@@ -145,7 +146,6 @@ def test_grant_lookup_joins_the_startup_approval_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Agent builds no longer wait on the snapshot; the first gated lookup does."""
-    from tools import omnio_approval_state
 
     joined: list[bool] = []
     monkeypatch.setattr(
