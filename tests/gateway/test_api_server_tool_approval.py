@@ -141,18 +141,20 @@ async def test_disconnect_cancels_approval_refresh_and_releases_joiner(
     assert tool_approval._injected_always_approved == set()
 
 
-def test_every_agent_build_joins_the_startup_approval_snapshot(
+def test_grant_lookup_joins_the_startup_approval_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    """Agent builds no longer wait on the snapshot; the first gated lookup does."""
+    from tools import omnio_approval_state
 
-    def joined() -> None:
-        raise LookupError("snapshot joined before agent imports")
+    joined: list[bool] = []
+    monkeypatch.setattr(
+        omnio_approval_state, "_always_approval_snapshot_waiter", lambda: joined.append(True)
+    )
 
-    monkeypatch.setattr(adapter, "_wait_for_omnio_approval_snapshot", joined)
+    omnio_approval_state.is_always_approved("mcp__connectors__WEBFLOW_PUBLISH")
 
-    with pytest.raises(LookupError, match="snapshot joined before agent imports"):
-        adapter._create_agent()
+    assert joined == [True]
 
 
 def _create_app(adapter: APIServerAdapter) -> web.Application:

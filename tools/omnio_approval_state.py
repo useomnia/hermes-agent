@@ -60,6 +60,16 @@ _injected_always_approved_slugs: set[str] = set()
 # warm gateway.
 _always_approval_authority: Callable[[str], bool] | None = None
 
+# Joins the gateway's startup grant snapshot (bounded). Called on the first
+# candidate lookup instead of before every agent build, so a Turn that never
+# reaches a gated write does not wait on the snapshot fetch.
+_always_approval_snapshot_waiter: Callable[[], None] | None = None
+
+
+def register_always_approval_snapshot_waiter(cb: Callable[[], None] | None) -> None:
+    global _always_approval_snapshot_waiter
+    _always_approval_snapshot_waiter = cb
+
 
 def is_always_approved(function_name: str) -> bool:
     """Return whether the authority currently grants a candidate tool.
@@ -67,6 +77,12 @@ def is_always_approved(function_name: str) -> bool:
     Local and injected names are only candidate indexes.  Missing authority,
     an authority exception, and any non-``True`` response all fail closed.
     """
+    waiter = _always_approval_snapshot_waiter
+    if waiter is not None:
+        try:
+            waiter()
+        except Exception:  # noqa: BLE001 — a failed join leaves candidates fail-closed
+            logger.debug("approval snapshot join failed", exc_info=True)
     slug = connector_tool_slug(function_name)
     with _lock:
         candidate = (
