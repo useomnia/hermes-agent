@@ -1727,6 +1727,12 @@ def init_agent(
     # conversation loop's intent-ack block.
     agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
 
+    # apply_patch file writes: "auto" (default — GPT-5+ on OpenRouter), true,
+    # false, or a list of model-name substrings. Resolved per request against
+    # the model then in use (agent/apply_patch_tool.py), so a fallback to a
+    # model without custom-tool support never receives it.
+    agent._apply_patch_tool = _agent_section.get("apply_patch_tool", "auto")
+
     # Universal task-completion guidance toggle.  Default True.  Surfaced
     # as a separate flag from tool_use_enforcement because the guidance
     # applies to ALL models, not just the model families enforcement

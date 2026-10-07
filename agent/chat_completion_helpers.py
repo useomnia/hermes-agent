@@ -28,6 +28,7 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH, VALID_REASONING_EFFORTS
+from agent import apply_patch_tool
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
@@ -1273,6 +1274,11 @@ def _build_api_kwargs_for_mode(agent, api_messages: list) -> dict:
 
     # ── chat_completions (default) ─────────────────────────────────────
     _ct = agent._get_transport()
+
+    # GPT-5+ models write files through a grammar-constrained apply_patch
+    # instead of one JSON-escaped write_file argument (agent/apply_patch_tool.py).
+    if apply_patch_tool.agent_enabled(agent):
+        tools_for_api, api_messages = apply_patch_tool.rewrite_request(tools_for_api, api_messages)
 
     # Provider detection flags
     _is_qwen = agent._is_qwen_portal()
@@ -3068,6 +3074,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         tool_calls_acc: dict = {}
         tool_gen_notified: set = set()
         tool_gen_event_notified: set = set()
+        # Slots holding an apply_patch call. Its arguments stream as raw patch
+        # text, not JSON; it is renamed to the internal patch tool on arrival.
+        _apply_patch_offered = apply_patch_tool.request_offers_apply_patch(api_kwargs)
+        apply_patch_slots: set = set()
         # Ollama-compatible endpoints reuse index 0 for every tool call
         # in a parallel batch, distinguishing them only by id.  Track
         # the last seen id per raw index so we can detect a new tool
@@ -3224,6 +3234,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # (matching the OpenAI Node SDK / LiteLLM /
                             # Vercel AI patterns) is immune to this.
                             entry["function"]["name"] = tc_delta.function.name
+                            if (
+                                _apply_patch_offered
+                                and tc_delta.function.name == apply_patch_tool.WIRE_TOOL_NAME
+                            ):
+                                apply_patch_slots.add(idx)
+                                entry["function"]["name"] = apply_patch_tool.INTERNAL_TOOL_NAME
                             tool_arg_progress.update(t=time.time(), entry=entry)
                         if tc_delta.function.arguments:
                             entry["function"]["arguments"] += tc_delta.function.arguments
@@ -3290,7 +3306,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 tc = tool_calls_acc[idx]
                 arguments = tc["function"]["arguments"]
                 tool_name = tc["function"]["name"] or "?"
-                if arguments and arguments.strip():
+                if idx in apply_patch_slots:
+                    # Raw patch text. Without its end marker the call was cut
+                    # off: refuse it, like a truncated JSON argument.
+                    if apply_patch_tool.is_complete(arguments):
+                        arguments = apply_patch_tool.internal_arguments(arguments)
+                    else:
+                        has_truncated_tool_args = True
+                        _abandon_unexecuted_tool_call(tc["id"])
+                elif arguments and arguments.strip():
                     try:
                         json.loads(arguments)
                     except json.JSONDecodeError:

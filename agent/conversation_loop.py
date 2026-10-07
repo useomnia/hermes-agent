@@ -27,6 +27,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from agent import apply_patch_tool
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -2294,10 +2295,17 @@ def run_conversation(
                     # returns no response. A later Stop must not replay this input.
                     agent._unsubmitted_steers = []
                     if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
+                        _response = agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                    else:
+                        _response = agent._interruptible_api_call(next_api_kwargs)
+                    # Streams translate apply_patch calls as they arrive; a
+                    # non-streamed response (including a stream request served
+                    # by the direct path) is translated here.
+                    if apply_patch_tool.request_offers_apply_patch(next_api_kwargs):
+                        apply_patch_tool.normalize_response(_response)
+                    return _response
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 

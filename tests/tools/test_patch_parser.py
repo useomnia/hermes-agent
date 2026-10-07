@@ -718,3 +718,58 @@ class TestV4ALspDiagnosticsPropagation:
         assert result.lsp_diagnostics is not None
         assert per_file["a.ts"] in result.lsp_diagnostics
         assert per_file["b.ts"] in result.lsp_diagnostics
+
+
+class TestCodexSyntax:
+    """Syntax the Codex apply_patch grammar emits, which GPT models write."""
+
+    def test_should_read_an_open_ended_context_marker_as_the_hint(self):
+        patch = """\
+*** Begin Patch
+*** Update File: f.py
+@@ def greet():
+-    print("hello")
++    print("hi")
+*** End Patch"""
+        ops, err = parse_v4a_patch(patch)
+        assert err is None
+        assert ops[0].hunks[0].context_hint == "def greet():"
+
+    def test_should_not_treat_the_end_of_file_marker_as_content(self):
+        patch = """\
+*** Begin Patch
+*** Update File: f.txt
+@@
+ last line
++appended
+*** End of File
+*** End Patch"""
+        ops, err = parse_v4a_patch(patch)
+        assert err is None
+        lines = [(l.prefix, l.content) for l in ops[0].hunks[0].lines]
+        assert lines == [(" ", "last line"), ("+", "appended")]
+
+    def test_should_replace_an_existing_file_when_adding_it(self):
+        patch = """\
+*** Begin Patch
+*** Add File: /tmp/draft.md
++brand:
++  name: Example
++
++competitors: []
+*** End Patch"""
+        operations, err = parse_v4a_patch(patch)
+        assert err is None
+
+        class FakeFileOps:
+            written = None
+
+            def write_file(self, path, content):
+                self.written = (path, content)
+                return SimpleNamespace(error=None)
+
+        file_ops = FakeFileOps()
+        result = apply_v4a_operations(operations, file_ops)
+
+        assert result.success is True
+        assert file_ops.written == ("/tmp/draft.md", "brand:\n  name: Example\n\ncompetitors: []")
