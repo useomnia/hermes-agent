@@ -14,8 +14,10 @@ and ``patch``. Everywhere else the call is the existing ``patch`` tool in V4A
 mode (``{"mode": "patch", "patch": <text>}``), so approvals, checkpoints,
 display and file-mutation tracking need no changes:
 
-- :func:`rewrite_request` swaps the tools and translates history on the way out.
-- :func:`internal_arguments` translates a completed call on the way back in.
+- :func:`rewrite_request` swaps the tools, keeps other tools from pointing the
+  model back at write_file or patch, and translates history on the way out.
+- :func:`internal_arguments` (streamed) and :func:`normalize_response`
+  (non-streamed) translate a completed call on the way back in.
 """
 
 from __future__ import annotations
