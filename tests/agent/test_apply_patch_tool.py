@@ -269,3 +269,48 @@ class TestBuildApiKwargs:
         kwargs = build_api_kwargs(agent, [{"role": "user", "content": "hi"}])
 
         assert _tool_names(kwargs["tools"]) == ["read_file", "write_file", "patch"]
+
+
+@pytest.fixture
+def hermes_home(monkeypatch, tmp_path):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    yield home
+    from tools.file_tools import clear_file_ops_cache
+    from tools.terminal_tool import _active_environments, _env_lock
+    clear_file_ops_cache()
+    with _env_lock:
+        _active_environments.clear()
+
+
+class TestPatchToolExecution:
+    """apply_patch calls run through the real patch tool with Codex's Add File semantics.
+
+    The fork's V4A parser lets Add File replace a file. Upstream refuses it (f79cb77224)
+    unless the call carries ``add_overwrites`` (NousResearch/hermes-agent#134467). If a
+    sync brings in that guard, these tests fail: make internal_arguments() send the flag.
+    """
+
+    def test_should_replace_an_existing_file_with_add_file(self, hermes_home, tmp_path):
+        from tools.file_tools import _handle_patch
+
+        target = tmp_path / "draft.yaml"
+        target.write_text("brand: old\n")
+        text = f"*** Begin Patch\n*** Add File: {target}\n+brand: new\n*** End Patch\n"
+
+        result = json.loads(_handle_patch(json.loads(apply_patch_tool.internal_arguments(text)), task_id="apply_patch_add_1"))
+
+        assert not result.get("error"), result
+        assert target.read_text() == "brand: new"
+
+    def test_should_create_a_new_file_with_add_file(self, hermes_home, tmp_path):
+        from tools.file_tools import _handle_patch
+
+        target = tmp_path / "new.yaml"
+        text = f"*** Begin Patch\n*** Add File: {target}\n+brand: new\n*** End Patch\n"
+
+        result = json.loads(_handle_patch(json.loads(apply_patch_tool.internal_arguments(text)), task_id="apply_patch_add_2"))
+
+        assert not result.get("error"), result
+        assert target.read_text() == "brand: new"
