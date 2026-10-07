@@ -141,3 +141,60 @@ def test_reload_clears_the_named_servers_connect_backoff(mcp):
     mcp_tool.reload_mcp_servers(["connectors"])
 
     assert "connectors" not in mcp_tool._server_connect_retry_after
+
+
+def test_live_reload_still_refreshes_in_place(mcp):
+    configs, servers, _ = mcp
+    configs["connectors"] = {"url": "https://a.test/mcp"}
+    servers["connectors"] = server = _Server("connectors", configs["connectors"])
+
+    assert mcp_tool.reload_mcp_servers(["connectors"], live=True) == {"connectors": "refreshed"}
+    assert (server.refreshes, server.stopped) == (1, False)
+
+
+def test_live_reload_defers_a_config_change_without_closing_the_connection(mcp):
+    configs, servers, registered = mcp
+    servers["connectors"] = old = _Server("connectors", {"url": "https://old.test/mcp"})
+    configs["connectors"] = {"url": "https://new.test/mcp"}
+
+    assert mcp_tool.reload_mcp_servers(["connectors"], live=True) == {"connectors": "deferred"}
+    assert (old.stopped, servers["connectors"], registered) == (False, old, [])
+
+
+def test_live_reload_defers_when_the_in_place_refresh_fails(mcp):
+    configs, servers, registered = mcp
+    configs["connectors"] = {"url": "https://a.test/mcp"}
+    servers["connectors"] = server = _Server("connectors", configs["connectors"])
+    server.refresh_error = RuntimeError("tools/list failed")
+
+    assert mcp_tool.reload_mcp_servers(["connectors"], live=True) == {"connectors": "deferred"}
+    assert (server.stopped, registered) == (False, [])
+
+
+def test_live_reload_defers_a_server_without_a_live_session(mcp):
+    configs, servers, _ = mcp
+    configs["connectors"] = {"url": "https://a.test/mcp"}
+    servers["connectors"] = server = _Server("connectors", configs["connectors"], session=None)
+
+    assert mcp_tool.reload_mcp_servers(["connectors"], live=True) == {"connectors": "deferred"}
+    assert not server.stopped
+
+
+def test_live_reload_defers_removing_a_server_dropped_from_config(mcp):
+    _, servers, _ = mcp
+    servers["connectors"] = server = _Server("connectors", {"url": "https://a.test/mcp"})
+
+    assert mcp_tool.reload_mcp_servers(["connectors"], live=True) == {"connectors": "deferred"}
+    assert (server.stopped, "connectors" in servers) == (False, True)
+
+
+def test_live_reload_connects_a_configured_server_with_no_connection(mcp):
+    configs, _, registered = mcp
+    configs["connectors"] = {"url": "https://a.test/mcp"}
+
+    assert mcp_tool.reload_mcp_servers(["connectors"], live=True) == {"connectors": "reconnected"}
+    assert registered == ["connectors"]
+
+
+def test_live_reload_reports_an_unknown_server_absent(mcp):
+    assert mcp_tool.reload_mcp_servers(["nope"], live=True) == {"nope": "absent"}

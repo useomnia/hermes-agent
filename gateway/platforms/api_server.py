@@ -51,7 +51,7 @@ import hmac
 import json
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from functools import wraps
+from functools import partial, wraps
 import logging
 import os
 import re
@@ -1310,6 +1310,10 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
             "code": code,
         }
     }
+
+
+def _bad_mcp_reload_body(message: str) -> "web.Response":
+    return web.json_response(_openai_error(message), status=400)
 
 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
@@ -4477,6 +4481,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "approval_events": True,
                 "omnio_blocking_interactions": True,
                 "mcp_reload": True,
+                # Named-server reloads (``{"servers": [...]}``) and their
+                # ``live`` mode, safe to request while runs are in flight.
+                "mcp_named_reload": {"apiVersion": 1, "live": True},
                 "skills_reload": True,
                 "structured_output": True,
                 "session_resources": True,
@@ -11389,11 +11396,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         An optional ``{"servers": [...]}`` body reloads only those servers and
         reports each one's outcome; without it every server is reconnected.
+        ``"live": true`` (named servers only) is for a caller with runs in
+        flight: reloads that would close an open connection report
+        ``deferred`` instead of running.
         """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-        requested, body_err = await self._requested_mcp_reload_servers(request)
+        requested, live, body_err = await self._requested_mcp_reload_servers(request)
         if body_err:
             return body_err
 
@@ -11435,7 +11445,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     new_tools = await loop.run_in_executor(None, discover_mcp_tools)
                     results = None
                 else:
-                    results = await loop.run_in_executor(None, reload_mcp_servers, requested)
+                    results = await loop.run_in_executor(
+                        None, partial(reload_mcp_servers, requested, live=live)
+                    )
                     with _lock:
                         new_tools = _existing_tool_names()
                 with _lock:
@@ -11458,29 +11470,34 @@ class APIServerAdapter(BasePlatformAdapter):
     @staticmethod
     async def _requested_mcp_reload_servers(
         request: "web.Request",
-    ) -> "tuple[Optional[List[str]], Optional[web.Response]]":
-        """The server names a reload body selects, or None to reload every server."""
+    ) -> "tuple[Optional[List[str]], bool, Optional[web.Response]]":
+        """The server names a reload body selects (None reloads every server),
+        whether the reload is live, or the 400 a malformed body earns."""
         if not request.can_read_body:
-            return None, None
+            return None, False, None
         try:
             body = await request.json()
         except (json.JSONDecodeError, UnicodeDecodeError):
-            return None, web.json_response(
-                _openai_error("Reload body must be JSON"), status=400
-            )
-        servers = body.get("servers") if isinstance(body, dict) else None
-        if servers is None and isinstance(body, dict):
-            return None, None
+            return None, False, _bad_mcp_reload_body("Reload body must be JSON")
+        if not isinstance(body, dict):
+            return None, False, _bad_mcp_reload_body("Reload body must be a JSON object")
+        servers = body.get("servers")
+        live = body.get("live", False)
+        if not isinstance(live, bool):
+            return None, False, _bad_mcp_reload_body("'live' must be a boolean")
+        if servers is None:
+            if live:
+                return None, False, _bad_mcp_reload_body("A live reload must name its 'servers'")
+            return None, False, None
         if (
             not isinstance(servers, list)
             or not servers
             or not all(isinstance(name, str) and name for name in servers)
         ):
-            return None, web.json_response(
-                _openai_error("'servers' must be a non-empty list of server names"),
-                status=400,
+            return None, False, _bad_mcp_reload_body(
+                "'servers' must be a non-empty list of server names"
             )
-        return servers, None
+        return servers, live, None
 
     @_admit_api_control_request
     async def _handle_skills_reload(

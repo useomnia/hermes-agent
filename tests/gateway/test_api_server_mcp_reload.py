@@ -419,14 +419,15 @@ async def test_concurrent_reloads_are_serialized(adapter, monkeypatch):
 
 
 def _stub_targeted_reload(monkeypatch) -> dict:
-    calls = {"full": 0, "targeted": []}
+    calls = {"full": 0, "targeted": [], "live": []}
     monkeypatch.setattr(mcp_tool, "_servers", {})
 
     def _full_shutdown():
         calls["full"] += 1
 
-    def _targeted(names):
+    def _targeted(names, *, live=False):
         calls["targeted"].append(list(names))
+        calls["live"].append(live)
         return {name: "refreshed" for name in names}
 
     monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", _full_shutdown)
@@ -443,7 +444,18 @@ async def test_named_reload_reloads_only_the_named_servers(adapter, monkeypatch)
         resp = await cli.post("/v1/mcp/reload", json={"servers": ["connectors"]})
 
     assert resp.status == 200
-    assert calls == {"full": 0, "targeted": [["connectors"]]}
+    assert calls == {"full": 0, "targeted": [["connectors"]], "live": [False]}
+
+
+@pytest.mark.asyncio
+async def test_live_named_reload_asks_for_a_live_reload(adapter, monkeypatch):
+    calls = _stub_targeted_reload(monkeypatch)
+
+    async with TestClient(TestServer(_create_app(adapter))) as cli:
+        resp = await cli.post("/v1/mcp/reload", json={"servers": ["connectors"], "live": True})
+
+    assert resp.status == 200
+    assert calls == {"full": 0, "targeted": [["connectors"]], "live": [True]}
 
 
 @pytest.mark.asyncio
@@ -471,7 +483,16 @@ async def test_reload_without_a_server_list_reconnects_every_server(adapter, mon
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "payload",
-    ['{"servers": []}', '{"servers": "connectors"}', '{"servers": [""]}', '{"servers": [1]}', "not json"],
+    [
+        '{"servers": []}',
+        '{"servers": "connectors"}',
+        '{"servers": [""]}',
+        '{"servers": [1]}',
+        "not json",
+        '["connectors"]',
+        '{"servers": ["connectors"], "live": "yes"}',
+        '{"live": true}',
+    ],
 )
 async def test_malformed_server_list_is_rejected_without_reloading(adapter, monkeypatch, payload):
     calls = _stub_targeted_reload(monkeypatch)
@@ -482,3 +503,14 @@ async def test_malformed_server_list_is_rejected_without_reloading(adapter, monk
         )
 
     assert (resp.status, calls["full"], calls["targeted"]) == (400, 0, [])
+
+
+@pytest.mark.asyncio
+async def test_capabilities_advertise_live_named_reloads(adapter):
+    app = _create_app(adapter)
+    app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/v1/capabilities")
+        body = await resp.json()
+
+    assert body["features"]["mcp_named_reload"] == {"apiVersion": 1, "live": True}
