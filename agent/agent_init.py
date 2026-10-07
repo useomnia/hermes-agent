@@ -1728,7 +1728,7 @@ def init_agent(
     agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
 
     # apply_patch file writes: "auto" (default — GPT-5+ on OpenRouter), true,
-    # false, or a list of model-name substrings. Resolved per request against
+    # false, or a list of model-name substrings added to auto. Resolved per request against
     # the model then in use (agent/apply_patch_tool.py), so a fallback to a
     # model without custom-tool support never receives it.
     agent._apply_patch_tool = _agent_section.get("apply_patch_tool", "auto")
