@@ -188,6 +188,27 @@ def _wire_message(message: Any) -> Any:
     return {**message, "tool_calls": rewritten}
 
 
+# Other tools' descriptions that point at the replaced tools (terminal: "use
+# write_file instead"). execute_code is left alone: its scripts still call the
+# real write_file and patch functions.
+_REDIRECTED_PHRASES = (("use write_file instead", "use apply_patch instead"), ("use patch instead", "use apply_patch instead"))
+
+
+def _redirect_description(tool: Any) -> Any:
+    fn = tool.get("function") if isinstance(tool, dict) else None
+    if not isinstance(fn, dict) or fn.get("name") == "execute_code":
+        return tool
+    description = fn.get("description")
+    if not isinstance(description, str):
+        return tool
+    redirected = description
+    for old, new in _REDIRECTED_PHRASES:
+        redirected = redirected.replace(old, new)
+    if redirected == description:
+        return tool
+    return {**tool, "function": {**fn, "description": redirected}}
+
+
 def rewrite_request(tools: Optional[list], messages: list) -> tuple[Optional[list], list]:
     """Offer apply_patch in place of ``write_file``/``patch`` and replay history in its form.
 
@@ -196,7 +217,7 @@ def rewrite_request(tools: Optional[list], messages: list) -> tuple[Optional[lis
     """
     if not tools or not any(_tool_name(t) in _REPLACED_TOOL_NAMES for t in tools):
         return tools, messages
-    kept = [t for t in tools if _tool_name(t) not in _REPLACED_TOOL_NAMES]
+    kept = [_redirect_description(t) for t in tools if _tool_name(t) not in _REPLACED_TOOL_NAMES]
     return kept + [wire_tool()], [_wire_message(m) for m in messages]
 
 
