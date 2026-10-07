@@ -1012,7 +1012,8 @@ DEFAULT_CONFIG = {
         # apply_patch tool in place of write_file and patch, as OpenAI's Codex
         # does. JSON-escaped whole-file arguments can loop until the output cap.
         # Values: "auto" (default — GPT-5+ models on OpenRouter), true/false, or
-        # a list of model-name substrings (for presets that hide the model).
+        # a list of model-name substrings enabled on top of auto (for presets that
+        # hide the model).
         "apply_patch_tool": "auto",
         # Universal "finish the job" guidance — short prompt block applied to
         # all models that targets two cross-family failure modes: (1) stopping
