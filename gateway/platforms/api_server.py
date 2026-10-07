@@ -3230,7 +3230,8 @@ class APIServerAdapter(BasePlatformAdapter):
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
         """
-        self._wait_for_omnio_approval_snapshot()
+        # The startup grant snapshot is joined by the first gated-write lookup
+        # (``is_always_approved``), not before every agent build.
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs,
@@ -11850,6 +11851,7 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             from tools.omnio_approval_state import (
                 register_always_approval_authority,
+                register_always_approval_snapshot_waiter,
                 replace_injected_always_approvals,
             )
             from utils import env_var_enabled
@@ -11863,6 +11865,7 @@ class APIServerAdapter(BasePlatformAdapter):
         register_always_approval_authority(
             self._is_omnio_connector_toolkit_approval_granted
         )
+        register_always_approval_snapshot_waiter(self._wait_for_omnio_approval_snapshot)
         if clear_snapshot:
             replace_injected_always_approvals([])
         if env_var_enabled(_OMNIO_DURABLE_APPROVALS_DISABLED_ENV):
@@ -11960,7 +11963,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
     def _wait_for_omnio_approval_snapshot(self) -> None:
-        """Join the startup snapshot before agent construction, bounded."""
+        """Join the startup snapshot before a standing-grant lookup, bounded."""
         if self._omnio_approval_snapshot_ready.is_set():
             return
         started = time.monotonic()

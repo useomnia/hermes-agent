@@ -2,6 +2,7 @@
 
 import json
 import threading
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -402,6 +403,70 @@ class TestBuiltinDiscovery:
 
         assert imported == ["tools.alpha"]
         mock_import.assert_called_once_with("tools.alpha")
+
+
+_ALPHA_SOURCE = (
+    "from tools.registry import registry\n"
+    "registry.register(name='alpha', toolset='x', schema={}, handler=lambda *_a, **_k: '{}')\n"
+)
+
+
+class TestBuiltinDiscoveryCache:
+    """The per-module "does it register tools" verdict is memoized on disk."""
+
+    def _tools_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "alpha.py").write_text(_ALPHA_SOURCE, encoding="utf-8")
+        (tools_dir / "beta.py").write_text("VALUE = 1\n", encoding="utf-8")
+        return tools_dir
+
+    def _discover_counting_parses(self, tools_dir):
+        from tools import registry as registry_module
+
+        parsed = []
+        real = registry_module._module_registers_tools
+
+        def counting(path):
+            parsed.append(path.name)
+            return real(path)
+
+        with patch("tools.registry._module_registers_tools", counting), patch(
+            "tools.registry.importlib.import_module"
+        ):
+            imported = discover_builtin_tools(tools_dir)
+        return imported, parsed
+
+    def test_reuses_verdicts_for_unchanged_modules(self, tmp_path, monkeypatch):
+        tools_dir = self._tools_dir(tmp_path, monkeypatch)
+        self._discover_counting_parses(tools_dir)
+
+        imported, parsed = self._discover_counting_parses(tools_dir)
+
+        assert (imported, parsed) == (["tools.alpha"], [])
+
+    def test_reparses_a_module_whose_file_changed(self, tmp_path, monkeypatch):
+        tools_dir = self._tools_dir(tmp_path, monkeypatch)
+        self._discover_counting_parses(tools_dir)
+        beta = tools_dir / "beta.py"
+        beta.write_text(_ALPHA_SOURCE.replace("alpha", "beta"), encoding="utf-8")
+        stat = beta.stat()
+        os.utime(beta, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+
+        imported, parsed = self._discover_counting_parses(tools_dir)
+
+        assert (imported, parsed) == (["tools.alpha", "tools.beta"], ["beta.py"])
+
+    def test_ignores_an_unreadable_cache(self, tmp_path, monkeypatch):
+        tools_dir = self._tools_dir(tmp_path, monkeypatch)
+        cache = tmp_path / "home" / "cache" / "tool_discovery_cache.json"
+        cache.parent.mkdir(parents=True)
+        cache.write_text("not json", encoding="utf-8")
+
+        imported, parsed = self._discover_counting_parses(tools_dir)
+
+        assert (imported, sorted(parsed)) == (["tools.alpha"], ["alpha.py", "beta.py"])
 
 
 class TestEmojiMetadata:

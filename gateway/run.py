@@ -2339,6 +2339,57 @@ async def _require_offline_marker_invalidated(
         )
 
 
+def _warm_agent_stack() -> None:
+    """Pay the first agent build's one-time costs while the gateway is idle.
+
+    Imports the agent stack and ``openai``, resolves the OpenRouter preset and
+    assembles the API server's tool definitions, so the first request does
+    not. Builds no agent and never raises.
+    """
+    started = time.monotonic()
+    marks: dict[str, int] = {}
+
+    def _mark(name: str) -> None:
+        marks[name] = round((time.monotonic() - started) * 1000)
+
+    try:
+        import run_agent  # noqa: F401 — imports model_tools and the tool modules
+        import openai  # noqa: F401
+
+        _mark("imports")
+        try:
+            from agent.model_metadata import resolve_openrouter_preset_context
+
+            runtime = _resolve_runtime_agent_kwargs()
+            resolve_openrouter_preset_context(
+                _resolve_gateway_model(),
+                base_url=str(runtime.get("base_url") or ""),
+                provider=str(runtime.get("provider") or ""),
+                api_key=runtime.get("api_key") or "",
+            )
+        except Exception:
+            logger.debug("agent warm-up: preset context skipped", exc_info=True)
+        _mark("preset")
+        try:
+            from hermes_cli.tools_config import _get_platform_tools
+            from model_tools import get_tool_definitions
+
+            get_tool_definitions(
+                enabled_toolsets=sorted(_get_platform_tools(_load_gateway_config(), "api_server")),
+                quiet_mode=True,
+            )
+        except Exception:
+            logger.debug("agent warm-up: tool definitions skipped", exc_info=True)
+        _mark("tools")
+    except Exception:
+        logger.debug("agent warm-up failed", exc_info=True)
+    logger.info("Agent stack warm-up done %s", " ".join(f"{k}_ms={v}" for k, v in marks.items()))
+
+
+def _start_agent_stack_warmup() -> None:
+    threading.Thread(target=_warm_agent_stack, name="agent-warmup", daemon=True).start()
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -8661,6 +8712,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "Gateway ready%s",
             f" [{ready_timeline}]" if ready_timeline else "",
         )
+        # Started once the boot's own imports are done, so the two never import
+        # the agent stack concurrently; the gateway idles until its first
+        # request, which then finds those costs paid.
+        _start_agent_stack_warmup()
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
