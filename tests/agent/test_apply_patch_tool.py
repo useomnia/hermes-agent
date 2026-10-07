@@ -68,19 +68,31 @@ class TestRewriteRequest:
         assert custom["type"] == "custom"
         assert custom["format"] == {"type": "grammar", "syntax": "lark", "definition": apply_patch_tool.GRAMMAR}
 
-    def test_should_point_other_tools_at_apply_patch_without_touching_execute_code(self):
+    def test_should_point_other_tools_at_apply_patch(self):
         terminal = {"type": "function", "function": {"name": "terminal", "description": "Do NOT use sed/awk to edit files — use patch instead. Do NOT use echo/cat heredoc to create files — use write_file instead."}}
-        execute_code = {"type": "function", "function": {"name": "execute_code", "description": "write_file(path, content) — use write_file instead"}}
-        tools = [terminal, execute_code, _function_tool("write_file")]
 
-        rewritten, _ = apply_patch_tool.rewrite_request(tools, [])
+        rewritten, _ = apply_patch_tool.rewrite_request([terminal, _function_tool("write_file")], [])
 
         assert rewritten[0]["function"]["description"] == (
             "Do NOT use sed/awk to edit files — use apply_patch instead. "
             "Do NOT use echo/cat heredoc to create files — use apply_patch instead."
         )
-        assert rewritten[1] is execute_code
         assert "use write_file instead" in terminal["function"]["description"]
+
+    def test_should_stop_execute_code_from_offering_file_writes(self):
+        from tools.code_execution_tool import build_execute_code_schema
+
+        execute_code = {"type": "function", "function": build_execute_code_schema({"read_file", "write_file", "patch", "terminal"}, mode="project")}
+        assert "write_file(" in execute_code["function"]["description"]
+        tools = [execute_code, _function_tool("read_file"), _function_tool("write_file"), _function_tool("patch"), _function_tool("terminal")]
+
+        rewritten, _ = apply_patch_tool.rewrite_request(tools, [])
+
+        description = rewritten[0]["function"]["description"]
+        assert "write_file(" not in description
+        assert "patch(" not in description
+        assert "read_file(" in description
+        assert "write_file(" in execute_code["function"]["description"]
 
     def test_should_leave_requests_without_file_writing_tools_alone(self):
         tools = [_function_tool("read_file")]
