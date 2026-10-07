@@ -173,11 +173,15 @@ def parse_v4a_patch(patch_content: str) -> Tuple[List[PatchOperation], Optional[
                 if current_hunk and current_hunk.lines:
                     current_op.hunks.append(current_hunk)
                 
-                # Extract context hint
-                hint_match = re.match(r'@@\s*(.+?)\s*@@', line)
+                # Extract context hint: "@@ text @@", or Codex's "@@ text"
+                hint_match = re.match(r'@@\s*(.+?)\s*@@', line) or re.match(r'@@\s+(.+?)\s*$', line)
                 hint = hint_match.group(1) if hint_match else None
                 current_hunk = Hunk(context_hint=hint)
-                
+
+        elif line.strip() == '*** End of File':
+            # Codex's end-of-file anchor; not file content
+            pass
+
         elif current_op and line:
             # Parse hunk line
             if current_hunk is None:
