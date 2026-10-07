@@ -376,6 +376,25 @@ def inspect_session_database(
         temp_dir.cleanup()
 
 
+def _source_column_sql(table: str, column: str) -> str:
+    """Map the legacy nullable origin to its canonical unknown-origin value."""
+    quoted = f'"{column}"'
+    if table == "async_delegations" and column == "origin_session_id":
+        # Older delegation writers added this column as nullable TEXT. A
+        # rebuild retains those rows with the canonical default, without
+        # changing the source or relaxing any other integrity constraint.
+        return f"COALESCE({quoted}, '')"
+    return quoted
+
+
+def _copy_columns_sql(table: str, columns: list[str]) -> tuple[str, str, str]:
+    """Share insertion columns and source projection across both copy modes."""
+    quoted = ", ".join(f'"{column}"' for column in columns)
+    projection = ", ".join(_source_column_sql(table, column) for column in columns)
+    placeholders = ", ".join("?" for _ in columns)
+    return quoted, projection, placeholders
+
+
 def _copy_table(
     source: sqlite3.Connection,
     destination: sqlite3.Connection,
@@ -401,9 +420,8 @@ def _copy_table(
         result["error"] = "source and destination have no compatible columns"
         return result
 
-    quoted = ", ".join(f'"{column}"' for column in columns)
-    placeholders = ", ".join("?" for _ in columns)
-    select_sql = f'SELECT {quoted} FROM "{table}"'
+    quoted, source_columns_sql, placeholders = _copy_columns_sql(table, columns)
+    select_sql = f'SELECT {source_columns_sql} FROM "{table}"'
     insert_prefix = "INSERT OR REPLACE" if table == "state_meta" else "INSERT"
     insert_sql = f'{insert_prefix} INTO "{table}" ({quoted}) VALUES ({placeholders})'
 
@@ -552,10 +570,9 @@ def _copy_table_salvage(
             result["error"] += f": {details}"
         return result
 
-    quoted = ", ".join(f'"{column}"' for column in columns)
-    placeholders = ", ".join("?" for _ in columns)
+    quoted, source_columns_sql, placeholders = _copy_columns_sql(table, columns)
     select_sql = (
-        f'SELECT rowid, {quoted} FROM "{table}" '
+        f'SELECT rowid, {source_columns_sql} FROM "{table}" '
         "WHERE rowid BETWEEN ? AND ? ORDER BY rowid"
     )
     insert_sql = (

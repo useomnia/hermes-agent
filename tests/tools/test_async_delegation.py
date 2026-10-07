@@ -621,7 +621,10 @@ print(json.dumps({"delegation_id": r["delegation_id"], "row": row}, sort_keys=Tr
     consumer = r'''
 import json
 from tools.process_registry import process_registry
-evt = process_registry.completion_queue.get_nowait()
+assert process_registry.completion_queue.empty()
+events = process_registry.drain_notifications(session_key="owner-session")
+assert len(events) == 1
+evt = events[0][0]
 print(json.dumps({"event": evt, "remaining": process_registry.completion_queue.qsize()}, sort_keys=True))
 '''
     second = subprocess.run(
@@ -643,7 +646,7 @@ assert ad.mark_completion_delivered({delegation_id!r})
         text=True, capture_output=True, timeout=15, check=True,
     )
     probe = subprocess.run(
-        [sys.executable, "-c", "from tools.process_registry import process_registry; print(process_registry.completion_queue.qsize())"],
+        [sys.executable, "-c", "from tools.process_registry import process_registry; process_registry.restore_completions(); print(process_registry.completion_queue.qsize())"],
         cwd=repo, env=env, text=True, capture_output=True, timeout=15, check=True,
     )
     assert probe.stdout.strip().splitlines()[-1] == "0"
@@ -715,7 +718,10 @@ print(r["delegation_id"])
     consumer = r'''
 import json
 from tools.process_registry import process_registry
-evt = process_registry.completion_queue.get_nowait()
+assert process_registry.completion_queue.empty()
+events = process_registry.drain_notifications(session_key="owner-session")
+assert len(events) == 1
+evt = events[0][0]
 print(json.dumps(evt, sort_keys=True))
 '''
     second = subprocess.run(
@@ -737,7 +743,7 @@ assert ad.mark_completion_delivered({delegation_id!r})
         text=True, capture_output=True, timeout=15, check=True,
     )
     probe = subprocess.run(
-        [sys.executable, "-c", "from tools.process_registry import process_registry; print(process_registry.completion_queue.qsize())"],
+        [sys.executable, "-c", "from tools.process_registry import process_registry; process_registry.restore_completions(); print(process_registry.completion_queue.qsize())"],
         cwd=repo, env=env, text=True, capture_output=True, timeout=15, check=True,
     )
     assert probe.stdout.strip().splitlines()[-1] == "0"

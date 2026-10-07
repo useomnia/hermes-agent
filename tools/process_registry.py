@@ -159,6 +159,8 @@ class ProcessRegistry:
         "tcsetattr: Inappropriate ioctl for device",
     )
 
+    _completions_restored = False
+
     def __init__(self):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
@@ -182,13 +184,9 @@ class ProcessRegistry:
         # gateway drain this after each agent turn to auto-trigger new turns.
         import queue as _queue_mod
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
-        # Rehydrate durable delegation completions only at registry startup.
-        # Consumers still inject them as fresh turns through this existing rail.
-        try:
-            from tools.async_delegation import restore_undelivered_completions
-            restore_undelivered_completions(self.completion_queue)
-        except Exception as exc:
-            logger.warning("Could not restore async delegation completions: %s", exc)
+        # The singleton is constructed at import. Durable recovery belongs to
+        # its first consumer, so tool discovery cannot create a partial store.
+        import tools.async_delegation  # noqa: F401
 
         # Track sessions whose completion was already consumed by the agent
         # via wait/log.  Drain loops AND gateway/tui watchers skip notifications
@@ -1407,6 +1405,44 @@ class ProcessRegistry:
             skip_poll_observed and session_id in self._poll_observed
         )
 
+    @staticmethod
+    def _owns_event(evt: dict, session_key: str, owns_event) -> bool:
+        """Decide ownership before a consumer can suppress or deliver an event."""
+        is_async_delegation = evt.get("type") == "async_delegation"
+        evt_session_key = str(evt.get("session_key") or "")
+        evt_origin_sid = str(evt.get("origin_ui_session_id") or "")
+        requires_positive_proof = is_async_delegation or bool(evt_session_key or evt_origin_sid)
+        if owns_event is not None and requires_positive_proof:
+            try:
+                return bool(owns_event(evt))
+            except Exception:
+                return False  # A broken ownership check must never leak an event.
+        if session_key and requires_positive_proof:
+            return evt_session_key == session_key
+        return not (is_async_delegation and evt.get("restored"))
+
+    def restore_completions(self) -> int:
+        """Replay the launch profile's durable completions once, at first use.
+
+        Gateway boot and the CLI/TUI consumers opt in after session setup.
+        A secondary profile binding must not redirect this process-wide replay.
+        """
+        with self._lock:
+            if self._completions_restored:
+                return 0
+            self._completions_restored = True
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        token = set_hermes_home_override(None)
+        try:
+            from tools.async_delegation import restore_undelivered_completions
+            return restore_undelivered_completions(self.completion_queue)
+        except Exception as exc:
+            logger.warning("Could not restore async delegation completions: %s", exc)
+            return 0
+        finally:
+            reset_hermes_home_override(token)
+
     def drain_notifications(
         self,
         session_key: str = "",
@@ -1443,6 +1479,7 @@ class ProcessRegistry:
         filter is provided, ownerless async-delegation events remain
         fail-closed and require positive proof.
         """
+        self.restore_completions()
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
         while not self.completion_queue.empty():
@@ -1450,32 +1487,7 @@ class ProcessRegistry:
                 evt = self.completion_queue.get_nowait()
             except Exception:
                 break
-            # Positive-proof ownership beats bare key equality. Delegation
-            # payloads always require proof; ordinary events require it once
-            # they carry routing metadata. Ownerless ordinary events preserve
-            # legacy single-session delivery.
-            is_async_delegation = evt.get("type") == "async_delegation"
-            evt_session_key = str(evt.get("session_key") or "")
-            evt_origin_sid = str(evt.get("origin_ui_session_id") or "")
-            requires_positive_proof = is_async_delegation or bool(
-                evt_session_key or evt_origin_sid
-            )
-            if owns_event is not None and requires_positive_proof:
-                try:
-                    owned = bool(owns_event(evt))
-                except Exception:
-                    owned = False  # fail closed — never leak on a broken check
-                if not owned:
-                    requeue.append(evt)
-                    continue
-            elif session_key and requires_positive_proof:
-                if evt_session_key != session_key:
-                    requeue.append(evt)
-                    continue
-            elif is_async_delegation and evt.get("restored"):
-                # Durable restore can enqueue previous-process payloads into a
-                # fresh registry. An unfiltered legacy drain cannot prove
-                # ownership, so leave those events queued for the owner.
+            if not self._owns_event(evt, session_key, owns_event):
                 requeue.append(evt)
                 continue
             # Local consumed/observed state may suppress only events this
