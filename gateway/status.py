@@ -11,6 +11,8 @@ that will be useful when we add named profiles (multiple agents running
 concurrently under distinct configurations).
 """
 
+import atexit
+import copy
 import hashlib
 import json
 import logging
@@ -973,6 +975,74 @@ def write_pid_file() -> None:
         raise
 
 
+class _RuntimeStatusWriter:
+    """Persist the newest runtime-status snapshot on one background thread.
+
+    Status updates are diagnostics: callers publish and move on, and only the
+    latest snapshot is ever written (each write is a temp file + fsync). In-process
+    readers are served from the canonical in-memory record, so a pending write is
+    never visible as stale state."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._pending: Optional[tuple[int, Path, dict[str, Any]]] = None
+        self._submitted = 0
+        self._settled = 0
+        self._thread: Optional[threading.Thread] = None
+
+    def submit(self, path: Path, payload: dict[str, Any]) -> None:
+        with self._condition:
+            self._submitted += 1
+            self._pending = (self._submitted, path, copy.deepcopy(payload))
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._run, name="gateway-runtime-status-writer", daemon=True
+                )
+                self._thread.start()
+            self._condition.notify_all()
+
+    def flush(self, timeout: float = 2.0) -> bool:
+        """Wait until every submitted snapshot has been written (or failed)."""
+        deadline = time.monotonic() + max(timeout, 0.0)
+        with self._condition:
+            target = self._submitted
+            while self._settled < target:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+            return True
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None:
+                    self._condition.wait()
+                generation, path, payload = self._pending
+                self._pending = None
+            try:
+                _write_json_file(path, payload)
+            except Exception as exc:  # noqa: BLE001 — diagnostics must not kill the writer
+                logger.debug("Failed to persist gateway runtime status: %s", exc)
+            with self._condition:
+                self._settled = max(self._settled, generation)
+                self._condition.notify_all()
+
+
+_runtime_status_writer = _RuntimeStatusWriter()
+_runtime_status_lock = threading.RLock()
+# (path, payload) this process last published; the canonical record for its own file.
+_runtime_status_record: Optional[tuple[Path, dict[str, Any]]] = None
+
+
+def flush_runtime_status(timeout: float = 2.0) -> bool:
+    """Bounded wait for the latest runtime-status snapshot to reach disk."""
+    return _runtime_status_writer.flush(timeout=timeout)
+
+
+atexit.register(flush_runtime_status, 1.0)
+
+
 def write_runtime_status(
     *,
     gateway_state: Any = _UNSET,
@@ -985,9 +1055,44 @@ def write_runtime_status(
     error_message: Any = _UNSET,
     served_profiles: Any = _UNSET,
 ) -> None:
-    """Persist gateway runtime health information for diagnostics/status."""
+    """Publish gateway runtime health information for diagnostics/status.
+
+    Updates the in-process record immediately and persists it in the
+    background; ``flush_runtime_status`` waits for the disk copy."""
     path = _get_runtime_status_path()
-    payload = _read_json_file(path) or _build_runtime_status_record()
+    with _runtime_status_lock:
+        _publish_runtime_status_locked(
+            path,
+            gateway_state=gateway_state,
+            exit_reason=exit_reason,
+            restart_requested=restart_requested,
+            active_agents=active_agents,
+            platform=platform,
+            platform_state=platform_state,
+            error_code=error_code,
+            error_message=error_message,
+            served_profiles=served_profiles,
+        )
+
+
+def _publish_runtime_status_locked(
+    path: Path,
+    *,
+    gateway_state: Any,
+    exit_reason: Any,
+    restart_requested: Any,
+    active_agents: Any,
+    platform: Any,
+    platform_state: Any,
+    error_code: Any,
+    error_message: Any,
+    served_profiles: Any,
+) -> None:
+    global _runtime_status_record
+    if _runtime_status_record is not None and _runtime_status_record[0] == path:
+        payload = copy.deepcopy(_runtime_status_record[1])
+    else:
+        payload = _read_json_file(path) or _build_runtime_status_record()
     current_record = _build_pid_record()
     payload.setdefault("platforms", {})
     payload["kind"] = current_record["kind"]
@@ -1021,7 +1126,8 @@ def write_runtime_status(
         platform_payload["updated_at"] = _utc_now_iso()
         payload["platforms"][platform] = platform_payload
 
-    _write_json_file(path, payload)
+    _runtime_status_record = (path, payload)
+    _runtime_status_writer.submit(path, payload)
 
 
 def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:
@@ -1032,7 +1138,11 @@ def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]
     can do so without mutating ``HERMES_HOME`` in-process.  Defaults to
     the active profile's ``gateway_state.json``.
     """
-    return _read_json_file(path or _get_runtime_status_path())
+    target = path or _get_runtime_status_path()
+    with _runtime_status_lock:
+        if _runtime_status_record is not None and _runtime_status_record[0] == target:
+            return copy.deepcopy(_runtime_status_record[1])
+    return _read_json_file(target)
 
 
 # Max age of a persisted ``gateway_state.json`` snapshot before its liveness

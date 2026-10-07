@@ -1636,7 +1636,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home, get_hermes_home_override
-from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
+from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, fast_safe_load, is_truthy_value
 _hermes_home = get_hermes_home()
 
 
@@ -1696,7 +1696,7 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
     try:
         import yaml as _yaml
         with open(config_path, encoding="utf-8") as f:
-            cfg = _yaml.safe_load(f) or {}
+            cfg = fast_safe_load(f) or {}
         from hermes_cli.config import _expand_env_vars
         cfg = _expand_env_vars(cfg)
         # Managed scope: keep administrator-pinned values authoritative on every
@@ -1862,7 +1862,7 @@ if _config_path.exists():
     try:
         import yaml as _yaml
         with open(_config_path, encoding="utf-8") as _f:
-            _cfg = _yaml.safe_load(_f) or {}
+            _cfg = fast_safe_load(_f) or {}
         # Expand ${ENV_VAR} references before bridging to env vars.
         from hermes_cli.config import _expand_env_vars
         _cfg = _expand_env_vars(_cfg)
@@ -2309,6 +2309,36 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 _UNSET = object()
 
 
+def _start_offline_marker_invalidation() -> "concurrent.futures.Future[bool]":
+    """Invalidate the offline quiescence marker on a worker thread."""
+    from gateway.quiescence import mark_offline_quiescence_unknown
+
+    future: "concurrent.futures.Future[bool]" = concurrent.futures.Future()
+
+    def _run() -> None:
+        try:
+            future.set_result(bool(mark_offline_quiescence_unknown()))
+        except BaseException as exc:  # noqa: BLE001 — surfaced by the awaiting start
+            future.set_exception(exc)
+
+    threading.Thread(target=_run, name="offline-marker-invalidate", daemon=True).start()
+    return future
+
+
+async def _require_offline_marker_invalidated(
+    invalidation: "Optional[concurrent.futures.Future[bool]]",
+) -> None:
+    """Fail closed unless the previous offline quiescence marker is durably invalidated.
+
+    ``None`` is a runner built without ``__init__`` (test doubles), which never
+    started an invalidation."""
+    if invalidation is not None and not await asyncio.wrap_future(invalidation):
+        raise RuntimeError(
+            "Could not durably invalidate the offline quiescence marker; "
+            "refusing to admit gateway work"
+        )
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -2428,7 +2458,7 @@ def _try_resolve_fallback_provider() -> dict | None:
         if not cfg_path.exists():
             return None
         with open(cfg_path, encoding="utf-8") as _f:
-            cfg = _y.safe_load(_f) or {}
+            cfg = fast_safe_load(_f) or {}
         fb_list = get_fallback_chain(cfg)
         if not fb_list:
             return None
@@ -2829,7 +2859,7 @@ def _load_gateway_config() -> dict:
             if config_path.exists():
                 import yaml
                 with open(config_path, 'r', encoding='utf-8') as f:
-                    raw = yaml.safe_load(f) or {}
+                    raw = fast_safe_load(f) or {}
         except Exception:
             logger.debug("Could not load gateway config from %s", config_path)
             raw = {}
@@ -3377,14 +3407,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self.config = config if config is not None else load_gateway_config_for_runner()
         # Invalidate any prior clean quiescence marker before this process can
         # admit work. A cold reader must never mistake a stale marker from a
-        # previous gateway generation for proof about this one.
-        from gateway.quiescence import mark_offline_quiescence_unknown
-
-        if not mark_offline_quiescence_unknown():
-            raise RuntimeError(
-                "Could not durably invalidate the offline quiescence marker; "
-                "refusing to admit gateway work"
-            )
+        # previous gateway generation for proof about this one. The durable
+        # write (two fsyncs) overlaps the rest of the boot; ``start`` awaits it
+        # before anything that can admit work.
+        self._offline_marker_invalidation = _start_offline_marker_invalidation()
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -5875,7 +5901,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cfg_path = _hermes_home / "config.yaml"
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
+                    cfg = fast_safe_load(_f) or {}
                 return cfg.get("provider_routing", {}) or {}
         except Exception:
             pass
@@ -5894,7 +5920,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cfg_path = _hermes_home / "config.yaml"
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
+                    cfg = fast_safe_load(_f) or {}
                 fb = get_fallback_chain(cfg)
                 if fb:
                     return fb
@@ -5923,7 +5949,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._fallback_model = None
                 return self._fallback_model
             with open(cfg_path, encoding="utf-8") as _f:
-                cfg = _y.safe_load(_f) or {}
+                cfg = fast_safe_load(_f) or {}
         except Exception:
             # Transient failure — keep last known-good chain.
             logger.debug(
@@ -8224,6 +8250,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "plugin discovery failed at gateway startup", exc_info=True,
             )
         _boot_mark("plugins")
+        await _require_offline_marker_invalidated(
+            getattr(self, "_offline_marker_invalidation", None)
+        )
 
         # Register the generic relay adapter when a connector relay URL is
         # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
@@ -25035,7 +25064,7 @@ def main():
     if args.config:
         import yaml
         with open(args.config, encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            data = fast_safe_load(f) or {}
             config = GatewayConfig.from_dict(data)
     
     # start_gateway() performs the full graceful teardown (adapters
@@ -25107,6 +25136,11 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
     # could still take up to its timeout on a wedged disk, and these locks must
     # never be stranded. os._exit skips atexit, and the early SystemExit exit
     # paths never run _stop_impl, so release here (idempotent).
+    try:
+        from gateway.status import flush_runtime_status
+        flush_runtime_status(timeout=1.0)
+    except Exception:
+        pass
     try:
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
