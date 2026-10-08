@@ -1350,9 +1350,14 @@ EOF
     if [ -n "$INSTALL_COMMIT" ]; then
         log_info "Pinning checkout to commit $INSTALL_COMMIT..."
         if ! git cat-file -e "$INSTALL_COMMIT^{commit}" 2>/dev/null; then
-            git fetch origin "$INSTALL_COMMIT" || true
+            local pin_fetch_args=()
+            # Preserve the shallow install's history boundary for an absent pin.
+            if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+                pin_fetch_args=(--depth 1)
+            fi
+            git fetch "${pin_fetch_args[@]}" origin "$INSTALL_COMMIT" || true
         fi
-        git checkout --detach "$INSTALL_COMMIT"
+        git checkout --detach "$INSTALL_COMMIT" || return $?
     fi
 
     log_success "Repository ready"
