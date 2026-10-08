@@ -3167,8 +3167,8 @@ IMAGE_TOKEN_COST = 1500
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     """Rough token estimate for a message list (pre-flight only).
 
-    Image parts (base64 PNG/JPEG) are counted as a flat ~1500 tokens per
-    image — the Anthropic pricing model — instead of counting raw base64
+    Image parts (base64 PNG/JPEG) use a rough allowance of 1500 tokens per
+    image — actual usage varies by provider — instead of counting raw base64
     character length. Without this, a single ~1MB screenshot would be
     estimated at ~250K tokens and trigger premature context compression.
     """

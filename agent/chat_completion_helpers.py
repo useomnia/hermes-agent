@@ -145,6 +145,11 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
     def _chars(value: Any) -> int:
         return _payload_chars(value, image_cost)
 
+    def _opaque_chars(value: Any) -> int:
+        # Tools/instructions are text even when a schema example looks like
+        # an image part; only conversational payloads can contain images.
+        return 0 if value is None else len(str(value))
+
     if isinstance(api_payload, list):
         return sum(_chars(item) for item in api_payload) // 4
     if not isinstance(api_payload, dict):
@@ -153,10 +158,14 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
     if isinstance(messages, list):
         total_chars = sum(_chars(item) for item in messages)
         if "tools" in api_payload:
-            total_chars += _chars(api_payload.get("tools"))
+            total_chars += _opaque_chars(api_payload.get("tools"))
         return total_chars // 4
     if "input" in api_payload:
-        return sum(_chars(api_payload.get(k)) for k in ("input", "instructions", "tools")) // 4
+        return (
+            _chars(api_payload["input"])
+            + _opaque_chars(api_payload.get("instructions"))
+            + _opaque_chars(api_payload.get("tools"))
+        ) // 4
     return sum(_chars(value) for value in api_payload.values()) // 4
 
 
@@ -3444,6 +3453,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             index=0,
             message=mock_message,
             finish_reason=effective_finish_reason,
+            # Keep the provider's reason while routing incomplete arguments
+            # through bounded recovery; malformed JSON is not proof of a cap.
+            provider_finish_reason=finish_reason,
         )
         return SimpleNamespace(
             id="stream-" + str(uuid.uuid4()),

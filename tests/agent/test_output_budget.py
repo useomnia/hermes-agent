@@ -232,3 +232,36 @@ def test_catalog_budget_reaches_serialized_sdk_requests_and_retries(catalog, ini
             cap = boosted_output_cap(a, kwargs["max_tokens"], n + 1)
     assert [body["max_tokens"] for body in bodies] == expected
     assert all(body["model"] == a.model for body in bodies)
+
+
+@pytest.mark.parametrize("mode", ["chat_completions", "codex_responses"])
+@pytest.mark.parametrize("initial", [None, 4096])
+def test_image_encoding_size_cannot_starve_initial_or_recovery_budget(catalog, mode, initial):
+    from copy import deepcopy
+
+    a = agent(api_mode=mode, max_tokens=initial,
+              context_compressor=SimpleNamespace(context_length=1050000))
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 1400000}}
+    messages = [{"role": "user", "content": [{"type": "text", "text": "normal text " * 70000}] + [image] * 4}]
+    field = "max_tokens" if mode == "chat_completions" else "max_output_tokens"
+    payload = {"messages" if mode == "chat_completions" else "input": messages}
+    if initial:
+        payload[field] = initial
+    original = deepcopy(payload)
+    cap = None
+    budgets = []
+    for attempt in range(5):
+        request = apply_output_budget(a, payload, recovery_cap=cap)
+        budgets.append(request[field])
+        cap = boosted_output_cap(a, request[field], attempt + 1)
+    assert budgets == ([128000] * 5 if initial is None else [4096, 8192, 16384, 32768, 65536])
+    assert payload == original
+
+
+def test_exhausted_rough_context_defers_to_provider_instead_of_one_token(catalog):
+    a = agent(context_compressor=SimpleNamespace(context_length=2000))
+    payload = {"messages": [{"role": "user", "content": "x" * 12000}]}
+    assert apply_output_budget(a, payload)["max_tokens"] == 128000
+    # A provider-derived recovery cap remains authoritative even when our
+    # rough input estimate still overshoots the real prompt size.
+    assert apply_output_budget(a, payload, recovery_cap=8192)["max_tokens"] == 8192

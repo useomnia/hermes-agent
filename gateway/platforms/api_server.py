@@ -10508,11 +10508,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     isinstance(result, dict) and result.get("response_previewed")
                 )
                 streamed_final_block = "".join(current_message_text_parts)
-                # A failed run's final_response is its error summary, not a
-                # reply: it travels in response.failed and must not become an
-                # assistant message a client reads as the Turn's answer.
-                run_failed = bool(isinstance(result, dict) and result.get("failed"))
-                if not run_failed:
+                # Error summaries travel in response.failed. A partial result
+                # can also carry a real answer distinct from its error; retain
+                # that answer without presenting the diagnostic as a reply.
+                run_failed = bool(isinstance(result, dict) and (
+                    result.get("failed")
+                    or result.get("partial")
+                    # A deliberate iteration-budget summary also reports
+                    # completed=False; without an error it remains a normal
+                    # terminal reply for existing clients.
+                    or result.get("completed") is False and result.get("error")
+                ))
+                final_is_error = run_failed and (
+                    bool(result.get("failed"))
+                    or final_response == result.get("error")
+                )
+                if not final_is_error:
                     if final_response and not streamed_final_block and not response_previewed:
                         _emit_text(final_response, from_stream=False)
                     elif (
@@ -10532,11 +10543,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 _close_text_item()
                 _close_reasoning_item()
 
-                log = self._turn_event_logs.get_log(run_id)
-                failure_reason = log.failure_reason if log is not None else None
                 was_interrupted = bool(
                     isinstance(result, dict) and result.get("interrupted")
                 )
+                if run_id not in self._stopping_run_ids and not was_interrupted:
+                    # Completed blocks still need their annotations when a later
+                    # generation fails. Drain before either terminal event.
+                    await _drain_annotation_tasks()
+                log = self._turn_event_logs.get_log(run_id)
+                failure_reason = log.failure_reason if log is not None else None
 
                 def _close_log_cap_exceeded() -> None:
                     error_msg = "Turn event log exceeded the 8 MiB cap"
@@ -10578,7 +10593,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
                 elif run_failed:
-                    error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
+                    error_msg = _redact_api_error_text(
+                        result.get("error") or "Agent run ended before completing the request"
+                    )
                     self._set_run_status(
                         run_id,
                         "failed",
@@ -10593,34 +10610,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     _legacy_terminal("run.failed", error=error_msg)
                 else:
-                    await _drain_annotation_tasks()
-                    log = self._turn_event_logs.get_log(run_id)
-                    annotation_failure_reason = (
-                        log.failure_reason if log is not None else None
+                    self._set_run_status(
+                        run_id,
+                        "completed",
+                        output=final_response,
+                        usage=usage,
+                        last_event="run.completed",
+                        completed_at=time.time(),
                     )
-                    # A log-cap breach also marks the run stopping (it stops the
-                    # run through the same cooperative path a user stop uses),
-                    # so it is read first — the run failed on its own cap, it
-                    # was not cancelled.
-                    if annotation_failure_reason == "log_cap_exceeded":
-                        _close_log_cap_exceeded()
-                    elif run_id in self._stopping_run_ids:
-                        _close_cancelled()
-                    else:
-                        self._set_run_status(
-                            run_id,
-                            "completed",
-                            output=final_response,
-                            usage=usage,
-                            last_event="run.completed",
-                            completed_at=time.time(),
-                        )
-                        emitter.response_completed()
-                        _legacy_terminal(
-                            "run.completed",
-                            output=final_response,
-                            usage=usage,
-                        )
+                    emitter.response_completed()
+                    _legacy_terminal(
+                        "run.completed",
+                        output=final_response,
+                        usage=usage,
+                    )
             except asyncio.CancelledError:
                 _close_open_tool_calls()
                 missed_steer = await self._close_run_steering(run_id, agent)

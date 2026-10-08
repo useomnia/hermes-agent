@@ -710,3 +710,78 @@ class TestRouterRewriteTruncationMessageIsHonest:
             "the output length limit — the honest-message fix must not blank "
             "out the accurate case (#91717 scenario 1)."
         )
+
+
+@pytest.mark.parametrize("openrouter", [False, True])
+@pytest.mark.parametrize("recover,finish_reason", [
+    (False, "length"), (True, "length"),
+    (False, "tool_calls"), (True, "tool_calls"), (True, "stop"),
+])
+def test_streamed_malformed_arguments_get_fresh_bounded_retries(
+    loop_agent, recover, openrouter, finish_reason,
+):
+    """Exercise assembly + conversation recovery, including cache reset after success."""
+    from copy import deepcopy
+
+    requests = []
+    saved_headers = {"x-openrouter-cache": "true", "X-Correlation-ID": "test"}
+    original_build = loop_agent._build_api_kwargs
+    if not openrouter:
+        loop_agent.base_url = "https://example.com/v1"
+        loop_agent._base_url_lower = loop_agent.base_url
+    loop_agent.valid_tool_names = {"terminal"}
+    loop_agent.stream_delta_callback = lambda text: None
+    loop_agent.tool_gen_event_callback = lambda *args: None
+
+    def build(messages):
+        request = original_build(messages)
+        request["extra_headers"] = saved_headers
+        return request
+
+    def generate(**request):
+        requests.append(deepcopy(request))
+        attempt = len(requests)
+        if recover and attempt == 3:
+            return iter([_make_stream_chunk(content="Done", finish_reason="stop")])
+        if finish_reason == "stop" and attempt == 1:
+            return iter([_make_stream_chunk(finish_reason="stop")])
+        args = '{"command":"printf ok"}' if recover and attempt == 2 else '{"command":"printf'
+        return iter([
+            _make_stream_chunk(tool_calls=[_make_tool_call_delta(tc_id=f"call_{attempt}", name="terminal", arguments=args)]),
+            _make_stream_chunk(finish_reason="tool_calls" if recover and attempt == 2 else finish_reason),
+        ])
+
+    client = MagicMock()
+    client.chat.completions.create.side_effect = generate
+    with (
+        patch.object(loop_agent, "_build_api_kwargs", side_effect=build),
+        patch.object(loop_agent, "_create_request_openai_client", return_value=client),
+        patch.object(loop_agent, "_close_request_openai_client"),
+        patch.object(loop_agent, "_persist_session"),
+        patch.object(loop_agent, "_save_trajectory"),
+        patch.object(loop_agent, "_cleanup_task_resources"),
+        patch("run_agent.handle_function_call", return_value='{"output":"ok"}') as execute,
+    ):
+        result = loop_agent.run_conversation("Run printf ok")
+
+    assert saved_headers == {"x-openrouter-cache": "true", "X-Correlation-ID": "test"}
+    assert requests[0]["extra_headers"] == saved_headers
+    for request in requests[1:2] if recover else requests[1:]:
+        expected = {"X-OpenRouter-Cache": "false", "X-Correlation-ID": "test"} if openrouter else saved_headers
+        assert request["extra_headers"] == expected
+    if recover:
+        assert result["completed"] is True
+        assert result["final_response"] == "Done"
+        assert len(requests) == 3
+        assert requests[2]["extra_headers"] == saved_headers
+        execute.assert_called_once()
+    else:
+        assert len(requests) == 5
+        assert result["completed"] is False
+        assert result["partial"] is True
+        if finish_reason == "length":
+            assert "output length limit" in result["error"]
+        else:
+            assert "output length limit" not in result["error"]
+            assert "finish_reason='tool_calls'" in result["error"]
+        execute.assert_not_called()

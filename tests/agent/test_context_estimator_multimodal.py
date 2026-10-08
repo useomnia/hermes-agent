@@ -44,9 +44,32 @@ def test_schema_nodes_with_structured_type_values_keep_the_legacy_estimate():
     payload = {"messages": messages, "tools": _tools("type")}
     renamed = {"messages": messages, "tools": _tools("kind")}  # equal-length key: identical walk
     assert estimate_request_context_tokens(payload) == estimate_request_context_tokens(renamed)
-    # A real image part in the same request is still priced at the learned cost.
+    # A real image part in the same request is still priced at the shared cost.
     chat = {"messages": [{"role": "user", "content": [
         {"type": "text", "text": "look"},
         {"type": "image_url", "image_url": {"url": _B64}},
     ]}], "tools": _tools("type")}
     assert DEFAULT_IMAGE_TOKEN_COST <= estimate_request_context_tokens(chat) < DEFAULT_IMAGE_TOKEN_COST + 400
+
+
+def test_compression_and_output_budget_charge_the_same_image_cost():
+    from agent.context_compressor import _content_length_for_budget
+    from agent.model_metadata import estimate_messages_tokens_rough
+
+    image = {"type": "image_url", "image_url": {"url": _B64}}
+    messages = [{"role": "user", "content": [image]}]
+    tail = _content_length_for_budget([image]) // 4
+    preflight = estimate_messages_tokens_rough(messages)
+    wire = estimate_request_context_tokens(messages)
+    assert tail == DEFAULT_IMAGE_TOKEN_COST
+    assert abs(preflight - tail) < 100
+    assert abs(wire - tail) < 100
+
+
+def test_image_examples_in_tool_schemas_are_text():
+    image_example = {"type": "image_url", "image_url": {"url": _B64}}
+    schema = [{"type": "function", "function": {"name": "store_image", "parameters": {
+        "type": "object", "properties": {"payload": {"default": image_example}},
+    }}}]
+    # Schema bytes consume text context, including an image-shaped default.
+    assert estimate_request_context_tokens({"messages": [], "tools": schema}) == len(str(schema)) // 4

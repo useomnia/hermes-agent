@@ -2120,6 +2120,20 @@ def run_conversation(
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
                 api_kwargs = agent._build_api_kwargs(api_messages)
+                if (
+                    truncated_tool_call_retries > 0
+                    or length_continue_retries > 0
+                    or agent._empty_content_retries > 0
+                ) and agent._is_openrouter_url():
+                    # Recovery needs a fresh generation. The response cache
+                    # otherwise replays the same broken result at the catalog
+                    # ceiling. This leaves provider prompt/KV caching intact.
+                    headers = api_kwargs.get("extra_headers") or {}
+                    api_kwargs["extra_headers"] = {
+                        key: value for key, value in headers.items()
+                        if key.lower() != "x-openrouter-cache"
+                    }
+                    api_kwargs["extra_headers"]["X-OpenRouter-Cache"] = "false"
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -3029,11 +3043,21 @@ def run_conversation(
                                     force=True,
                                 )
                             agent._cleanup_task_resources(effective_task_id)
+                            _provider_finish = getattr(
+                                response.choices[0], "provider_finish_reason",
+                                response.choices[0].finish_reason,
+                            )
+                            _truncation_error = (
+                                "Response truncated due to output length limit"
+                                if _provider_finish == "length"
+                                else "Provider returned incomplete tool arguments "
+                                f"(finish_reason={_provider_finish!r}); the tool was not executed"
+                            )
                             _final_response = (
                                 "Stream repeatedly dropped mid tool-call (network); "
                                 "the tool was not executed"
                                 if _is_stub_stall
-                                else "Response truncated due to output length limit"
+                                else _truncation_error
                             )
                             agent._persist_session(messages, conversation_history)
                             return {
