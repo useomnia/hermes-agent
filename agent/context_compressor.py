@@ -29,6 +29,7 @@ from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
+    IMAGE_TOKEN_COST,
     MINIMUM_CONTEXT_LENGTH,
     get_model_context_length,
     estimate_messages_tokens_rough,
@@ -629,16 +630,9 @@ def _collect_protected_skill_names(
 
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
-# Flat token cost per attached image part.  Real cost varies by provider and
-# dimensions (Anthropic ≈ width×height/750, GPT-4o up to ~1700 for
-# high-detail 2048×2048, Gemini 258/tile), but 1600 is a realistic ceiling
-# that keeps compression budgeting honest for multi-image conversations.
-# Matches Claude Code's IMAGE_TOKEN_ESTIMATE constant.
-_IMAGE_TOKEN_ESTIMATE = 1600
-# Same figure expressed in the char-budget currency the rest of the
-# compressor speaks in.  Used when accumulating message "content length"
-# for tail-cut decisions.
-_IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
+# Use the same image price as preflight and prepared-request output budgeting.
+_IMAGE_TOKEN_ESTIMATE = IMAGE_TOKEN_COST
+_IMAGE_CHAR_EQUIVALENT = IMAGE_TOKEN_COST * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
 # Hard ceiling for the deterministic summary-failure handoff.  The fallback is

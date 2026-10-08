@@ -121,7 +121,13 @@ def apply_output_budget(agent: Any, kwargs: dict, *, recovery_cap: Optional[int]
 
         # Estimate the prepared wire request, including tool schemas and Responses
         # instructions. Existing overflow recovery remains authoritative if it differs.
-        cap = min(cap, max(1, context - estimate_request_context_tokens(kwargs)))
+        available = context - estimate_request_context_tokens(kwargs)
+        # A rough estimate is not proof of overflow. Preflight already tries
+        # compaction; when it defers to recent real usage, do not undo that
+        # decision by manufacturing a one-token generation. A real overflow
+        # must reach the existing provider-error/compaction recovery path.
+        if available > 0:
+            cap = min(cap, available)
     if fields:
         for body, name in fields:
             body[name] = cap

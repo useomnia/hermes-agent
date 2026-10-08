@@ -3762,7 +3762,8 @@ async def test_session_id_without_gateway_key_uses_legacy_empty_history() -> Non
 
 
 @pytest.mark.asyncio
-async def test_stop_wind_down_is_logged_and_visible_to_attached_subscriber() -> None:
+@pytest.mark.parametrize("incomplete_flags", [{}, {"partial": True, "completed": False}])
+async def test_stop_wind_down_is_logged_and_visible_to_attached_subscriber(incomplete_flags) -> None:
     adapter = _make_adapter()
     running = threading.Event()
     interrupted = threading.Event()
@@ -3789,6 +3790,7 @@ async def test_stop_wind_down_is_logged_and_visible_to_attached_subscriber() -> 
             return {
                 "final_response": "",
                 "interrupted": True,
+                **incomplete_flags,
                 "messages": [
                     {
                         "role": "assistant",
@@ -4036,3 +4038,50 @@ def test_client_projection_withheld_skips_hooks_for_non_allowlisted_tools() -> N
         assert client_projection_withheld("terminal", {"command": "ls"}) is False
 
     resolve.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flags", [
+    {"partial": True}, {"completed": False}, {"failed": True},
+    {"partial": True, "completed": False},
+])
+async def test_incomplete_run_preserves_blocks_annotations_and_failed_replay(monkeypatch, flags):
+    adapter = _make_adapter()
+    summary = "Provider returned incomplete tool arguments"
+    partial = "Saved the report at `/brand/report.pdf`."
+    annotation = _file_annotation("/brand/report.pdf")
+    monkeypatch.setenv(api_server_module._OMNIO_TURN_FINALIZE_HOOK_ENV, "http://127.0.0.1:8642/finalize")
+    monkeypatch.setattr(api_server_module, "_request_turn_finalize_annotations", AsyncMock(return_value=[annotation]))
+
+    def build(**callbacks):
+        def run(**kwargs):
+            callbacks["stream_delta_callback"](partial)
+            return {"final_response": summary, "error": summary, "pending_steer": "Keep the report", **flags}
+        return _agent(run)
+
+    with patch.object(adapter, "_create_agent", side_effect=build):
+        started, events = await _run_without_http_server(adapter, {"input": "make report"})
+    run_id = json.loads(started.text)["run_id"]
+    assert adapter._run_statuses[run_id]["status"] == "failed"
+    assert events[-1]["type"] == "response.failed"
+    assert events[-1]["response"]["error"]["message"] == summary
+    assert "response.completed" not in [event["type"] for event in events]
+    text = "".join(event.get("delta", "") for event in events if event["type"] == "response.output_text.delta")
+    assert text == partial
+    assert any(event["type"] == "response.output_text.annotation.added" for event in events[:-1])
+    assert any(event["type"] == "response.omnio.steer_missed" for event in events[:-1])
+    assert [event["sequence_number"] for event in events] == list(range(1, len(events) + 1))
+    log = adapter._turn_event_logs.get_log(run_id)
+    assert log.terminal and log.failure_reason == "run_failed"
+
+
+@pytest.mark.asyncio
+async def test_unstreamed_partial_answer_is_preserved_on_failure():
+    adapter = _make_adapter()
+    with patch.object(adapter, "_create_agent", return_value=_agent(lambda **kwargs: {
+        "final_response": "Here is the first part", "partial": True,
+        "error": "Response remained truncated after continuation attempts",
+    })):
+        _, events = await _run_without_http_server(adapter, {"input": "long answer"})
+    assert events[-1]["type"] == "response.failed"
+    assert any(event.get("delta") == "Here is the first part" for event in events)
