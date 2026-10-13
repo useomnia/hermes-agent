@@ -111,6 +111,7 @@ _CLONE_ALL_DEFAULT_EXCLUDE_ROOT: frozenset[str] = frozenset({
 #
 # Rationale per item:
 #   state.db (+wal/shm) — SQLite session store (can reach many GB)
+#   runs_idempotency.db (+wal/shm) — source runtime's accepted Turn identities
 #   sessions            — per-session transcript/data dirs
 #   backups             — `hermes backup` archives
 #   state-snapshots     — quick-backup snapshot trees
@@ -119,6 +120,9 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
     "state.db",
     "state.db-wal",
     "state.db-shm",
+    "runs_idempotency.db",
+    "runs_idempotency.db-wal",
+    "runs_idempotency.db-shm",
     "sessions",
     "backups",
     "state-snapshots",

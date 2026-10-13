@@ -2309,34 +2309,8 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 _UNSET = object()
 
 
-def _start_offline_marker_invalidation() -> "concurrent.futures.Future[bool]":
-    """Invalidate the offline quiescence marker on a worker thread."""
-    from gateway.quiescence import mark_offline_quiescence_unknown
-
-    future: "concurrent.futures.Future[bool]" = concurrent.futures.Future()
-
-    def _run() -> None:
-        try:
-            future.set_result(bool(mark_offline_quiescence_unknown()))
-        except BaseException as exc:  # noqa: BLE001 — surfaced by the awaiting start
-            future.set_exception(exc)
-
-    threading.Thread(target=_run, name="offline-marker-invalidate", daemon=True).start()
-    return future
 
 
-async def _require_offline_marker_invalidated(
-    invalidation: "Optional[concurrent.futures.Future[bool]]",
-) -> None:
-    """Fail closed unless the previous offline quiescence marker is durably invalidated.
-
-    ``None`` is a runner built without ``__init__`` (test doubles), which never
-    started an invalidation."""
-    if invalidation is not None and not await asyncio.wrap_future(invalidation):
-        raise RuntimeError(
-            "Could not durably invalidate the offline quiescence marker; "
-            "refusing to admit gateway work"
-        )
 
 
 def _warm_agent_stack() -> None:
@@ -3456,12 +3430,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
-        # Invalidate any prior clean quiescence marker before this process can
-        # admit work. A cold reader must never mistake a stale marker from a
-        # previous gateway generation for proof about this one. The durable
-        # write (two fsyncs) overlaps the rest of the boot; ``start`` awaits it
-        # before anything that can admit work.
-        self._offline_marker_invalidation = _start_offline_marker_invalidation()
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -5003,16 +4971,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # zero work. Keep shutdown polling alive until the owner recovers.
             return 1 if strict else 0
 
-    def _omnio_quiescence_force_active(self) -> bool:
-        """Whether the API adapter has a force-quiescence admission gate."""
-        try:
-            adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
-            return bool(
-                getattr(adapter, "_quiescence_force_latched", False)
-                or getattr(adapter, "_quiescence_force_in_progress", False)
-            )
-        except Exception:
-            return False
 
     # ── scale-to-zero idle detection / dormant-quiesce (Phase 0) ──────────────
     # The gateway-side BEHAVIOUR that consumes the relay scale-to-zero primitives
@@ -8301,9 +8259,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "plugin discovery failed at gateway startup", exc_info=True,
             )
         _boot_mark("plugins")
-        await _require_offline_marker_invalidated(
-            getattr(self, "_offline_marker_invalidation", None)
-        )
+
 
         # Register the generic relay adapter when a connector relay URL is
         # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
@@ -10072,29 +10028,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _task.cancel()
             self._background_tasks.clear()
 
-            # Preserve a force-retired handover generation in the cold marker
-            # even when this process exits cleanly. A replacement gateway
-            # must not silently reopen writer admission after a force proof.
-            _api_quiescence_adapter = self.adapters.get(Platform.API_SERVER)
-            _force_quiescence_latched = bool(
-                getattr(_api_quiescence_adapter, "_quiescence_force_latched", False)
-            )
-            _force_quiescence_generation = getattr(
-                _api_quiescence_adapter, "_quiescence_generation", None
-            )
-            _force_quiescence_boot_id = getattr(
-                _api_quiescence_adapter, "_quiescence_force_boot_id", None
-            )
-            _force_quiescence_request_id = getattr(
-                _api_quiescence_adapter, "_quiescence_force_request_id", None
-            )
-            _force_quiescence_request_required = bool(
-                getattr(
-                    _api_quiescence_adapter,
-                    "_quiescence_force_request_required",
-                    False,
-                )
-            )
             self.adapters.clear()
             for _session_key in list(self._running_agents):
                 self._release_running_agent_state(_session_key)
@@ -10155,37 +10088,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Shutdown phase: SessionDB close done at +%.2fs",
                 _phase_elapsed(),
             )
-
-            # Persist the final handover proof for supervisors that inspect a
-            # stopped profile without a live HTTP listener.  This is only a
-            # point-in-time cold-state marker: a non-zero or unknown snapshot
-            # remains busy/unknown, never an optimistic zero. Startup
-            # invalidates the marker before admitting any new work.
-            try:
-                from gateway.quiescence import (
-                    collect_writer_work_snapshot,
-                    write_offline_quiescence_snapshot,
-                )
-
-                write_offline_quiescence_snapshot(
-                    # Keep the API adapter captured above as the accounting
-                    # owner.  ``self.adapters`` is cleared before this cold
-                    # marker is written; falling back to the runner alone
-                    # would report api_runs=0 while a canceled default
-                    # executor worker is still writing through that adapter.
-                    collect_writer_work_snapshot(
-                        adapter=_api_quiescence_adapter,
-                        runner=self,
-                    ),
-                    lifecycle="stopped",
-                    force_latched=_force_quiescence_latched,
-                    generation=_force_quiescence_generation,
-                    force_boot_id=_force_quiescence_boot_id,
-                    force_request_id=_force_quiescence_request_id,
-                    force_request_required=_force_quiescence_request_required,
-                )
-            except Exception as _e:
-                logger.debug("Could not persist offline quiescence snapshot: %s", _e)
 
             from gateway.status import remove_pid_file, release_gateway_runtime_lock
             remove_pid_file()
@@ -12628,20 +12530,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "⏳ This agent is draining for a maintenance action and isn't "
                 "accepting new turns right now. It'll be back in a moment — "
                 "please resend shortly."
-            )
-
-        # Force handover is a process-wide writer gate, not just an API
-        # listener gate. Internal completion/recovery events continue to flow,
-        # but no new external messaging turn may create another agent while
-        # the force endpoint is proving that all writers have stopped.
-        if self._omnio_quiescence_force_active() and not is_internal:
-            logger.info(
-                "Refusing new turn for session %s — Omnio force quiescence active.",
-                _quick_key,
-            )
-            return (
-                "⏳ This agent is quiescing for a maintenance action and isn't "
-                "accepting new turns right now. Please resend shortly."
             )
 
         # ── Claim this session before any await ───────────────────────
@@ -18737,46 +18625,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
-    def _completion_barrier_active(self) -> bool:
-        """Whether the API server reports a handover barrier over this gateway.
-
-        See ``APIServerAdapter.quiescence_barrier_active``. Behind that
-        barrier no turn can be admitted here, so a completion notification
-        that needs a turn to be consumed is undeliverable on this gateway and
-        must not be requeued: the queue depth is counted as writer work by the
-        quiescence proof, and an event nothing can drain would otherwise hold
-        the handover open forever. Durable async-delegation rows stay owned by
-        their SQLite replay; process notices are best-effort and are dropped.
-        """
-        adapters = getattr(self, "adapters", None)
-        adapter = adapters.get(Platform.API_SERVER) if isinstance(adapters, dict) else None
-        helper = getattr(adapter, "quiescence_barrier_active", None)
-        if not callable(helper):
-            return False
-        try:
-            return bool(helper())
-        except Exception:
-            return False
-
-    def _requeue_async_completion(self, evt: dict, barrier_active: bool) -> None:
-        """Requeue a failed async completion unless a handover barrier owns the retry.
-
-        Delivery failure has already released the durable claim
-        (``release_completion_delivery``), so the SQLite row is what replays
-        this completion on the next gateway; the in-memory copy is only useful
-        while this gateway can still start a turn.
-        """
-        from tools.process_registry import process_registry as _pr
-
-        if not barrier_active:
-            _pr.completion_queue.put(evt)
-            return
-        logger.warning(
-            "Not requeueing async delegation %s completion: handover barrier "
-            "active; durable replay owns its delivery",
-            evt.get("delegation_id") or "<legacy>",
-        )
-
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -18810,19 +18658,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         async_events.append(evt)
                     else:
                         requeue.append(evt)
-                barrier_active = bool(requeue or async_events) and self._completion_barrier_active()
                 for evt in requeue:
-                    if barrier_active:
-                        # Only an agent turn drains these, and the barrier
-                        # admits none. Keeping the event would pin the
-                        # quiescence proof on a notice nobody can receive.
-                        logger.warning(
-                            "Dropping %s notification for process %s: handover "
-                            "barrier active, no turn can consume it on this gateway",
-                            evt.get("type", "?"),
-                            evt.get("session_id") or evt.get("session_key") or "?",
-                        )
-                        continue
                     _pr.completion_queue.put(evt)
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
@@ -18832,9 +18668,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         delivered = await self._deliver_completion_notification(synth_text, evt)
                         if delivered is False:
-                            self._requeue_async_completion(evt, barrier_active)
+                            _pr.completion_queue.put(evt)
                     except Exception as e:
-                        self._requeue_async_completion(evt, barrier_active)
+                        _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
@@ -19002,16 +18838,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         synth_text, completion_evt,
                     )
                     if delivered is False:
-                        if self._completion_barrier_active():
-                            # A fenced gateway cannot start the turn this
-                            # notice needs; retrying would keep the watcher
-                            # counted as writer work for the whole handover.
-                            logger.warning(
-                                "Process watcher: giving up delivery for %s: "
-                                "handover barrier active on this gateway",
-                                session_id,
-                            )
-                            break
                         # The process remains terminal; retry after failed
                         # adapter injection instead of suppressing the result.
                         continue
@@ -24979,15 +24805,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # external-drain dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
         def _cron_admission_open() -> bool:
-            try:
-                _force_blocked = runner._omnio_quiescence_force_active()
-            except Exception:
-                _force_blocked = False
-            return not (
-                runner._draining
-                or runner._external_drain_active
-                or _force_blocked
-            )
+            return not (runner._draining or runner._external_drain_active)
 
         cron_start_kwargs["can_dispatch"] = _cron_admission_open
     cron_thread = threading.Thread(

@@ -22,20 +22,15 @@ AUTH = {"Authorization": "Bearer test-key"}
 SESSION = "conversation-session"
 
 
-def _managed(turn_id: str = "turn-continue") -> dict:
+def _identity(turn_id: str = "turn-continue") -> dict:
     return {
         "turn_id": turn_id,
         "session_id": SESSION,
-        "omnio_managed": {
-            "version": 1,
-            "submission_id": "12345678-1234-4234-8234-123456789abc",
-            "execution_fingerprint": "a" * 64,
-        },
     }
 
 
 def _continue(close=None, **extra) -> dict:
-    return {"input": None, "continuation": {"close": close}, **_managed(), **extra}
+    return {"input": None, "continuation": {"close": close}, **_identity(), **extra}
 
 
 def _call(call_id: str, name: str, arguments: str = "{}") -> dict:
@@ -56,7 +51,8 @@ def db(tmp_path):
 def adapter(db, tmp_path):
     value = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
     value._session_db = db
-    value._run_idempotency = RunIdempotencyStore(tmp_path / "state.db")
+    value._run_idempotency.close()
+    value._run_idempotency = RunIdempotencyStore(tmp_path / "runs_idempotency.db")
     return value
 
 
@@ -605,7 +601,7 @@ def test_an_expired_approval_is_remembered_once_and_bounded(monkeypatch):
 async def test_runs_shared_state_is_ephemeral_prefill(adapter, db, continuation):
     db.append_message(SESSION, "user", "launch")
     agent = _agent()
-    body = _continue() if continuation else {"input": "continue", **_managed()}
+    body = _continue() if continuation else {"input": "continue", **_identity()}
     body["ag_ui_state"] = {"competitors": {"competitors": []}}
     async with TestClient(TestServer(_app(adapter))) as client:
         with patch.object(adapter, "_create_agent", return_value=agent) as create_agent:
