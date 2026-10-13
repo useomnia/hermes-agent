@@ -514,8 +514,8 @@ class TestStartRun:
         assert foo.status == bar.status == 202
         assert foo_data["run_id"] != bar_data["run_id"]
         assert mock_create.call_count == 2
-        assert (profile_homes["foo"] / "state.db").exists()
-        assert (profile_homes["bar"] / "state.db").exists()
+        assert (profile_homes["foo"] / "runs_idempotency.db").exists()
+        assert (profile_homes["bar"] / "runs_idempotency.db").exists()
 
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):

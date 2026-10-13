@@ -21,7 +21,6 @@ this file would have caught the regression and now pins the fix.
 from __future__ import annotations
 
 import asyncio
-import threading
 import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -287,21 +286,10 @@ class TestAPIServerDisconnectClosesResponseStore:
     """
 
     def _build_adapter_with_store(self, store: ResponseStore) -> APIServerAdapter:
-        """Build an APIServerAdapter with the required internal state.
-
-        We bypass ``__init__`` (which would try to start aiohttp
-        immediately) and set just the fields ``disconnect()`` reads.
-        """
-        adapter = APIServerAdapter.__new__(APIServerAdapter)
-        adapter._mark_disconnected = lambda: None  # type: ignore[method-assign]
-        adapter._site = None
-        adapter._runner = None
-        adapter._app = None
+        """Construct real owned stores without starting the HTTP listener."""
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._response_store.close()
         adapter._response_store = store
-        adapter._omnio_approval_refresh_task = None
-        adapter._omnio_approval_snapshot_ready = threading.Event()
-        adapter._omnio_approval_snapshot_ready.set()
-        adapter.platform = Platform.API_SERVER
         return adapter
 
     @pytest.mark.asyncio
@@ -349,6 +337,29 @@ class TestAPIServerDisconnectClosesResponseStore:
         adapter = self._build_adapter_with_store(store)
 
         # Must not raise — disconnect() swallows the close error and
-        # continues to the aiohttp teardown (no-op here since we
-        # bypassed __init__).
+        # continues to release the adapter's other owned resources.
         await adapter.disconnect()
+
+
+    @pytest.mark.asyncio
+    async def test_disconnect_drains_reservation_writes_and_closes_store(self):
+        import sqlite3
+        from gateway.run_idempotency import RunIdempotencyStore
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        store = adapter._run_idempotency
+        await adapter._run_reservation_io(
+            None, "reserve", turn_id="shutdown", run_id="one-run",
+            request_fingerprint="same", session_id="s", owner_profile=None,
+        )
+        adapter._set_run_status("one-run", "running", turn_id="shutdown")
+        adapter._set_run_status("one-run", "completed")
+        await adapter.disconnect()
+
+        with pytest.raises(sqlite3.ProgrammingError):
+            store.get("shutdown")
+        reopened = RunIdempotencyStore(store.db_path)
+        try:
+            assert reopened.get("shutdown").status == "completed"
+        finally:
+            reopened.close()
