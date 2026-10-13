@@ -120,8 +120,8 @@ from gateway.turn_event_log import (
     TurnEventLogStore,
     UnknownRunError,
 )
-from hermes_state_errors import is_sqlite_lock_error
 from gateway.run_idempotency import (
+    RunReservationBusy,
     RunIdempotencyMismatch,
     RunIdempotencyRecord,
     RunIdempotencyStore,
@@ -8575,10 +8575,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     _openai_error("turn_id was already used with different request semantics", code="turn_id_conflict"),
                     status=409,
                 )
-            except sqlite3.OperationalError as exc:
-                if not is_sqlite_lock_error(exc):
-                    raise
-                # The worker has returned and rolled back: no task was published.
+            except RunReservationBusy:
+                # Rollback and a successful read prove there is no accepted ID.
                 return web.json_response(
                     _openai_error("Turn reservation storage is busy; retry shortly.", code="run_reservation_busy"),
                     status=503,

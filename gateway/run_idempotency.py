@@ -20,6 +20,7 @@ from typing import Any, Mapping
 
 from hermes_constants import get_hermes_home
 from hermes_state import apply_wal_with_fallback
+from hermes_state_errors import is_sqlite_lock_error
 
 
 _TABLE = "api_run_idempotency"
@@ -27,6 +28,10 @@ _TABLE = "api_run_idempotency"
 
 class RunIdempotencyMismatch(ValueError):
     """A reused Turn ID carried different immutable request semantics."""
+
+
+class RunReservationBusy(sqlite3.OperationalError):
+    """The reservation write rolled back and a read confirmed no accepted ID."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +136,21 @@ class RunIdempotencyStore:
     def _record(row: sqlite3.Row) -> RunIdempotencyRecord:
         return RunIdempotencyRecord(**dict(row))
 
+    @staticmethod
+    def _replay(
+        record: RunIdempotencyRecord,
+        fingerprint: str,
+        owner_profile: str | None,
+    ) -> tuple[RunIdempotencyRecord, bool]:
+        if (
+            record.request_fingerprint != fingerprint
+            or record.owner_profile != owner_profile
+        ):
+            raise RunIdempotencyMismatch(
+                "turn_id was already used with different request semantics"
+            )
+        return record, False
+
     def reserve(
         self,
         *,
@@ -141,40 +161,42 @@ class RunIdempotencyStore:
         owner_profile: str | None,
     ) -> tuple[RunIdempotencyRecord, bool]:
         now = time.time()
-        with self._transaction() as conn:
-            row = conn.execute(
-                f"SELECT * FROM {_TABLE} WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if row is not None:
-                record = self._record(row)
-                if (
-                    record.request_fingerprint != request_fingerprint
-                    or record.owner_profile != owner_profile
-                ):
-                    raise RunIdempotencyMismatch(
-                        "turn_id was already used with different request semantics"
-                    )
-                return record, False
-            conn.execute(
-                f"""INSERT INTO {_TABLE} (
-                    turn_id, run_id, request_fingerprint, session_id,
-                    owner_profile, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)""",
-                (
-                    turn_id,
-                    run_id,
-                    request_fingerprint,
-                    session_id,
-                    owner_profile,
-                    now,
-                    now,
-                ),
-            )
-            row = conn.execute(
-                f"SELECT * FROM {_TABLE} WHERE turn_id = ?", (turn_id,)
-            ).fetchone()
-            return self._record(row), True
+        try:
+            with self._transaction() as conn:
+                row = conn.execute(
+                    f"SELECT * FROM {_TABLE} WHERE turn_id = ?",
+                    (turn_id,),
+                ).fetchone()
+                if row is not None:
+                    return self._replay(self._record(row), request_fingerprint, owner_profile)
+                conn.execute(
+                    f"""INSERT INTO {_TABLE} (
+                        turn_id, run_id, request_fingerprint, session_id,
+                        owner_profile, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                    (
+                        turn_id,
+                        run_id,
+                        request_fingerprint,
+                        session_id,
+                        owner_profile,
+                        now,
+                        now,
+                    ),
+                )
+                row = conn.execute(
+                    f"SELECT * FROM {_TABLE} WHERE turn_id = ?", (turn_id,)
+                ).fetchone()
+                return self._record(row), True
+        except sqlite3.OperationalError as exc:
+            if not is_sqlite_lock_error(exc):
+                raise
+            # A failed write does not prove a prior submission never ran. Read
+            # after rollback; an unreadable store must remain an unknown outcome.
+            record = self.get(turn_id)
+            if record is not None:
+                return self._replay(record, request_fingerprint, owner_profile)
+            raise RunReservationBusy("Turn reservation storage is busy") from exc
 
     def update_status(
         self,

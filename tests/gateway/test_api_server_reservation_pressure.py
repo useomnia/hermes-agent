@@ -148,3 +148,51 @@ async def test_disconnected_admission_publishes_one_run_for_same_id_recovery():
         blocker.rollback()
         blocker.close()
         await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_reserved_turn_replays_while_reservation_writer_is_busy():
+    adapter = _make_adapter()
+    blocker = sqlite3.connect(adapter._run_idempotency.db_path)
+    body = {"input": "hello", "turn_id": "accepted-before-contention"}
+    try:
+        with patch.object(adapter, "_create_agent", return_value=_agent()) as create:
+            async with TestClient(TestServer(_create_runs_app(adapter))) as client:
+                accepted = await client.post("/v1/runs", json=body)
+                assert accepted.status == 202
+                run_id = (await accepted.json())["run_id"]
+                await asyncio.gather(*adapter._active_run_tasks.values())
+                await adapter._run_reservation_io(None, "get", body["turn_id"])
+                blocker.execute("BEGIN IMMEDIATE")
+                replay = await client.post("/v1/runs", json=body)
+                assert replay.status == 202
+                assert (await replay.json())["run_id"] == run_id
+                conflict = await client.post("/v1/runs", json={**body, "input": "different"})
+                assert conflict.status == 409
+                create.assert_called_once()
+    finally:
+        blocker.rollback()
+        blocker.close()
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_unreadable_reservation_cannot_claim_no_execution():
+    adapter = _make_adapter()
+    adapter._run_idempotency._conn.execute("PRAGMA journal_mode=DELETE")
+    adapter._run_idempotency._conn.execute("PRAGMA busy_timeout=50")
+    blocker = sqlite3.connect(adapter._run_idempotency.db_path)
+    try:
+        blocker.execute("BEGIN EXCLUSIVE")
+        with patch.object(adapter, "_create_agent", return_value=_agent()) as create:
+            async with TestClient(TestServer(_create_runs_app(adapter))) as client:
+                response = await client.post(
+                    "/v1/runs", json={"input": "hello", "turn_id": "unknown-under-lock"},
+                )
+                # An unclassified 500 keeps the proxy's ambiguous-start recovery.
+                assert response.status == 500
+                create.assert_not_called()
+    finally:
+        blocker.rollback()
+        blocker.close()
+        await adapter.disconnect()
