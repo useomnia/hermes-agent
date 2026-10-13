@@ -357,6 +357,8 @@ class TestCreateProfile:
         (default_home / "state.db").write_text("sessions-data")
         (default_home / "state.db-wal").write_text("wal")
         (default_home / "state.db-shm").write_text("shm")
+        for suffix in ("", "-wal", "-shm"):
+            (default_home / f"runs_idempotency.db{suffix}").write_text("runtime")
         (default_home / "sessions" / "20260101_old").mkdir(parents=True)
         (default_home / "backups").mkdir(exist_ok=True)
         (default_home / "backups" / "backup.tar.gz").write_text("archive")
@@ -372,12 +374,41 @@ class TestCreateProfile:
 
         for history in (
             "state.db", "state.db-wal", "state.db-shm",
+            "runs_idempotency.db", "runs_idempotency.db-wal", "runs_idempotency.db-shm",
             "sessions", "backups", "state-snapshots", "checkpoints",
         ):
             assert not (profile_dir / history).exists(), history
         assert (profile_dir / "config.yaml").read_text() == "model: gpt-4"
         # Root-only: nested same-name dirs survive
         assert (profile_dir / "workspace" / "backups" / "user-data.txt").read_text() == "mine"
+
+    @pytest.mark.parametrize("source_name", ["default", "source"])
+    def test_clone_all_starts_without_source_turn_reservations(self, profile_env, source_name):
+        from gateway.run_idempotency import RunIdempotencyStore
+
+        source_dir = (
+            profile_env / ".hermes"
+            if source_name == "default"
+            else create_profile(source_name, no_alias=True)
+        )
+        source = RunIdempotencyStore(source_dir / "runs_idempotency.db")
+        try:
+            source.reserve(
+                turn_id="source-turn", run_id="source-run",
+                request_fingerprint="request", session_id="session", owner_profile=None,
+            )
+        finally:
+            source.close()
+
+        cloned_dir = create_profile("fresh", clone_from=source_name, clone_all=True, no_alias=True)
+        cloned = RunIdempotencyStore(cloned_dir / "runs_idempotency.db")
+        source = RunIdempotencyStore(source_dir / "runs_idempotency.db")
+        try:
+            assert cloned.get("source-turn") is None
+            assert source.get("source-turn").run_id == "source-run"
+        finally:
+            cloned.close()
+            source.close()
 
     def test_clone_config_missing_files_skipped(self, profile_env):
         """Clone config gracefully skips files that don't exist in source."""
