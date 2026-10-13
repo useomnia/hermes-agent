@@ -369,7 +369,7 @@ class TestStartRun:
                 first = await cli.post("/v1/runs", json=body)
                 first_data = await first.json()
 
-        record = store.get("turn-setup-failure")
+        record = await adapter._run_reservation_io(None, "get", "turn-setup-failure")
         assert first.status == 503
         assert first_data["error"]["code"] == "run_initialization_failed"
         assert record is not None
