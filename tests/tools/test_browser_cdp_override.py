@@ -496,6 +496,7 @@ class TestCdpOverrideProbeBoundary:
 
         with (
             patch("tools.browser_tool.check_browser_requirements", return_value=True),
+            patch("tools.browser_tool._is_browser_use_cli_mode", return_value=False),
             patch("tools.browser_tool.requests.get") as mock_get,
         ):
             assert _browser_cdp_check() is True

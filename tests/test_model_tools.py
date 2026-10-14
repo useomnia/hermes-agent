@@ -1,6 +1,7 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
+import pytest
 from unittest.mock import ANY, call, patch
 
 
@@ -587,3 +588,22 @@ class TestDisabledToolsetsPostureToolset:
             )
         }
         assert "write_file" not in no_file
+
+
+@pytest.mark.parametrize("terminal_enabled", [False, True])
+def test_browser_python_aliases_require_terminal(monkeypatch, terminal_enabled):
+    import model_tools
+
+    names = {"browser_exec", "browser_exec_headless"}
+    if terminal_enabled:
+        names.add("terminal")
+    definitions = [{"type": "function", "function": {"name": name, "description": "", "parameters": {}}} for name in names]
+    monkeypatch.setattr(model_tools, "validate_toolset", lambda name: True)
+    monkeypatch.setattr(model_tools, "resolve_toolset", lambda name: names)
+    monkeypatch.setattr(model_tools.registry, "get_definitions", lambda *a, **kw: definitions)
+
+    resolved = model_tools._compute_tool_definitions(
+        enabled_toolsets=["browser"], quiet_mode=True, skip_tool_search_assembly=True,
+    )
+    actual = {item["function"]["name"] for item in resolved}
+    assert actual == (names if terminal_enabled else set())

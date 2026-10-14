@@ -102,7 +102,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["browserbase", "browser-use", "firecrawl"],
+        ["browserbase", "firecrawl"],
     )
     def test_each_plugin_has_setup_schema(self, plugin_name: str) -> None:
         """``get_setup_schema()`` returns a dict the picker can consume."""
@@ -115,9 +115,18 @@ class TestBundledPluginsRegister:
         assert isinstance(schema, dict)
         assert "name" in schema
         assert "env_vars" in schema
-        # Every cloud-browser plugin needs the agent-browser post-setup hook
-        # so the picker auto-installs the CLI on selection.
-        assert schema.get("post_setup") == "agent_browser"
+        # Every visible cloud-browser plugin carries a post-setup hook so the
+        # picker auto-installs its CLI on selection.
+        assert schema.get("post_setup")
+
+    def test_browser_use_hidden_from_direct_cloud_picker(self) -> None:
+        """Browser Use is the local CLI surface, not a direct cloud row."""
+        _ensure_plugins_loaded()
+        from agent.browser_registry import get_provider
+
+        provider = get_provider("browser-use")
+        assert provider is not None
+        assert provider.get_setup_schema() is None
 
     @pytest.mark.parametrize(
         "plugin_name",
@@ -348,7 +357,7 @@ class TestLegacyAbcAliases:
 
 
 class TestPickerIntegration:
-    """`_plugin_browser_providers()` exposes all three plugins as picker rows."""
+    """`_plugin_browser_providers()` exposes visible cloud plugin rows."""
 
     def test_picker_rows_match_registered_plugins(self) -> None:
         _ensure_plugins_loaded()
@@ -356,11 +365,10 @@ class TestPickerIntegration:
 
         rows = _plugin_browser_providers()
         names = sorted(r.get("browser_provider") for r in rows)
-        assert names == ["browser-use", "browserbase", "firecrawl"]
+        assert names == ["browserbase", "firecrawl"]
 
     def test_picker_rows_carry_post_setup_hook(self) -> None:
-        """Every browser plugin row has post_setup='agent_browser' so
-        selecting it triggers the agent-browser CLI install."""
+        """Every visible cloud plugin row has a post-setup hook."""
         _ensure_plugins_loaded()
         from hermes_cli.tools_config import _plugin_browser_providers
 
