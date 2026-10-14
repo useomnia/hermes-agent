@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 from hermes_constants import MAX_TODO_ITEMS
 
 
-TURN_EVENT_LOG_API_VERSION = 3
+TURN_EVENT_LOG_API_VERSION = 4
 DEFAULT_RUN_LOG_CAP_BYTES = 8 * 1024 * 1024
 DEFAULT_TERMINAL_RETENTION_SECONDS = 5 * 60
 DEFAULT_TOMBSTONE_LIMIT = 1000
@@ -52,10 +52,16 @@ CUSTOM_TOOL_INPUT_KEYS = {
 
 OMNIO_EXTENSION_EVENT_TYPES = frozenset({
     "response.omnio.interaction",
+    # The call an approval card waits on, emitted just before the card, for a
+    # host that keeps it while the card is open. Never part of the card.
+    "response.omnio.pending_call",
     "response.omnio.interaction_completed",
+    # First event of a no-user continuation: the unfinished calls it closed.
+    "response.omnio.continuation",
     "response.omnio.compaction",
     "response.omnio.client_event",
     "response.omnio.gen_ui",
+    "response.omnio.shared_state",
     "response.omnio.task_list",
     "response.omnio.warmup",
     # Native replacements for surfaces carried by the former CUSTOM set.
@@ -808,7 +814,11 @@ class TurnEventEmitter:
         if client_projection_withheld(name, arguments):
             return
         extension_type, payload_key = _TOOL_EXTENSION_EVENTS[name]
-        self.omnio_event(extension_type, **{payload_key: arguments})
+        self.omnio_event(
+            extension_type,
+            tool_call_id=call_id,
+            **{payload_key: arguments},
+        )
 
     def function_call_done(self, call_id: str) -> None:
         state = self._function_calls.pop(call_id, None)
@@ -880,18 +890,22 @@ class TurnEventEmitter:
             started_at=started_at,
         )
 
-    def semantic_tool_done(self, source_call_id: str) -> None:
+    def semantic_tool_done(
+        self, source_call_id: str, *, success: Optional[bool] = None
+    ) -> None:
         state = self._semantic_tool_calls.pop(source_call_id, None)
         if state is None:
             return
-        self.omnio_event(
-            "response.omnio.tool_progress",
-            source_call_id=source_call_id,
-            tool=state["tool"],
-            status="completed",
-            started_at=state["started_at"],
-            completed_at=self.clock(),
-        )
+        fields: Dict[str, Any] = {
+            "source_call_id": source_call_id,
+            "tool": state["tool"],
+            "status": "completed",
+            "started_at": state["started_at"],
+            "completed_at": self.clock(),
+        }
+        if isinstance(success, bool):
+            fields["success"] = success
+        self.omnio_event("response.omnio.tool_progress", **fields)
 
     def task_list(self, todos: list) -> None:
         """Emit the bounded canonical todo snapshot without exposing its result."""

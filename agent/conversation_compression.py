@@ -74,7 +74,10 @@ def _emit_compaction_snapshot(
         return
     from agent.compaction_snapshot import capture_compaction
 
-    snapshot = capture_compaction(messages, previous_count=previous_count, session_id=agent.session_id)
+    snapshot = capture_compaction(
+        messages, previous_count=previous_count, session_id=agent.session_id,
+        previous_messages=previous_messages,
+    )
     if snapshot is not None:
         try:
             callback("compaction", snapshot=snapshot)
@@ -1190,6 +1193,15 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
 def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) -> None:
     """Preserve human intent, not merely a synthetic user-role placeholder."""
     if any(_is_real_user_message(message) for message in compressed):
+        return
+    from agent.context_compressor import ContextCompressor
+
+    if any(
+        ContextCompressor._has_merged_inflight_replay(message)
+        for message in compressed
+    ):
+        # The in-flight request was restated onto the summary carrier
+        # (#100818); inserting an anchor would duplicate it.
         return
     from agent.context_compressor import (
         COMPRESSION_CONTINUATION_USER_CONTENT,

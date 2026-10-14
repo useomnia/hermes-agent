@@ -35,6 +35,7 @@ from agent.skill_commands import (
     describe_skill_invocation,
 )
 from hermes_constants import get_hermes_home
+from hermes_state_errors import is_sqlite_lock_error
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
@@ -1304,7 +1305,8 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     owner_started_at INTEGER,
     task_json TEXT,
     delivery_claim TEXT,
-    delivery_claimed_at REAL
+    delivery_claimed_at REAL,
+    origin_session_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -1883,6 +1885,30 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             handle.close()
 
 
+def _answer_response(content: Any) -> Optional[str]:
+    """The User's answer carried by a question's tool result, if it holds one.
+
+    A live or continued answer is ``{"status": "answered", "response": ...}``;
+    a session rebuilt from saved history records the bare answer text.
+    """
+    if not isinstance(content, str):
+        return None
+    try:
+        value = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return content
+    if isinstance(value, dict):
+        response = value.get("response")
+        return response if value.get("status") == "answered" and isinstance(response, str) else None
+    return content
+
+
+def _same_answer(stored: Any, content: Any) -> bool:
+    """Whether a question's recorded result and a closing answer carry the same answer."""
+    stored_answer = _answer_response(stored)
+    return stored_answer is not None and stored_answer == _answer_response(content)
+
+
 class SessionDB:
     """
     SQLite-backed session storage with FTS5 search.
@@ -1900,7 +1926,11 @@ class SessionDB:
     # Instead, we keep the SQLite timeout short (1s) and handle retries at the
     # application level with random jitter, which naturally staggers competing
     # writers and avoids the convoy.
-    _WRITE_MAX_RETRIES = 15
+    _WRITE_PATIENCE_S = 20.0
+    _TRANSCRIPT_WRITE_PATIENCE_S = 60.0
+    _WRITE_RETRY_SLOW_AFTER_S = 2.0
+    _WRITE_RETRY_SLOW_MIN_S = 0.250
+    _WRITE_RETRY_SLOW_MAX_S = 1.000
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
@@ -2018,8 +2048,44 @@ class SessionDB:
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
 
+            def _connect_and_init_with_lock_patience():
+                # Lock contention during open: _init_schema's DDL/reconcile
+                # statements run on a 1s-timeout connection with no retry, so
+                # a sibling process holding the write lock (VACUUM, TRUNCATE
+                # checkpoint at close, a long FTS pass from an older
+                # still-running install) used to fail the ENTIRE open —
+                # callers then disable persistence for the whole run
+                # ("Failed to initialize SessionDB ... database is locked",
+                # #74478). The store is healthy; wait it out with the same
+                # jittered patience the write path uses. Non-lock errors
+                # (including the malformed class) propagate immediately.
+                deadline = time.monotonic() + self._WRITE_PATIENCE_S
+                while True:
+                    try:
+                        _connect_and_init()
+                        return
+                    except sqlite3.OperationalError as exc:
+                        if not is_sqlite_lock_error(exc):
+                            raise
+                        try:
+                            if self._conn is not None:
+                                self._conn.close()
+                        except Exception:
+                            pass
+                        now = time.monotonic()
+                        if now >= deadline:
+                            raise
+                        time.sleep(
+                            min(
+                                random.uniform(
+                                    self._WRITE_RETRY_SLOW_MIN_S,
+                                    self._WRITE_RETRY_SLOW_MAX_S,
+                                ),
+                                max(deadline - now, 0.001),
+                            )
+                        )
             try:
-                _connect_and_init()
+                _connect_and_init_with_lock_patience()
             except sqlite3.DatabaseError as exc:
                 # The malformed-schema class (e.g. a duplicate sqlite_master
                 # row for messages_fts) fails on the very first statement —
@@ -2042,7 +2108,7 @@ class SessionDB:
                 report = repair_state_db_schema(self.db_path)
                 if not report.get("repaired"):
                     raise
-                _connect_and_init()
+                _connect_and_init_with_lock_patience()
 
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
@@ -2404,6 +2470,7 @@ class SessionDB:
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
+        patience_s: Optional[float] = None,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -2414,13 +2481,25 @@ class SessionDB:
         BEGIN IMMEDIATE acquires the WAL write lock at transaction start
         (not at commit time), so lock contention surfaces immediately.
         On ``database is locked``, we release the Python lock, sleep a
-        random 20-150ms, and retry — breaking the convoy pattern that
+        random jitter, and retry — breaking the convoy pattern that
         SQLite's built-in deterministic backoff creates.
+
+        *patience_s* is the total time budget for lock retries (default
+        ``_WRITE_PATIENCE_S``).  Transcript-critical writes pass
+        ``_TRANSCRIPT_WRITE_PATIENCE_S`` so a sibling process holding the
+        lock for a legitimate long operation (VACUUM, TRUNCATE checkpoint,
+        pre-bounded-merge FTS optimize from an older still-running
+        install) exhausts routine writers' patience without destroying a
+        user turn.  Jitter starts small (20-150ms) for fast reclaim on
+        millisecond contention and backs off to 250ms-1s once the lock has
+        been held longer than ``_WRITE_RETRY_SLOW_AFTER_S``.
 
         Returns whatever *fn* returns.
         """
-        last_err: Optional[Exception] = None
-        for attempt in range(self._WRITE_MAX_RETRIES):
+        if patience_s is None:
+            patience_s = self._WRITE_PATIENCE_S
+        deadline = time.monotonic() + patience_s
+        while True:
             try:
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
@@ -2441,17 +2520,33 @@ class SessionDB:
                     self._try_optimize_fts()
                 return result
             except sqlite3.OperationalError as exc:
-                err_msg = str(exc).lower()
-                if "locked" in err_msg or "busy" in err_msg:
-                    last_err = exc
-                    if attempt < self._WRITE_MAX_RETRIES - 1:
-                        jitter = random.uniform(
-                            self._WRITE_RETRY_MIN_S,
-                            self._WRITE_RETRY_MAX_S,
-                        )
-                        time.sleep(jitter)
+                if is_sqlite_lock_error(exc):
+                    now = time.monotonic()
+                    if now < deadline:
+                        elapsed = now - (deadline - patience_s)
+                        if elapsed >= self._WRITE_RETRY_SLOW_AFTER_S:
+                            jitter = random.uniform(
+                                self._WRITE_RETRY_SLOW_MIN_S,
+                                self._WRITE_RETRY_SLOW_MAX_S,
+                            )
+                        else:
+                            jitter = random.uniform(
+                                self._WRITE_RETRY_MIN_S,
+                                self._WRITE_RETRY_MAX_S,
+                            )
+                        # Never overshoot the deadline by a full slow-jitter.
+                        time.sleep(min(jitter, max(deadline - now, 0.001)))
                         continue
-                # Non-lock error or retries exhausted — propagate.
+                    # Patience exhausted — say what actually happened so the
+                    # surfaced error doesn't read as disk/permission damage.
+                    raise sqlite3.OperationalError(
+                        f"database is locked (another Hermes process held the "
+                        f"state.db write lock for over {patience_s:.0f}s — "
+                        "likely a long maintenance operation such as VACUUM, "
+                        "a large WAL checkpoint, or an older pre-update "
+                        "process; the database itself is healthy)"
+                    ) from exc
+                # Non-lock error — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
                 # Corrupt FTS shadow tables make every write raise the
@@ -2466,10 +2561,6 @@ class SessionDB:
                 if not self._try_runtime_fts_rebuild(exc):
                     raise
                 continue
-        # Retries exhausted (shouldn't normally reach here).
-        raise last_err or sqlite3.OperationalError(
-            "database is locked after max retries"
-        )
 
     @staticmethod
     def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:
@@ -3251,7 +3342,9 @@ class SessionDB:
                 rows = cursor.execute(
                     f'PRAGMA table_info("{table_name}")'
                 ).fetchall()
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as exc:
+                if is_sqlite_lock_error(exc):
+                    raise
                 continue  # Table doesn't exist yet (shouldn't happen after executescript)
             live_cols = set()
             for row in rows:
@@ -3267,6 +3360,9 @@ class SessionDB:
                             f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {col_type}'
                         )
                     except sqlite3.OperationalError as exc:
+                        if is_sqlite_lock_error(exc):
+                            # Retry initialization instead of exposing a partial schema.
+                            raise
                         # Expected: "duplicate column name" from a race or
                         # re-run.  Unexpected: "Cannot add a NOT NULL column
                         # with default value NULL" from a schema mistake.
@@ -3327,9 +3423,8 @@ class SessionDB:
         # before the fix.  It was previously gated at ``current_version <
         # 12`` which never re-ran for already-v12+ databases.
         try:
-            cursor.execute(
-                "UPDATE messages SET active = 1 WHERE active IS NULL"
-            )
+            if cursor.execute("SELECT 1 FROM messages WHERE active IS NULL LIMIT 1").fetchone() is not None:
+                cursor.execute("UPDATE messages SET active = 1 WHERE active IS NULL")
         except sqlite3.OperationalError:
             pass
 
@@ -3597,9 +3692,11 @@ class SessionDB:
                 ).fetchone() is None
                 and not self._has_fts_trash(cursor)
             ):
-                self.set_meta(
-                    "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor
-                )
+                if cursor.execute(
+                    "SELECT 1 FROM state_meta WHERE key = 'fts_storage_version' AND value = ?",
+                    (str(FTS_STORAGE_VERSION),),
+                ).fetchone() is None:
+                    self.set_meta("fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor)
 
             # Advance schema_version to current for ALL non-FTS-layout
             # migrations. This is deliberately NOT gated on the FTS opt-in —
@@ -3863,7 +3960,7 @@ class SessionDB:
                        )""",
                     (session_id,),
                 )
-        self._execute_write(_do)
+        self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
@@ -6678,6 +6775,241 @@ class SessionDB:
                     (session_id,),
                 )
             return msg_id
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def close_continuation_tail(
+        self,
+        session_id: str,
+        close: Optional[Dict[str, Any]],
+        *,
+        interrupted_content: str,
+        is_interaction_tool: Callable[[str], bool],
+        notes: Optional[List[str]] = None,
+        continuation_id: Optional[str] = None,
+        request_key: Optional[str] = None,
+    ) -> tuple[str, Dict[str, Any]]:
+        """Make a session's durable tail resumable for a no-user continuation.
+
+        A continuation runs the agent from the saved history without adding a
+        user message, so the tail must be one a provider can answer: the
+        user's own message (nothing ran yet), or an assistant tool-call block
+        whose calls all have results. ``close`` supplies what finishes an
+        unfinished block, in one ``BEGIN IMMEDIATE`` transaction with the
+        checks:
+
+        - ``None``: nothing to close; any unresolved call is refused.
+        - ``{"kind": "interrupted"}``: every unresolved call gets
+          ``interrupted_content``; a call that may already have run is never
+          re-executed.
+        - ``{"kind": "answer", "tool_call_id", "content"}``: the unresolved
+          interaction call receives ``content`` as its result.
+        - ``{"kind": "approval", "tool_call_id", "scope", "content"}``: a
+          ``deny`` records ``content`` as the gated call's result; any other
+          scope stores a durable grant on the assistant row so the
+          continuation re-dispatches exactly that call.
+
+        Unresolved siblings of an answered or approved call are closed as
+        interrupted. Replaying the same closing step is idempotent; a
+        different decision for an already-closed call is a conflict.
+
+        Returns ``("ok" | "not_resumable" | "not_found" | "conflict", info)``.
+        """
+        kind = close.get("kind") if isinstance(close, dict) else None
+        target_id = close.get("tool_call_id") if isinstance(close, dict) else None
+        stored_interrupted = self._encode_content(interrupted_content)
+        notes = list(notes or [])
+        if notes and not continuation_id:
+            raise ValueError("continuation_id is required when carrying notes")
+        request_key = request_key or json.dumps(
+            {"close": close, "notes": notes}, sort_keys=True, ensure_ascii=False
+        )
+
+        def _with_notes(conn, anchor, info, *, deferred=False):
+            if not notes:
+                return "ok", info
+            from agent.context_notes import context_note_message
+
+            info = {**info, "notes": notes}
+            metadata = self._decode_display_metadata(anchor["display_metadata"]) or {}
+            receipts = metadata.setdefault("_omnio_continuation_notes", {})
+            receipts[continuation_id] = {
+                "request_key": request_key,
+                "notes": notes,
+                "deferred": deferred,
+                "info": info,
+            }
+            conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                (self._encode_display_metadata(metadata), anchor["id"]),
+            )
+            if not deferred:
+                for note in notes:
+                    conn.execute(
+                        "INSERT INTO messages "
+                        "(session_id, role, content, timestamp, observed, active, display_kind) "
+                        "VALUES (?, 'user', ?, ?, 0, 1, 'context_note')",
+                        (session_id, self._encode_content(context_note_message(note)["content"]), time.time()),
+                    )
+                conn.execute(
+                    "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
+                    (len(notes), session_id),
+                )
+            return "ok", info
+
+        def _calls(raw: Any) -> List[Dict[str, Any]]:
+            if not raw:
+                return []
+            try:
+                value = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError):
+                return []
+            if not isinstance(value, list):
+                return []
+            return [call for call in value if isinstance(call, dict)]
+
+        def _call_name(call: Dict[str, Any]) -> Optional[str]:
+            function = call.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+            return name if isinstance(name, str) and name else None
+
+        def _append_tool(conn, call_id: str, name: Optional[str], content: Any) -> None:
+            conn.execute(
+                "INSERT INTO messages "
+                "(session_id, role, content, tool_call_id, tool_name, "
+                "timestamp, observed, active) VALUES (?, 'tool', ?, ?, ?, ?, 0, 1)",
+                (session_id, content, call_id, _scrub_surrogates(name), time.time()),
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                (session_id,),
+            )
+
+        def _do(conn):
+            rows = conn.execute(
+                "SELECT id, role, content, tool_call_id, tool_calls, display_metadata "
+                "FROM messages WHERE session_id = ? AND active = 1 "
+                "AND role IN ('user', 'assistant', 'tool') ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            if not rows:
+                return "not_resumable", {"reason": "empty_session"}
+            if continuation_id:
+                for row in reversed(rows):
+                    metadata = self._decode_display_metadata(row["display_metadata"]) or {}
+                    receipt = (metadata.get("_omnio_continuation_notes") or {}).get(continuation_id)
+                    if receipt is not None:
+                        if receipt.get("request_key") != request_key:
+                            return "conflict", {"reason": "continuation_notes_changed"}
+                        return "ok", {**receipt["info"], "replayed": True}
+            assistant_idx = next(
+                (
+                    idx
+                    for idx in range(len(rows) - 1, -1, -1)
+                    if rows[idx]["role"] != "tool"
+                ),
+                None,
+            )
+            if assistant_idx is None:
+                return "not_resumable", {"reason": "orphan_tool_results"}
+            anchor = rows[assistant_idx]
+            if anchor["role"] == "user":
+                if assistant_idx != len(rows) - 1:
+                    return "not_resumable", {"reason": "orphan_tool_results"}
+                if kind not in (None, "interrupted"):
+                    return "not_found", {"reason": "no_pending_call"}
+                return _with_notes(conn, anchor, {"tail": "user", "closed": []})
+            calls = _calls(anchor["tool_calls"])
+            if not calls:
+                return "not_resumable", {"reason": "final_assistant_message"}
+            call_ids = [call.get("id") for call in calls if isinstance(call.get("id"), str)]
+            results = {
+                row["tool_call_id"]: row
+                for row in rows[assistant_idx + 1:]
+                if row["tool_call_id"] in call_ids
+            }
+            if len(results) != len(rows) - assistant_idx - 1:
+                return "not_resumable", {"reason": "foreign_tool_results"}
+            unresolved = [call for call in calls if call.get("id") not in results]
+            metadata = self._decode_display_metadata(anchor["display_metadata"]) or {}
+            grants = metadata.get("_omnio_resolved_approvals")
+            if not isinstance(grants, dict):
+                grants = {}
+
+            target = None
+            if kind in ("answer", "approval"):
+                target = next((call for call in calls if call.get("id") == target_id), None)
+                target_name = _call_name(target) if target is not None else None
+                if target is None or target_name is None:
+                    return "not_found", {"reason": "unknown_call"}
+                interaction = is_interaction_tool(target_name)
+                if (kind == "answer") != interaction:
+                    return "not_found", {"reason": "wrong_call_kind"}
+                grants_call = kind == "approval" and close.get("scope") != "deny"
+                existing = results.get(target_id)
+                if grants_call and target_id in grants:
+                    # The grant may already have been consumed: the approved
+                    # call then has its real result, which is not a conflict.
+                    same = grants[target_id].get("scope") == close.get("scope")
+                    if not same:
+                        return "conflict", {"replayed": True}
+                    return _with_notes(conn, anchor, {"replayed": True}, deferred=existing is None)
+                if existing is not None:
+                    same = not grants_call and (
+                        existing["content"] == self._encode_content(close.get("content"))
+                        or (
+                            kind == "answer"
+                            and _same_answer(
+                                self._decode_content(existing["content"]), close.get("content")
+                            )
+                        )
+                    )
+                    if not same:
+                        return "conflict", {"replayed": True}
+                    return _with_notes(conn, anchor, {"replayed": True})
+            elif kind not in (None, "interrupted"):
+                return "not_found", {"reason": "unknown_close_kind"}
+            elif kind is None and unresolved:
+                return "not_resumable", {"reason": "unresolved_calls"}
+
+            closed: List[str] = []
+            for call in unresolved:
+                call_id = call["id"]
+                if target is not None and call_id == target_id:
+                    if kind == "approval" and close.get("scope") != "deny":
+                        raw_arguments = (call.get("function") or {}).get("arguments")
+                        grants[call_id] = {
+                            "scope": close.get("scope"),
+                            "tool_name": _call_name(call),
+                            "arguments": (
+                                raw_arguments if isinstance(raw_arguments, str) else "{}"
+                            ),
+                        }
+                        metadata["_omnio_resolved_approvals"] = grants
+                        conn.execute(
+                            "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                            (self._encode_display_metadata(metadata), anchor["id"]),
+                        )
+                    else:
+                        _append_tool(
+                            conn,
+                            call_id,
+                            _call_name(call),
+                            self._encode_content(close.get("content")),
+                        )
+                    closed.append(call_id)
+                    continue
+                _append_tool(conn, call_id, _call_name(call), stored_interrupted)
+                closed.append(call_id)
+            # Read the metadata after granting approval so adding notes cannot
+            # overwrite the durable grant written in this transaction.
+            anchor = conn.execute(
+                "SELECT id, display_metadata FROM messages WHERE id = ?", (anchor["id"],)
+            ).fetchone()
+            return _with_notes(
+                conn, anchor, {"tail": "tool_calls", "closed": closed},
+                deferred=kind == "approval" and close.get("scope") != "deny",
+            )
 
         return self._execute_write(_do)
 
@@ -11056,6 +11388,17 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
+
+
+def reconcile_state_schema(conn: sqlite3.Connection) -> None:
+    """Initialize raw state.db writers from the same schema as SessionDB.
+
+    Backport of upstream a6d65cdd09: delegation writers must not establish a
+    partial store or maintain a second definition of its durable tables.
+    """
+    conn.executescript(SCHEMA_SQL)
+    shim = object.__new__(SessionDB)
+    shim._reconcile_columns(conn.cursor())
 
 
 class AsyncSessionDB:

@@ -512,3 +512,45 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
+
+
+def test_continuation_preflight_compression_preserves_no_user_anchor(tmp_path):
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+    agent._compress_context = MagicMock(
+        side_effect=lambda messages, *_args, **_kwargs: (
+            [dict(message) for message in messages],
+            "SYSTEM",
+        )
+    )
+    history = [
+        {"role": "user", "content": "historical user"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "pending-1",
+                "type": "function",
+                "function": {
+                    "name": "request_user_input",
+                    "arguments": "{}",
+                },
+            }],
+        },
+    ]
+
+    with patch(
+        "agent.turn_context._should_run_preflight_estimate", return_value=True
+    ), patch(
+        "agent.turn_context.estimate_request_tokens_rough", return_value=999_999
+    ):
+        ctx = _build(
+            agent,
+            user_message="",
+            conversation_history=history,
+            continuation=True,
+        )
+
+    agent._compress_context.assert_called()
+    assert ctx.current_turn_user_idx == -1
+    assert agent._persist_user_message_idx is None
+    assert ctx.messages == history

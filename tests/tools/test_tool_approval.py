@@ -10,6 +10,7 @@ import tools.mcp_tool as mcp_tool
 import tools.tool_approval as tool_approval
 from tools.approval import reset_current_session_key, set_current_session_key
 from tools.interrupt import set_interrupt
+from tools.omnio_approval_state import register_conversation_grant_loader
 from tools.tool_approval import (
     APPROVAL_OPTION_SCOPES,
     APPROVAL_OPTIONS,
@@ -33,8 +34,8 @@ from tools.tool_approval import (
     is_tool_approved,
     maybe_require_tool_approval,
     record_always_approval,
+    rehydrate_resolved_approval,
     record_session_approval,
-    register_always_approval_authority,
     register_tool_approval_notify,
     replace_injected_always_approvals,
     resolve_tool_approval,
@@ -53,6 +54,7 @@ CREDIT_DESCRIPTOR = {
     "creditsPerUnit": 30,
 }
 SESSION = "sess-1"
+OTHER_SESSION = "sess-2"
 
 
 @pytest.fixture(autouse=True)
@@ -66,7 +68,7 @@ def _clean_state(monkeypatch):
     _injected_always_approved.clear()
     _injected_always_approved_slugs.clear()
     clear_session(SESSION)
-    register_always_approval_authority(lambda _function_name: True)
+    register_conversation_grant_loader(None)
     mcp_tool._mcp_tool_read_only_hints.clear()
     mcp_tool._mcp_tool_credits_meta.clear()
     # Model the connectors route having advertised its tools: the write is NOT
@@ -81,7 +83,8 @@ def _clean_state(monkeypatch):
     _injected_always_approved.clear()
     _injected_always_approved_slugs.clear()
     clear_session(SESSION)
-    register_always_approval_authority(None)
+    clear_session(OTHER_SESSION)
+    register_conversation_grant_loader(None)
     mcp_tool._mcp_tool_read_only_hints.clear()
     mcp_tool._mcp_tool_credits_meta.clear()
     reset_current_session_key(token)
@@ -92,6 +95,8 @@ def _resolving_notify(scope):
     unblocks in-thread — exercises the full block→resolve path without a thread."""
 
     def cb(event):
+        if event.get("completed"):
+            return
         resolve_tool_approval(SESSION, event["interaction"]["approval"]["tool"], scope)
 
     return cb
@@ -217,15 +222,15 @@ class TestMaybeRequireToolApproval:
 
     def test_should_fail_closed_on_timeout(self, monkeypatch):
         monkeypatch.setenv("OMNIO_TOOL_APPROVAL_TIMEOUT", "0")
-        register_tool_approval_notify(SESSION, lambda event: None)  # never resolves
+        events = []
+        register_tool_approval_notify(SESSION, events.append)  # never resolves
         result = maybe_require_tool_approval(GATED, "call-1")
         assert result is not None
         # A genuine timeout with a real interactive surface IS turn-ending.
         assert json.loads(result)["status"] == "approval_no_response"
         assert isinstance(result, ToolApprovalDenial)
-        assert (
-            consume_tool_approval_completion_reason(SESSION, "call-1") == "expired"
-        )
+        assert events[-1]["interaction"]["timed_out"] is True
+        assert consume_tool_approval_completion_reason(SESSION, "call-1") is None
 
     def test_notify_raising_is_a_plumbing_error_not_a_user_timeout(self):
         # The notify callback raising means the card was never actually shown
@@ -244,7 +249,7 @@ class TestMaybeRequireToolApproval:
         captured = {}
         register_tool_approval_notify(
             SESSION,
-            lambda event: (
+            lambda event: None if event.get("completed") else (
                 captured.update(event),
                 resolve_tool_approval(SESSION, GATED, "once"),
             ),
@@ -263,10 +268,55 @@ class TestMaybeRequireToolApproval:
 
 
 class TestCreditApproval:
+    def test_rehydrated_bridge_approval_targets_the_underlying_call_once(
+        self, monkeypatch
+    ):
+        bridge_args = {
+            "name": CREDIT_GATED,
+            "arguments": {"engines": ["openai"]},
+        }
+        monkeypatch.setattr(
+            "tools.tool_search.resolve_underlying_call",
+            lambda args: (
+                CREDIT_GATED,
+                args["arguments"],
+                None,
+            ),
+        )
+
+        assert rehydrate_resolved_approval(
+            SESSION,
+            "call-credit",
+            "tool_call",
+            json.dumps(bridge_args, separators=(",", ":")),
+            {
+                "scope": "once",
+                "tool_name": "tool_call",
+                "arguments": json.dumps(bridge_args, separators=(",", ":")),
+            },
+        )
+        assert (
+            maybe_require_tool_approval(
+                CREDIT_GATED,
+                "call-credit",
+                {"engines": ["openai"]},
+            )
+            is None
+        )
+
+        second = maybe_require_tool_approval(
+            CREDIT_GATED,
+            "call-credit",
+            {"engines": ["openai"]},
+        )
+        assert json.loads(second)["status"] == "approval_error"
+
     def test_should_surface_only_per_call_approve_and_deny_options(self):
         captured = {}
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.update(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once")
 
@@ -291,6 +341,8 @@ class TestCreditApproval:
         captured = {}
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.update(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once")
 
@@ -320,6 +372,8 @@ class TestCreditApproval:
         captured = {}
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.update(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once")
 
@@ -355,6 +409,8 @@ class TestCreditApproval:
         captured = {}
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.update(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once")
 
@@ -386,6 +442,8 @@ class TestCreditApproval:
         )
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.update(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once")
 
@@ -417,6 +475,8 @@ class TestCreditApproval:
         prompts = []
 
         def notify(event):
+            if event.get("completed"):
+                return
             prompts.append(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once")
 
@@ -426,11 +486,15 @@ class TestCreditApproval:
 
     @pytest.mark.parametrize("scope", ["session", "always"])
     def test_should_treat_standing_scope_resolutions_as_once(self, scope):
-        notify = _resolving_notify(scope)
-        notify_token = register_tool_approval_notify(SESSION, notify)
+        events = []
+        resolve = _resolving_notify(scope)
+        notify_token = register_tool_approval_notify(
+            SESSION, lambda event: (events.append(event), resolve(event))
+        )
         assert maybe_require_tool_approval(CREDIT_GATED, "call-credit") is None
 
-        assert consume_tool_approval_decision(SESSION, "call-credit") == "once"
+        assert events[-1]["interaction"]["answered"] == "once"
+        assert consume_tool_approval_decision(SESSION, "call-credit") is None
         assert is_tool_approved(SESSION, CREDIT_GATED) is False
         assert is_always_approved(CREDIT_GATED) is False
 
@@ -490,6 +554,8 @@ class TestCreditApprovalDispatch:
             return json.dumps({"success": True})
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.update(event)
             resolve_tool_approval(SESSION, CREDIT_GATED, "once", "call-credit")
 
@@ -620,52 +686,23 @@ class TestAlwaysScope:
         unregister_tool_approval_notify(SESSION, notify_token)
         assert maybe_require_tool_approval(GATED) is None
 
-    def test_first_always_call_proceeds_but_later_call_waits_for_persistence(self):
-        register_always_approval_authority(None)
-        notify = _resolving_notify("always")
-        notify_token = register_tool_approval_notify(SESSION, notify)
+    def test_in_chat_always_grant_applies_to_other_conversations_on_the_gateway(self):
+        resolve_tool_approval(SESSION, GATED, "always")
 
+        token = set_current_session_key(OTHER_SESSION)
+        try:
+            assert maybe_require_tool_approval(GATED, "call-2") is None
+        finally:
+            reset_current_session_key(token)
+
+    def test_loaded_grant_holds_until_the_next_snapshot_replaces_it(self):
+        replace_injected_always_approvals([GATED])
         assert maybe_require_tool_approval(GATED, "call-1") is None
 
-        unregister_tool_approval_notify(SESSION, notify_token)
-        result = maybe_require_tool_approval(GATED, "call-2")
-        assert json.loads(result)["status"] == "approval_error"
-
-    def test_warm_gateway_rechecks_and_prompts_after_authoritative_revoke(self):
-        replace_injected_always_approvals([GATED])
-        authority_results = iter([True, False])
-        checked: list[str] = []
-
-        def authority(function_name: str) -> bool:
-            checked.append(function_name)
-            return next(authority_results)
-
-        register_always_approval_authority(authority)
-        assert maybe_require_tool_approval(GATED, "call-1") is None
-
-        prompts: list[dict] = []
-
-        def deny_prompt(event: dict) -> None:
-            prompts.append(event)
-            resolve_tool_approval(SESSION, GATED, "deny", "call-2")
-
-        register_tool_approval_notify(SESSION, deny_prompt)
-        result = maybe_require_tool_approval(GATED, "call-2")
-
-        assert json.loads(result)["status"] == "approval_denied"
-        assert prompts[0]["interaction"]["approval"]["tool"] == GATED
-        assert checked == [GATED, GATED]
-
-    def test_authority_outage_prompts_instead_of_using_stale_grant(self):
-        replace_injected_always_approvals([GATED])
-
-        def unavailable(_function_name: str) -> bool:
-            raise TimeoutError("omnia timed out")
-
-        register_always_approval_authority(unavailable)
+        replace_injected_always_approvals([])
         register_tool_approval_notify(SESSION, _resolving_notify("deny"))
 
-        result = maybe_require_tool_approval(GATED, "call-1")
+        result = maybe_require_tool_approval(GATED, "call-2")
         assert json.loads(result)["status"] == "approval_denied"
 
     def test_injected_always_refresh_replaces_local_always(self):
@@ -747,12 +784,6 @@ class TestSlugKeyedGrants:
         assert is_always_approved(GATED) is True
         assert is_always_approved(SIBLING) is False
 
-    def test_slug_candidate_still_requires_the_authority(self):
-        replace_injected_always_approvals([], tool_slugs=["GMAIL_CREATE_EMAIL_DRAFT"])
-        register_always_approval_authority(lambda _function_name: False)
-
-        assert is_always_approved(GATED) is False
-
     def test_session_grant_should_record_a_legacy_spelled_sibling_as_native(self):
         # The client blankets the toolkit with names in the spelling IT knows;
         # an older client sends legacy names, which must map onto this
@@ -764,6 +795,92 @@ class TestSlugKeyedGrants:
         )
 
         assert is_tool_approved(SESSION, SIBLING) is True
+
+
+class TestConversationGrants:
+    """"Allow for this chat" grants saved in Omnia load once per conversation
+    on the first gated call, so they survive a gateway restart."""
+
+    def _loader(self, *results):
+        calls: list[int] = []
+        pending = list(results)
+
+        def load():
+            calls.append(1)
+            result = pending.pop(0) if len(pending) > 1 else pending[0]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        register_conversation_grant_loader(load)
+        return calls
+
+    def test_should_proceed_without_prompting_when_the_chat_grant_was_saved(self):
+        self._loader(([GATED], ["GMAIL_CREATE_EMAIL_DRAFT"]))
+
+        assert maybe_require_tool_approval(GATED, "call-1") is None
+
+    def test_should_load_the_saved_grants_once_per_conversation(self):
+        calls = self._loader(([GATED], ["GMAIL_CREATE_EMAIL_DRAFT"]))
+
+        assert is_tool_approved(SESSION, GATED) is True
+        assert is_tool_approved(SESSION, SIBLING) is False
+        assert is_tool_approved(SESSION, GATED) is True
+
+        assert len(calls) == 1
+
+    def test_should_match_a_saved_slug_under_either_wire_prefix(self):
+        self._loader(([], ["GMAIL_CREATE_EMAIL_DRAFT"]))
+
+        assert is_tool_approved(SESSION, GATED) is True
+        assert is_tool_approved(SESSION, LEGACY_GATED) is True
+
+    def test_should_derive_slugs_when_omnia_sends_only_names(self):
+        self._loader(([LEGACY_GATED], None))
+
+        assert is_tool_approved(SESSION, GATED) is True
+
+    def test_should_ignore_saved_names_outside_the_connectors_server(self):
+        self._loader((["terminal"], []))
+
+        assert is_tool_approved(SESSION, "terminal") is False
+
+    def test_should_not_share_one_conversation_grants_with_another(self):
+        self._loader(([GATED], ["GMAIL_CREATE_EMAIL_DRAFT"]), ([], []))
+
+        assert is_tool_approved(SESSION, GATED) is True
+        assert is_tool_approved(OTHER_SESSION, GATED) is False
+
+    def test_should_prompt_and_retry_the_load_when_omnia_is_unreachable(self):
+        calls = self._loader(
+            TimeoutError("omnia timed out"), ([GATED], ["GMAIL_CREATE_EMAIL_DRAFT"])
+        )
+
+        assert is_tool_approved(SESSION, GATED) is False
+        assert is_tool_approved(SESSION, GATED) is True
+        assert len(calls) == 2
+
+    def test_should_retry_the_load_when_the_conversation_is_not_known_yet(self):
+        calls = self._loader(None, ([GATED], ["GMAIL_CREATE_EMAIL_DRAFT"]))
+
+        assert is_tool_approved(SESSION, GATED) is False
+        assert is_tool_approved(SESSION, GATED) is True
+        assert len(calls) == 2
+
+    def test_should_keep_an_in_chat_grant_when_the_saved_grants_load_later(self):
+        self._loader(([], []))
+        resolve_tool_approval(SESSION, GATED, "session")
+
+        assert is_tool_approved(SESSION, GATED) is True
+
+    def test_should_reload_the_saved_grants_after_the_conversation_is_reset(self):
+        calls = self._loader(([GATED], ["GMAIL_CREATE_EMAIL_DRAFT"]))
+        assert is_tool_approved(SESSION, GATED) is True
+
+        clear_session(SESSION)
+
+        assert is_tool_approved(SESSION, GATED) is True
+        assert len(calls) == 2
 
 
 class TestResolveToolApproval:
@@ -1002,6 +1119,8 @@ class TestConcurrentApproval:
         captured: list[str] = []
 
         def notify(event):
+            if event.get("completed"):
+                return
             captured.append(event["interaction"]["approval"]["tool_call_id"])
             if len(captured) == 2:
                 both_blocked.set()
@@ -1042,7 +1161,8 @@ class TestInterruptRelease:
     def test_interrupt_releases_a_blocked_wait_and_denies(self):
         result: dict[str, object] = {}
         blocked = threading.Event()
-        register_tool_approval_notify(SESSION, lambda event: blocked.set())
+        events = []
+        register_tool_approval_notify(SESSION, lambda event: (events.append(event), blocked.set()))
 
         def worker():
             set_current_session_key(
@@ -1064,10 +1184,9 @@ class TestInterruptRelease:
             assert result["choice"] is not None, (
                 "interrupted wait fails closed (denial)"
             )
-            assert (
-                consume_tool_approval_completion_reason(SESSION, "call-1")
-                == "cancelled"
-            )
+            assert events[-1]["completed"] is True
+            assert events[-1]["interaction"]["timed_out"] is False
+            assert consume_tool_approval_completion_reason(SESSION, "call-1") is None
         finally:
             set_interrupt(False, thread.ident)
 

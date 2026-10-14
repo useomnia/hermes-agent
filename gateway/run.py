@@ -1636,7 +1636,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home, get_hermes_home_override
-from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
+from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, fast_safe_load, is_truthy_value
 _hermes_home = get_hermes_home()
 
 
@@ -1696,7 +1696,7 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
     try:
         import yaml as _yaml
         with open(config_path, encoding="utf-8") as f:
-            cfg = _yaml.safe_load(f) or {}
+            cfg = fast_safe_load(f) or {}
         from hermes_cli.config import _expand_env_vars
         cfg = _expand_env_vars(cfg)
         # Managed scope: keep administrator-pinned values authoritative on every
@@ -1862,7 +1862,7 @@ if _config_path.exists():
     try:
         import yaml as _yaml
         with open(_config_path, encoding="utf-8") as _f:
-            _cfg = _yaml.safe_load(_f) or {}
+            _cfg = fast_safe_load(_f) or {}
         # Expand ${ENV_VAR} references before bridging to env vars.
         from hermes_cli.config import _expand_env_vars
         _cfg = _expand_env_vars(_cfg)
@@ -2309,6 +2309,61 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 _UNSET = object()
 
 
+
+
+
+
+def _warm_agent_stack() -> None:
+    """Pay the first agent build's one-time costs while the gateway is idle.
+
+    Imports the agent stack and ``openai``, resolves the OpenRouter preset and
+    assembles the API server's tool definitions, so the first request does
+    not. Builds no agent and never raises.
+    """
+    started = time.monotonic()
+    marks: dict[str, int] = {}
+
+    def _mark(name: str) -> None:
+        marks[name] = round((time.monotonic() - started) * 1000)
+
+    try:
+        import run_agent  # noqa: F401 — imports model_tools and the tool modules
+        import openai  # noqa: F401
+
+        _mark("imports")
+        try:
+            from agent.model_metadata import resolve_openrouter_preset_context
+
+            runtime = _resolve_runtime_agent_kwargs()
+            resolve_openrouter_preset_context(
+                _resolve_gateway_model(),
+                base_url=str(runtime.get("base_url") or ""),
+                provider=str(runtime.get("provider") or ""),
+                api_key=runtime.get("api_key") or "",
+            )
+        except Exception:
+            logger.debug("agent warm-up: preset context skipped", exc_info=True)
+        _mark("preset")
+        try:
+            from hermes_cli.tools_config import _get_platform_tools
+            from model_tools import get_tool_definitions
+
+            get_tool_definitions(
+                enabled_toolsets=sorted(_get_platform_tools(_load_gateway_config(), "api_server")),
+                quiet_mode=True,
+            )
+        except Exception:
+            logger.debug("agent warm-up: tool definitions skipped", exc_info=True)
+        _mark("tools")
+    except Exception:
+        logger.debug("agent warm-up failed", exc_info=True)
+    logger.info("Agent stack warm-up done %s", " ".join(f"{k}_ms={v}" for k, v in marks.items()))
+
+
+def _start_agent_stack_warmup() -> None:
+    threading.Thread(target=_warm_agent_stack, name="agent-warmup", daemon=True).start()
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -2428,7 +2483,7 @@ def _try_resolve_fallback_provider() -> dict | None:
         if not cfg_path.exists():
             return None
         with open(cfg_path, encoding="utf-8") as _f:
-            cfg = _y.safe_load(_f) or {}
+            cfg = fast_safe_load(_f) or {}
         fb_list = get_fallback_chain(cfg)
         if not fb_list:
             return None
@@ -2829,7 +2884,7 @@ def _load_gateway_config() -> dict:
             if config_path.exists():
                 import yaml
                 with open(config_path, 'r', encoding='utf-8') as f:
-                    raw = yaml.safe_load(f) or {}
+                    raw = fast_safe_load(f) or {}
         except Exception:
             logger.debug("Could not load gateway config from %s", config_path)
             raw = {}
@@ -3375,16 +3430,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
-        # Invalidate any prior clean quiescence marker before this process can
-        # admit work. A cold reader must never mistake a stale marker from a
-        # previous gateway generation for proof about this one.
-        from gateway.quiescence import mark_offline_quiescence_unknown
-
-        if not mark_offline_quiescence_unknown():
-            raise RuntimeError(
-                "Could not durably invalidate the offline quiescence marker; "
-                "refusing to admit gateway work"
-            )
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -4926,16 +4971,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # zero work. Keep shutdown polling alive until the owner recovers.
             return 1 if strict else 0
 
-    def _omnio_quiescence_force_active(self) -> bool:
-        """Whether the API adapter has a force-quiescence admission gate."""
-        try:
-            adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
-            return bool(
-                getattr(adapter, "_quiescence_force_latched", False)
-                or getattr(adapter, "_quiescence_force_in_progress", False)
-            )
-        except Exception:
-            return False
 
     # ── scale-to-zero idle detection / dormant-quiesce (Phase 0) ──────────────
     # The gateway-side BEHAVIOUR that consumes the relay scale-to-zero primitives
@@ -5875,7 +5910,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cfg_path = _hermes_home / "config.yaml"
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
+                    cfg = fast_safe_load(_f) or {}
                 return cfg.get("provider_routing", {}) or {}
         except Exception:
             pass
@@ -5894,7 +5929,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cfg_path = _hermes_home / "config.yaml"
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
+                    cfg = fast_safe_load(_f) or {}
                 fb = get_fallback_chain(cfg)
                 if fb:
                     return fb
@@ -5923,7 +5958,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._fallback_model = None
                 return self._fallback_model
             with open(cfg_path, encoding="utf-8") as _f:
-                cfg = _y.safe_load(_f) or {}
+                cfg = fast_safe_load(_f) or {}
         except Exception:
             # Transient failure — keep last known-good chain.
             logger.debug(
@@ -8225,6 +8260,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         _boot_mark("plugins")
 
+
         # Register the generic relay adapter when a connector relay URL is
         # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
         # direct/single-tenant deployments are unaffected. When configured, the
@@ -8284,6 +8320,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Recover background processes from checkpoint (crash recovery)
         try:
             from tools.process_registry import process_registry
+            process_registry.restore_completions()
             recovered = process_registry.recover_from_checkpoint()
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
@@ -8632,6 +8669,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "Gateway ready%s",
             f" [{ready_timeline}]" if ready_timeline else "",
         )
+        # Started once the boot's own imports are done, so the two never import
+        # the agent stack concurrently; the gateway idles until its first
+        # request, which then finds those costs paid.
+        _start_agent_stack_warmup()
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
@@ -9987,29 +10028,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _task.cancel()
             self._background_tasks.clear()
 
-            # Preserve a force-retired handover generation in the cold marker
-            # even when this process exits cleanly. A replacement gateway
-            # must not silently reopen writer admission after a force proof.
-            _api_quiescence_adapter = self.adapters.get(Platform.API_SERVER)
-            _force_quiescence_latched = bool(
-                getattr(_api_quiescence_adapter, "_quiescence_force_latched", False)
-            )
-            _force_quiescence_generation = getattr(
-                _api_quiescence_adapter, "_quiescence_generation", None
-            )
-            _force_quiescence_boot_id = getattr(
-                _api_quiescence_adapter, "_quiescence_force_boot_id", None
-            )
-            _force_quiescence_request_id = getattr(
-                _api_quiescence_adapter, "_quiescence_force_request_id", None
-            )
-            _force_quiescence_request_required = bool(
-                getattr(
-                    _api_quiescence_adapter,
-                    "_quiescence_force_request_required",
-                    False,
-                )
-            )
             self.adapters.clear()
             for _session_key in list(self._running_agents):
                 self._release_running_agent_state(_session_key)
@@ -10070,37 +10088,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Shutdown phase: SessionDB close done at +%.2fs",
                 _phase_elapsed(),
             )
-
-            # Persist the final handover proof for supervisors that inspect a
-            # stopped profile without a live HTTP listener.  This is only a
-            # point-in-time cold-state marker: a non-zero or unknown snapshot
-            # remains busy/unknown, never an optimistic zero. Startup
-            # invalidates the marker before admitting any new work.
-            try:
-                from gateway.quiescence import (
-                    collect_writer_work_snapshot,
-                    write_offline_quiescence_snapshot,
-                )
-
-                write_offline_quiescence_snapshot(
-                    # Keep the API adapter captured above as the accounting
-                    # owner.  ``self.adapters`` is cleared before this cold
-                    # marker is written; falling back to the runner alone
-                    # would report api_runs=0 while a canceled default
-                    # executor worker is still writing through that adapter.
-                    collect_writer_work_snapshot(
-                        adapter=_api_quiescence_adapter,
-                        runner=self,
-                    ),
-                    lifecycle="stopped",
-                    force_latched=_force_quiescence_latched,
-                    generation=_force_quiescence_generation,
-                    force_boot_id=_force_quiescence_boot_id,
-                    force_request_id=_force_quiescence_request_id,
-                    force_request_required=_force_quiescence_request_required,
-                )
-            except Exception as _e:
-                logger.debug("Could not persist offline quiescence snapshot: %s", _e)
 
             from gateway.status import remove_pid_file, release_gateway_runtime_lock
             remove_pid_file()
@@ -12543,20 +12530,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "⏳ This agent is draining for a maintenance action and isn't "
                 "accepting new turns right now. It'll be back in a moment — "
                 "please resend shortly."
-            )
-
-        # Force handover is a process-wide writer gate, not just an API
-        # listener gate. Internal completion/recovery events continue to flow,
-        # but no new external messaging turn may create another agent while
-        # the force endpoint is proving that all writers have stopped.
-        if self._omnio_quiescence_force_active() and not is_internal:
-            logger.info(
-                "Refusing new turn for session %s — Omnio force quiescence active.",
-                _quick_key,
-            )
-            return (
-                "⏳ This agent is quiescing for a maintenance action and isn't "
-                "accepting new turns right now. Please resend shortly."
             )
 
         # ── Claim this session before any await ───────────────────────
@@ -18652,46 +18625,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
-    def _completion_barrier_active(self) -> bool:
-        """Whether the API server reports a handover barrier over this gateway.
-
-        See ``APIServerAdapter.quiescence_barrier_active``. Behind that
-        barrier no turn can be admitted here, so a completion notification
-        that needs a turn to be consumed is undeliverable on this gateway and
-        must not be requeued: the queue depth is counted as writer work by the
-        quiescence proof, and an event nothing can drain would otherwise hold
-        the handover open forever. Durable async-delegation rows stay owned by
-        their SQLite replay; process notices are best-effort and are dropped.
-        """
-        adapters = getattr(self, "adapters", None)
-        adapter = adapters.get(Platform.API_SERVER) if isinstance(adapters, dict) else None
-        helper = getattr(adapter, "quiescence_barrier_active", None)
-        if not callable(helper):
-            return False
-        try:
-            return bool(helper())
-        except Exception:
-            return False
-
-    def _requeue_async_completion(self, evt: dict, barrier_active: bool) -> None:
-        """Requeue a failed async completion unless a handover barrier owns the retry.
-
-        Delivery failure has already released the durable claim
-        (``release_completion_delivery``), so the SQLite row is what replays
-        this completion on the next gateway; the in-memory copy is only useful
-        while this gateway can still start a turn.
-        """
-        from tools.process_registry import process_registry as _pr
-
-        if not barrier_active:
-            _pr.completion_queue.put(evt)
-            return
-        logger.warning(
-            "Not requeueing async delegation %s completion: handover barrier "
-            "active; durable replay owns its delivery",
-            evt.get("delegation_id") or "<legacy>",
-        )
-
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -18708,6 +18641,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
+        _pr.restore_completions()
         while self._running:
             try:
                 # Peek the queue for async-delegation events. We must NOT
@@ -18724,19 +18658,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         async_events.append(evt)
                     else:
                         requeue.append(evt)
-                barrier_active = bool(requeue or async_events) and self._completion_barrier_active()
                 for evt in requeue:
-                    if barrier_active:
-                        # Only an agent turn drains these, and the barrier
-                        # admits none. Keeping the event would pin the
-                        # quiescence proof on a notice nobody can receive.
-                        logger.warning(
-                            "Dropping %s notification for process %s: handover "
-                            "barrier active, no turn can consume it on this gateway",
-                            evt.get("type", "?"),
-                            evt.get("session_id") or evt.get("session_key") or "?",
-                        )
-                        continue
                     _pr.completion_queue.put(evt)
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
@@ -18746,9 +18668,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         delivered = await self._deliver_completion_notification(synth_text, evt)
                         if delivered is False:
-                            self._requeue_async_completion(evt, barrier_active)
+                            _pr.completion_queue.put(evt)
                     except Exception as e:
-                        self._requeue_async_completion(evt, barrier_active)
+                        _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
@@ -18916,16 +18838,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         synth_text, completion_evt,
                     )
                     if delivered is False:
-                        if self._completion_barrier_active():
-                            # A fenced gateway cannot start the turn this
-                            # notice needs; retrying would keep the watcher
-                            # counted as writer work for the whole handover.
-                            logger.warning(
-                                "Process watcher: giving up delivery for %s: "
-                                "handover barrier active on this gateway",
-                                session_id,
-                            )
-                            break
                         # The process remains terminal; retry after failed
                         # adapter injection instead of suppressing the result.
                         continue
@@ -24893,15 +24805,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # external-drain dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
         def _cron_admission_open() -> bool:
-            try:
-                _force_blocked = runner._omnio_quiescence_force_active()
-            except Exception:
-                _force_blocked = False
-            return not (
-                runner._draining
-                or runner._external_drain_active
-                or _force_blocked
-            )
+            return not (runner._draining or runner._external_drain_active)
 
         cron_start_kwargs["can_dispatch"] = _cron_admission_open
     cron_thread = threading.Thread(
@@ -25033,7 +24937,7 @@ def main():
     if args.config:
         import yaml
         with open(args.config, encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            data = fast_safe_load(f) or {}
             config = GatewayConfig.from_dict(data)
     
     # start_gateway() performs the full graceful teardown (adapters
@@ -25105,6 +25009,11 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
     # could still take up to its timeout on a wedged disk, and these locks must
     # never be stranded. os._exit skips atexit, and the early SystemExit exit
     # paths never run _stop_impl, so release here (idempotent).
+    try:
+        from gateway.status import flush_runtime_status
+        flush_runtime_status(timeout=1.0)
+    except Exception:
+        pass
     try:
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()

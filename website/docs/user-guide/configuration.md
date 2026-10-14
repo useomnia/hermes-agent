@@ -1615,7 +1615,7 @@ Example footer:
   • concepts/rag-pipeline.md — [patch] Could not find match for old_string
 ```
 
-Set `file_mutation_verifier: false` (or `HERMES_FILE_MUTATION_VERIFIER=0`) to suppress the footer. The verifier only fires when real failures are outstanding at turn end — a model that retries a failed patch and succeeds within the same turn will not trigger it for that file.
+Set `file_mutation_verifier: false` (or `HERMES_FILE_MUTATION_VERIFIER=0`) to suppress the footer. Unresolved failures still produce an `Unresolved file mutation` warning in the active profile's `logs/agent.log` and `logs/errors.log`, including the session, tool, path, and error preview. Logging also covers empty and interrupted turns. A model that retries a failed patch and succeeds within the same turn will produce neither the warning nor the footer for that file.
 
 **Trust the verifier over the model's summary.** The footer means the listed files were **not** modified on disk, even if the assistant's closing message says the task is done. Common causes:
 

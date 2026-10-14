@@ -118,6 +118,90 @@ def agent():
         return a
 
 
+def test_first_request_and_retry_use_catalog_output_ceiling(agent, monkeypatch):
+    """The real AIAgent builder must carry catalog metadata onto the wire."""
+    from agent import model_metadata
+
+    monkeypatch.setattr(model_metadata, "fetch_model_metadata", lambda: {
+        "vendor/catalog-model": {"context_length": 200000, "max_completion_tokens": 128000},
+        "vendor/other-model": {"context_length": 200000, "max_completion_tokens": 16000},
+    })
+    from providers import get_provider_profile
+
+    profile = get_provider_profile("openrouter")
+    monkeypatch.setattr(profile, "get_max_tokens", lambda model: 4096)
+    agent.provider = "openrouter"
+    agent.api_mode = "chat_completions"
+    agent.model = "vendor/catalog-model@preset/demo"
+    agent.max_tokens = None
+    agent.context_compressor.context_length = 200000
+    messages = [{"role": "user", "content": "hello"}]
+
+    first = agent._build_api_kwargs(messages)
+    assert agent._requested_output_cap_from_api_kwargs(first) == 128000
+    # Even a stale retry override from a previous model is clamped at request construction.
+    agent._ephemeral_max_output_tokens = 256000
+    assert agent._requested_output_cap_from_api_kwargs(agent._build_api_kwargs(messages)) == 128000
+    agent.model = "vendor/other-model@preset/demo"
+    assert agent._requested_output_cap_from_api_kwargs(agent._build_api_kwargs(messages)) == 16000
+    assert agent.max_tokens is None
+
+
+@pytest.mark.parametrize("mode", ["chat_completions", "codex_responses"])
+@pytest.mark.parametrize("setting", ["agent", "request", "extra_body"])
+def test_explicit_cap_doubles_on_retries_then_resets(agent, monkeypatch, mode, setting):
+    from agent import model_metadata
+    from agent.output_budget import boosted_output_cap
+
+    monkeypatch.setattr(model_metadata, "fetch_model_metadata", lambda: {
+        "vendor/catalog-model": {"max_completion_tokens": 128000},
+    })
+    agent.provider = "openrouter"
+    agent.model = "vendor/catalog-model"
+    agent.api_mode = mode
+    agent.context_compressor.context_length = 200000
+    agent.max_tokens = 4096 if setting == "agent" else None
+    field = "max_tokens" if mode == "chat_completions" else "max_output_tokens"
+    overrides = ({field: 4096} if setting == "request" else
+                 {"extra_body": {field: 4096}} if setting == "extra_body" else {})
+    from copy import deepcopy
+
+    original_overrides = deepcopy(overrides)
+    agent.request_overrides = overrides
+    messages = [{"role": "user", "content": "hello"}]
+    request = agent._build_api_kwargs(messages)
+    budgets = [agent._requested_output_cap_from_api_kwargs(request)]
+    for n in range(1, 7):
+        agent._ephemeral_max_output_tokens = boosted_output_cap(agent, budgets[-1], n)
+        request = agent._build_api_kwargs(messages)
+        budgets.append(agent._requested_output_cap_from_api_kwargs(request))
+        if setting == "extra_body":
+            assert request["extra_body"][field] == budgets[-1]
+    assert budgets == [4096, 8192, 16384, 32768, 65536, 128000, 128000]
+    assert agent._ephemeral_max_output_tokens is None
+    assert agent._requested_output_cap_from_api_kwargs(agent._build_api_kwargs(messages)) == 4096
+    assert agent.max_tokens == (4096 if setting == "agent" else None)
+    assert agent.request_overrides == original_overrides
+
+
+def test_catalog_output_cap_keeps_responses_recovery_budget(agent, monkeypatch):
+    from agent import model_metadata
+
+    monkeypatch.setattr(model_metadata, "fetch_model_metadata", lambda: {
+        "vendor/catalog-model": {"max_completion_tokens": 128000},
+    })
+    agent.provider = "openrouter"
+    agent.model = "vendor/catalog-model"
+    agent.api_mode = "codex_responses"
+    agent.max_tokens = None
+    agent.context_compressor.context_length = 200000
+    messages = [{"role": "user", "content": "hello"}]
+    agent._ephemeral_max_output_tokens = 2048
+    assert agent._build_api_kwargs(messages)["max_output_tokens"] == 2048
+    assert agent._ephemeral_max_output_tokens is None
+    assert agent._build_api_kwargs(messages)["max_output_tokens"] == 128000
+
+
 def test_persist_user_message_override_rewrites_text_turns(agent):
     messages = [{"role": "user", "content": "API-only synthetic prefix\nhello"}]
     agent._persist_user_message_idx = 0
@@ -6038,11 +6122,12 @@ class TestRunConversation:
 
         assert result["completed"] is False
         assert result["partial"] is True
-        assert "truncated due to output length limit" in result["error"]
+        assert "output length limit" not in result["error"]
+        assert "finish_reason='tool_calls'" in result["error"]
         mock_handle_function_call.assert_not_called()
 
-    def test_truncated_tool_json_after_tool_batch_closes_tool_tail(self, agent):
-        """finish_reason=tool_calls + truncated args after a real tool must close tool→user."""
+    def test_truncated_tool_json_after_tool_batch_preserves_tool_tail(self, agent):
+        """Truncated args leave completed work intact and diagnostics outside history."""
         self._setup_agent(agent)
         agent.valid_tool_names.add("write_file")
         good_tc = _mock_tool_call(
@@ -6072,13 +6157,17 @@ class TestRunConversation:
             result = agent.run_conversation("write then truncate")
 
         assert result.get("partial") is True
+        assert result["completed"] is False
+        assert "truncated" in result["error"].lower()
         msgs = result.get("messages") or []
-        assert msgs[-1].get("role") == "assistant"
-        assert "truncated" in (msgs[-1].get("content") or "").lower()
-        assert any(isinstance(m, dict) and m.get("role") == "tool" for m in msgs)
+        tool_results = [msg for msg in msgs if msg.get("role") == "tool"]
+        assert len(tool_results) == 1
+        assert msgs[-1] == tool_results[0]
+        assert tool_results[0]["tool_call_id"] == "c_ok"
+        assert json.loads(tool_results[0]["content"]) == {"success": True}
 
-    def test_length_truncated_tool_exhaustion_after_tool_batch_closes_tool_tail(self, agent):
-        """Length-handler truncated-tool exhaustion after a tool batch must close tool→user."""
+    def test_length_truncated_tool_exhaustion_after_tool_batch_preserves_tool_tail(self, agent):
+        """Length exhaustion preserves completed work without a fabricated answer."""
         self._setup_agent(agent)
         agent.valid_tool_names.add("write_file")
         good_tc = _mock_tool_call(
@@ -6112,10 +6201,14 @@ class TestRunConversation:
             result = agent.run_conversation("write then hit length truncate")
 
         assert result.get("partial") is True
+        assert result["completed"] is False
         assert "truncated due to output length limit" in (result.get("error") or "")
         msgs = result.get("messages") or []
-        assert msgs[-1].get("role") == "assistant"
-        assert "truncated" in (msgs[-1].get("content") or "").lower()
+        tool_results = [msg for msg in msgs if msg.get("role") == "tool"]
+        assert len(tool_results) == 1
+        assert msgs[-1] == tool_results[0]
+        assert tool_results[0]["tool_call_id"] == "c_ok"
+        assert json.loads(tool_results[0]["content"]) == {"success": True}
 
     def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
         """Regression: kanban worker must signal the dispatcher when its

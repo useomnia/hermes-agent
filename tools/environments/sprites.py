@@ -289,6 +289,24 @@ class SpritesEnvironment(BaseEnvironment):
         self._sync_manager.sync(force=True)
         self.init_session()
 
+    def _identity_headers(self) -> dict[str, str]:
+        """Pair credentials, the Brand, and the calling session when bound.
+
+        The Omnio proxy maps the session to its conversation so the Toolbox
+        can select that conversation's home; without one it keeps the Brand's
+        shared home.
+        """
+        headers = {
+            "Authorization": f"Bearer {self.bearer_token}",
+            "X-Omnio-Brand": self.brand,
+        }
+        from gateway.session_context import current_session_id
+
+        session_id = current_session_id()
+        if session_id is not None:
+            headers["X-Hermes-Session-Id"] = session_id
+        return headers
+
     def _request_json(
         self,
         path: str,
@@ -302,10 +320,7 @@ class SpritesEnvironment(BaseEnvironment):
         request_id: str | None = None,
     ) -> dict[str, Any]:
         data = None
-        headers = {
-            "Authorization": f"Bearer {self.bearer_token}",
-            "X-Omnio-Brand": self.brand,
-        }
+        headers = self._identity_headers()
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -436,6 +451,31 @@ class SpritesEnvironment(BaseEnvironment):
         """Send a file operation to the toolbox Sprite."""
         return self._request_json("/files", payload)
 
+    def open_code_rpc(self, token: str):
+        """Open one authenticated channel bound to this environment's Brand."""
+        from websockets.sync.client import connect
+
+        capability = self._request_json("/code/capabilities", method="GET")
+        if capability.get("rpc") != 1:
+            raise SpritesToolboxError("Toolbox does not support code RPC v1")
+        url = self.toolbox_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        connection = connect(
+            f"{url}/code/rpc",
+            additional_headers=self._identity_headers(),
+            open_timeout=10, close_timeout=2, max_size=16 * 1024 * 1024,
+            proxy=None,
+        )
+        try:
+            connection.send(json.dumps({"token": token}))
+            ready = json.loads(connection.recv(timeout=15))
+            path = ready.get("socket", "")
+            if ready.get("type") != "ready" or not isinstance(path, str) or not path.startswith("/tmp/code-rpc-"):
+                raise SpritesToolboxError("Toolbox returned invalid code RPC readiness")
+            return connection, path
+        except Exception:
+            connection.close()
+            raise
+
     def read_file_bytes(self, path: str, *, max_bytes: int) -> bytes:
         """Read at most ``max_bytes`` from a Toolbox file as raw bytes."""
         if max_bytes < 1:
@@ -445,10 +485,7 @@ class SpritesEnvironment(BaseEnvironment):
         query = urllib.parse.urlencode({"path": path})
         request = urllib.request.Request(
             f"{self.toolbox_url}/files?{query}",
-            headers={
-                "Authorization": f"Bearer {self.bearer_token}",
-                "X-Omnio-Brand": self.brand,
-            },
+            headers=self._identity_headers(),
             method="GET",
         )
         try:
@@ -485,10 +522,7 @@ class SpritesEnvironment(BaseEnvironment):
         query = urllib.parse.urlencode({"path": path})
         request = urllib.request.Request(
             f"{self.toolbox_url}/files?{query}",
-            headers={
-                "Authorization": f"Bearer {self.bearer_token}",
-                "X-Omnio-Brand": self.brand,
-            },
+            headers=self._identity_headers(),
             method="GET",
         )
         try:
@@ -628,8 +662,7 @@ class SpritesEnvironment(BaseEnvironment):
         })
         request = urllib.request.Request(
             f"{self.toolbox_url}/files?{query}", data=data, method="PUT",
-            headers={"Authorization": f"Bearer {self.bearer_token}",
-                     "X-Omnio-Brand": self.brand,
+            headers={**self._identity_headers(),
                      "Content-Type": "application/octet-stream"},
         )
         try:

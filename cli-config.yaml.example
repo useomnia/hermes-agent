@@ -66,10 +66,11 @@ model:
   #
   # max_tokens: OUTPUT cap — maximum tokens the model may generate per response.
   #   Unrelated to how long your conversation history can be.
-  #   The OpenAI-standard name "max_tokens" is a misnomer; Anthropic's native
-  #   API has since renamed it "max_output_tokens" for clarity.
-  #   Leave unset to use the model's native output ceiling (recommended).
-  #   Set only if you want to deliberately limit individual response length.
+  #   OpenAI-compatible requests use the active route's catalog output ceiling
+  #   when unset; unavailable metadata leaves the provider default unchanged.
+  #   An explicit cap sets the first request's budget. Truncation retries may
+  #   double it within the known model ceiling and remaining context.
+  #   Native adapters retain their protocol-specific defaults.
   #
 # max_tokens: 8192
 
@@ -1200,6 +1201,8 @@ stt:
 code_execution:
   timeout: 300         # Max seconds per script before kill (default: 300 = 5 min)
   max_tool_calls: 50   # Max RPC tool calls per execution (default: 50)
+  rpc_transport: file # Remote RPC: file (default), auto (capability detection), or strict stream
+  rpc_concurrency: 8  # Stream only: bounded parallel MCP reads (1-32); other tools stay serial
 
 # =============================================================================
 # Subagent Delegation

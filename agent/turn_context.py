@@ -467,6 +467,7 @@ def build_turn_context(
     set_current_write_origin,
     ra,
     moa_active: bool = False,
+    continuation: bool = False,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
@@ -625,28 +626,29 @@ def build_turn_context(
     # Initialize conversation (copy to avoid mutating the caller's list).
     messages = list(conversation_history) if conversation_history else []
 
-    # The CLI may already have staged this input outside the history passed to
-    # ``run_conversation``. Reuse it only when its clean transcript text matches
-    # this turn; a stale handoff from a failed prior turn must not replace a
-    # later, different user input. Voice turns compare against their explicit
-    # clean persistence override rather than the API-only prefixed payload.
     pending_cli_message = getattr(agent, "_pending_cli_user_message", None)
-    expected_persist_content = (
-        persist_user_message if persist_user_message is not None else user_message
-    )
-    if (
-        isinstance(pending_cli_message, dict)
-        and pending_cli_message.get("content") == expected_persist_content
-    ):
-        user_msg = pending_cli_message
-        # The CLI-staged value is the clean transcript text. Restore the
-        # API-facing variant (for example, a voice-mode prefix) while retaining
-        # the same dict and any close-path durable marker.
-        user_msg["content"] = user_message
-    else:
-        user_msg = {"role": "user", "content": user_message}
-        if isinstance(pending_cli_message, dict):
-            agent._pending_cli_user_message = None
+    if not continuation:
+        # The CLI may already have staged this input outside the history passed to
+        # ``run_conversation``. Reuse it only when its clean transcript text matches
+        # this turn; a stale handoff from a failed prior turn must not replace a
+        # later, different user input. Voice turns compare against their explicit
+        # clean persistence override rather than the API-only prefixed payload.
+        expected_persist_content = (
+            persist_user_message if persist_user_message is not None else user_message
+        )
+        if (
+            isinstance(pending_cli_message, dict)
+            and pending_cli_message.get("content") == expected_persist_content
+        ):
+            user_msg = pending_cli_message
+            # The CLI-staged value is the clean transcript text. Restore the
+            # API-facing variant (for example, a voice-mode prefix) while retaining
+            # the same dict and any close-path durable marker.
+            user_msg["content"] = user_message
+        else:
+            user_msg = {"role": "user", "content": user_message}
+            if isinstance(pending_cli_message, dict):
+                agent._pending_cli_user_message = None
 
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():
@@ -662,18 +664,23 @@ def build_turn_context(
             if agent._memory_nudge_interval > 0 and agent._turns_since_memory == 0:
                 agent._turns_since_memory = prior_user_turns % agent._memory_nudge_interval
 
-    # Add the current user message after the prompt/session setup has made
-    # close persistence safe. The handoff above preserves any marker already
-    # stamped by an earlier close flush.
-    messages.append(user_msg)
-    current_turn_user_idx = len(messages) - 1
-    agent._persist_user_message_idx = current_turn_user_idx
+    if continuation:
+        current_turn_user_idx = -1
+        agent._persist_user_message_idx = None
+        agent._is_user_initiated_turn = False
+    else:
+        # Add the current user message after the prompt/session setup has made
+        # close persistence safe. The handoff above preserves any marker already
+        # stamped by an earlier close flush.
+        messages.append(user_msg)
+        current_turn_user_idx = len(messages) - 1
+        agent._persist_user_message_idx = current_turn_user_idx
 
-    # Track user turns for memory flush and periodic nudge logic.
-    agent._user_turn_count += 1
-    # Copilot x-initiator: the first API call of this user turn is
-    # user-initiated; tool-loop follow-ups revert to "agent" (#3040).
-    agent._is_user_initiated_turn = True
+        # Track user turns for memory flush and periodic nudge logic.
+        agent._user_turn_count += 1
+        # Copilot x-initiator: the first API call of this user turn is
+        # user-initiated; tool-loop follow-ups revert to "agent" (#3040).
+        agent._is_user_initiated_turn = True
 
     # Reset the streaming context scrubber at the top of each turn.
     scrubber = getattr(agent, "_stream_context_scrubber", None)
@@ -689,7 +696,7 @@ def build_turn_context(
 
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False
-    if (agent._memory_nudge_interval > 0
+    if (not continuation and agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
@@ -831,10 +838,11 @@ def build_turn_context(
                     # Compaction rebuilt the list, so the index of this turn's
                     # just-appended user message is stale — re-anchor it the
                     # same way the preflight path does below.
-                    current_turn_user_idx = reanchor_current_turn_user_idx(
-                        messages, user_message
-                    )
-                    agent._persist_user_message_idx = current_turn_user_idx
+                    if not continuation:
+                        current_turn_user_idx = reanchor_current_turn_user_idx(
+                            messages, user_message
+                        )
+                        agent._persist_user_message_idx = current_turn_user_idx
 
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.
@@ -1150,10 +1158,11 @@ def build_turn_context(
         # row (#48677) must all target the surviving dict, not a stale
         # position. Exact-content match first so a todo-snapshot user message
         # appended after the tail can't steal the anchor.
-        current_turn_user_idx = reanchor_current_turn_user_idx(
-            messages, user_message
-        )
-        agent._persist_user_message_idx = current_turn_user_idx
+        if not continuation:
+            current_turn_user_idx = reanchor_current_turn_user_idx(
+                messages, user_message
+            )
+            agent._persist_user_message_idx = current_turn_user_idx
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""

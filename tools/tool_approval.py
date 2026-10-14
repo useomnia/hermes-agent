@@ -33,6 +33,8 @@ replace or release each other, while session grants remain conversation-scoped.
 from __future__ import annotations
 
 import contextvars
+from collections import OrderedDict
+import hashlib
 import json
 import logging
 import os
@@ -52,9 +54,9 @@ from tools.omnio_approval_state import (
     _injected_always_approved,
     _injected_always_approved_slugs,
     connector_tool_slug,
+    conversation_grant_loader,
     is_always_approved,
     record_always_approval as _record_always_approval_state,
-    register_always_approval_authority as _register_always_approval_authority_state,
     replace_injected_always_approvals as _replace_injected_always_approvals_state,
 )
 from utils import env_var_enabled
@@ -98,6 +100,26 @@ class ToolApprovalDenial(str):
 _lock = threading.Lock()
 # session_key -> tool names approved for the whole conversation.
 _session_approved: dict[str, set[str]] = {}
+# session_key -> connector slugs approved for the whole conversation, so a
+# durable grant survives a wire-name prefix rename like standing grants do.
+_session_approved_slugs: dict[str, set[str]] = {}
+# Conversations whose durable "Allow for this chat" grants are already loaded.
+_conversation_grants_loaded: set[str] = set()
+# (session_key, tool_call_id, tool_name, canonical args) grants consumed by
+# exactly one re-dispatch. Kept process-local like the existing session grant
+# store: the durable interaction is the dangling SessionDB tool call, not a
+# second grant record with a separate lifecycle.
+_once_approved: set[tuple[str, str, str, str]] = set()
+# Stands in for the tool-call id of a late approval whose call no longer exists
+# in history (a gated call nested inside ``execute_code``): the model's next
+# call with the same tool and arguments consumes it, whatever its id.
+_ANY_TOOL_CALL = "\x00any"
+# (session_key, tool_call_id) -> (tool name, arguments) of approvals whose wait
+# ended unanswered. A nested call never enters history, so this is the only
+# record of what the user was asked when a late decision arrives. Arguments stay
+# in-process: approval events deliberately never carry them to a client.
+_EXPIRED_APPROVALS: "OrderedDict[tuple[str, str], tuple[str, dict]]" = OrderedDict()
+_EXPIRED_APPROVALS_MAX = 256
 # Mechanical surface/wait state stays isolated from the user-input gate by this
 # module's own registry instance. The waiter payload is the gated tool name.
 _wait_registry: BlockingWaitRegistry[
@@ -205,8 +227,47 @@ def is_credit_gated_tool(function_name: str) -> bool:
 
 def is_tool_approved(session_key: str, function_name: str) -> bool:
     """True when the tool is approved for the whole session (`session` scope)."""
+    _ensure_conversation_grants(session_key)
+    slug = connector_tool_slug(function_name)
     with _lock:
-        return function_name in _session_approved.get(session_key, set())
+        return function_name in _session_approved.get(session_key, set()) or (
+            slug is not None and slug in _session_approved_slugs.get(session_key, set())
+        )
+
+
+def _ensure_conversation_grants(session_key: str) -> None:
+    """Load a conversation's durable chat grants once per gateway process.
+
+    A failed or unidentifiable load is not remembered, so the next gated call
+    tries again; until then the conversation simply prompts.
+    """
+    loader = conversation_grant_loader()
+    if not session_key or loader is None:
+        return
+    with _lock:
+        if session_key in _conversation_grants_loaded:
+            return
+    try:
+        loaded = loader()
+    except Exception:
+        logger.warning(
+            "could not load chat tool approvals; prompting until they load",
+            exc_info=True,
+        )
+        return
+    if loaded is None:
+        return
+    tools, tool_slugs = loaded
+    names = {name for name in tools if connector_tool_slug(name) is not None}
+    slugs = (
+        set(tool_slugs)
+        if tool_slugs is not None
+        else {slug for slug in map(connector_tool_slug, names) if slug}
+    )
+    with _lock:
+        _session_approved.setdefault(session_key, set()).update(names)
+        _session_approved_slugs.setdefault(session_key, set()).update(slugs)
+        _conversation_grants_loaded.add(session_key)
 
 
 def record_session_approval(session_key: str, function_name: str) -> None:
@@ -215,11 +276,161 @@ def record_session_approval(session_key: str, function_name: str) -> None:
         _session_approved.setdefault(session_key, set()).add(function_name)
 
 
-def register_always_approval_authority(
-    cb: Callable[[str], bool] | None,
+def _canonical_args(function_args: Optional[dict]) -> str:
+    """Stable, non-secret-bearing key material for an exact tool call."""
+    try:
+        canonical = json.dumps(
+            function_args if isinstance(function_args, dict) else {},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    except (TypeError, ValueError):
+        return hashlib.sha256(b"{}").hexdigest()
+
+
+def record_once_approval(
+    session_key: str,
+    tool_call_id: str,
+    function_name: str,
+    function_args: Optional[dict],
 ) -> None:
-    """Set the server-authoritative checker used for standing grant candidates."""
-    _register_always_approval_authority_state(cb)
+    """Grant exactly one matching resumed tool-call identity."""
+    with _lock:
+        _once_approved.add(
+            (session_key, tool_call_id, function_name, _canonical_args(function_args))
+        )
+
+
+def consume_once_approval(
+    session_key: str,
+    tool_call_id: str,
+    function_name: str,
+    function_args: Optional[dict],
+) -> bool:
+    """Atomically consume the exact one-shot tool-call grant, if present."""
+    canonical = _canonical_args(function_args)
+    with _lock:
+        for call_id in (tool_call_id, _ANY_TOOL_CALL):
+            key = (session_key, call_id, function_name, canonical)
+            if key in _once_approved:
+                _once_approved.remove(key)
+                return True
+        return False
+
+
+def record_late_approval(
+    session_key: str,
+    function_name: str,
+    function_args: Optional[dict],
+    scope: str,
+) -> None:
+    """Grant a decision made after its approval wait ended.
+
+    Used when the gated call cannot be re-dispatched because it no longer
+    exists in history (it ran nested inside ``execute_code``): the model is
+    told about the approval and its next matching call must not ask again.
+    Credit-spend tools demote standing scopes to one exact call, matching the
+    live resolver.
+    """
+    approval_name, approval_args = resolve_approval_target(function_name, function_args)
+    try:
+        credit_gated = is_credit_gated_tool(approval_name)
+    except Exception:
+        credit_gated = True
+    if scope == "once" or credit_gated:
+        record_once_approval(session_key, _ANY_TOOL_CALL, approval_name, approval_args)
+    elif scope == "session":
+        record_session_approval(session_key, approval_name)
+    elif scope == "always":
+        record_always_approval(approval_name)
+
+
+def resolve_approval_target(
+    function_name: str,
+    function_args: Optional[dict],
+) -> tuple[str, dict]:
+    """Return the tool identity that the approval gate actually protects.
+
+    Progressive disclosure presents deferred MCP tools to the model through
+    the ``tool_call`` bridge.  The persisted assistant call therefore names
+    the bridge even though ``model_tools.handle_function_call`` unwraps it
+    before applying this approval gate.  Durable grants must follow that same
+    unwrapping or they approve the inert bridge and the resumed underlying
+    call asks the user a second time.
+
+    Resolution is deliberately fail-closed: malformed or unavailable bridge
+    calls keep their outer identity, which cannot approve an underlying write.
+    """
+    args = function_args if isinstance(function_args, dict) else {}
+    if function_name != "tool_call":
+        return function_name, args
+    try:
+        from tools.tool_search import resolve_underlying_call
+
+        underlying_name, underlying_args, error = resolve_underlying_call(args)
+    except Exception:
+        return function_name, args
+    if (
+        error
+        or not isinstance(underlying_name, str)
+        or not underlying_name
+        or not isinstance(underlying_args, dict)
+    ):
+        return function_name, args
+    return underlying_name, underlying_args
+
+
+def rehydrate_resolved_approval(
+    session_key: str,
+    tool_call_id: str,
+    function_name: str,
+    raw_arguments: str,
+    durable_grant: object,
+) -> bool:
+    """Restore one accepted durable approval after a gateway restart.
+
+    The assistant message remains the canonical record. Its tool-call identity
+    must exactly match the metadata captured by SessionDB before any transient
+    grant is restored. Credit-spend tools deliberately demote standing scopes
+    to one exact call, matching the live approval resolver.
+    """
+    if not isinstance(durable_grant, dict):
+        return False
+    scope = durable_grant.get("scope")
+    if scope not in {"once", "session", "always"}:
+        return False
+    if durable_grant.get("tool_name") != function_name:
+        return False
+    if durable_grant.get("arguments") != raw_arguments:
+        return False
+    try:
+        function_args = json.loads(raw_arguments or "{}")
+    except (TypeError, ValueError):
+        function_args = {}
+    if not isinstance(function_args, dict):
+        function_args = {}
+    approval_name, approval_args = resolve_approval_target(
+        function_name,
+        function_args,
+    )
+    try:
+        credit_gated = is_credit_gated_tool(approval_name)
+    except Exception:
+        credit_gated = True
+    if scope == "once" or credit_gated:
+        record_once_approval(
+            session_key,
+            tool_call_id,
+            approval_name,
+            approval_args,
+        )
+    elif scope == "session":
+        record_session_approval(session_key, approval_name)
+    else:
+        record_always_approval(approval_name)
+    return True
 
 
 def record_always_approval(function_name: str) -> None:
@@ -307,6 +518,8 @@ def await_tool_approval(
     function_name: str,
     interaction_event: dict,
     tool_call_id: str = "",
+    *,
+    publish_completion: bool = False,
 ) -> Optional[str]:
     """Surface the approval card and block until the user resolves it.
 
@@ -318,12 +531,23 @@ def await_tool_approval(
     fail closed (not execute the write) for both ``None`` and ``_NO_SURFACE`` —
     the two are kept distinct only so it can pick the right (turn-ending vs not)
     denial status.
+
+    The shared gate requests ``publish_completion`` so the same surface that
+    published the card also receives its terminal event. Low-level callers can
+    retain ownership of completion and consume the decision/reason themselves.
     """
+    notified_surface: Callable[[dict], None] | None = None
+
     def notify(cb: Callable[[dict], None] | None) -> None:
+        nonlocal notified_surface
         if cb is None:
             raise RuntimeError("tool-approval surface has no notify callback")
         cb(interaction_event)
+        notified_surface = cb
 
+    from tools.interrupt import current_execution_scope
+
+    execution = current_execution_scope()
     try:
         result, reason = _wait_registry.wait(
             session_key,
@@ -332,6 +556,7 @@ def await_tool_approval(
             "waiting for tool approval",
             payload=function_name,
             on_parked=notify,
+            cancelled=execution.is_cancelled if execution is not None else None,
         )
     except Exception:
         # The notify callback raising is a plumbing malfunction (e.g. the chat
@@ -344,6 +569,10 @@ def await_tool_approval(
         return _NO_SURFACE
     if reason == "no_surface":
         return _NO_SURFACE
+    if publish_completion:
+        _complete_tool_approval(
+            session_key, function_name, tool_call_id, notified_surface,
+        )
     return result
 
 
@@ -472,6 +701,10 @@ def clear_session(session_key: str) -> None:
         return
     with _lock:
         _session_approved.pop(session_key, None)
+        _session_approved_slugs.pop(session_key, None)
+        _conversation_grants_loaded.discard(session_key)
+        for key in [key for key in _once_approved if key[0] == session_key]:
+            _once_approved.discard(key)
         surface_keys = {
             surface_key
             for surface_key, (_, grant_session_key) in _surface_grant_sessions.items()
@@ -679,9 +912,18 @@ def maybe_require_tool_approval(
     """
     if not is_gated_tool(function_name):
         return None
+    from tools.interrupt import current_execution_scope
+
+    execution = current_execution_scope()
+    if execution is not None and not tool_call_id:
+        return _denial_result(None, status="approval_error")
     credits_descriptor = mcp_tool_credits_meta(function_name)
     grant_session_key = get_current_tool_approval_session_key()
     surface_key = get_current_tool_approval_surface_key()
+    if consume_once_approval(
+        grant_session_key, tool_call_id, function_name, function_args
+    ):
+        return None
     if credits_descriptor is None:
         if is_always_approved(function_name):
             return None  # granted for every conversation on this gateway
@@ -722,10 +964,18 @@ def maybe_require_tool_approval(
             "options": list(options),
             "approval": approval,
         },
+        # The call waiting on this decision, so a host that keeps it while the
+        # card is open can rebuild exactly this call on another sandbox. It
+        # never travels inside the card itself.
+        "pending_call": {
+            "tool": function_name,
+            "arguments": dict(function_args) if isinstance(function_args, dict) else {},
+        },
     }
 
     choice = await_tool_approval(
-        surface_key, function_name, interaction_event, tool_call_id or ""
+        surface_key, function_name, interaction_event, tool_call_id or "",
+        publish_completion=True,
     )
     if choice in ("session", "always"):
         # resolve_tool_approval already recorded the grant; proceed.
@@ -741,4 +991,51 @@ def maybe_require_tool_approval(
         return _denial_result(None, status="approval_error")
     # An unresolved wait with a real surface — timeout or interrupt (choice is
     # None) — fails closed and ends the turn via "approval_no_response".
+    if tool_call_id:
+        _remember_expired_approval(grant_session_key, tool_call_id, function_name, function_args)
     return _denial_result(None)
+
+
+def _remember_expired_approval(
+    session_key: str, tool_call_id: str, function_name: str, function_args: Optional[dict]
+) -> None:
+    with _lock:
+        _EXPIRED_APPROVALS[(session_key, tool_call_id)] = (
+            function_name,
+            dict(function_args) if isinstance(function_args, dict) else {},
+        )
+        _EXPIRED_APPROVALS.move_to_end((session_key, tool_call_id))
+        while len(_EXPIRED_APPROVALS) > _EXPIRED_APPROVALS_MAX:
+            _EXPIRED_APPROVALS.popitem(last=False)
+
+
+def take_expired_approval(session_key: str, tool_call_id: str) -> Optional[tuple[str, dict]]:
+    """The tool and arguments a timed-out approval asked about, consumed once."""
+    with _lock:
+        return _EXPIRED_APPROVALS.pop((session_key, tool_call_id), None)
+
+
+def _complete_tool_approval(
+    surface_key: str,
+    function_name: str,
+    tool_call_id: str,
+    notify: Callable[[dict], None] | None,
+) -> None:
+    """Close the approval itself, including calls without a top-level tool item."""
+    decision = consume_tool_approval_decision(surface_key, tool_call_id)
+    reason = consume_tool_approval_completion_reason(surface_key, tool_call_id)
+    if notify is None:
+        return
+    interaction: dict[str, object] = {"timed_out": reason == "expired"}
+    if decision is not None:
+        interaction["answered"] = decision
+    try:
+        notify({
+            "tool": function_name,
+            "toolCallId": tool_call_id,
+            "status": "completed",
+            "completed": True,
+            "interaction": interaction,
+        })
+    except Exception:
+        logger.warning("tool-approval completion notify failed", exc_info=True)

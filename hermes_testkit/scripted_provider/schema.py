@@ -355,6 +355,8 @@ class ResponseStep:
     # explicit mapping is emitted verbatim (after strict validation) on the
     # final streamed/non-streamed response.
     usage: Mapping[str, int] | None = None
+    # Fault injection at the wire boundary; the fixture itself stays valid JSON.
+    tool_arguments_limit: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, str) or self.kind not in _RESPONSE_KINDS:
@@ -382,6 +384,15 @@ class ResponseStep:
                 "response.tool_calls must contain ToolCall objects"
             )
         object.__setattr__(self, "tool_calls", tool_calls)
+        if self.tool_arguments_limit is not None:
+            if (
+                not (self.kind == "tool_calls" or self.kind == "hold" and self.hold_response_kind == "tool_calls")
+                or type(self.tool_arguments_limit) is not int
+                or self.tool_arguments_limit <= 0
+            ):
+                raise ScriptValidationError(
+                    "response.tool_arguments_limit requires tool_calls and a positive integer"
+                )
         _validate_status(self.status, where="response.status")
         if (
             isinstance(self.close_after_chunks, bool)
@@ -643,6 +654,8 @@ def _step_as_dict(step: ResponseStep) -> dict[str, Any]:
         if step.text:
             response["text"] = step.text
         response["tool_calls"] = [_tool_call_as_dict(call) for call in step.tool_calls]
+        if step.tool_arguments_limit is not None:
+            response["tool_arguments_limit"] = step.tool_arguments_limit
         if step.usage is not None:
             response["usage"] = dict(step.usage)
     elif step.kind == "http_error":
@@ -663,6 +676,8 @@ def _step_as_dict(step: ResponseStep) -> dict[str, Any]:
             inner["usage"] = dict(step.usage)
         if step.hold_response_kind == "tool_calls":
             inner["tool_calls"] = [_tool_call_as_dict(call) for call in step.tool_calls]
+            if step.tool_arguments_limit is not None:
+                inner["tool_arguments_limit"] = step.tool_arguments_limit
         if step.hold_response_kind == "http_error":
             inner["status"] = step.status
             if step.error is not None:
@@ -772,6 +787,14 @@ def _parse_step(value: Any, index: int, *, where: str | None = None) -> Response
     if not isinstance(raw_kind, str):
         raise ScriptValidationError(f"{where}.response.type must be a string")
     kind = _KIND_ALIASES.get(raw_kind.lower(), raw_kind.lower())
+    if "tool_arguments_limit" in response and (
+        kind != "tool_calls"
+        or type(response["tool_arguments_limit"]) is not int
+        or response["tool_arguments_limit"] <= 0
+    ):
+        raise ScriptValidationError(
+            "response.tool_arguments_limit requires tool_calls and a positive integer"
+        )
 
     if kind == "text":
         text, chunks = _parse_text_content(response, where=where)
@@ -809,6 +832,7 @@ def _parse_step(value: Any, index: int, *, where: str | None = None) -> Response
             request=request,
             text=text,
             tool_calls=parsed,
+            tool_arguments_limit=response.get("tool_arguments_limit"),
             usage=_parse_response_usage(response, where=where),
         )
 
@@ -906,6 +930,7 @@ def _parse_step(value: Any, index: int, *, where: str | None = None) -> Response
             hold_response_kind=inner_step.kind,
             chunks=inner_step.chunks,
             usage=inner_step.usage,
+            tool_arguments_limit=inner_step.tool_arguments_limit,
         )
 
     raise ScriptValidationError(

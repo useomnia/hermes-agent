@@ -77,6 +77,13 @@ When present, each model's metadata is merged directly into its item in
 discover and price the model. Omitting `model_metadata` preserves the original
 model-list response exactly.
 
+To reproduce malformed tool generations, a `tool_calls` response may set
+`tool_arguments_limit` to a positive integer. The fixture's arguments must still
+be valid JSON; only the emitted argument string is cut to that many characters,
+in streaming and non-streaming responses. The finish reason remains
+`tool_calls`, reproducing providers that report completion with incomplete JSON.
+Omitting this field preserves complete arguments. Other response kinds reject it.
+
 Other response kinds are `tool_calls`, `http_error`, `connection_close`, and
 `hold`; `hold` wraps one text, tool-call, or HTTP-error response and is released
 through the authenticated control endpoint.

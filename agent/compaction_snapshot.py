@@ -21,7 +21,8 @@ def _visible_message(message: dict) -> dict:
 
 
 def capture_compaction(
-    messages: list[dict], *, previous_count: int, session_id: str
+    messages: list[dict], *, previous_count: int, session_id: str,
+    previous_messages: list[dict] | None = None,
 ) -> dict | None:
     visible = [
         message
@@ -41,15 +42,27 @@ def capture_compaction(
     # context cannot be represented by a single durable summary message.
     if not isinstance(summary.get("content"), str) or summary.get("tool_calls"):
         return None
+    head = [_visible_message(message) for message in visible[:index]]
+    tail = [_visible_message(message) for message in visible[index + 1 :]]
+    if previous_messages is not None:
+        previous = [
+            _visible_message(message) for message in previous_messages
+            if message.get("role") in {"user", "assistant", "tool"}
+        ]
+        # Existing proxies resolve only an unchanged prefix and suffix. A
+        # restated user row has no durable tail reference; omit the manifest
+        # so cold restore keeps the complete history and can compact it again.
+        if (
+            len(head) + len(tail) > len(previous)
+            or head != previous[:len(head)]
+            or tail != (previous[-len(tail):] if tail else [])
+        ):
+            return None
     return {
         "summary": summary["content"],
         "summary_role": summary["role"],
-        "retained_head_messages": [
-            _visible_message(message) for message in visible[:index]
-        ],
-        "retained_tail_messages": [
-            _visible_message(message) for message in visible[index + 1 :]
-        ],
+        "retained_head_messages": head,
+        "retained_tail_messages": tail,
         "compacted_messages": max(0, previous_count - (len(visible) - 1)),
         "session_id": session_id,
         "retained_tail_from": None,

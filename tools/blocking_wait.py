@@ -26,6 +26,7 @@ class BlockingWaitEntry(Generic[ResultT, PayloadT]):
     tool_call_id: str
     payload: PayloadT | None = None
     result: ResultT | None = None
+    cancelled: Callable[[], bool] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +105,7 @@ class BlockingWaitRegistry(Generic[ResultT, SurfaceT, PayloadT]):
         *,
         payload: PayloadT | None = None,
         on_parked: Callable[[SurfaceT | None], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> tuple[ResultT | None, str | None]:
         """Park a call until it resolves, expires, or is interrupted.
 
@@ -120,6 +122,9 @@ class BlockingWaitRegistry(Generic[ResultT, SurfaceT, PayloadT]):
         """
         call_id = tool_call_id or ""
         with self._lock:
+            if cancelled is not None and cancelled():
+                self._completion_reasons[(session_key, call_id)] = "cancelled"
+                return None, "cancelled"
             surface = self._surfaces.get(session_key)
             if surface is None:
                 return None, "no_surface"
@@ -128,6 +133,7 @@ class BlockingWaitRegistry(Generic[ResultT, SurfaceT, PayloadT]):
                 event=threading.Event(),
                 tool_call_id=call_id,
                 payload=payload,
+                cancelled=cancelled,
             )
             self._waits.setdefault(session_key, []).append(entry)
             surface_value = surface.value
@@ -162,6 +168,8 @@ class BlockingWaitRegistry(Generic[ResultT, SurfaceT, PayloadT]):
         activity = {"last_touch": now, "start": now}
         expired = False
         while True:
+            if cancelled is not None and cancelled():
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 expired = True
@@ -224,6 +232,8 @@ class BlockingWaitRegistry(Generic[ResultT, SurfaceT, PayloadT]):
                 if queue is not None and not queue:
                     self._waits.pop(session_key, None)
                 if entry is None:
+                    return False
+                if entry.cancelled is not None and entry.cancelled():
                     return False
                 entry.result = value
                 if on_release is not None:

@@ -80,14 +80,15 @@ def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
 
 
 def test_early_return_still_closes_connection(monkeypatch, tmp_path):
-    """A no-op update (no matching row) must still open and close exactly once."""
+    """A no-op update must close its writer and any schema probe connections."""
     _point_ledger(monkeypatch, tmp_path)
     opened, closed = _track_connections(monkeypatch)
 
     assert ad.mark_completion_delivered("does-not-exist") is False
 
-    assert len(opened) == 1
-    assert len(closed) == 1
+    assert opened
+    assert len(opened) == len(closed)
+    assert set(opened) == set(closed)
 
 
 def test_exception_during_operation_still_closes_connection(monkeypatch, tmp_path):
@@ -102,8 +103,9 @@ def test_exception_during_operation_still_closes_connection(monkeypatch, tmp_pat
                 "INSERT INTO async_delegations (delegation_id) VALUES ('x')"
             )
 
-    assert len(opened) == 1
-    assert len(closed) == 1
+    assert opened
+    assert len(opened) == len(closed)
+    assert set(opened) == set(closed)
 
 
 def test_schema_init_failure_still_closes_connection(monkeypatch, tmp_path):
@@ -113,10 +115,10 @@ def test_schema_init_failure_still_closes_connection(monkeypatch, tmp_path):
     real_connect = sqlite3.connect
 
     class _FailingSchemaConnection(_TrackingConnection):
-        def execute(self, sql, *args, **kwargs):
+        def executescript(self, sql, *args, **kwargs):
             if "CREATE TABLE" in sql:
                 raise sqlite3.OperationalError("simulated schema init failure")
-            return self._real.execute(sql, *args, **kwargs)
+            return self._real.executescript(sql, *args, **kwargs)
 
     def tracking_connect(*args, **kwargs):
         conn = real_connect(*args, **kwargs)

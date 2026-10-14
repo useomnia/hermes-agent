@@ -853,6 +853,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 tool_calls=step.tool_calls,
                 chunks=step.chunks,
                 usage=step.usage,
+                tool_arguments_limit=step.tool_arguments_limit,
             )
         if stream:
             self._send_stream(
@@ -946,7 +947,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
             if step.tool_calls:
                 for index, call in enumerate(step.tool_calls):
                     emit({
-                        "tool_calls": [_tool_call_payload(call, completion_id, index)]
+                        "tool_calls": [_tool_call_payload(call, completion_id, index, arguments_limit=step.tool_arguments_limit)]
                     })
             emit({}, "tool_calls" if step.tool_calls else "stop", include_usage=True)
 
@@ -983,7 +984,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
         message: dict[str, Any] = {"role": "assistant", "content": content}
         if step.tool_calls:
             message["tool_calls"] = [
-                _tool_call_payload(call, completion_id, index, include_index=False)
+                _tool_call_payload(call, completion_id, index, include_index=False, arguments_limit=step.tool_arguments_limit)
                 for index, call in enumerate(step.tool_calls)
             ]
         response = {
@@ -1308,13 +1309,14 @@ def _completion_id(request_id: str) -> str:
 
 
 def _tool_call_payload(
-    call: ToolCall, completion_id: str, index: int, *, include_index: bool = True
+    call: ToolCall, completion_id: str, index: int, *, include_index: bool = True,
+    arguments_limit: int | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": call.id
         or f"call-{completion_id.removeprefix('scripted-completion-')}-{index:02d}",
         "type": "function",
-        "function": {"name": call.name, "arguments": call.arguments},
+        "function": {"name": call.name, "arguments": call.arguments[:arguments_limit]},
     }
     if include_index:
         payload["index"] = index

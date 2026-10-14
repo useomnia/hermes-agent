@@ -592,3 +592,196 @@ class TestContentFilterStallActivatesFallback:
             "_try_activate_fallback — it should fall through to continuation."
         )
         assert result["completed"] is True
+
+
+class TestRouterRewriteTruncationMessageIsHonest:
+    """Regression for #91717: the invalid-JSON truncation detector (the
+    secondary path that fires when the primary finish_reason='length' handler
+    was bypassed) must NOT blame the output-length limit when the model never
+    reported one.
+
+    Scenario: after a transport timeout, OpenRouter's router delivers a retry
+    whose finish_reason is rewritten from 'length' to 'tool_calls', and whose
+    tool-call arguments are cut off mid-JSON. The old code hardcoded
+    'Response truncated due to output length limit', misleading operators into
+    tuning max_tokens / switching models when the real cause is transport /
+    router corruption.
+    """
+
+    def _router_rewrite_response(self):
+        # finish_reason='tool_calls' (NOT 'length') + truncated JSON args
+        # ('{"cmd": "ls' — no closing brace), on a normal generation id (not
+        # the partial-stream stub). This bypasses the length handler and lands
+        # in the invalid-JSON truncation detector.
+        msg = SimpleNamespace(
+            role="assistant",
+            content="",
+            tool_calls=[SimpleNamespace(
+                id="call_1", type="function",
+                function=SimpleNamespace(name="terminal", arguments='{"cmd": "ls'),
+            )],
+            reasoning_content=None,
+        )
+        return SimpleNamespace(
+            id="gen-router-rewrite-xyz",
+            model="deepseek/deepseek-v4-flash",
+            choices=[SimpleNamespace(
+                index=0, message=msg, finish_reason="tool_calls",
+            )],
+            usage=None,
+        )
+
+    def test_router_rewrite_truncation_does_not_claim_output_length_limit(
+        self, loop_agent,
+    ):
+        loop_agent.valid_tool_names = {"terminal"}
+        loop_agent.client.chat.completions.create.side_effect = (
+            lambda *a, **kw: self._router_rewrite_response()
+        )
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("list the files")
+
+        final = result["final_response"] or ""
+        error = result["error"] or ""
+
+        # The misleading output-length-limit label must be gone: finish_reason
+        # was 'tool_calls', never 'length'.
+        assert "output length limit" not in final, (
+            "Router-rewrite / transport truncation must not be reported as an "
+            "output-length limit (#91717)."
+        )
+        assert "output length limit" not in error
+        # The honest message names the real suspect and surfaces finish_reason.
+        assert "finish_reason='tool_calls'" in final
+        assert (
+            "transport" in final or "router" in final
+        ), "Honest message must point at transport/router corruption."
+        # Recovery invariants preserved: incomplete tool args never execute.
+        assert result["completed"] is False
+        assert result["partial"] is True
+
+    def _genuine_length_truncated_tool_call(self):
+        # finish_reason='length' (the model truly hit its output cap) with a
+        # tool call whose JSON args are cut off. On a normal generation id, so
+        # it is NOT treated as a partial-stream network stub. After the loop
+        # exhausts its truncated-tool-call retries this lands on the primary
+        # length handler's tool-call path (scenario 1 in the issue's table).
+        msg = SimpleNamespace(
+            role="assistant",
+            content="",
+            tool_calls=[SimpleNamespace(
+                id="call_1", type="function",
+                function=SimpleNamespace(name="terminal", arguments='{"cmd": "ls'),
+            )],
+            reasoning_content=None,
+        )
+        return SimpleNamespace(
+            id="gen-real-length",
+            model="test/model",
+            choices=[SimpleNamespace(index=0, message=msg, finish_reason="length")],
+            usage=None,
+        )
+
+    def test_genuine_length_truncation_keeps_output_limit_wording(self, loop_agent):
+        """The primary length handler (finish_reason='length', real
+        output-cap exhaustion) must keep the accurate 'output length limit'
+        wording — scenario 1 in the issue's table is correct and must not
+        regress from the honest-message fix."""
+        loop_agent.valid_tool_names = {"terminal"}
+        loop_agent.client.chat.completions.create.side_effect = (
+            lambda *a, **kw: self._genuine_length_truncated_tool_call()
+        )
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("run a long command")
+
+        blob = (result.get("final_response") or "") + (result.get("error") or "")
+        assert "output length limit" in blob, (
+            "A genuine finish_reason='length' truncation must still reference "
+            "the output length limit — the honest-message fix must not blank "
+            "out the accurate case (#91717 scenario 1)."
+        )
+
+
+@pytest.mark.parametrize("openrouter", [False, True])
+@pytest.mark.parametrize("recover,finish_reason", [
+    (False, "length"), (True, "length"),
+    (False, "tool_calls"), (True, "tool_calls"), (True, "stop"),
+])
+def test_streamed_malformed_arguments_get_fresh_bounded_retries(
+    loop_agent, recover, openrouter, finish_reason,
+):
+    """Exercise assembly + conversation recovery, including cache reset after success."""
+    from copy import deepcopy
+
+    requests = []
+    saved_headers = {"x-openrouter-cache": "true", "X-Correlation-ID": "test"}
+    original_build = loop_agent._build_api_kwargs
+    if not openrouter:
+        loop_agent.base_url = "https://example.com/v1"
+        loop_agent._base_url_lower = loop_agent.base_url
+    loop_agent.valid_tool_names = {"terminal"}
+    loop_agent.stream_delta_callback = lambda text: None
+    loop_agent.tool_gen_event_callback = lambda *args: None
+
+    def build(messages):
+        request = original_build(messages)
+        request["extra_headers"] = saved_headers
+        return request
+
+    def generate(**request):
+        requests.append(deepcopy(request))
+        attempt = len(requests)
+        if recover and attempt == 3:
+            return iter([_make_stream_chunk(content="Done", finish_reason="stop")])
+        if finish_reason == "stop" and attempt == 1:
+            return iter([_make_stream_chunk(finish_reason="stop")])
+        args = '{"command":"printf ok"}' if recover and attempt == 2 else '{"command":"printf'
+        return iter([
+            _make_stream_chunk(tool_calls=[_make_tool_call_delta(tc_id=f"call_{attempt}", name="terminal", arguments=args)]),
+            _make_stream_chunk(finish_reason="tool_calls" if recover and attempt == 2 else finish_reason),
+        ])
+
+    client = MagicMock()
+    client.chat.completions.create.side_effect = generate
+    with (
+        patch.object(loop_agent, "_build_api_kwargs", side_effect=build),
+        patch.object(loop_agent, "_create_request_openai_client", return_value=client),
+        patch.object(loop_agent, "_close_request_openai_client"),
+        patch.object(loop_agent, "_persist_session"),
+        patch.object(loop_agent, "_save_trajectory"),
+        patch.object(loop_agent, "_cleanup_task_resources"),
+        patch("run_agent.handle_function_call", return_value='{"output":"ok"}') as execute,
+    ):
+        result = loop_agent.run_conversation("Run printf ok")
+
+    assert saved_headers == {"x-openrouter-cache": "true", "X-Correlation-ID": "test"}
+    assert requests[0]["extra_headers"] == saved_headers
+    for request in requests[1:2] if recover else requests[1:]:
+        expected = {"X-OpenRouter-Cache": "false", "X-Correlation-ID": "test"} if openrouter else saved_headers
+        assert request["extra_headers"] == expected
+    if recover:
+        assert result["completed"] is True
+        assert result["final_response"] == "Done"
+        assert len(requests) == 3
+        assert requests[2]["extra_headers"] == saved_headers
+        execute.assert_called_once()
+    else:
+        assert len(requests) == 5
+        assert result["completed"] is False
+        assert result["partial"] is True
+        if finish_reason == "length":
+            assert "output length limit" in result["error"]
+        else:
+            assert "output length limit" not in result["error"]
+            assert "finish_reason='tool_calls'" in result["error"]
+        execute.assert_not_called()

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 
 # This is the monitoring contract for the gateway startup timeline. Keep it
 # declarative rather than inspecting source text at test time: the names are
@@ -57,7 +58,23 @@ BOOT_CHECKPOINT_NAMES = frozenset(
 _checkpoints: list[tuple[str, float]] = []
 
 
+# time.monotonic() at this process's fork, resolved from procfs on first use so
+# later marks cost a clock read instead of two procfs reads.
+_process_start_monotonic: float | None = None
+
+
 def process_elapsed_seconds() -> float | None:
+    """Seconds since THIS process was forked, or None when unavailable."""
+    global _process_start_monotonic
+    if _process_start_monotonic is None:
+        elapsed = _procfs_elapsed_seconds()
+        if elapsed is None:
+            return None
+        _process_start_monotonic = time.monotonic() - elapsed
+    return time.monotonic() - _process_start_monotonic
+
+
+def _procfs_elapsed_seconds() -> float | None:
     """Seconds since THIS process was forked, or None when unavailable.
 
     Read from procfs rather than a module-import timestamp: by the time any of

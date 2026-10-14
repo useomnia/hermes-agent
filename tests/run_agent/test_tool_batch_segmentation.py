@@ -627,6 +627,8 @@ class TestSegmentedDispatchIntegration:
         assert "Truncated:" in messages[large_result_index]["content"]
         steer_messages = [m for m in messages if STEER_MARKER_OPEN in m["content"]]
         assert steer_messages == [messages[-1]]
+        assert messages[-1]["role"] == "user"
+        assert all(STEER_MARKER_OPEN not in m["content"] for m in messages if m["role"] == "tool")
         assert "preserve this steer after budget enforcement" in steer_messages[0]["content"]
 
 

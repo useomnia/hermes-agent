@@ -2909,7 +2909,11 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             len(orphaned_results),
         )
 
-    # 2. Inject stub results for calls whose result was dropped
+    # 2. Inject a result for each unresolved call. Omnio HITL calls remain
+    # explicitly pending in the request copy because their durable dangling
+    # tail can still be resolved later. Ordinary missing results retain the
+    # long-standing generic unavailable stub; treating an arbitrary failed
+    # tool as an open human interaction would mislead the model.
     missing_results = surviving_call_ids - result_call_ids
     if missing_results:
         patched: List[Dict[str, Any]] = []
@@ -2919,10 +2923,30 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 for tc in msg.get("tool_calls") or []:
                     cid = _ra().AIAgent._get_tool_call_id_static(tc)
                     if cid in missing_results:
+                        tool_name = _ra().AIAgent._get_tool_call_name_static(tc)
+                        is_hitl = tool_name == "request_user_input"
+                        if not is_hitl:
+                            try:
+                                from tools.tool_approval import is_gated_tool
+
+                                is_hitl = is_gated_tool(tool_name)
+                            except Exception:
+                                is_hitl = False
+                        content = (
+                            json.dumps({
+                                "status": "pending",
+                                "note": (
+                                    "The user has not answered this request yet; "
+                                    "it is still open. Do not assume an answer."
+                                ),
+                            }, ensure_ascii=False)
+                            if is_hitl
+                            else "[Result unavailable — see context summary above]"
+                        )
                         patched.append({
                             "role": "tool",
-                            "name": _ra().AIAgent._get_tool_call_name_static(tc),
-                            "content": "[Result unavailable — see context summary above]",
+                            "name": tool_name,
+                            "content": content,
                             "tool_call_id": cid,
                         })
         messages = patched
@@ -3258,75 +3282,139 @@ def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
     return changed
 
 
+def _iter_httpx_pool_objects(http_client: Any):
+    """Yield httpcore pool objects reachable from an httpx client.
+
+    Hermes' keepalive client (#10324 / ``_build_keepalive_http_client``) and
+    any ``HTTP(S)_PROXY`` configuration put live connections on *mounted*
+    transports (``client._mounts``), not only on the default
+    ``client._transport``. Walking the default transport alone makes
+    ``force_close_tcp_sockets`` return 0 while a stream is still mid-recv —
+    the interrupt logs success and the provider keeps burning the slot
+    (#72975).
+    """
+    seen_pools: set[int] = set()
+
+    def _emit(pool: Any):
+        if pool is None:
+            return
+        marker = id(pool)
+        if marker in seen_pools:
+            return
+        seen_pools.add(marker)
+        yield pool
+
+    def _pools_for_transport(transport: Any):
+        if transport is None:
+            return
+        # Normal httpx.HTTPTransport / HTTPProxy-as-transport: connections
+        # live under ``_pool``. HTTPProxy itself *is* a ConnectionPool and
+        # may be mounted directly — then ``_connections`` is on the
+        # transport.
+        pool = getattr(transport, "_pool", None)
+        if pool is not None:
+            yield from _emit(pool)
+            return
+        if getattr(transport, "_connections", None) is not None:
+            yield from _emit(transport)
+
+    try:
+        yield from _pools_for_transport(getattr(http_client, "_transport", None))
+        mounts = getattr(http_client, "_mounts", None) or {}
+        for _pattern, mounted in list(mounts.items()):
+            yield from _pools_for_transport(mounted)
+    except Exception:
+        return
+
+
+def _connection_candidates(conn: Any):
+    """Walk nested ``_connection`` wrappers (proxy tunnel → HTTP11/2)."""
+    seen: set[int] = set()
+    stack = [conn]
+    while stack:
+        candidate = stack.pop()
+        if candidate is None:
+            continue
+        marker = id(candidate)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        yield candidate
+        inner = getattr(candidate, "_connection", None)
+        if inner is not None and id(inner) not in seen:
+            stack.append(inner)
+
+
 def _iter_pool_sockets(client: Any):
     """Yield raw sockets reachable from an OpenAI/httpx client pool.
 
     httpcore 1.x stores the concrete HTTP11/HTTP2 connection under
     ``conn._connection``; older versions exposed stream attributes directly
-    on the pool entry. Keep the traversal defensive because these are private
-    transport internals and vary across httpx/httpcore releases.
+    on the pool entry. Proxy tunnels wrap another layer
+    (``TunnelHTTPConnection`` / ``ForwardHTTPConnection``). Keep the
+    traversal defensive because these are private transport internals and
+    vary across httpx/httpcore releases.
+
+    Also walks ``httpx`` mount transports — see ``_iter_httpx_pool_objects``.
     """
     try:
         http_client = getattr(client, "_client", None)
         if http_client is None:
-            return
-        transport = getattr(http_client, "_transport", None)
-        if transport is None:
-            return
-        pool = getattr(transport, "_pool", None)
-        if pool is None:
-            return
+            # Some SDK wrappers *are* the httpx client (or expose the pool
+            # directly). Fall through so mount-aware discovery still runs.
+            http_client = client
+        pools = list(_iter_httpx_pool_objects(http_client))
+    except Exception:
+        return
+
+    if not pools:
+        return
+
+    seen: set[int] = set()
+    for pool in pools:
         connections = (
             getattr(pool, "_connections", None)
             or getattr(pool, "_pool", None)
             or []
         )
-    except Exception:
-        return
-
-    seen: set[int] = set()
-    for conn in list(connections):
-        candidates = [conn]
-        inner = getattr(conn, "_connection", None)
-        if inner is not None:
-            candidates.append(inner)
-        for candidate in candidates:
-            stream = (
-                getattr(candidate, "_network_stream", None)
-                or getattr(candidate, "_stream", None)
-            )
-            if stream is None:
-                continue
-            sock = getattr(stream, "_sock", None)
-            if sock is None:
-                get_extra_info = getattr(stream, "get_extra_info", None)
-                if callable(get_extra_info):
-                    try:
-                        sock = get_extra_info("socket")
-                    except Exception:
-                        sock = None
-            if sock is None:
-                wrapped = getattr(stream, "stream", None)
-                if wrapped is not None:
-                    sock = getattr(wrapped, "_sock", None)
-            if sock is None:
-                # anyio-backed streams expose the raw socket through
-                # SocketAttribute.raw_socket when available.
-                wrapped = getattr(stream, "_stream", None)
-                extra = getattr(wrapped, "extra", None)
-                if callable(extra):
-                    try:
-                        from anyio.abc import SocketAttribute
-                        sock = extra(SocketAttribute.raw_socket)
-                    except Exception:
-                        sock = None
-            if sock is None:
-                continue
-            marker = id(sock)
-            if marker in seen:
-                continue
-            seen.add(marker)
-            yield sock
+        for conn in list(connections):
+            for candidate in _connection_candidates(conn):
+                stream = (
+                    getattr(candidate, "_network_stream", None)
+                    or getattr(candidate, "_stream", None)
+                )
+                if stream is None:
+                    continue
+                sock = getattr(stream, "_sock", None)
+                if sock is None:
+                    get_extra_info = getattr(stream, "get_extra_info", None)
+                    if callable(get_extra_info):
+                        try:
+                            sock = get_extra_info("socket")
+                        except Exception:
+                            sock = None
+                if sock is None:
+                    wrapped = getattr(stream, "stream", None)
+                    if wrapped is not None:
+                        sock = getattr(wrapped, "_sock", None)
+                if sock is None:
+                    # anyio-backed streams expose the raw socket through
+                    # SocketAttribute.raw_socket when available.
+                    wrapped = getattr(stream, "_stream", None)
+                    extra = getattr(wrapped, "extra", None)
+                    if callable(extra):
+                        try:
+                            from anyio.abc import SocketAttribute
+                            sock = extra(SocketAttribute.raw_socket)
+                        except Exception:
+                            sock = None
+                if sock is None:
+                    continue
+                marker = id(sock)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                yield sock
 
 
 def cleanup_dead_connections(agent) -> bool:
@@ -3457,65 +3545,59 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
 
 
 
+def _requeue_pending_steer(agent, steer_text: str) -> None:
+    def requeue():
+        existing = getattr(agent, "_pending_steer", None)
+        agent._pending_steer = steer_text + ("\n" + existing if existing else "")
+
+    lock = getattr(agent, "_pending_steer_lock", None)
+    if lock is None:
+        requeue()
+    else:
+        with lock:
+            requeue()
+
+
+def recover_unsubmitted_steers(agent, messages: list) -> None:
+    """Return only runtime-owned, exact tail rows that never entered a model call."""
+    pending = getattr(agent, "_unsubmitted_steers", [])
+    while pending:
+        row, text = pending.pop()
+        if not messages or messages[-1] is not row:
+            continue
+        if row.get("role") != "user" or row.get("content") != format_steer_marker(text):
+            continue
+        messages.pop()
+        _requeue_pending_steer(agent, text)
+
+
+def take_interrupted_steer(agent, messages: list):
+    recover_unsubmitted_steers(agent, messages)
+    return agent._drain_pending_steer()
+
+
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
-    """Append any pending /steer text to the last tool result in this turn.
-
-    Called at the end of a tool-call batch, before the next API call.
-    The steer is appended to the last ``role:"tool"`` message's content
-    with a clear marker so the model understands it came from the user
-    and NOT from the tool itself. Role alternation is preserved —
-    nothing new is inserted, we only modify existing content.
-
-    Args:
-        messages: The running messages list.
-        num_tool_msgs: Number of tool results appended in this batch;
-            used to locate the tail slice safely.
-    """
+    """Append a persistable user message after a complete tool-result batch."""
     if num_tool_msgs <= 0 or not messages:
         return
     steer_text = agent._drain_pending_steer()
     if not steer_text:
         return
-    # Find the last tool-role message in the recent tail. Skipping
-    # non-tool messages defends against future code appending
-    # something else at the boundary.
-    target_idx = None
-    for j in range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1):
-        msg = messages[j]
-        if isinstance(msg, dict) and msg.get("role") == "tool":
-            target_idx = j
-            break
-    if target_idx is None:
-        # No tool result in this batch (e.g. all skipped by interrupt);
-        # put the steer back so the caller's fallback path can deliver
-        # it as a normal next-turn user message.
-        _lock = getattr(agent, "_pending_steer_lock", None)
-        if _lock is not None:
-            with _lock:
-                if agent._pending_steer:
-                    agent._pending_steer = agent._pending_steer + "\n" + steer_text
-                else:
-                    agent._pending_steer = steer_text
-        else:
-            existing = getattr(agent, "_pending_steer", None)
-            agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+    if getattr(agent, "_interrupt_requested", False) and not agent._has_pending_redirect():
+        _requeue_pending_steer(agent, steer_text)
         return
-    marker = format_steer_marker(steer_text)
-    existing_content = messages[target_idx].get("content", "")
-    if not isinstance(existing_content, str):
-        # Anthropic multimodal content blocks — preserve them and append
-        # a text block at the end.
-        try:
-            blocks = list(existing_content) if existing_content else []
-            blocks.append({"type": "text", "text": marker.lstrip()})
-            messages[target_idx]["content"] = blocks
-        except Exception:
-            # Fall back to string replacement if content shape is unexpected.
-            messages[target_idx]["content"] = f"{existing_content}{marker}"
-    else:
-        messages[target_idx]["content"] = existing_content + marker
+    tail = messages[max(len(messages) - num_tool_msgs, 0):]
+    if not any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in tail):
+        _requeue_pending_steer(agent, steer_text)
+        return
+    row = {"role": "user", "content": format_steer_marker(steer_text)}
+    messages.append(row)
+    unsubmitted = getattr(agent, "_unsubmitted_steers", None)
+    if unsubmitted is None:
+        unsubmitted = agent._unsubmitted_steers = []
+    unsubmitted.append((row, steer_text))
     _ra().logger.info(
-        "Delivered /steer to agent after tool batch (%d chars): %s",
+        "Delivered /steer to agent after tool batch (%d chars) as new user message: %s",
         len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
     )

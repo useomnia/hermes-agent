@@ -28,12 +28,14 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH, VALID_REASONING_EFFORTS
+from agent import apply_patch_tool
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint, is_openrouter_preset_model
 from agent.message_content import flatten_message_text
+from agent.repetition_guard import is_line_cycle, is_repetition_dominated
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_surrogates,
@@ -103,57 +105,68 @@ def _ra():
     return run_agent
 
 
+_IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
+
+
+def _image_part_chars(part: Dict[str, Any], image_cost: int) -> int:
+    """Char-equivalent of one image content part: the shared per-image estimate
+    (x4 chars/token), never the base64 payload length. A single native screenshot priced as text
+    read as ~100K+ tokens and selected the giant-conversation watchdog tiers (#63871, #76411)."""
+    text = part.get("text")
+    return image_cost * 4 + (len(text) if isinstance(text, str) else 0)
+
+
+def _payload_chars(value: Any, image_cost: int) -> int:
+    """``len(str(value))`` with image content parts priced at ``image_cost`` tokens each."""
+    if value is None:
+        return 0
+    if isinstance(value, dict):
+        part_type = value.get("type")
+        # JSON-Schema nodes may hold a sub-schema (``properties.type``) or a multi-type list
+        # under the "type" key; only scalar content-part types can ever match (#104793).
+        if isinstance(part_type, str) and part_type in _IMAGE_PART_TYPES and any(k in value for k in ("image_url", "image", "source", "file_id")):
+            return _image_part_chars(value, image_cost)
+        return sum(len(str(k)) + 6 + _payload_chars(v, image_cost) for k, v in value.items())
+    if isinstance(value, list):
+        return sum(_payload_chars(item, image_cost) for item in value) + 2 * len(value)
+    return len(str(value))
+
+
 def estimate_request_context_tokens(api_payload: Any) -> int:
-    """Estimate context/load tokens from an API payload, dict or messages list.
+    """Cheap char/4 context estimate for the stale-call detectors. Handles both
+    wire shapes so Codex turns don't report ~0 tokens: list -> Chat ``messages``;
+    dict with ``messages`` (+``tools``); dict with ``input`` (Responses API,
+    +``instructions``/``tools``); any other dict -> sum of its values. Image parts
+    cost the shared per-image estimate, not their base64 length."""
+    from agent.model_metadata import IMAGE_TOKEN_COST
 
-    The stale-call detectors historically assumed a Chat Completions request:
-    they pulled ``api_kwargs["messages"]`` and ran a cheap char/4 estimate.
-    Codex / Responses API requests carry the conversational payload in
-    ``input`` (with additional load in ``instructions`` and ``tools``), so the
-    legacy estimator reported ~0 tokens for every Codex turn and the
-    context-tier scaling never fired.
-
-    This helper handles both shapes:
-      - bare list -> treat as Chat Completions ``messages``
-      - dict with ``messages`` -> Chat Completions (+ ``tools`` if present)
-      - dict with ``input`` -> Responses API (+ ``instructions``/``tools``)
-      - any other dict -> fall back to summing string values
-    """
+    image_cost = IMAGE_TOKEN_COST
 
     def _chars(value: Any) -> int:
-        if value is None:
-            return 0
-        if isinstance(value, str):
-            return len(value)
-        return len(str(value))
+        return _payload_chars(value, image_cost)
 
-    def _message_chars(messages: Any) -> int:
-        if not isinstance(messages, list):
-            return _chars(messages)
-        return sum(_chars(item) for item in messages)
+    def _opaque_chars(value: Any) -> int:
+        # Tools/instructions are text even when a schema example looks like
+        # an image part; only conversational payloads can contain images.
+        return 0 if value is None else len(str(value))
 
     if isinstance(api_payload, list):
-        return _message_chars(api_payload) // 4
-
-    if isinstance(api_payload, dict):
-        messages = api_payload.get("messages")
-        if isinstance(messages, list):
-            total_chars = _message_chars(messages)
-            if "tools" in api_payload:
-                total_chars += _chars(api_payload.get("tools"))
-            return total_chars // 4
-
-        if "input" in api_payload:
-            total_chars = (
-                _chars(api_payload.get("input"))
-                + _chars(api_payload.get("instructions"))
-                + _chars(api_payload.get("tools"))
-            )
-            return total_chars // 4
-
-        return sum(_chars(value) for value in api_payload.values()) // 4
-
-    return _chars(api_payload) // 4
+        return sum(_chars(item) for item in api_payload) // 4
+    if not isinstance(api_payload, dict):
+        return _chars(api_payload) // 4
+    messages = api_payload.get("messages")
+    if isinstance(messages, list):
+        total_chars = sum(_chars(item) for item in messages)
+        if "tools" in api_payload:
+            total_chars += _opaque_chars(api_payload.get("tools"))
+        return total_chars // 4
+    if "input" in api_payload:
+        return (
+            _chars(api_payload["input"])
+            + _opaque_chars(api_payload.get("instructions"))
+            + _opaque_chars(api_payload.get("tools"))
+        ) // 4
+    return sum(_chars(value) for value in api_payload.values()) // 4
 
 
 def _is_openai_codex_backend(agent) -> bool:
@@ -299,6 +312,108 @@ def _check_stale_giveup(agent) -> None:
             "avoid an indefinite stall. Switch models or start a new "
             "session, then retry."
         )
+
+
+# A tool call's streamed arguments are checked for a repetition loop once they
+# pass this size, and again after every further step of growth.  Degenerate
+# loops run until the output cap, so catching them early saves minutes.
+_TOOL_ARG_RUNAWAY_MIN_CHARS = 32_000
+_TOOL_ARG_RUNAWAY_STEP_CHARS = 16_000
+# The line-cycle check reads only this much of the newest arguments, so its cost stays flat.
+_TOOL_ARG_LINE_CYCLE_TAIL_CHARS = 32_000
+
+# A tool call whose arguments end in this many characters of nothing but blank
+# text (spaces, tabs, newlines or their JSON escapes) has degenerated into a
+# whitespace loop: the model emits newline-and-indent tokens until the output
+# cap. Real arguments never carry a blank run this long, and at one or two
+# characters per chunk the repetition check above would need ~90 s to see it.
+_TOOL_ARG_BLANK_RUN_CHARS = 2_000
+_BLANK_ARG_SUFFIX = re.compile(r"(?:[ \t\r\n]|\\[nrt])*\Z")
+
+
+# How much of a tool call's arguments a kill or slow-attempt log keeps: enough of
+# the start to name the call and of the end to show what it was repeating.
+_TOOL_ARG_SAMPLE_HEAD_CHARS = 160
+_TOOL_ARG_SAMPLE_TAIL_CHARS = 600
+
+
+def _tool_arg_sample(entry) -> str:
+    """Bounded head and tail of a tool call's arguments for a diagnostic log."""
+    if not isinstance(entry, dict):
+        return "none"
+    arguments = entry["function"]["arguments"]
+    if len(arguments) <= _TOOL_ARG_SAMPLE_HEAD_CHARS + _TOOL_ARG_SAMPLE_TAIL_CHARS:
+        return repr(arguments)
+    return (
+        f"head={arguments[:_TOOL_ARG_SAMPLE_HEAD_CHARS]!r} "
+        f"tail={arguments[-_TOOL_ARG_SAMPLE_TAIL_CHARS:]!r}"
+    )
+
+
+def _flag_runaway_tool_arguments(progress: dict, idx, entry: dict, delta: str) -> None:
+    """Mark the stream when a tool call's growing arguments are a whitespace,
+    repetition or line-cycle loop."""
+    arguments = entry["function"]["arguments"]
+    size = len(arguments)
+    if progress["runaway"] is not None:
+        return
+    # Length of the blank run ending the arguments, updated from the new delta.
+    # The window keeps the two characters before it so an escape split across
+    # deltas (``\`` then ``n``) still reads as blank, and a trailing lone
+    # backslash is held back until the next delta shows what it escapes.
+    window = arguments[-(len(delta) + 2):]
+    grown = len(delta)
+    if window.endswith("\\") and not window.endswith("\\\\"):
+        window, grown = window[:-1], grown - 1
+    match = _BLANK_ARG_SUFFIX.search(window)
+    suffix = len(window) - match.start() if match else 0
+    blank = progress["blank"]
+    blank[idx] = blank.get(idx, 0) + grown if suffix >= grown else suffix
+    if blank[idx] >= _TOOL_ARG_BLANK_RUN_CHARS:
+        progress["runaway"] = (entry["function"]["name"] or "?", size, "blank whitespace")
+        return
+    if size < _TOOL_ARG_RUNAWAY_MIN_CHARS:
+        return
+    checked = progress["checked"]
+    if size - checked.get(idx, 0) < _TOOL_ARG_RUNAWAY_STEP_CHARS:
+        return
+    checked[idx] = size
+    if is_repetition_dominated(arguments):
+        progress["runaway"] = (entry["function"]["name"] or "?", size, "repetition")
+    elif is_line_cycle(arguments[-_TOOL_ARG_LINE_CYCLE_TAIL_CHARS:]):
+        progress["runaway"] = (entry["function"]["name"] or "?", size, "repeated lines")
+
+
+# A completed attempt slower than this is logged with its diagnostics, so a
+# stalled-then-finished generation leaves the same trail as a dropped one.
+_SLOW_STREAM_LOG_SECONDS = 120.0
+
+
+def _log_slow_or_truncated_stream(
+    agent, diag, finish_reason, usage_obj, truncated_tool_args: bool, tool_names
+) -> None:
+    """Record a slow or tool-truncated stream attempt with its diagnostics.
+
+    The retry machinery only sees the final attempt's usage, so this is the
+    one place a stalled attempt's finish reason and token spend survive.
+    """
+    try:
+        started = diag.get("started_at") if isinstance(diag, dict) else None
+        elapsed = time.time() - started if started else 0.0
+        if not truncated_tool_args and elapsed < _SLOW_STREAM_LOG_SECONDS:
+            return
+        completion = getattr(usage_obj, "completion_tokens", None) if usage_obj else None
+        details = getattr(usage_obj, "completion_tokens_details", None) if usage_obj else None
+        reasoning = getattr(details, "reasoning_tokens", None) if details else None
+        logger.warning(
+            "Stream attempt %s: finish_reason=%s truncated_tool_args=%s tools=%s "
+            "completion_tokens=%s reasoning_tokens=%s %s",
+            "truncated" if truncated_tool_args else "slow",
+            finish_reason, truncated_tool_args, tool_names or [],
+            completion, reasoning, agent._stream_diag_summary(diag),
+        )
+    except Exception:
+        pass
 
 
 def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
@@ -1047,7 +1162,16 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
+    """Build the request using the same catalog ceiling as truncation recovery."""
+    from agent.output_budget import apply_output_budget
+
+    recovery_cap = getattr(agent, "_ephemeral_max_output_tokens", None)
+    return apply_output_budget(agent, _build_api_kwargs_for_mode(agent, api_messages), recovery_cap=recovery_cap)
+
+
+def _build_api_kwargs_for_mode(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
+    from agent.output_budget import model_output_limit
     tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
@@ -1136,6 +1260,9 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
                     getattr(agent, "log_prefix", ""), exc,
                 )
 
+        ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
+        if ephemeral_out is not None:
+            agent._ephemeral_max_output_tokens = None
         return _ct.build_kwargs(
             model=agent.model,
             messages=_msgs_for_codex,
@@ -1143,7 +1270,8 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             reasoning_config=agent.reasoning_config,
             session_id=getattr(agent, "session_id", None),
             base_url=agent.base_url,
-            max_tokens=agent.max_tokens,
+            max_tokens=ephemeral_out if ephemeral_out is not None else (
+                agent.max_tokens if agent.max_tokens is not None else model_output_limit(agent)),
             timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
             is_github_responses=is_github_responses,
@@ -1157,6 +1285,11 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
 
     # ── chat_completions (default) ─────────────────────────────────────
     _ct = agent._get_transport()
+
+    # GPT-5+ models write files through a grammar-constrained apply_patch
+    # instead of one JSON-escaped write_file argument (agent/apply_patch_tool.py).
+    if apply_patch_tool.agent_enabled(agent):
+        tools_for_api, api_messages = apply_patch_tool.rewrite_request(tools_for_api, api_messages)
 
     # Provider detection flags
     _is_qwen = agent._is_qwen_portal()
@@ -1251,7 +1384,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             tools=tools_for_api,
             base_url=agent.base_url,
             timeout=agent._resolved_api_call_timeout(),
-            max_tokens=agent.max_tokens,
+            max_tokens=agent.max_tokens if agent.max_tokens is not None else model_output_limit(agent),
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
             reasoning_config=agent.reasoning_config,
@@ -1285,7 +1418,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         tools=tools_for_api,
         base_url=agent.base_url,
         timeout=agent._resolved_api_call_timeout(),
-        max_tokens=agent.max_tokens,
+        max_tokens=agent.max_tokens if agent.max_tokens is not None else model_output_limit(agent),
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
         reasoning_config=agent.reasoning_config,
@@ -2712,6 +2845,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # poll loop uses this to detect stale connections that keep receiving
     # SSE keep-alive pings but no actual data.
     last_chunk_time = {"t": time.time()}
+    # Wall-clock timestamp of the last growth of a streaming tool call (a new
+    # call or more argument text), ``None`` while no tool call is open.  A
+    # provider can keep delivering chunks while a tool call's arguments stop
+    # growing, which the chunk-based stale detector cannot see.
+    tool_arg_progress = {"t": None, "runaway": None, "checked": {}, "blank": {}, "entry": None}
     # Stale-stream patience, shared between the httpx socket read timeout
     # (built in ``_call_chat_completions`` below) and the stale-stream detector
     # (computed further down, before the worker thread starts).  Initialized
@@ -2868,6 +3006,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Reset stale-stream timer so the detector measures from this
         # attempt's start, not a previous attempt's last chunk.
         last_chunk_time["t"] = time.time()
+        tool_arg_progress.update(t=None, runaway=None, checked={}, blank={}, entry=None)
         agent._touch_activity("waiting for provider response (streaming)")
         # Initialize per-attempt stream diagnostics so the retry block can
         # reach for them after the stream dies.  Lives on
@@ -2946,6 +3085,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         tool_calls_acc: dict = {}
         tool_gen_notified: set = set()
         tool_gen_event_notified: set = set()
+        # Slots holding an apply_patch call. Its arguments stream as raw patch
+        # text, not JSON; it is renamed to the internal patch tool on arrival.
+        _apply_patch_offered = apply_patch_tool.request_offers_apply_patch(api_kwargs)
+        apply_patch_slots: set = set()
         # Ollama-compatible endpoints reuse index 0 for every tool call
         # in a parallel batch, distinguishing them only by id.  Track
         # the last seen id per raw index so we can detect a new tool
@@ -2970,13 +3113,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     api_kwargs.get("model", "unknown"),
                 )
                 break
-            last_chunk_time["t"] = time.time()
+            _chunk_at = time.time()
+            _chunk_gap = _chunk_at - last_chunk_time["t"]
+            last_chunk_time["t"] = _chunk_at
             agent._touch_activity("receiving stream response")
 
             # Update per-attempt diagnostic counters.  Best-effort —
             # failures are swallowed so the streaming hot path is never
             # interrupted by diagnostic accounting.
             try:
+                if _diag.get("first_chunk_at") is not None:
+                    _diag["max_chunk_gap_s"] = max(float(_diag.get("max_chunk_gap_s", 0.0)), _chunk_gap)
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                 if _diag.get("first_chunk_at") is None:
                     _diag["first_chunk_at"] = last_chunk_time["t"]
@@ -3009,10 +3156,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             delta = chunk.choices[0].delta
             if hasattr(chunk, "model") and chunk.model:
                 model_name = chunk.model
+            # OpenRouter names the upstream that served the attempt only in the
+            # chunk body; the diag summary attributes a runaway to it.
+            _served_by = getattr(chunk, "provider", None)
+            if isinstance(_served_by, str) and _served_by and not _diag.get("serving_provider"):
+                _diag["serving_provider"] = _served_by.strip()[:64]
 
             # Accumulate reasoning content
             reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning_text:
+                _diag["reasoning_chars"] = int(_diag.get("reasoning_chars", 0)) + len(reasoning_text)
                 reasoning_parts.append(reasoning_text)
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
@@ -3092,8 +3245,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # (matching the OpenAI Node SDK / LiteLLM /
                             # Vercel AI patterns) is immune to this.
                             entry["function"]["name"] = tc_delta.function.name
+                            if (
+                                _apply_patch_offered
+                                and tc_delta.function.name == apply_patch_tool.WIRE_TOOL_NAME
+                            ):
+                                apply_patch_slots.add(idx)
+                                entry["function"]["name"] = apply_patch_tool.INTERNAL_TOOL_NAME
+                            tool_arg_progress.update(t=time.time(), entry=entry)
                         if tc_delta.function.arguments:
                             entry["function"]["arguments"] += tc_delta.function.arguments
+                            tool_arg_progress.update(t=time.time(), entry=entry)
+                            _flag_runaway_tool_arguments(
+                                tool_arg_progress, idx, entry, tc_delta.function.arguments
+                            )
                     extra = getattr(tc_delta, "extra_content", None)
                     if extra is None and hasattr(tc_delta, "model_extra"):
                         extra = (tc_delta.model_extra if isinstance(tc_delta.model_extra, dict) else {}).get("extra_content")
@@ -3131,6 +3295,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
             if chunk.choices[0].finish_reason:
                 finish_reason = chunk.choices[0].finish_reason
+                tool_arg_progress["t"] = None
+                tool_arg_progress["runaway"] = None
 
             # Usage in the final chunk
             if hasattr(chunk, "usage") and chunk.usage:
@@ -3151,7 +3317,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 tc = tool_calls_acc[idx]
                 arguments = tc["function"]["arguments"]
                 tool_name = tc["function"]["name"] or "?"
-                if arguments and arguments.strip():
+                if idx in apply_patch_slots:
+                    # Raw patch text. Without its end marker the call was cut
+                    # off: refuse it, like a truncated JSON argument.
+                    if apply_patch_tool.is_complete(arguments):
+                        arguments = apply_patch_tool.internal_arguments(arguments)
+                    else:
+                        has_truncated_tool_args = True
+                        _abandon_unexecuted_tool_call(tc["id"])
+                elif arguments and arguments.strip():
                     try:
                         json.loads(arguments)
                     except json.JSONDecodeError:
@@ -3179,6 +3353,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         arguments=arguments,
                     ),
                 ))
+
+        _log_slow_or_truncated_stream(
+            agent, _diag, finish_reason, usage_obj, has_truncated_tool_args,
+            [
+                f'{tool_calls_acc[i]["function"]["name"] or "?"}'
+                f'({len(tool_calls_acc[i]["function"]["arguments"])} chars,'
+                f' {_tool_arg_sample(tool_calls_acc[i])})'
+                for i in sorted(tool_calls_acc)
+            ],
+        )
 
         # Zero-chunk guard: stream yielded nothing usable — a provider/upstream
         # error or malformed SSE, not a legitimate empty completion. Raise so the
@@ -3269,6 +3453,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             index=0,
             message=mock_message,
             finish_reason=effective_finish_reason,
+            # Keep the provider's reason while routing incomplete arguments
+            # through bounded recovery; malformed JSON is not proof of a cap.
+            provider_finish_reason=finish_reason,
         )
         return SimpleNamespace(
             id="stream-" + str(uuid.uuid4()),
@@ -3834,6 +4021,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
+    # Argument text streams token by token, so a tool call that stops growing
+    # for this long has stalled even when other chunks keep the stream alive.
+    _tool_arg_stall_timeout = (
+        float("inf")
+        if _stream_stale_timeout == float("inf")
+        else env_float("HERMES_TOOL_ARG_STALL_TIMEOUT", 120.0)
+    )
 
     t = threading.Thread(target=_call, daemon=True)
     t.start()
@@ -3882,14 +4076,46 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # but delivering no real chunks.  Kill the client so the
         # inner retry loop can start a fresh connection.
         _stale_elapsed = time.time() - last_chunk_time["t"]
-        if _stale_elapsed > _stream_stale_timeout:
+        _tool_arg_last = tool_arg_progress["t"]
+        _tool_arg_stalled = (
+            _tool_arg_last is not None
+            and time.time() - _tool_arg_last > _tool_arg_stall_timeout
+        )
+        _tool_arg_runaway = tool_arg_progress["runaway"]
+        if (
+            _stale_elapsed > _stream_stale_timeout
+            or _tool_arg_stalled
+            or (_tool_arg_runaway is not None and _tool_arg_stall_timeout != float("inf"))
+        ):
             _est_ctx = estimate_request_context_tokens(api_kwargs)
-            logger.warning(
-                "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
-                "model=%s context=~%s tokens. Killing connection.",
-                _stale_elapsed, _stream_stale_timeout,
-                api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
-            )
+            if _tool_arg_runaway is not None:
+                _stale_elapsed = time.time() - last_chunk_time["t"]
+                logger.warning(
+                    "Tool call '%s' arguments degenerated into %s (%s chars) while "
+                    "streaming. model=%s context=~%s tokens diag=%s args=%s. Killing connection.",
+                    _tool_arg_runaway[0], _tool_arg_runaway[2], f"{_tool_arg_runaway[1]:,}",
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                    agent._stream_diag_summary(request_client_holder.get("diag")),
+                    _tool_arg_sample(tool_arg_progress.get("entry")),
+                )
+            elif _tool_arg_stalled:
+                _stale_elapsed = time.time() - _tool_arg_last
+                logger.warning(
+                    "Tool call arguments stalled for %.0fs (threshold %.0fs) while the "
+                    "stream stayed open. model=%s context=~%s tokens diag=%s args=%s. "
+                    "Killing connection.",
+                    _stale_elapsed, _tool_arg_stall_timeout,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                    agent._stream_diag_summary(request_client_holder.get("diag")),
+                    _tool_arg_sample(tool_arg_progress.get("entry")),
+                )
+            else:
+                logger.warning(
+                    "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
+                    "model=%s context=~%s tokens. Killing connection.",
+                    _stale_elapsed, _stream_stale_timeout,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                )
             agent._buffer_status(
                 f"⚠️ No response from provider for {int(_stale_elapsed)}s "
                 f"(model: {api_kwargs.get('model', 'unknown')}, "
@@ -3925,9 +4151,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # The shared client will be replaced lazily by
                 # _ensure_primary_openai_client on the next request.
                 pass
-            # Reset the timer so we don't kill repeatedly while
+            # Reset the timers so we don't kill repeatedly while
             # the inner thread processes the closure.
             last_chunk_time["t"] = time.time()
+            tool_arg_progress.update(t=None, runaway=None)
             agent._emit_wait_notice(
                 f"⚠ no output from provider for {int(_stale_elapsed)}s — "
                 f"reconnecting..."

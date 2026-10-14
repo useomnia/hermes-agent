@@ -1652,3 +1652,61 @@ def test_module_command_starts_loopback_server_without_logging_control_secret(
 def _request_raw(url: str) -> tuple[int, bytes, dict[str, str]]:
     with urllib.request.urlopen(url, timeout=2) as response:
         return response.status, response.read(), dict(response.headers.items())
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("held", [False, True])
+def test_tool_argument_fault_is_emitted_on_wire_and_round_trips(stream, held):
+    step = _tool("terminal", {"command": "printf never-execute"})
+    step["response"]["tool_arguments_limit"] = 15
+    if held:
+        step = {"response": {"type": "hold", "id": "fault", "response": step["response"]}}
+    fixture = _script(step)
+    assert parse_script(fixture).as_dict() == parse_script(parse_script(fixture).as_dict()).as_dict()
+    with ScriptedProviderServer(fixture, control_token="test") as server:
+        if held:
+            results = []
+            worker = threading.Thread(target=lambda: results.append(
+                _chat(server, {"model": "matrix-model", "messages": [], "stream": stream})
+            ))
+            worker.start()
+            try:
+                deadline = time.monotonic() + 2
+                while not server.state["held"] and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert server.state["held"]
+                status, _, _ = _request(server, "POST", "/__control/release", {"id": "fault"}, token="test")
+                assert status == 200
+            finally:
+                worker.join(timeout=3)
+            assert not worker.is_alive()
+            status, body, _ = results[0]
+        else:
+            status, body, _ = _chat(server, {"model": "matrix-model", "messages": [], "stream": stream})
+    assert status == 200
+    if stream:
+        chunks = _sse_payloads(body)
+        call = next(chunk["choices"][0]["delta"]["tool_calls"][0] for chunk in chunks
+                    if chunk["choices"][0]["delta"].get("tool_calls"))
+        assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    else:
+        call = body["choices"][0]["message"]["tool_calls"][0]
+        assert body["choices"][0]["finish_reason"] == "tool_calls"
+    assert len(call["function"]["arguments"]) == 15
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(call["function"]["arguments"])
+
+
+@pytest.mark.parametrize("limit", [None, True, False, 0, -1, 1.5, "15"])
+def test_tool_argument_fault_rejects_invalid_limits(limit):
+    step = _tool()
+    step["response"]["tool_arguments_limit"] = limit
+    with pytest.raises(ScriptValidationError):
+        parse_script(_script(step))
+
+
+def test_tool_argument_fault_requires_tool_calls():
+    step = _text("hello")
+    step["response"]["tool_arguments_limit"] = 5
+    with pytest.raises(ScriptValidationError):
+        parse_script(_script(step))

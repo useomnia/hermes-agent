@@ -140,6 +140,8 @@ class TestOmnioAlwaysLoad:
     OMNIO_TOOLS = [
         "web_read", "web_map", "request_user_input",
         "render_component", "store-credential", "emit_client_event",
+        "search_conversations", "read_conversation",
+        "list_conversation_files", "import_conversation_files",
     ]
 
     @staticmethod

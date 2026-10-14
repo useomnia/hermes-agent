@@ -18,7 +18,7 @@ from enum import Enum
 
 from hermes_cli.config import get_hermes_home
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
-from utils import is_truthy_value
+from utils import fast_safe_load, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -1279,7 +1279,7 @@ def load_gateway_config() -> GatewayConfig:
         config_yaml_path = _home / "config.yaml"
         if config_yaml_path.exists():
             with open(config_yaml_path, encoding="utf-8") as f:
-                yaml_cfg = yaml.safe_load(f) or {}
+                yaml_cfg = fast_safe_load(f) or {}
 
             # Managed scope: overlay administrator-pinned values so the gateway
             # honors them too. This loader builds its own dict instead of going

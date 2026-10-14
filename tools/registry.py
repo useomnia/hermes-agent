@@ -18,6 +18,7 @@ import ast
 import importlib
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -64,15 +65,72 @@ def _module_registers_tools(module_path: Path) -> bool:
     return any(_is_registry_register_call(stmt) for stmt in tree.body)
 
 
+def _discovery_cache_path() -> Optional[Path]:
+    """Path of the tool-discovery verdict cache, or None if unresolvable."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home()) / "cache" / "tool_discovery_cache.json"
+    except Exception:
+        return None
+
+
+def _load_discovery_cache() -> Dict[str, list]:
+    path = _discovery_cache_path()
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_discovery_cache(cache: Dict[str, list]) -> None:
+    path = _discovery_cache_path()
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(cache), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        logger.debug("Could not write tool discovery cache %s: %s", path, exc)
+
+
 def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
-    """Import built-in self-registering tool modules and return their module names."""
+    """Import built-in self-registering tool modules and return their module names.
+
+    The per-file AST scan is memoized on disk keyed by ``(mtime_ns, size)``
+    (ported from upstream): a fresh gateway process otherwise re-parses every
+    tool module's source before its first agent can build.
+    """
     tools_path = Path(tools_dir) if tools_dir is not None else Path(__file__).resolve().parent
-    module_names = [
-        f"tools.{path.stem}"
-        for path in sorted(tools_path.glob("*.py"))
-        if path.name not in {"__init__.py", "registry.py", "mcp_tool.py"}
-        and _module_registers_tools(path)
-    ]
+    cache = _load_discovery_cache()
+    fresh_cache: Dict[str, list] = {}
+    dirty = False
+    module_names: List[str] = []
+    for path in sorted(tools_path.glob("*.py")):
+        if path.name in {"__init__.py", "registry.py", "mcp_tool.py"}:
+            continue
+        abs_path = str(path.resolve())
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        stat_key = [st.st_mtime_ns, st.st_size]
+        cached = cache.get(abs_path)
+        if isinstance(cached, list) and len(cached) == 3 and cached[:2] == stat_key:
+            registers = bool(cached[2])
+        else:
+            registers = _module_registers_tools(path)
+            dirty = True
+        fresh_cache[abs_path] = [*stat_key, registers]
+        if registers:
+            module_names.append(f"tools.{path.stem}")
+    if dirty or set(fresh_cache) != set(cache):
+        _save_discovery_cache(fresh_cache)
 
     imported: List[str] = []
     for mod_name in module_names:

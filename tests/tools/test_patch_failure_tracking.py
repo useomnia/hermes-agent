@@ -52,6 +52,29 @@ def fresh_tracker():
 
 
 class TestPatchFailureEscalation:
+    @pytest.mark.parametrize("inert_position", [0, 1, 2])
+    def test_identical_hunk_does_not_block_real_edits(
+        self, hermes_home, tmp_path, fresh_tracker, inert_position
+    ):
+        from tools.file_tools import _handle_patch
+
+        target = tmp_path / "guide.md"
+        target.write_text("A = 1\nB = 2\nC = 3\n")
+        hunks = ["-B = 2\n+B = 4", "-C = 3\n+C = 5"]
+        hunks.insert(inert_position, "-A = 1\n+A = 1")
+        patch = (
+            f"*** Begin Patch\n*** Update File: {target}\n@@\n"
+            + "\n@@\n".join(hunks)
+            + "\n*** End Patch"
+        )
+
+        result = json.loads(_handle_patch(
+            {"mode": "patch", "patch": patch}, task_id="identical-hunk"
+        ))
+
+        assert result.get("success") is True, result
+        assert target.read_text() == "A = 1\nB = 4\nC = 5\n"
+
     def test_first_two_failures_use_normal_hint(self, hermes_home, tmp_path, fresh_tracker):
         from tools.file_tools import _handle_patch
 

@@ -96,7 +96,7 @@ def test_overlapping_dispatch_preserves_other_threads_output(
     done = [threading.Event(), threading.Event()]
     stdout, stderr = io.StringIO(), io.StringIO()
 
-    def handler(_name, _args, *, task_id):
+    def handler(_name, _args, *, task_id, tool_call_id):
         index = int(task_id)
         print("handler chatter")
         print("handler chatter", file=sys.stderr)

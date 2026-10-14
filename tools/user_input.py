@@ -10,8 +10,8 @@ than the older "end the turn, the answer is the next message" shape. That
 inline-resume shape holds only when the user answers before the timeout: a
 timeout now ENDS the turn (mirroring the plugin's "presented" sentinel) instead
 of letting the agent keep working with a "no_response" result — the card
-stays open and answerable in the chat, and a late answer arrives as the next
-turn's user message.
+stays open and answerable in the chat, and a late answer closes the call
+through a continuation of that turn (``/v1/runs`` with ``continuation``).
 
 The card itself rides the tool's ``running`` lifecycle event, emitted by the
 api_server seam (``_on_tool_start``) with the tool's args under ``interaction``,
@@ -51,7 +51,7 @@ BLOCKING_DISABLED: bool = env_var_enabled(_ENV_DISABLED)
 # the approval gate's 300s default. On timeout the turn ends (see api_server's
 # _on_tool_complete) rather than letting the agent keep working with a
 # "no_response" result — the card stays open and answerable in the chat, and
-# the user's late answer arrives as the next turn's user message. The chat
+# the user's late answer closes the call through a continuation. The chat
 # keepalive holds the SSE open while the worker is parked.
 _ENV_TIMEOUT = "OMNIO_USER_INPUT_TIMEOUT"
 _DEFAULT_TIMEOUT_S = 300
@@ -101,7 +101,7 @@ def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
     agent is interrupted (the user stopped the turn, or the chat disconnected).
     The caller (the plugin) maps ``None`` to a "no_response" tool result, which
     the api_server seam treats as turn-ending — the card stays answerable in the
-    chat and a late answer arrives as the next turn's user message.
+    chat and a late answer closes the call through a continuation of the turn.
     """
     if not session_key:
         # No conversation surface to receive an answer on — don't park forever.

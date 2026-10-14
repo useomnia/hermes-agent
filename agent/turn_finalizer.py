@@ -66,6 +66,38 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def _extract_last_reasoning(
+    messages,
+    *,
+    continuation: bool,
+    continuation_boundary_tool_call_ids=None,
+):
+    """Return reasoning from this logical turn without crossing its boundary.
+
+    Normal user turns may reason on an assistant tool-call step, so their
+    intervening tool rows are not boundaries. A no-user Omnio continuation has
+    no fresh user row to stop at, so the original assistant tool-call IDs mark
+    the boundary while allowing reasoning from new same-continuation tools.
+    """
+    boundary_call_ids = set(continuation_boundary_tool_call_ids or ())
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            break
+        if continuation and msg.get("role") == "assistant":
+            message_call_ids = {
+                call.get("id")
+                for call in msg.get("tool_calls") or []
+                if isinstance(call, dict) and isinstance(call.get("id"), str)
+            }
+            if boundary_call_ids and message_call_ids & boundary_call_ids:
+                break
+        if continuation and not boundary_call_ids and msg.get("role") == "tool":
+            break
+        if msg.get("role") == "assistant" and msg.get("reasoning"):
+            return msg["reasoning"]
+    return None
+
+
 def finalize_turn(
     agent,
     *,
@@ -81,6 +113,8 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    continuation=False,
+    continuation_boundary_tool_call_ids=None,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
 ):
@@ -195,6 +229,7 @@ def finalize_turn(
     completed = (
         final_response is not None
         and not failed
+        and not interrupted
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
@@ -263,6 +298,10 @@ def finalize_turn(
     # scaffolding has been removed. Otherwise a later user "continue" turn
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
+    if interrupted:
+        from agent.agent_runtime_helpers import recover_unsubmitted_steers
+        recover_unsubmitted_steers(agent, messages)
+
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
@@ -272,23 +311,10 @@ def finalize_turn(
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
 
-        # When the turn was interrupted and the last message is a tool
-        # result, append a synthetic assistant message to close the
-        # tool-call sequence. Without this, the session persists a
-        # ``tool → user`` alternation that strict providers (Gemini,
-        # Claude) reject, causing them to hallucinate a continuation of
-        # the user's message on the next turn (#48879).
-        #
-        # ``_drop_trailing_empty_response_scaffolding`` only rewinds the
-        # tool tail when an empty-response scaffolding flag is present; a
-        # clean ``/stop`` interrupt after a successful tool sets no such
-        # flag, so the tool result survives as the tail and we close it
-        # here instead. On an interrupt ``final_response`` is typically
-        # empty, so fall back to an explicit placeholder rather than
-        # persisting an empty-content assistant turn.
-        if interrupted:
-            from agent.message_sanitization import close_interrupted_tool_sequence
-            close_interrupted_tool_sequence(messages, final_response)
+        # An interrupt is a run outcome, not an assistant response. Preserve the
+        # actual tool tail: tool results followed by a new user message are legal
+        # (including steering), and a fabricated assistant closer would make an
+        # unresolved Omnio interaction look durably completed.
 
         # Some recovery/fallback paths return a real final_response without
         # adding a closing assistant message to the transcript (e.g. the
@@ -398,30 +424,22 @@ def finalize_turn(
     else:
         logger.info(_diag_msg, *_diag_args)
 
-    # File-mutation verifier footer.
-    # If one or more ``write_file`` / ``patch`` calls failed during this
-    # turn and were never superseded by a successful write to the same
-    # path, append an advisory footer to the assistant response.  This
-    # catches the specific case — reported by Ben Eng (#15524-adjacent)
-    # — where a model issues a batch of parallel patches, half of them
-    # fail with "Could not find old_string", and the model summarises
-    # the turn claiming every file was edited.  The user then has to
-    # manually run ``git status`` to catch the lie.  With this footer
-    # the truth is surfaced on every turn, so over-claiming is
-    # structurally impossible past the model.
-    #
-    # Gate: only applied when a real text response exists for this
-    # turn and the user didn't interrupt.  Empty/interrupted turns
-    # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted:
-        try:
-            _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
-            if _failed and agent._file_mutation_verifier_enabled():
-                footer = agent._format_file_mutation_failure_footer(_failed)
-                if footer:
-                    final_response = final_response.rstrip() + "\n\n" + footer
-        except Exception as _ver_err:
-            logger.debug("file-mutation verifier footer failed: %s", _ver_err)
+    # Display settings suppress the advisory, never the diagnostic evidence.
+    # Log unresolved attempts even when an empty/interrupted turn has no footer.
+    try:
+        _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
+        for path, info in _failed.items():
+            logger.warning(
+                "Unresolved file mutation: session=%s tool=%s path=%r error=%r",
+                agent.session_id or "none", info.get("tool") or "patch",
+                path, info.get("error_preview") or "",
+            )
+        if _failed and final_response and not interrupted and agent._file_mutation_verifier_enabled():
+            footer = agent._format_file_mutation_failure_footer(_failed)
+            if footer:
+                final_response = final_response.rstrip() + "\n\n" + footer
+    except Exception as _ver_err:
+        logger.debug("file-mutation verifier reporting failed: %s", _ver_err)
 
     # Turn-completion explainer.
     # When a turn ends abnormally after substantive work — empty content
@@ -562,13 +580,11 @@ def finalize_turn(
     # reasoning on the tool-call step and leave the final-answer step
     # with reasoning=None, so picking only the last assistant would
     # silently drop legitimate same-turn reasoning.
-    last_reasoning = None
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            break  # turn boundary — don't cross into prior turns
-        if msg.get("role") == "assistant" and msg.get("reasoning"):
-            last_reasoning = msg["reasoning"]
-            break
+    last_reasoning = _extract_last_reasoning(
+        messages,
+        continuation=continuation,
+        continuation_boundary_tool_call_ids=continuation_boundary_tool_call_ids,
+    )
 
     # Build result with interrupt info if applicable
     result = {
@@ -625,7 +641,7 @@ def finalize_turn(
         result["interrupt_message"] = agent._interrupt_message
 
     # Clear interrupt state after handling
-    agent.clear_interrupt()
+    agent.clear_interrupt(preserve_steer=True)
 
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None

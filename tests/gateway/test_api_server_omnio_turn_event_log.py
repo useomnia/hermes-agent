@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -235,10 +236,13 @@ async def test_capabilities_stamp_turn_event_log_without_changing_legacy_boolean
 def test_omnio_extension_event_types_are_explicit_and_namespaced() -> None:
     expected = {
         "response.omnio.interaction",
+        "response.omnio.pending_call",
         "response.omnio.interaction_completed",
+        "response.omnio.continuation",
         "response.omnio.compaction",
         "response.omnio.client_event",
         "response.omnio.gen_ui",
+        "response.omnio.shared_state",
         "response.omnio.task_list",
         "response.omnio.warmup",
         "response.omnio.subagent_start",
@@ -1008,6 +1012,40 @@ async def test_none_final_response_does_not_mask_structured_run_failure() -> Non
     assert events[-1]["type"] == "response.failed"
     assert events[-1]["response"]["error"]["code"] == "run_failed"
     assert adapter._run_statuses[run_id]["error"] == "original agent failure"
+
+
+@pytest.mark.asyncio
+async def test_failed_run_keeps_its_error_out_of_the_reply() -> None:
+    adapter = _make_adapter()
+    failed_result = {
+        "final_response": "HTTP 400: provider refused the request",
+        "failed": True,
+        "error": "HTTP 400: provider refused the request",
+        "messages": [],
+    }
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(
+            adapter,
+            "_create_agent",
+            return_value=_agent(lambda **_kwargs: failed_result),
+        ):
+            started = await client.post("/v1/runs", json={"input": "fail"})
+            run_id = (await started.json())["run_id"]
+            response = await client.get(f"/v1/runs/{run_id}/events")
+            events = _sse_events(await response.text())
+
+    assert not [
+        event
+        for event in events
+        if event["type"].startswith("response.output_text")
+        or (
+            event["type"] == "response.output_item.added"
+            and event.get("item", {}).get("type") == "message"
+        )
+    ]
+    assert events[-1]["type"] == "response.failed"
+    assert events[-1]["response"]["error"]["message"] == "HTTP 400: provider refused the request"
 
 
 @pytest.mark.asyncio
@@ -1950,13 +1988,11 @@ async def test_gated_tool_progress_emits_correlated_interaction_extensions() -> 
                     "approval": {"detail": f"nested {secret}"},
                 },
             })
-            callbacks["tool_progress_callback"](
-                "tool.progress",
-                "mcp__crm__write",
-                None,
-                None,
-                interaction={"kind": "approval"},
-            )
+            with pytest.raises(ValueError, match="tool-call ID"):
+                callbacks["tool_progress_callback"](
+                    "tool.progress", "mcp__crm__write", None, None,
+                    interaction={"kind": "approval"},
+                )
             callbacks["tool_progress_callback"](
                 "tool.progress",
                 "mcp__crm__write",
@@ -1964,6 +2000,10 @@ async def test_gated_tool_progress_emits_correlated_interaction_extensions() -> 
                 None,
                 toolCallId="missing-interaction",
             )
+            registered["callback"]({
+                "tool": "mcp__crm__write", "toolCallId": "call-gated",
+                "completed": True, "interaction": {'answered': 'once', 'timed_out': False},
+            })
             callbacks["tool_complete_callback"](
                 "call-gated",
                 "mcp__crm__write",
@@ -1983,6 +2023,10 @@ async def test_gated_tool_progress_emits_correlated_interaction_extensions() -> 
                     "question": "Approve another write?",
                     "options": ["once", "deny"],
                 },
+            })
+            registered["callback"]({
+                "tool": "mcp__crm__write", "toolCallId": "call-timeout",
+                "completed": True, "interaction": {'timed_out': True},
             })
             callbacks["tool_complete_callback"](
                 "call-timeout",
@@ -2025,15 +2069,6 @@ async def test_gated_tool_progress_emits_correlated_interaction_extensions() -> 
             "tools.tool_approval.unregister_tool_approval_notify",
             unregister_notify,
         ),
-        patch("tools.tool_approval.is_gated_tool", return_value=True),
-        patch(
-            "tools.tool_approval.consume_tool_approval_decision",
-            side_effect=["once", None],
-        ),
-        patch(
-            "tools.tool_approval.consume_tool_approval_completion_reason",
-            return_value="expired",
-        ),
     ):
         started, events = await _run_without_http_server(
             adapter, {"input": "write record"}
@@ -2053,8 +2088,9 @@ async def test_gated_tool_progress_emits_correlated_interaction_extensions() -> 
     assert secret not in gated["interaction"]["question"]
     assert secret not in gated["interaction"]["approval"]["detail"]
     argument_derived = next(
-        event for event in interactions if "tool_call_id" not in event
+        event for event in interactions if event.get("tool_call_id") == "call-input"
     )
+    assert argument_derived["tool_call_id"] == "call-input"
     assert argument_derived["interaction"] == {"prompt": "Choose one"}
 
     completed = [
@@ -2258,11 +2294,21 @@ async def test_concurrent_runs_legacy_resolution_is_ambiguous_without_surface_id
             second_run_id = json.loads(second_started.text)["run_id"]
             run_ids.extend((first_run_id, second_run_id))
 
+            def card_logged(run_id: str) -> bool:
+                return any(
+                    event["type"] == "response.omnio.interaction"
+                    for event in run_events(run_id)
+                )
+
+            # The waiter registers on the agent thread before its card reaches
+            # the run's event log, so wait for both.
             deadline = asyncio.get_running_loop().time() + 3
             while asyncio.get_running_loop().time() < deadline:
                 if (
                     tool_approval._wait_registry.pending_count(first_run_id) == 1
                     and tool_approval._wait_registry.pending_count(second_run_id) == 1
+                    and card_logged(first_run_id)
+                    and card_logged(second_run_id)
                 ):
                     break
                 await asyncio.sleep(0.01)
@@ -2536,8 +2582,10 @@ async def test_multiplex_profiles_isolate_tool_approval_session_grants(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("nested", [False, True])
 async def test_tool_approval_timeout_interrupts_the_turn_before_another_iteration(
     monkeypatch: pytest.MonkeyPatch,
+    nested: bool,
 ) -> None:
     adapter = _make_adapter()
     session_id = "conversation-approval-timeout"
@@ -2553,18 +2601,17 @@ async def test_tool_approval_timeout_interrupts_the_turn_before_another_iteratio
 
         def run(**_kwargs: Any) -> Dict[str, Any]:
             nonlocal continued_after_timeout
-            callbacks["tool_start_callback"]("call-timeout", tool_name, {})
+            if not nested:
+                callbacks["tool_start_callback"]("call-timeout", tool_name, {})
             guard_result = tool_approval.maybe_require_tool_approval(
                 tool_name,
                 "call-timeout",
-                {},
+                {"record": 7},
             )
-            callbacks["tool_complete_callback"](
-                "call-timeout",
-                tool_name,
-                {},
-                guard_result,
-            )
+            if not nested:
+                callbacks["tool_complete_callback"](
+                    "call-timeout", tool_name, {}, guard_result,
+                )
             continued_after_timeout = not interrupted.is_set()
             return {
                 "final_response": "",
@@ -2602,7 +2649,64 @@ async def test_tool_approval_timeout_interrupts_the_turn_before_another_iteratio
             and event.get("tool_call_id") == "call-timeout"
         )
         assert completed["timed_out"] is True
+        opened = [event for event in events if event["type"] == "response.omnio.interaction"]
+        assert len(opened) == 1
+        assert opened[0]["tool_call_id"] == completed["tool_call_id"]
+        assert opened[0]["sequence_number"] < completed["sequence_number"]
+        assert sum(event["type"] == "response.omnio.interaction_completed" for event in events) == 1
+        # The gated call travels once, just before its card, and never inside it.
+        pending = [event for event in events if event["type"] == "response.omnio.pending_call"]
+        assert len(pending) == 1
+        assert pending[0]["tool_call_id"] == "call-timeout"
+        assert pending[0]["tool"] == tool_name
+        assert pending[0]["arguments"] == {"record": 7}
+        assert pending[0]["sequence_number"] == opened[0]["sequence_number"] - 1
+        assert "record" not in json.dumps(opened[0])
+        if nested:
+            assert not any(event.get("item", {}).get("call_id") == "call-timeout" for event in events)
         assert events[-1]["type"] == "response.incomplete"
+    finally:
+        tool_approval.clear_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_nested_approval_timeout_leaves_the_enclosing_call_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter()
+    session_id = "conversation-nested-approval-timeout"
+    tool_name = "mcp_connectors_TEST_WRITE"
+    built_agent: Optional[MagicMock] = None
+    tool_approval.clear_session(session_id)
+    monkeypatch.setattr(tool_approval, "_approval_timeout", lambda: 0)
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        nonlocal built_agent
+
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            callbacks["tool_start_callback"]("call-script", "execute_code", {})
+            # The start is marshalled onto the event loop; the gate runs later
+            # inside the script, as it does on a real sandbox.
+            time.sleep(0.1)
+            tool_approval.maybe_require_tool_approval(tool_name, "nested-1", {})
+            return {"final_response": "", "messages": [], "interrupted": True}
+
+        built_agent = _agent(run)
+        return built_agent
+
+    try:
+        with (
+            patch.object(adapter, "_create_agent", side_effect=build_agent),
+            patch.object(tool_approval, "is_gated_tool", return_value=True),
+            patch.object(tool_approval, "mcp_tool_has_read_only_hint", return_value=True),
+        ):
+            await _run_without_http_server(
+                adapter,
+                {"input": "run the script", "session_id": session_id},
+            )
+
+        assert built_agent is not None
+        assert built_agent._omnio_skip_persist_tool_call_ids == {"call-script"}
     finally:
         tool_approval.clear_session(session_id)
 
@@ -2644,11 +2748,19 @@ async def test_user_input_timeout_interrupts_the_run_and_stamps_timed_out() -> N
         built_agent = _agent(run, interrupt=lambda _message=None: interrupted.set())
         return built_agent
 
+    consumed_keys: list[str] = []
+
+    def consume_reason(key: str) -> Optional[str]:
+        # The wait is registered under the run's approval key; the conversation
+        # session id never holds a reason on /v1/runs.
+        consumed_keys.append(key)
+        return "expired" if key.startswith("run_") else None
+
     with (
         patch.object(adapter, "_create_agent", side_effect=build_agent),
         patch(
             "tools.user_input.consume_user_input_completion_reason",
-            return_value="expired",
+            side_effect=consume_reason,
         ),
     ):
         _, events = await _run_without_http_server(
@@ -2657,6 +2769,7 @@ async def test_user_input_timeout_interrupts_the_run_and_stamps_timed_out() -> N
         )
 
     assert built_agent is not None
+    assert consumed_keys and all(key.startswith("run_") for key in consumed_keys)
     built_agent.interrupt.assert_called_once_with(
         "awaiting user interaction (request_user_input)"
     )
@@ -2748,6 +2861,10 @@ async def test_cancelled_gated_tool_closes_interaction_without_timeout() -> None
                     "options": ["once", "deny"],
                 },
             })
+            registered["callback"]({
+                "tool": "mcp__crm__write", "toolCallId": "call-cancelled",
+                "completed": True, "interaction": {"timed_out": False},
+            })
             callbacks["tool_complete_callback"](
                 "call-cancelled",
                 "mcp__crm__write",
@@ -2765,15 +2882,6 @@ async def test_cancelled_gated_tool_closes_interaction_without_timeout() -> None
             side_effect=register_notify,
         ),
         patch("tools.tool_approval.unregister_tool_approval_notify"),
-        patch("tools.tool_approval.is_gated_tool", return_value=True),
-        patch(
-            "tools.tool_approval.consume_tool_approval_decision",
-            return_value=None,
-        ),
-        patch(
-            "tools.tool_approval.consume_tool_approval_completion_reason",
-            return_value="cancelled",
-        ),
     ):
         _, events = await _run_without_http_server(
             adapter,
@@ -2793,7 +2901,7 @@ async def test_cancelled_gated_tool_closes_interaction_without_timeout() -> None
         and event.get("tool_call_id") == "call-cancelled"
     )
     assert "choice" not in completed
-    assert "timed_out" not in completed
+    assert completed["timed_out"] is False
     call_done = next(
         event
         for event in events
@@ -3133,6 +3241,78 @@ async def test_runs_emit_function_call_boundary_while_arguments_are_generating()
     ]
     assert call_events[-1]["item"]["arguments"] == ""
     assert "hidden" not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call_shape",
+    ["direct", "direct-streamed", "tool-search"],
+    ids=["direct", "direct-streamed", "tool-search"],
+)
+@pytest.mark.parametrize(
+    ("function_result", "expected_success"),
+    [
+        (
+            json.dumps({"result": json.dumps({"data": {"brand": {"id": "brand-secret"}}})}),
+            True,
+        ),
+        (json.dumps({"error": "MCP_RESULT_SECRET"}), False),
+        (json.dumps({"result": "unexpected MCP shape"}), False),
+    ],
+    ids=["success", "mcp-error", "unknown-result"],
+)
+async def test_complete_brand_setup_projects_bounded_outcome_for_exact_call(
+    call_shape: str,
+    function_result: str,
+    expected_success: bool,
+) -> None:
+    adapter = _make_adapter()
+    tool_name = "mcp__omnia__complete_brand_setup"
+    call_id = "call-brand-setup-exact"
+
+    def build_agent(**callbacks: Any) -> MagicMock:
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            if call_shape == "direct-streamed":
+                callbacks["tool_gen_event_callback"](tool_name, call_id)
+            elif call_shape == "tool-search":
+                callbacks["tool_gen_event_callback"]("tool_call", call_id)
+            callbacks["tool_start_callback"](call_id, tool_name, {"domain": "example.test"})
+            callbacks["tool_complete_callback"](
+                call_id,
+                tool_name,
+                {"domain": "example.test"},
+                function_result,
+            )
+            return {"final_response": "done", "messages": []}
+
+        return _agent(run)
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", side_effect=build_agent):
+            started = await client.post("/v1/runs", json={"input": "finish brand setup"})
+            run_id = (await started.json())["run_id"]
+            response = await client.get(f"/v1/runs/{run_id}/events")
+            events = _sse_events(await response.text())
+
+    progress = [
+        event for event in events if event["type"] == "response.omnio.tool_progress"
+    ]
+    assert [event["status"] for event in progress] == ["running", "completed"]
+    assert all(event["source_call_id"] == call_id for event in progress)
+    assert all(event["tool"] == tool_name for event in progress)
+    assert "success" not in progress[0]
+    assert progress[1]["success"] is expected_success
+    assert "brand-secret" not in json.dumps(progress)
+    assert "MCP_RESULT_SECRET" not in json.dumps(progress)
+    raw_call = next(
+        event["item"]
+        for event in events
+        if event["type"] == "response.output_item.added"
+        and event["item"].get("type") == "function_call"
+    )
+    assert raw_call["name"] == (
+        "tool_call" if call_shape == "tool-search" else tool_name
+    )
 
 
 @pytest.mark.asyncio
@@ -3582,7 +3762,8 @@ async def test_session_id_without_gateway_key_uses_legacy_empty_history() -> Non
 
 
 @pytest.mark.asyncio
-async def test_stop_wind_down_is_logged_and_visible_to_attached_subscriber() -> None:
+@pytest.mark.parametrize("incomplete_flags", [{}, {"partial": True, "completed": False}])
+async def test_stop_wind_down_is_logged_and_visible_to_attached_subscriber(incomplete_flags) -> None:
     adapter = _make_adapter()
     running = threading.Event()
     interrupted = threading.Event()
@@ -3609,6 +3790,7 @@ async def test_stop_wind_down_is_logged_and_visible_to_attached_subscriber() -> 
             return {
                 "final_response": "",
                 "interrupted": True,
+                **incomplete_flags,
                 "messages": [
                     {
                         "role": "assistant",
@@ -3856,3 +4038,50 @@ def test_client_projection_withheld_skips_hooks_for_non_allowlisted_tools() -> N
         assert client_projection_withheld("terminal", {"command": "ls"}) is False
 
     resolve.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flags", [
+    {"partial": True}, {"completed": False}, {"failed": True},
+    {"partial": True, "completed": False},
+])
+async def test_incomplete_run_preserves_blocks_annotations_and_failed_replay(monkeypatch, flags):
+    adapter = _make_adapter()
+    summary = "Provider returned incomplete tool arguments"
+    partial = "Saved the report at `/brand/report.pdf`."
+    annotation = _file_annotation("/brand/report.pdf")
+    monkeypatch.setenv(api_server_module._OMNIO_TURN_FINALIZE_HOOK_ENV, "http://127.0.0.1:8642/finalize")
+    monkeypatch.setattr(api_server_module, "_request_turn_finalize_annotations", AsyncMock(return_value=[annotation]))
+
+    def build(**callbacks):
+        def run(**kwargs):
+            callbacks["stream_delta_callback"](partial)
+            return {"final_response": summary, "error": summary, "pending_steer": "Keep the report", **flags}
+        return _agent(run)
+
+    with patch.object(adapter, "_create_agent", side_effect=build):
+        started, events = await _run_without_http_server(adapter, {"input": "make report"})
+    run_id = json.loads(started.text)["run_id"]
+    assert adapter._run_statuses[run_id]["status"] == "failed"
+    assert events[-1]["type"] == "response.failed"
+    assert events[-1]["response"]["error"]["message"] == summary
+    assert "response.completed" not in [event["type"] for event in events]
+    text = "".join(event.get("delta", "") for event in events if event["type"] == "response.output_text.delta")
+    assert text == partial
+    assert any(event["type"] == "response.output_text.annotation.added" for event in events[:-1])
+    assert any(event["type"] == "response.omnio.steer_missed" for event in events[:-1])
+    assert [event["sequence_number"] for event in events] == list(range(1, len(events) + 1))
+    log = adapter._turn_event_logs.get_log(run_id)
+    assert log.terminal and log.failure_reason == "run_failed"
+
+
+@pytest.mark.asyncio
+async def test_unstreamed_partial_answer_is_preserved_on_failure():
+    adapter = _make_adapter()
+    with patch.object(adapter, "_create_agent", return_value=_agent(lambda **kwargs: {
+        "final_response": "Here is the first part", "partial": True,
+        "error": "Response remained truncated after continuation attempts",
+    })):
+        _, events = await _run_without_http_server(adapter, {"input": "long answer"})
+    assert events[-1]["type"] == "response.failed"
+    assert any(event.get("delta") == "Here is the first part" for event in events)

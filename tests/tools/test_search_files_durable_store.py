@@ -199,3 +199,75 @@ def test_description_advertises_the_store_only_when_the_hook_is_set(
         file_tools.SEARCH_FILES_BASE_DESCRIPTION + file_tools.SEARCH_FILES_DURABLE_SUFFIX
     )
     assert "fetch_file" in overrides["description"]
+
+
+@pytest.fixture
+def conversation_tools(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(file_tools, "_conversation_tools_loaded", lambda: True)
+
+
+def test_description_states_its_scope_where_conversation_tools_are_loaded(
+    hook_env, conversation_tools
+):
+    description = file_tools._build_dynamic_search_files_schema()["description"]
+
+    assert description.endswith(file_tools.SEARCH_FILES_CONVERSATION_SCOPE)
+
+
+def test_description_omits_other_conversations_without_the_conversation_tools(
+    hook_env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(file_tools, "_conversation_tools_loaded", lambda: False)
+
+    description = file_tools._build_dynamic_search_files_schema()["description"]
+
+    assert "search_conversations" not in description
+
+
+def test_empty_search_points_to_other_conversations_when_nothing_is_stored(
+    hook_env, conversation_tools, monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    monkeypatch.setattr(urllib.request, "urlopen", _RecordingHook({"files": []}))
+
+    result = _search("*.ics", path=str(tmp_path))
+
+    assert result["_hint"] == file_tools.SEARCH_FILES_OTHER_CONVERSATIONS_HINT
+
+
+def test_stored_matches_leave_out_the_other_conversations_hint(
+    hook_env, conversation_tools, monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    monkeypatch.setattr(urllib.request, "urlopen", _RecordingHook({"files": [_STORED]}))
+
+    result = _search("*.ics", path=str(tmp_path))
+
+    assert "_hint" not in result
+
+
+def test_empty_search_has_no_hint_without_the_conversation_tools(
+    hook_env, monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    monkeypatch.setattr(file_tools, "_conversation_tools_loaded", lambda: False)
+    monkeypatch.setattr(urllib.request, "urlopen", _RecordingHook({"files": []}))
+
+    result = _search("*.ics", path=str(tmp_path))
+
+    assert "_hint" not in result
+
+
+def test_empty_search_has_no_hint_without_the_durable_store(
+    conversation_tools, monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    monkeypatch.delenv(file_tools.SEARCH_FILES_HOOK_ENV, raising=False)
+
+    result = _search("*.ics", path=str(tmp_path))
+
+    assert "_hint" not in result
+
+
+def test_conversation_tools_are_detected_from_the_registry(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        file_tools.registry, "get_entry", lambda name: object() if name == "search_conversations" else None
+    )
+
+    assert file_tools._conversation_tools_loaded() is True

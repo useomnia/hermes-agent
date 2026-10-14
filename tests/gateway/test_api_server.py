@@ -1389,6 +1389,8 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_structured_output"] is True
             assert data["features"]["run_turn_idempotency"] == {
                 "apiVersion": 2,
+                "storage": "dedicated_sqlite",
+                "retryableRefusals": ["run_reservation_busy"],
                 "recoverableInventory": {
                     "apiVersion": 1,
                     "completeSnapshot": True,
@@ -1398,7 +1400,7 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["omnio_quiescence"] == {
                 "apiVersion": 1,
                 "atomicWriterSnapshot": True,
-                "forceCancel": True,
+                "forceCancel": False,
             }
             assert data["features"]["model_options"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"

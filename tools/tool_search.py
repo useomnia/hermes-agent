@@ -189,8 +189,10 @@ def load_config() -> ToolSearchConfig:
 # capability: the agent's operating docs and skills reference them BY NAME, so
 # a deferred one reads to the model as "not available" and it silently
 # substitutes a weaker built-in (observed live: web_read deferred, web_extract
-# used instead). The catalog is six tools, so deferral saves nothing measurable
-# while costing a blind tool_call round-trip on every use.
+# used instead; with the conversation tools deferred, the model searched the
+# filesystem for another conversation's files before finding them). The catalog
+# is a handful of tools, so deferral saves little while costing a search,
+# describe and blind tool_call round-trip on every first use.
 #
 # Kept as a separate constant rather than appended to _HERMES_CORE_TOOLS
 # because that list is also the ``tools:`` payload for the hermes-cli,
@@ -204,6 +206,10 @@ _OMNIO_ALWAYS_LOAD_TOOLS = frozenset({
     "render_component",
     "store-credential",
     "emit_client_event",
+    "search_conversations",
+    "read_conversation",
+    "list_conversation_files",
+    "import_conversation_files",
 })
 
 

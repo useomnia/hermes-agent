@@ -1977,6 +1977,11 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             durable = _durable_store_block(pattern, limit)
             if durable is not None:
                 result_dict["durable_store"] = durable
+            elif (
+                (os.environ.get(SEARCH_FILES_HOOK_ENV) or "").strip()
+                and _conversation_tools_loaded()
+            ):
+                result_dict["_hint"] = SEARCH_FILES_OTHER_CONVERSATIONS_HINT
 
         result_json = json.dumps(result_dict, ensure_ascii=False)
         # Hint when results were truncated — explicit next offset is clearer
@@ -2093,6 +2098,19 @@ SEARCH_FILES_BASE_DESCRIPTION = "Search file contents or find files by name. Use
 # reach for it.
 SEARCH_FILES_DURABLE_SUFFIX = "\n\nFile search also covers durable storage: when no file on disk matches, previously delivered or uploaded files that match are listed separately under 'durable_store'. Those are not on disk — restore one with fetch_file before reading it."
 
+# Where Omnio's conversation tools are loaded, search_files and fetch_file say
+# that they cover only the current conversation and the Brand, and point to the
+# tools that reach the user's other conversations.
+SEARCH_FILES_CONVERSATION_SCOPE = " It covers only this conversation's files and the Brand's, on disk and in storage: files from the user's other conversations are found with search_conversations and list_conversation_files, and copied in with import_conversation_files."
+FETCH_FILE_CONVERSATION_SCOPE = " It restores this conversation's and the Brand's files to their own path; a file from another conversation is copied in with import_conversation_files instead."
+SEARCH_FILES_OTHER_CONVERSATIONS_HINT = "Nothing in this conversation or the Brand matches. If the file came from another conversation, find it with search_conversations and list_conversation_files, then copy it in with import_conversation_files."
+FETCH_FILE_OTHER_CONVERSATIONS_HINT = " If the file came from another conversation, copy it in with import_conversation_files instead."
+
+
+def _conversation_tools_loaded() -> bool:
+    """Whether the tools that reach the user's other conversations are registered."""
+    return registry.get_entry("search_conversations") is not None
+
 SEARCH_FILES_SCHEMA = {
     "name": "search_files",
     "description": SEARCH_FILES_BASE_DESCRIPTION,
@@ -2184,7 +2202,17 @@ def _build_dynamic_search_files_schema() -> dict:
     without it sees the plain disk-search description."""
     if not (os.environ.get(SEARCH_FILES_HOOK_ENV) or "").strip():
         return {}
-    return {"description": SEARCH_FILES_BASE_DESCRIPTION + SEARCH_FILES_DURABLE_SUFFIX}
+    description = SEARCH_FILES_BASE_DESCRIPTION + SEARCH_FILES_DURABLE_SUFFIX
+    if _conversation_tools_loaded():
+        description += SEARCH_FILES_CONVERSATION_SCOPE
+    return {"description": description}
+
+
+def _build_dynamic_fetch_file_schema() -> dict:
+    """State fetch_file's scope where the conversation tools are loaded."""
+    if not _conversation_tools_loaded():
+        return {}
+    return {"description": FETCH_FILE_SCHEMA["description"] + FETCH_FILE_CONVERSATION_SCOPE}
 
 
 SEARCH_FILES_HOOK_ENV = "OMNIO_FILE_SEARCH_HOOK"
@@ -2192,6 +2220,25 @@ SEARCH_FILES_HOOK_ENV = "OMNIO_FILE_SEARCH_HOOK"
 # store lookup riding on it stays cheap: one request, no retries, and a short
 # deadline. Exceeding it costs the store results, never the search.
 _SEARCH_FILES_TIMEOUT_SECONDS = 3.0
+
+
+def _durable_hook_headers() -> dict[str, str]:
+    """Headers for the Omnio durable-file hooks.
+
+    The calling session lets the proxy resolve a conversation home path such as
+    ``~/report.csv`` to that conversation; the hooks keep Brand-wide lookups
+    when no session is bound.
+    """
+    from gateway.session_context import current_session_id
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Omnio-Service-Token": os.environ.get("OMNIO_INTERNAL_TOKEN", ""),
+    }
+    session_id = current_session_id()
+    if session_id is not None:
+        headers["X-Hermes-Session-Id"] = session_id
+    return headers
 
 
 def _durable_store_matches(pattern: str, limit: int) -> list:
@@ -2215,10 +2262,7 @@ def _durable_store_matches(pattern: str, limit: int) -> list:
     request = urllib.request.Request(
         hook_url,
         data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "X-Omnio-Service-Token": os.environ.get("OMNIO_INTERNAL_TOKEN", ""),
-        },
+        headers=_durable_hook_headers(),
         method="POST",
     )
     try:
@@ -2326,10 +2370,7 @@ def _handle_fetch_file(args, **kw):
     request = urllib.request.Request(
         hook_url,
         data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "X-Omnio-Service-Token": os.environ.get("OMNIO_INTERNAL_TOKEN", ""),
-        },
+        headers=_durable_hook_headers(),
         method="POST",
     )
     try:
@@ -2356,10 +2397,14 @@ def _handle_fetch_file(args, **kw):
                 if (os.environ.get(SEARCH_FILES_HOOK_ENV) or "").strip()
                 else ""
             )
+            elsewhere = (
+                FETCH_FILE_OTHER_CONVERSATIONS_HINT if _conversation_tools_loaded() else ""
+            )
             return tool_error(
                 f"No stored copy of {path} was found. Only files that were delivered to "
                 "the user or uploaded by them are recoverable; scratch files are not."
                 + recovery
+                + elsewhere
             )
         logger.warning("fetch_file hook returned status=%s for path=%s", exc.code, path)
         return tool_error(
@@ -2396,4 +2441,4 @@ registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, han
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000, dynamic_schema_overrides=_build_dynamic_search_files_schema)
-registry.register(name="fetch_file", toolset="file", schema=FETCH_FILE_SCHEMA, handler=_handle_fetch_file, check_fn=_check_fetch_file_reqs, emoji="📥", max_result_size_chars=2_000)
+registry.register(name="fetch_file", toolset="file", schema=FETCH_FILE_SCHEMA, handler=_handle_fetch_file, check_fn=_check_fetch_file_reqs, emoji="📥", max_result_size_chars=2_000, dynamic_schema_overrides=_build_dynamic_fetch_file_schema)

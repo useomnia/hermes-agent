@@ -27,6 +27,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from agent import apply_patch_tool
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -54,7 +55,6 @@ from agent.turn_context import (
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
-    close_interrupted_tool_sequence,
     _repair_tool_call_arguments_detailed,
     insert_ephemeral_messages,
     _sanitize_messages_non_ascii,
@@ -114,6 +114,32 @@ def _resolve_billable_cost_delta(
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
+
+
+def _should_rearm_compression_budget(
+    compression_attempts: int,
+    *,
+    completed_compaction_pending: bool,
+    prompt_tokens: int,
+    threshold_tokens: int,
+    preflight_blocked: bool = False,
+) -> bool:
+    """Return True after a provider proves a completed compaction worked.
+
+    Rough estimates cannot safely rearm the anti-thrash budget: they can dip
+    below the threshold while the provider-visible prompt remains too large.
+    Require the completed-compaction latch plus a positive, normalized prompt
+    count below the threshold from the next successful provider response.
+    A fallback may already have reset the counter while leaving the preflight
+    block armed; that block needs the same verified recovery before clearing.
+    """
+    return bool(
+        (compression_attempts or preflight_blocked)
+        and completed_compaction_pending
+        and threshold_tokens > 0
+        and 0 < prompt_tokens < threshold_tokens
+    )
+
 
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
@@ -1076,6 +1102,7 @@ def run_conversation(
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    continuation: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1098,7 +1125,7 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
-    if moa_config is None:
+    if moa_config is None and not continuation:
         try:
             from hermes_cli.moa_config import decode_moa_turn
 
@@ -1110,6 +1137,11 @@ def run_conversation(
                     persist_user_message = _decoded_message
         except Exception:
             pass
+
+    if continuation:
+        # Continuations deliberately have no user turn. Keep downstream
+        # helpers that expect text on their established empty-string path.
+        user_message = ""
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
@@ -1145,6 +1177,7 @@ def run_conversation(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
+        continuation=continuation,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -1157,6 +1190,118 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+
+    # A continuation can begin at a durable assistant(tool_calls) block after a
+    # late approval, optionally followed by results from sibling calls in that
+    # same block. Re-dispatch only the unresolved calls the user explicitly
+    # approved before the first provider request; the one-shot approval grant is
+    # consumed by the normal gate. Every other unresolved call was closed by the
+    # continuation's closing step: a call that may already have run must never
+    # be re-executed blindly.
+    _continuation_boundary_tool_call_ids = set()
+    if continuation and messages:
+        _assistant_idx = next(
+            (
+                _idx
+                for _idx in range(len(messages) - 1, -1, -1)
+                if isinstance(messages[_idx], dict)
+                and messages[_idx].get("role") == "assistant"
+                and messages[_idx].get("tool_calls")
+            ),
+            None,
+        )
+        if _assistant_idx is not None and all(
+            isinstance(_message, dict) and _message.get("role") == "tool"
+            for _message in messages[_assistant_idx + 1:]
+        ):
+            from types import SimpleNamespace
+
+            _assistant = messages[_assistant_idx]
+            _continuation_boundary_tool_call_ids = {
+                _call.get("id")
+                for _call in _assistant["tool_calls"]
+                if isinstance(_call, dict) and isinstance(_call.get("id"), str)
+            }
+            _resolved_call_ids = {
+                _message.get("tool_call_id")
+                for _message in messages[_assistant_idx + 1:]
+                if isinstance(_message.get("tool_call_id"), str)
+            }
+            _metadata = _assistant.get("display_metadata")
+            _durable_grants = (
+                _metadata.get("_omnio_resolved_approvals", {})
+                if isinstance(_metadata, dict)
+                else {}
+            )
+            pending_calls = []
+            for _call in _assistant["tool_calls"]:
+                if not isinstance(_call, dict):
+                    continue
+                _function = _call.get("function") or {}
+                _name = _function.get("name") if isinstance(_function, dict) else None
+                _arguments = _function.get("arguments") if isinstance(_function, dict) else None
+                _call_id = _call.get("id")
+                if (
+                    not isinstance(_name, str)
+                    or not isinstance(_call_id, str)
+                    or _call_id in _resolved_call_ids
+                ):
+                    continue
+                _durable_grant = (
+                    _durable_grants.get(_call_id)
+                    if isinstance(_durable_grants, dict)
+                    else None
+                )
+                if _durable_grant is None:
+                    continue
+                from tools.tool_approval import (
+                    get_current_tool_approval_session_key,
+                    rehydrate_resolved_approval,
+                )
+
+                if not rehydrate_resolved_approval(
+                    get_current_tool_approval_session_key(),
+                    _call_id,
+                    _name,
+                    _arguments if isinstance(_arguments, str) else "{}",
+                    _durable_grant,
+                ):
+                    continue
+                pending_calls.append(
+                    SimpleNamespace(
+                        id=_call_id,
+                        function=SimpleNamespace(
+                            name=_name,
+                            arguments=_arguments if isinstance(_arguments, str) else "{}",
+                        ),
+                    )
+                )
+            if pending_calls:
+                agent._execute_tool_calls(
+                    SimpleNamespace(tool_calls=pending_calls), messages, effective_task_id
+                )
+            # Notes are durable on the call block while an approved call is
+            # pending. They enter model history only after every result exists.
+            resolved_ids = {
+                message.get("tool_call_id")
+                for message in messages[_assistant_idx + 1:]
+                if message.get("role") == "tool"
+            }
+            if _continuation_boundary_tool_call_ids <= resolved_ids:
+                from agent.context_notes import context_note_message
+
+                receipts = (_metadata or {}).get("_omnio_continuation_notes", {})
+                pending_notes = [note for receipt in receipts.values() if receipt.get("deferred")
+                                 for note in receipt["notes"]]
+                if pending_notes:
+                    messages.extend(context_note_message(note) for note in pending_notes)
+                    agent._persist_session(messages, conversation_history)
+
+    # A no-user continuation has no current user boundary. Keep its transient
+    # state after the closed history, never before an old user request (which
+    # would invalidate the cached history prefix). Follow the anchor as this
+    # run grows; if compaction removes it, use the new complete tail.
+    _continuation_prefill_anchor = messages[-1] if continuation and messages else None
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -1174,7 +1319,10 @@ def run_conversation(
     compression_attempts = 0
     # One resolved per-turn compression attempt cap, shared by every site that
     # consumes ``compression_attempts``: the pre-API pressure gate, the
-    # overflow/413 retry handlers, and the post-tool compaction gate.
+    # overflow/413 retry handlers, and the post-tool compaction gate. The
+    # counter is a consecutive unverified/ineffective-attempt backstop: a
+    # completed compaction rearms it only after a successful provider response
+    # reports a prompt below the threshold.
     # Config-driven via compression.max_attempts (parsed + validated in
     # agent_init); default 3 preserves the prior hardcoded behavior for
     # objects without the attribute (older pickles / minimal stubs).
@@ -1298,56 +1446,8 @@ def run_conversation(
                 and "skill_manage" in agent.valid_tool_names):
             agent._iters_since_skill += 1
         
-        # ── Pre-API-call /steer drain ──────────────────────────────────
-        # If a /steer arrived during the previous API call (while the model
-        # was thinking), drain it now — before we build api_messages — so
-        # the model sees the steer text on THIS iteration.  Without this,
-        # steers sent during an API call only land after the NEXT tool batch,
-        # which may never come if the model returns a final response.
-        #
-        # We scan backwards for the last tool-role message in the messages
-        # list.  If found, the steer is appended there.  If not (first
-        # iteration, no tools yet), the steer stays pending for the next
-        # tool batch — injecting into a user message would break role
-        # alternation, and there's no tool output to piggyback on.
-        _pre_api_steer = agent._drain_pending_steer()
-        if _pre_api_steer:
-            _injected = False
-            for _si in range(len(messages) - 1, -1, -1):
-                _sm = messages[_si]
-                if isinstance(_sm, dict) and _sm.get("role") == "tool":
-                    from agent.prompt_builder import format_steer_marker
-                    marker = format_steer_marker(_pre_api_steer)
-                    existing = _sm.get("content", "")
-                    if isinstance(existing, str):
-                        _sm["content"] = existing + marker
-                    else:
-                        # Multimodal content blocks — append text block
-                        try:
-                            blocks = list(existing) if existing else []
-                            blocks.append({"type": "text", "text": marker})
-                            _sm["content"] = blocks
-                        except Exception:
-                            pass
-                    _injected = True
-                    logger.debug(
-                        "Pre-API-call steer drain: injected into tool msg at index %d",
-                        _si,
-                    )
-                    break
-            if not _injected:
-                # No tool message to inject into — put it back so
-                # the post-tool-execution drain picks it up later.
-                _lock = getattr(agent, "_pending_steer_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        if agent._pending_steer:
-                            agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
-                        else:
-                            agent._pending_steer = _pre_api_steer
-                else:
-                    existing = getattr(agent, "_pending_steer", None)
-                    agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+        # A steer arriving between batches uses the same append-only user row.
+        agent._apply_pending_steer_to_tool_results(messages, len(messages))
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages
@@ -1563,6 +1663,12 @@ def run_conversation(
             api_messages,
             agent.prefill_messages,
             before_current_user=getattr(agent, "_prefill_before_current_user", False),
+            at_index=(
+                next((idx + 1 for idx, message in enumerate(messages)
+                      if message is _continuation_prefill_anchor), len(messages))
+                + int(bool(effective_system))
+                if continuation else None
+            ),
         )
 
         # Per-turn context selection hook (additive, no-op by default).
@@ -2014,6 +2120,20 @@ def run_conversation(
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
                 api_kwargs = agent._build_api_kwargs(api_messages)
+                if (
+                    truncated_tool_call_retries > 0
+                    or length_continue_retries > 0
+                    or agent._empty_content_retries > 0
+                ) and agent._is_openrouter_url():
+                    # Recovery needs a fresh generation. The response cache
+                    # otherwise replays the same broken result at the catalog
+                    # ceiling. This leaves provider prompt/KV caching intact.
+                    headers = api_kwargs.get("extra_headers") or {}
+                    api_kwargs["extra_headers"] = {
+                        key: value for key, value in headers.items()
+                        if key.lower() != "x-openrouter-cache"
+                    }
+                    api_kwargs["extra_headers"]["X-OpenRouter-Cache"] = "false"
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -2183,11 +2303,23 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
+                    if agent._interrupt_requested:
+                        raise InterruptedError("Operation interrupted before model dispatch")
+                    # Calling the transport is the submission boundary, even if it
+                    # returns no response. A later Stop must not replay this input.
+                    agent._unsubmitted_steers = []
                     if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
+                        _response = agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                    else:
+                        _response = agent._interruptible_api_call(next_api_kwargs)
+                    # Streams translate apply_patch calls as they arrive; a
+                    # non-streamed response (including a stream request served
+                    # by the direct path) is translated here.
+                    if apply_patch_tool.request_offers_apply_patch(next_api_kwargs):
+                        apply_patch_tool.normalize_response(_response)
+                    return _response
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -2483,15 +2615,17 @@ def run_conversation(
                         if agent._interrupt_requested:
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
-                            close_interrupted_tool_sequence(messages, _interrupt_text)
+                            from agent.agent_runtime_helpers import take_interrupted_steer
+                            _leftover_steer = take_interrupted_steer(agent, messages)
                             agent._persist_session(messages, conversation_history)
-                            agent.clear_interrupt()
+                            agent.clear_interrupt(preserve_steer=True)
                             return {
                                 "final_response": _interrupt_text,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "interrupted": True,
+                                **({"pending_steer": _leftover_steer} if _leftover_steer else {}),
                             }
                         time.sleep(0.2)
                         # Touch activity every ~30s so the gateway's inactivity
@@ -2886,18 +3020,13 @@ def run_conversation(
                                         f"retrying API call "
                                         f"({truncated_tool_call_retries}/4)..."
                                     )
-                                # Boost max_tokens on each retry so the model has
-                                # more room to complete the tool-call JSON. A
-                                # network stall doesn't need a bigger budget, but
-                                # a genuine output-cap truncation does, and the
-                                # boost is harmless for the stall case.
-                                _tc_boost_base = agent.max_tokens if agent.max_tokens else 4096
-                                _tc_boost = _tc_boost_base * (2 ** truncated_tool_call_retries)
-                                _tc_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
-                                if _tc_requested_cap is not None:
-                                    _tc_boost = max(_tc_boost, _tc_requested_cap)
-                                _tc_boost_cap = max(32768, _tc_requested_cap or 0)
-                                agent._ephemeral_max_output_tokens = min(_tc_boost, _tc_boost_cap)
+                                # Double the failed request within a published
+                                # ceiling; keep an unknown provider default unchanged.
+                                from agent.output_budget import boosted_output_cap
+                                agent._ephemeral_max_output_tokens = boosted_output_cap(
+                                    agent, agent._requested_output_cap_from_api_kwargs(api_kwargs),
+                                    truncated_tool_call_retries,
+                                )
                                 # Don't append the broken response to messages;
                                 # just re-run the same API call from the current
                                 # message state, giving the model another chance.
@@ -2914,16 +3043,22 @@ def run_conversation(
                                     force=True,
                                 )
                             agent._cleanup_task_resources(effective_task_id)
+                            _provider_finish = getattr(
+                                response.choices[0], "provider_finish_reason",
+                                response.choices[0].finish_reason,
+                            )
+                            _truncation_error = (
+                                "Response truncated due to output length limit"
+                                if _provider_finish == "length"
+                                else "Provider returned incomplete tool arguments "
+                                f"(finish_reason={_provider_finish!r}); the tool was not executed"
+                            )
                             _final_response = (
                                 "Stream repeatedly dropped mid tool-call (network); "
                                 "the tool was not executed"
                                 if _is_stub_stall
-                                else "Response truncated due to output length limit"
+                                else _truncation_error
                             )
-                            # Prior successful tool batches (or injected tool
-                            # errors) can leave a tool-result tail; this path
-                            # never reaches finalize_turn (#48879 class).
-                            close_interrupted_tool_sequence(messages, _final_response)
                             agent._persist_session(messages, conversation_history)
                             return {
                                 "final_response": _final_response,
@@ -3029,7 +3164,51 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    # Capture the boundary latch before update_from_response()
+                    # consumes it. Only a real provider prompt count for the
+                    # request immediately following a completed compaction can
+                    # prove that attempt effective and rearm the shared budget.
+                    _completed_compaction_pending = bool(
+                        getattr(
+                            agent.context_compressor,
+                            "_verify_compaction_cleared_threshold",
+                            False,
+                        )
+                    )
                     agent.context_compressor.update_from_response(usage_dict)
+                    _compression_threshold = int(
+                        getattr(agent.context_compressor, "threshold_tokens", 0)
+                        or 0
+                    )
+                    if _should_rearm_compression_budget(
+                        compression_attempts,
+                        completed_compaction_pending=_completed_compaction_pending,
+                        prompt_tokens=prompt_tokens,
+                        threshold_tokens=_compression_threshold,
+                        preflight_blocked=_preflight_compression_blocked,
+                    ):
+                        logger.info(
+                            "Compression budget rearmed after provider-confirmed "
+                            "recovery: prompt=%s < threshold=%s (attempts were %s/%s)",
+                            f"{prompt_tokens:,}",
+                            f"{_compression_threshold:,}",
+                            compression_attempts,
+                            max_compression_attempts,
+                        )
+                        compression_attempts = 0
+                        # Provider-confirmed recovery also invalidates the
+                        # insufficient-progress preflight state: with the
+                        # prompt proven back below the threshold, a prior
+                        # "insufficient progress" verdict (and the stale
+                        # pressure reading it would be compared against)
+                        # describes a request shape that no longer exists.
+                        # Left armed, _preflight_compression_blocked keeps the
+                        # pre-API gate dark for the rest of the turn even
+                        # though the attempt budget was just rearmed, so a
+                        # later pressure spike would grow unchecked until the
+                        # provider's overflow handler fired.
+                        _preflight_compression_blocked = False
+                        _last_preflight_pressure = None
 
                     # Stash this response's canonical usage so the post-turn
                     # on_turn_complete() observation hook can forward it (the
@@ -4033,15 +4212,17 @@ def run_conversation(
                 if agent._interrupt_requested:
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
-                    close_interrupted_tool_sequence(messages, _interrupt_text)
+                    from agent.agent_runtime_helpers import take_interrupted_steer
+                    _leftover_steer = take_interrupted_steer(agent, messages)
                     agent._persist_session(messages, conversation_history)
-                    agent.clear_interrupt()
+                    agent.clear_interrupt(preserve_steer=True)
                     return {
                         "final_response": _interrupt_text,
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "interrupted": True,
+                        **({"pending_steer": _leftover_steer} if _leftover_steer else {}),
                     }
                 
                 # Check for 413 payload-too-large BEFORE generic 4xx handler.
@@ -5269,15 +5450,17 @@ def run_conversation(
                     if agent._interrupt_requested:
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
-                        close_interrupted_tool_sequence(messages, _interrupt_text)
+                        from agent.agent_runtime_helpers import take_interrupted_steer
+                        _leftover_steer = take_interrupted_steer(agent, messages)
                         agent._persist_session(messages, conversation_history)
-                        agent.clear_interrupt()
+                        agent.clear_interrupt(preserve_steer=True)
                         return {
                             "final_response": _interrupt_text,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "interrupted": True,
+                            **({"pending_steer": _leftover_steer} if _leftover_steer else {}),
                         }
                     time.sleep(0.2)  # Check interrupt every 200ms
                     # Touch activity every ~30s so the gateway's inactivity
@@ -5317,10 +5500,11 @@ def run_conversation(
             # lands on a historical user message would make the live-compose
             # fallback inject this turn's prefetch into that message on the
             # wire only, diverging the next turn's replayed prefix there.
-            current_turn_user_idx = reanchor_current_turn_user_idx(
-                messages, user_message
-            )
-            agent._persist_user_message_idx = current_turn_user_idx
+            if not continuation:
+                current_turn_user_idx = reanchor_current_turn_user_idx(
+                    messages, user_message
+                )
+                agent._persist_user_message_idx = current_turn_user_idx
             continue
 
         if _retry.restart_with_rebuilt_messages:
@@ -5335,20 +5519,12 @@ def run_conversation(
             continue
 
         if _retry.restart_with_length_continuation:
-            # Progressively boost the output token budget on each retry.
-            # Retry 1 → 2× base, retry 2 → 4× base, retry 3 → 8× base,
-            # retry 4 → 16× base, then cap at 32 768.
-            # Applies to all providers via _ephemeral_max_output_tokens.
-            # If the original request already used a larger provider/model
-            # default budget, keep that floor so continuation retries do
-            # not accidentally downshift to a much smaller cap.
-            _boost_base = agent.max_tokens if agent.max_tokens else 4096
-            _boost = _boost_base * (2 ** length_continue_retries)
-            _requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
-            if _requested_cap is not None:
-                _boost = max(_boost, _requested_cap)
-            _boost_cap = max(32768, _requested_cap or 0)
-            agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
+            # Use the same catalog/caller budget policy as the initial request.
+            from agent.output_budget import boosted_output_cap
+            agent._ephemeral_max_output_tokens = boosted_output_cap(
+                agent, agent._requested_output_cap_from_api_kwargs(api_kwargs),
+                length_continue_retries,
+            )
             continue
 
         # Guard: if all retries exhausted without a successful response
@@ -5694,11 +5870,6 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Max retries (3) for invalid tool calls exceeded. Stopping as partial.", force=True)
                         agent._invalid_tool_retries = 0
                         _final_response = f"Model generated invalid tool call: {invalid_preview}"
-                        # Prior <3 retries (or an earlier successful tool batch)
-                        # leave a tool-result tail. Closing it here matches
-                        # interrupt aborts (#48879 / #52592) so the next user
-                        # turn is not tool→user for strict providers.
-                        close_interrupted_tool_sequence(messages, _final_response)
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _final_response,
@@ -5780,10 +5951,26 @@ def run_conversation(
                         )
                         agent._invalid_json_retries = 0
                         agent._cleanup_task_resources(effective_task_id)
-                        _final_response = "Response truncated due to output length limit"
-                        # Same tool-tail close as interrupt / invalid-tool
-                        # exhaustion — this path never reaches finalize_turn.
-                        close_interrupted_tool_sequence(messages, _final_response)
+                        # Only call it an output-length truncation when the
+                        # model actually reported one. This branch is the
+                        # secondary detector for the case where the length
+                        # handler above was bypassed: an upstream router
+                        # rewrote finish_reason away from "length" (e.g.
+                        # OpenRouter) or a transport/stream break left the tool
+                        # arguments cut off mid-JSON after a timeout+retry. In
+                        # those cases the real cause is transport/router
+                        # corruption, not max_output_tokens — say so instead of
+                        # the misleading "output length limit" (#91717).
+                        if finish_reason == "length":
+                            _final_response = "Response truncated due to output length limit"
+                        else:
+                            _final_response = (
+                                "Tool call arguments were truncated mid-JSON, but the model "
+                                f"did not report an output-length limit (finish_reason="
+                                f"{finish_reason!r}). This usually means a transport/stream "
+                                "interruption or an upstream router rewriting finish_reason "
+                                "(e.g. OpenRouter). The tool was not executed."
+                            )
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _final_response,
@@ -6030,6 +6217,7 @@ def run_conversation(
                 # execution so a single truncation doesn't poison the
                 # entire conversation.
                 truncated_tool_call_retries = 0
+                agent._empty_content_retries = 0
 
                 # Signal that a paragraph break is needed before the next
                 # streamed text.  We don't emit it immediately because
@@ -6921,6 +7109,10 @@ def run_conversation(
         original_user_message=original_user_message,
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
+        continuation=continuation,
+        continuation_boundary_tool_call_ids=(
+            _continuation_boundary_tool_call_ids
+        ),
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )

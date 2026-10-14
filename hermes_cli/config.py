@@ -1008,6 +1008,13 @@ DEFAULT_CONFIG = {
         # api_modes — fixes the Gemini/Claude "stops after stating intent" case),
         # false (never), or a list of model-name substrings to match.
         "intent_ack_continuation": "auto",
+        # File writes for GPT-5+ models: offer a grammar-constrained freeform
+        # apply_patch tool in place of write_file and patch, as OpenAI's Codex
+        # does. JSON-escaped whole-file arguments can loop until the output cap.
+        # Values: "auto" (default — GPT-5+ models on OpenRouter), true/false, or
+        # a list of model-name substrings enabled on top of auto (for presets that
+        # hide the model).
+        "apply_patch_tool": "auto",
         # Universal "finish the job" guidance — short prompt block applied to
         # all models that targets two cross-family failure modes: (1) stopping
         # after a stub instead of finishing the artifact, (2) fabricating
@@ -3041,6 +3048,9 @@ DEFAULT_CONFIG = {
 
     # execute_code settings — controls the tool used for programmatic tool calls.
     "code_execution": {
+        # Stream RPC is an explicit opt-in for compatible paired Toolboxes.
+        "rpc_transport": "file",
+        "rpc_concurrency": 8,
         # Execution mode:
         #   project (default) — scripts run in the session's working directory
         #     with the active virtualenv/conda env's python, so project deps

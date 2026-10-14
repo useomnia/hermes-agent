@@ -1,9 +1,9 @@
-"""Durable idempotency records for the structured ``/v1/runs`` API.
+"""Durable Turn reservations isolated from transcript and tool-accounting writes.
 
-Only scalar identity, request fingerprints, and lifecycle metadata are kept.
-The request body (including model input) never enters this table. SQLite's
-write transaction is the admission fence: one process wins a ``turn_id`` and
-all concurrent or retried callers observe that same run identity.
+Adapted from upstream gateway/platforms/api_server_run_idempotency.py: one
+profile-local WAL database, one serialized connection, explicit transactions
+and close. Omnia retains scalar Turn identity for the lifetime of the runtime;
+there is no memory fallback, request-body storage, or terminal-row expiry.
 """
 
 from __future__ import annotations
@@ -11,27 +11,27 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from hermes_constants import get_hermes_home
+from hermes_state import apply_wal_with_fallback
+from hermes_state_errors import is_sqlite_lock_error
 
 
 _TABLE = "api_run_idempotency"
-_CANCELLED_BEFORE_START = "cancelled_before_start"
-_ACTIVE_STATUSES = {"queued", "running", "waiting_for_approval", "stopping"}
 
 
 class RunIdempotencyMismatch(ValueError):
-    """A reused ``turn_id`` carried different immutable request semantics."""
+    """A reused Turn ID carried different immutable request semantics."""
 
 
-@dataclass(frozen=True, slots=True)
-class ManagedRunIdentity:
-    submission_id: str
-    execution_fingerprint: str
+class RunReservationBusy(sqlite3.OperationalError):
+    """The reservation write rolled back and a read confirmed no accepted ID."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,19 +43,8 @@ class RunIdempotencyRecord:
     owner_profile: str | None
     status: str
     failure_reason: str | None
-    managed_submission_id: str | None
-    managed_execution_fingerprint: str | None
-    cancel_requested: bool
     created_at: float
     updated_at: float
-
-    @property
-    def is_cancel_tombstone(self) -> bool:
-        return (
-            self.cancel_requested
-            and self.status == "cancelled"
-            and self.failure_reason == _CANCELLED_BEFORE_START
-        )
 
 
 def request_fingerprint(value: Mapping[str, Any]) -> str:
@@ -70,48 +59,29 @@ def request_fingerprint(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def managed_cancel_fingerprint(
-    *,
-    turn_id: str,
-    session_id: str,
-    owner_profile: str | None,
-    identity: ManagedRunIdentity,
-) -> str:
-    """Hash cancellation identity for a tombstone that has no launch request."""
-    return request_fingerprint(
-        {
-            "domain": "hermes.managed-run.cancel-tombstone.v1",
-            "turn_id": turn_id,
-            "session_id": session_id,
-            "owner_profile": owner_profile,
-            "submission_id": identity.submission_id,
-            "execution_fingerprint": identity.execution_fingerprint,
-        }
-    )
-
-
 class RunIdempotencyStore:
-    """Small state.db-backed relation for ``turn_id`` to run identity."""
+    """One durable admission fence per profile, independent of state.db."""
 
-    def __init__(self, db_path: str | Path | None = None) -> None:
+    def __init__(self, db_path: str | Path | None = None, *, timeout: float = 1.0):
         self.db_path = (
             Path(db_path)
             if db_path is not None
-            else get_hermes_home() / "state.db"
+            else get_hermes_home() / "runs_idempotency.db"
         )
+        if db_path is None:
+            self._require_fresh_reservation_storage()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_schema()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=10000")
-        return conn
-
-    def _ensure_schema(self) -> None:
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            timeout=timeout,
+            isolation_level=None,
+        )
+        self._conn.row_factory = sqlite3.Row
+        try:
+            apply_wal_with_fallback(self._conn, db_label="runs_idempotency.db")
+            self._conn.execute(
                 f"""CREATE TABLE IF NOT EXISTS {_TABLE} (
                     turn_id TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL UNIQUE,
@@ -120,80 +90,66 @@ class RunIdempotencyStore:
                     owner_profile TEXT,
                     status TEXT NOT NULL,
                     failure_reason TEXT,
-                    managed_submission_id TEXT,
-                    managed_execution_fingerprint TEXT,
-                    cancel_requested INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 )"""
             )
-            columns = {
-                str(row["name"])
-                for row in conn.execute(f"PRAGMA table_info({_TABLE})")
-            }
-            additions = {
-                "managed_submission_id": "TEXT",
-                "managed_execution_fingerprint": "TEXT",
-                "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
-            }
-            for column, declaration in additions.items():
-                if column not in columns:
-                    conn.execute(
-                        f"ALTER TABLE {_TABLE} ADD COLUMN {column} {declaration}"
-                    )
-            conn.execute(
-                f"CREATE INDEX IF NOT EXISTS {_TABLE}_updated_idx "
-                f"ON {_TABLE}(updated_at)"
-            )
+            for suffix in ("", "-wal", "-shm"):
+                path = Path(str(self.db_path) + suffix)
+                if path.exists():
+                    path.chmod(0o600)
+        except BaseException:
+            self._conn.close()
+            raise
+
+    def _require_fresh_reservation_storage(self) -> None:
+        """Refuse an in-place upgrade that would forget accepted Turn IDs."""
+        legacy = self.db_path.with_name("state.db")
+        if not legacy.exists():
+            return
+        conn = sqlite3.connect(legacy.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (_TABLE,),
+            ).fetchone()
+            if table and conn.execute(f"SELECT 1 FROM {_TABLE} LIMIT 1").fetchone():
+                raise RuntimeError(
+                    "Legacy Turn reservations exist in state.db. This release requires "
+                    "a fresh reprovisioned runtime; keep the source runtime for its owned Turns."
+                )
+        finally:
+            conn.close()
+
+    @contextmanager
+    def _transaction(self):
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     @staticmethod
     def _record(row: sqlite3.Row) -> RunIdempotencyRecord:
-        return RunIdempotencyRecord(
-            turn_id=str(row["turn_id"]),
-            run_id=str(row["run_id"]),
-            request_fingerprint=str(row["request_fingerprint"]),
-            session_id=str(row["session_id"]),
-            owner_profile=row["owner_profile"],
-            status=str(row["status"]),
-            failure_reason=row["failure_reason"],
-            managed_submission_id=row["managed_submission_id"],
-            managed_execution_fingerprint=row[
-                "managed_execution_fingerprint"
-            ],
-            cancel_requested=bool(row["cancel_requested"]),
-            created_at=float(row["created_at"]),
-            updated_at=float(row["updated_at"]),
-        )
+        return RunIdempotencyRecord(**dict(row))
 
     @staticmethod
-    def _assert_identity(
+    def _replay(
         record: RunIdempotencyRecord,
-        *,
-        session_id: str,
+        fingerprint: str,
         owner_profile: str | None,
-        managed_identity: ManagedRunIdentity | None,
-    ) -> None:
-        stored_managed = (
-            record.managed_submission_id is not None
-            or record.managed_execution_fingerprint is not None
-        )
-        if managed_identity is None:
-            if stored_managed:
-                raise RunIdempotencyMismatch(
-                    "managed and legacy reservations cannot adopt each other"
-                )
-            return
+    ) -> tuple[RunIdempotencyRecord, bool]:
         if (
-            not stored_managed
-            or record.session_id != session_id
+            record.request_fingerprint != fingerprint
             or record.owner_profile != owner_profile
-            or record.managed_submission_id != managed_identity.submission_id
-            or record.managed_execution_fingerprint
-            != managed_identity.execution_fingerprint
         ):
             raise RunIdempotencyMismatch(
-                "managed run identity does not match the reserved turn"
+                "turn_id was already used with different request semantics"
             )
+        return record, False
 
     def reserve(
         self,
@@ -203,159 +159,44 @@ class RunIdempotencyStore:
         request_fingerprint: str,
         session_id: str,
         owner_profile: str | None,
-        managed_identity: ManagedRunIdentity | None = None,
     ) -> tuple[RunIdempotencyRecord, bool]:
-        """Atomically reserve a turn, returning ``(record, is_new)``."""
         now = time.time()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                f"SELECT * FROM {_TABLE} WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if row is not None:
-                record = self._record(row)
-                self._assert_identity(
-                    record,
-                    session_id=session_id,
-                    owner_profile=owner_profile,
-                    managed_identity=managed_identity,
-                )
-                if (
-                    not record.is_cancel_tombstone
-                    and record.request_fingerprint != request_fingerprint
-                ):
-                    raise RunIdempotencyMismatch(
-                        "turn_id was already used with different request semantics"
-                    )
-                return record, False
-            conn.execute(
-                f"""INSERT INTO {_TABLE}(
-                    turn_id, run_id, request_fingerprint, session_id,
-                    owner_profile, status, managed_submission_id,
-                    managed_execution_fingerprint, cancel_requested,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, 0, ?, ?)""",
-                (
-                    turn_id,
-                    run_id,
-                    request_fingerprint,
-                    session_id,
-                    owner_profile,
-                    managed_identity.submission_id if managed_identity else None,
-                    (
-                        managed_identity.execution_fingerprint
-                        if managed_identity
-                        else None
-                    ),
-                    now,
-                    now,
-                ),
-            )
-            row = conn.execute(
-                f"SELECT * FROM {_TABLE} WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            assert row is not None
-            return self._record(row), True
-
-    def reconcile_managed(
-        self,
-        *,
-        turn_id: str,
-        session_id: str,
-        owner_profile: str | None,
-        identity: ManagedRunIdentity,
-    ) -> RunIdempotencyRecord | None:
-        """Read one exact managed mapping without creating or changing it."""
-        with self._connect() as conn:
-            row = conn.execute(
-                f"SELECT * FROM {_TABLE} WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        record = self._record(row)
-        self._assert_identity(
-            record,
-            session_id=session_id,
-            owner_profile=owner_profile,
-            managed_identity=identity,
-        )
-        return record
-
-    def cancel_managed(
-        self,
-        *,
-        turn_id: str,
-        run_id: str,
-        session_id: str,
-        owner_profile: str | None,
-        identity: ManagedRunIdentity,
-    ) -> tuple[RunIdempotencyRecord, bool]:
-        """Atomically latch cancellation, creating a terminal tombstone if absent."""
-        now = time.time()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                f"SELECT * FROM {_TABLE} WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if row is None:
+        try:
+            with self._transaction() as conn:
+                row = conn.execute(
+                    f"SELECT * FROM {_TABLE} WHERE turn_id = ?",
+                    (turn_id,),
+                ).fetchone()
+                if row is not None:
+                    return self._replay(self._record(row), request_fingerprint, owner_profile)
                 conn.execute(
-                    f"""INSERT INTO {_TABLE}(
+                    f"""INSERT INTO {_TABLE} (
                         turn_id, run_id, request_fingerprint, session_id,
-                        owner_profile, status, failure_reason,
-                        managed_submission_id, managed_execution_fingerprint,
-                        cancel_requested, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'cancelled', ?, ?, ?, 1, ?, ?)""",
+                        owner_profile, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)""",
                     (
                         turn_id,
                         run_id,
-                        managed_cancel_fingerprint(
-                            turn_id=turn_id,
-                            session_id=session_id,
-                            owner_profile=owner_profile,
-                            identity=identity,
-                        ),
+                        request_fingerprint,
                         session_id,
                         owner_profile,
-                        _CANCELLED_BEFORE_START,
-                        identity.submission_id,
-                        identity.execution_fingerprint,
                         now,
                         now,
                     ),
                 )
                 row = conn.execute(
-                    f"SELECT * FROM {_TABLE} WHERE turn_id = ?",
-                    (turn_id,),
+                    f"SELECT * FROM {_TABLE} WHERE turn_id = ?", (turn_id,)
                 ).fetchone()
-                assert row is not None
                 return self._record(row), True
-
-            record = self._record(row)
-            self._assert_identity(
-                record,
-                session_id=session_id,
-                owner_profile=owner_profile,
-                managed_identity=identity,
-            )
-            if record.status not in _ACTIVE_STATUSES:
-                return record, False
-            next_status = "cancelled" if record.status == "queued" else "stopping"
-            conn.execute(
-                f"""UPDATE {_TABLE}
-                    SET status = ?, cancel_requested = 1, updated_at = ?
-                    WHERE turn_id = ?""",
-                (next_status, now, turn_id),
-            )
-            row = conn.execute(
-                f"SELECT * FROM {_TABLE} WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            assert row is not None
-            return self._record(row), False
+        except sqlite3.OperationalError as exc:
+            if not is_sqlite_lock_error(exc):
+                raise
+            # A failed write does not prove a prior submission never ran. Read
+            # after rollback; an unreadable store must remain an unknown outcome.
+            record = self.get(turn_id)
+            if record is not None:
+                return self._replay(record, request_fingerprint, owner_profile)
+            raise RunReservationBusy("Turn reservation storage is busy") from exc
 
     def update_status(
         self,
@@ -365,47 +206,32 @@ class RunIdempotencyStore:
         failure_reason: str | None = None,
         updated_at: float | None = None,
     ) -> RunIdempotencyRecord | None:
-        """Persist lifecycle state without allowing cancellation resurrection."""
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                f"SELECT * FROM {_TABLE} WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            record = self._record(row)
-            if record.is_cancel_tombstone or (
-                record.cancel_requested and status != "cancelled"
-            ):
-                return record
+        with self._transaction() as conn:
             conn.execute(
-                f"""UPDATE {_TABLE}
-                    SET status = ?, failure_reason = ?, updated_at = ?
-                    WHERE turn_id = ?""",
-                (status, failure_reason, updated_at or time.time(), turn_id),
+                f"""UPDATE {_TABLE} SET status = ?, failure_reason = ?, updated_at = ?
+                    WHERE turn_id = ? AND (status != ? OR failure_reason IS NOT ?)""",
+                (
+                    status,
+                    failure_reason,
+                    updated_at if updated_at is not None else time.time(),
+                    turn_id,
+                    status,
+                    failure_reason,
+                ),
             )
             row = conn.execute(
-                f"SELECT * FROM {_TABLE} WHERE turn_id = ?",
-                (turn_id,),
+                f"SELECT * FROM {_TABLE} WHERE turn_id = ?", (turn_id,)
             ).fetchone()
-            assert row is not None
-            return self._record(row)
+            return self._record(row) if row is not None else None
 
     def get(self, turn_id: str) -> RunIdempotencyRecord | None:
-        with self._connect() as conn:
-            row = conn.execute(
+        with self._lock:
+            row = self._conn.execute(
                 f"SELECT * FROM {_TABLE} WHERE turn_id = ?",
                 (turn_id,),
             ).fetchone()
         return self._record(row) if row is not None else None
 
-
-__all__ = [
-    "ManagedRunIdentity",
-    "RunIdempotencyMismatch",
-    "RunIdempotencyRecord",
-    "RunIdempotencyStore",
-    "managed_cancel_fingerprint",
-    "request_fingerprint",
-]
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()

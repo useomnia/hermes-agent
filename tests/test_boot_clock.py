@@ -15,8 +15,9 @@ LINUX_ONLY = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def _clear_checkpoints():
+def _clear_checkpoints(monkeypatch):
     boot_clock._checkpoints.clear()
+    monkeypatch.setattr(boot_clock, "_process_start_monotonic", None)
     yield
     boot_clock._checkpoints.clear()
 
@@ -232,3 +233,14 @@ def test_mark_records_nothing_without_a_clock(monkeypatch):
     boot_clock.mark("main")
 
     assert boot_clock._checkpoints == []
+
+
+def test_procfs_is_read_once_per_process(monkeypatch):
+    reads = []
+    monkeypatch.setattr(boot_clock, "_procfs_elapsed_seconds", lambda: reads.append(1) or 2.0)
+
+    first = boot_clock.process_elapsed_seconds()
+    second = boot_clock.process_elapsed_seconds()
+
+    assert len(reads) == 1
+    assert 2.0 <= first <= second
