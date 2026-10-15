@@ -3576,7 +3576,8 @@ def take_interrupted_steer(agent, messages: list):
     return agent._drain_pending_steer()
 
 
-def _deliver_context_notes(agent, messages: list) -> None:
+def deliver_context_notes(agent, messages: list) -> None:
+    """Append the steered app facts, if any, as context-note rows and report them."""
     notes = agent._drain_pending_context_notes()
     if not notes:
         return
@@ -3604,7 +3605,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     tail = messages[max(len(messages) - num_tool_msgs, 0):]
     if not any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in tail):
         return
-    _deliver_context_notes(agent, messages)
+    deliver_context_notes(agent, messages)
     steer_text = agent._drain_pending_steer()
     if not steer_text:
         return

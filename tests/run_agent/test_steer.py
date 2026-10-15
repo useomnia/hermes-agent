@@ -272,6 +272,49 @@ class TestActiveTurnRedirectCheckpoint:
         )
 
 
+class TestRedirectContextNotes:
+    """Steered app facts ride a redirect, ahead of the correction."""
+
+    def test_should_put_notes_before_the_correction(self):
+        from agent.conversation_loop import _apply_active_turn_redirect
+
+        agent = _bare_agent()
+        agent.add_context_notes([_note("1", "Project: Alpha")])
+        messages = [{"role": "user", "content": "start"}]
+
+        _apply_active_turn_redirect(agent, messages, "Keep going.")
+
+        assert [m["role"] for m in messages] == ["user", "assistant", "user", "user"]
+        assert messages[2] == context_note_message("Project: Alpha")
+        assert messages[3]["content"] == "Keep going."
+
+    def test_should_report_notes_delivered_with_a_redirect(self):
+        from agent.conversation_loop import _apply_active_turn_redirect
+
+        agent = _bare_agent()
+        delivered = []
+        agent.context_notes_callback = delivered.append
+        agent.add_context_notes([_note("1", "Project: Alpha")])
+
+        _apply_active_turn_redirect(
+            agent,
+            [{"role": "user", "content": "start"}, {"role": "assistant", "content": "draft"}],
+            "Keep going.",
+        )
+
+        assert delivered == [[_note("1", "Project: Alpha")]]
+
+    def test_should_leave_the_redirect_unchanged_without_notes(self):
+        from agent.conversation_loop import _apply_active_turn_redirect
+
+        agent = _bare_agent()
+        messages = [{"role": "user", "content": "start"}, {"role": "assistant", "content": "draft"}]
+
+        _apply_active_turn_redirect(agent, messages, "Keep going.")
+
+        assert [m["role"] for m in messages] == ["user", "assistant", "user"]
+
+
 class TestSteerInjection:
     def test_appends_standalone_user_message_after_tool_results(self):
         agent = _bare_agent()
