@@ -1838,6 +1838,196 @@ class TestSteerRun:
         }
 
 
+class TestSteerContextNotes:
+    """Steers that carry app facts queue them on the run without interrupting it."""
+
+    NOTES = [{"id": "note-1", "text": "Gmail is connected"}]
+
+    def _make_active_agent(self, adapter, run_id="run_notes"):
+        agent = MagicMock()
+        agent.api_mode = "chat_completions"
+        task = MagicMock()
+        task.done.return_value = False
+        adapter._run_statuses[run_id] = {"object": "hermes.run", "run_id": run_id, "status": "running"}
+        adapter._active_run_agents[run_id] = agent
+        adapter._active_run_tasks[run_id] = task
+        adapter._run_lifecycles[run_id] = {
+            "accepting": True,
+            "agent": agent,
+            "pending": [],
+            "pending_notes": [],
+            "lock": asyncio.Lock(),
+        }
+        return agent
+
+    async def _steer(self, adapter, body, run_id="run_notes"):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(f"/v1/runs/{run_id}/steer", json=body)
+            return response.status, await response.json()
+
+    @pytest.mark.asyncio
+    async def test_should_queue_notes_on_the_running_agent(self, adapter):
+        agent = self._make_active_agent(adapter)
+
+        await self._steer(adapter, {"notes": self.NOTES})
+
+        agent.add_context_notes.assert_called_once_with(self.NOTES)
+
+    @pytest.mark.asyncio
+    async def test_should_report_notes_as_queued(self, adapter):
+        self._make_active_agent(adapter)
+
+        status, body = await self._steer(adapter, {"notes": self.NOTES})
+
+        assert (status, body) == (200, {"status": "queued"})
+
+    @pytest.mark.asyncio
+    async def test_should_not_interrupt_the_run_for_notes(self, adapter):
+        agent = self._make_active_agent(adapter)
+        agent._supports_active_turn_redirect = True
+
+        await self._steer(adapter, {"notes": self.NOTES})
+
+        agent.redirect.assert_not_called()
+        agent.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_should_steer_text_that_comes_with_notes(self, adapter):
+        agent = self._make_active_agent(adapter)
+        agent._supports_active_turn_redirect = False
+        agent.steer.return_value = True
+
+        await self._steer(adapter, {"notes": self.NOTES, "text": "use it"})
+
+        agent.add_context_notes.assert_called_once_with(self.NOTES)
+        agent.steer.assert_called_once_with("use it")
+
+    @pytest.mark.asyncio
+    async def test_should_refuse_notes_for_a_codex_app_server_run(self, adapter):
+        agent = self._make_active_agent(adapter)
+        agent.api_mode = "codex_app_server"
+
+        status, body = await self._steer(adapter, {"notes": self.NOTES})
+
+        assert status == 409
+        assert body["error"]["code"] == "context_notes_unsupported"
+        agent.add_context_notes.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_should_report_a_finished_run_as_not_found(self, adapter):
+        agent = self._make_active_agent(adapter)
+        adapter._active_run_tasks["run_notes"].done.return_value = True
+
+        status, body = await self._steer(adapter, {"notes": self.NOTES})
+
+        assert status == 404
+        assert body["error"]["code"] == "run_not_found"
+        agent.add_context_notes.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "notes",
+        [
+            "Gmail is connected",
+            [{"text": "no id"}],
+            [{"id": "", "text": "empty id"}],
+            [{"id": "x" * 201, "text": "long id"}],
+            [{"id": "a", "text": "one"}, {"id": "a", "text": "two"}],
+            [{"id": "a", "text": "   "}],
+            [{"id": "a", "text": "x" * 10_001}],
+            [{"id": str(index), "text": "note"} for index in range(21)],
+        ],
+    )
+    async def test_should_reject_invalid_notes(self, adapter, notes):
+        agent = self._make_active_agent(adapter)
+
+        status, body = await self._steer(adapter, {"notes": notes})
+
+        assert status == 400
+        assert body["error"]["code"] == "steer_invalid_notes"
+        agent.add_context_notes.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_should_hand_notes_to_the_agent_once_it_is_published(self, adapter):
+        app = _create_runs_app(adapter)
+        create_started = threading.Event()
+        allow_create = threading.Event()
+        run_started = threading.Event()
+        allow_run_finish = threading.Event()
+        agent = MagicMock()
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        def _create_agent(**_kwargs):
+            create_started.set()
+            assert allow_create.wait(5)
+            return agent
+
+        def _run_conversation(*_args, **_kwargs):
+            run_started.set()
+            assert allow_run_finish.wait(5)
+            return {"final_response": "done"}
+
+        agent.run_conversation.side_effect = _run_conversation
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                start_response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_response.json())["run_id"]
+                assert await _wait_for_thread_event(create_started)
+                queued = await cli.post(f"/v1/runs/{run_id}/steer", json={"notes": self.NOTES})
+                assert await queued.json() == {"status": "queued"}
+                agent.add_context_notes.assert_not_called()
+
+                allow_create.set()
+                assert await _wait_for_thread_event(run_started)
+                agent.add_context_notes.assert_called_once_with(self.NOTES)
+                allow_run_finish.set()
+                for _ in range(40):
+                    if run_id not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
+    async def test_should_emit_delivered_notes_on_the_run_stream(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                agent = MagicMock()
+                agent.session_prompt_tokens = 0
+                agent.session_completion_tokens = 0
+                agent.session_total_tokens = 0
+
+                def _run_conversation(*_args, **_kwargs):
+                    agent.context_notes_callback(self.NOTES)
+                    return {"final_response": "done"}
+
+                agent.run_conversation.side_effect = _run_conversation
+                mock_create.return_value = agent
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        delivered = [event for event in events if event["type"] == "response.omnio.context_notes"]
+        assert [event["notes"] for event in delivered] == [self.NOTES]
+
+    @pytest.mark.asyncio
+    async def test_capabilities_advertise_steer_context_notes(self, adapter):
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            payload = await (await cli.get("/v1/capabilities")).json()
+
+        assert payload["features"]["run_steer_context_notes"] == {"apiVersion": 1}
+
+
 class TestRunsProviderAuthFailure:
     @pytest.mark.asyncio
     async def test_status_reports_provider_auth_failure_distinctly(self, adapter):

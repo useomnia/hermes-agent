@@ -8,7 +8,9 @@ from __future__ import annotations
 import threading
 
 import pytest
+from unittest.mock import MagicMock
 
+from agent.context_notes import context_note_message
 from agent.prompt_builder import STEER_MARKER_OPEN, format_steer_marker
 from run_agent import AIAgent
 from tests.run_agent.test_run_agent import agent as loop_agent, _mock_response
@@ -445,6 +447,124 @@ class TestPreApiCallSteerDrain:
         assert [m["role"] for m in saved] == ["user", "assistant", "tool", "user"]
         assert saved[-1]["content"] == messages[-1]["content"] == format_steer_marker("remember this")
         assert saved[-2]["content"] == "output"
+        db.close()
+
+
+def _note(note_id: str, text: str) -> dict:
+    return {"id": note_id, "text": text}
+
+
+class TestSteeredContextNotes:
+    """App facts steered into a run share the steer drain hook."""
+
+    def _answered_batch(self):
+        return [
+            {"role": "user", "content": "plan the launch"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "q1", "type": "function", "function": {"name": "request_user_input", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "content": "answered", "tool_call_id": "q1"},
+        ]
+
+    def test_should_append_each_note_after_the_tool_batch(self):
+        agent = _bare_agent()
+        agent.add_context_notes([_note("1", "Project: Alpha"), _note("2", "Connector: Notion connected")])
+        messages = self._answered_batch()
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        assert messages[2]["content"] == "answered"
+        assert messages[3:] == [
+            context_note_message("Project: Alpha"),
+            context_note_message("Connector: Notion connected"),
+        ]
+        assert agent._drain_pending_context_notes() == []
+
+    def test_should_put_notes_ahead_of_a_steer(self):
+        agent = _bare_agent()
+        agent.add_context_notes([_note("1", "Project: Alpha")])
+        agent.steer("use the new project")
+        messages = self._answered_batch()
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        assert messages[3] == context_note_message("Project: Alpha")
+        assert messages[4] == {"role": "user", "content": format_steer_marker("use the new project")}
+
+    def test_should_keep_notes_when_the_run_is_interrupted(self):
+        agent = _bare_agent()
+        agent._interrupt_requested = True
+        agent.add_context_notes([_note("1", "Project: Alpha")])
+        agent.steer("will be handed back")
+        messages = self._answered_batch()
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        assert messages[-1] == context_note_message("Project: Alpha")
+        assert agent._drain_pending_steer() == "will be handed back"
+
+    def test_should_report_delivered_notes(self):
+        agent = _bare_agent()
+        delivered = []
+        agent.context_notes_callback = delivered.append
+        agent.add_context_notes([_note("1", "Project: Alpha")])
+        agent._apply_pending_steer_to_tool_results(self._answered_batch(), num_tool_msgs=1)
+        assert delivered == [[_note("1", "Project: Alpha")]]
+
+    def test_should_not_report_notes_still_waiting_for_a_batch(self):
+        agent = _bare_agent()
+        delivered = []
+        agent.context_notes_callback = delivered.append
+        agent.add_context_notes([_note("1", "Project: Alpha")])
+        agent._apply_pending_steer_to_tool_results([{"role": "user", "content": "hello"}], num_tool_msgs=0)
+        assert delivered == []
+
+    def test_should_keep_notes_when_the_delivery_report_fails(self):
+        agent = _bare_agent()
+        agent.context_notes_callback = MagicMock(side_effect=RuntimeError("closed"))
+        agent.add_context_notes([_note("1", "Project: Alpha")])
+        messages = self._answered_batch()
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        assert messages[-1] == context_note_message("Project: Alpha")
+
+    def test_should_leave_history_unchanged_without_notes(self):
+        agent = _bare_agent()
+        messages = self._answered_batch()
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        assert messages == self._answered_batch()
+
+    def test_should_keep_queued_notes_until_a_batch_completes(self):
+        agent = _bare_agent()
+        agent.add_context_notes([_note("1", "Project: Alpha")])
+        messages = [{"role": "user", "content": "hello"}]
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=0)
+        assert messages == [{"role": "user", "content": "hello"}]
+        assert agent._drain_pending_context_notes() == [_note("1", "Project: Alpha")]
+
+    def test_should_keep_notes_from_concurrent_answers(self):
+        agent = _bare_agent()
+        threads = [
+            threading.Thread(target=agent.add_context_notes, args=([_note(str(i), f"note {i}")],))
+            for i in range(20)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        drained = agent._drain_pending_context_notes()
+        assert sorted(note["text"] for note in drained) == sorted(f"note {i}" for i in range(20))
+
+    def test_should_persist_notes_with_the_session(self, tmp_path):
+        from hermes_state import SessionDB
+        from tests.agent.test_session_rotation_flush_cold_resume_68454 import _make_flush_agent
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("notes", source="cli")
+        agent = _bare_agent()
+        flush_agent = _make_flush_agent(db, "notes")
+        messages = self._answered_batch()
+        flush_agent._flush_messages_to_session_db(messages)
+        agent.add_context_notes([_note("1", "Project: Alpha")])
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        agent._repair_message_sequence(messages)
+        flush_agent._flush_messages_to_session_db(messages)
+        saved = db.get_messages("notes")
+        assert [m["role"] for m in saved] == ["user", "assistant", "tool", "user"]
+        assert saved[-1]["content"] == context_note_message("Project: Alpha")["content"]
         db.close()
 
 

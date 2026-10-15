@@ -3576,18 +3576,39 @@ def take_interrupted_steer(agent, messages: list):
     return agent._drain_pending_steer()
 
 
+def _deliver_context_notes(agent, messages: list) -> None:
+    notes = agent._drain_pending_context_notes()
+    if not notes:
+        return
+    from agent.context_notes import context_note_message
+
+    messages.extend(context_note_message(note["text"]) for note in notes)
+    callback = getattr(agent, "context_notes_callback", None)
+    if callback is None:
+        return
+    try:
+        callback(notes)
+    except Exception:
+        _ra().logger.warning("Context note delivery callback failed", exc_info=True)
+
+
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
-    """Append a persistable user message after a complete tool-result batch."""
+    """Append persistable user rows after a complete tool-result batch.
+
+    Steered app facts come first. They are history whatever happens next, so
+    an interrupted run keeps them, and the run reports them as delivered. A
+    steer follows as the tail row, where its interrupt hand-back expects it.
+    """
     if num_tool_msgs <= 0 or not messages:
         return
+    tail = messages[max(len(messages) - num_tool_msgs, 0):]
+    if not any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in tail):
+        return
+    _deliver_context_notes(agent, messages)
     steer_text = agent._drain_pending_steer()
     if not steer_text:
         return
     if getattr(agent, "_interrupt_requested", False) and not agent._has_pending_redirect():
-        _requeue_pending_steer(agent, steer_text)
-        return
-    tail = messages[max(len(messages) - num_tool_msgs, 0):]
-    if not any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in tail):
         _requeue_pending_steer(agent, steer_text)
         return
     row = {"role": "user", "content": format_steer_marker(steer_text)}
