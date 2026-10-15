@@ -403,6 +403,23 @@ def _project_custom_tool_inputs(function_name: str, function_args: Any) -> dict[
     return {output_key: copy.deepcopy(function_args)}
 
 
+def _parse_steer_notes(value: Any) -> List[Dict[str, str]]:
+    """App facts a steer carries: ``[{"id", "text"}]``, within the note limits."""
+    from agent.context_notes import parse_context_notes
+
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("Invalid 'notes'; expected an array")
+    ids = [item.get("id") if isinstance(item, dict) else None for item in value]
+    if any(not isinstance(note_id, str) or not 0 < len(note_id) <= 200 for note_id in ids):
+        raise ValueError("Each note needs an 'id' of 1 to 200 characters")
+    if len(set(ids)) != len(ids):
+        raise ValueError("Note ids must be unique")
+    texts = parse_context_notes([item.get("text") for item in value])
+    return [{"id": note_id, "text": text} for note_id, text in zip(ids, texts)]
+
+
 def _redact_response_extension_value(value: Any) -> Any:
     """Recursively redact string values before they enter a Turn extension."""
     if isinstance(value, str):
@@ -3735,6 +3752,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_steer": True,
+                # Steers may carry app facts that wait for the next tool batch.
+                "run_steer_context_notes": {"apiVersion": 1},
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -7669,6 +7688,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return False
             self._active_run_agents[run_id] = agent
             lifecycle["agent"] = agent
+            pending_notes = lifecycle.get("pending_notes") or []
+            lifecycle["pending_notes"] = []
+            if pending_notes and run_id not in self._stopping_run_ids:
+                agent.add_context_notes(pending_notes)
             pending = lifecycle["pending"]
             lifecycle["pending"] = []
             if pending and run_id not in self._stopping_run_ids:
@@ -7685,6 +7708,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not accepted:
                     lifecycle["pending"] = pending
             return True
+
+    async def _queue_run_context_notes(self, run_id: str, notes: List[Dict[str, str]]) -> str:
+        """Queue app facts on a live run without interrupting it.
+
+        They wait for the run's next complete tool batch. Notes that arrive
+        before the agent exists are handed to it on publication.
+        """
+        lifecycle = self._run_lifecycles.get(run_id)
+        if lifecycle is None:
+            return "not_found"
+        async with lifecycle["lock"]:
+            if self._run_lifecycles.get(run_id) is not lifecycle or not lifecycle["accepting"]:
+                return "not_found"
+            task = self._active_run_tasks.get(run_id)
+            if task is None or task.done():
+                return "not_found"
+            agent = self._active_run_agents.get(run_id)
+            if agent is None:
+                lifecycle.setdefault("pending_notes", []).extend(notes)
+                return "queued"
+            # Codex app-server runs own their history; the tool-batch hook never sees them.
+            if getattr(agent, "api_mode", None) == "codex_app_server":
+                return "unsupported"
+            agent.add_context_notes(notes)
+            return "queued"
 
     async def _close_run_steering(self, run_id: str, agent: Any = None) -> Optional[str]:
         """Close steering acceptance and drain the final undelivered artifact."""
@@ -8829,6 +8877,19 @@ class APIServerAdapter(BasePlatformAdapter):
             except RuntimeError:
                 pass
 
+        def _context_notes_cb(notes: List[Dict[str, str]]) -> None:
+            # Scheduled from the agent thread after the tool batch's own events,
+            # so the delivery lands at the position the model received it.
+            try:
+                loop.call_soon_threadsafe(
+                    lambda: emitter.omnio_event(
+                        "response.omnio.context_notes",
+                        notes=_redact_response_extension_value(copy.deepcopy(notes)),
+                    )
+                )
+            except RuntimeError:
+                pass
+
         def _emit_reasoning(delta: Optional[str]) -> None:
             nonlocal reasoning_started
             if not isinstance(delta, str) or not delta:
@@ -9160,6 +9221,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "accepting": True,
             "agent": None,
             "pending": [],
+            "pending_notes": [],
             "lock": asyncio.Lock(),
         }
 
@@ -9227,6 +9289,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
 
                 agent = await self._run_in_executor_tracked(_build_agent)
+                agent.context_notes_callback = _context_notes_cb
                 await self._publish_run_agent(run_id, agent)
                 if run_id in self._stopping_run_ids:
                     missed_steer = await self._close_run_steering(run_id, agent)
@@ -10522,7 +10585,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         raw_text = body.get("text") if isinstance(body, dict) else None
         text = raw_text.strip() if isinstance(raw_text, str) else ""
-        if not text:
+        try:
+            notes = _parse_steer_notes(body.get("notes") if isinstance(body, dict) else None)
+        except ValueError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="steer_invalid_notes"),
+                status=400,
+            )
+        if not text and not notes:
             return web.json_response(
                 _openai_error("Missing 'text'", code="steer_missing_text"),
                 status=400,
@@ -10538,7 +10608,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        if notes:
+            noted = await self._queue_run_context_notes(run_id, notes)
+            if noted == "unsupported":
+                return web.json_response(
+                    _openai_error(
+                        "This run cannot take context notes",
+                        code="context_notes_unsupported",
+                    ),
+                    status=409,
+                )
+            if noted == "not_found" or not text:
+                return self._steer_outcome_response(run_id, noted)
         outcome = await self._steer_run_off_loop(run_id, text, mode)
+        return self._steer_outcome_response(run_id, outcome)
+
+    @staticmethod
+    def _steer_outcome_response(run_id: str, outcome: str) -> "web.Response":
         if outcome in {"redirected", "queued"}:
             return web.json_response({"status": outcome})
         if outcome == "not_found":

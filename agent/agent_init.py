@@ -781,6 +781,13 @@ def init_agent(
     agent._pending_steer: Optional[str] = None
     agent._pending_steer_lock = threading.Lock()
 
+    # App facts steered into the run. The steer drain hook appends them as
+    # context-note user rows after the next complete tool batch, ahead of any
+    # steer, and reports them through ``context_notes_callback``.
+    agent._pending_context_notes: list[dict[str, str]] = []
+    agent._pending_context_notes_lock = threading.Lock()
+    agent.context_notes_callback = None
+
     # Active-turn redirect mechanism. A regular follow-up sent while the model
     # is generating is different from a hard /stop: preserve the valid turn
     # prefix, cancel only the in-flight model request, and rebuild its tail with

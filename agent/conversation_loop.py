@@ -198,7 +198,11 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     # followed by the correction preserves strict alternation. If a transport
     # already committed an assistant item, attribute the checkpoint inside the
     # user correction instead of creating assistant→assistant.
+    from agent.agent_runtime_helpers import deliver_context_notes
+
     if messages and messages[-1].get("role") == "assistant":
+        # Steered app facts ride the correction, ahead of it.
+        deliver_context_notes(agent, messages)
         messages.append(
             {"role": "user", "content": text, "api_content": correction}
         )
@@ -214,6 +218,7 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         if not visible:
             placeholder["display_kind"] = "hidden"
         messages.append(placeholder)
+        deliver_context_notes(agent, messages)
         messages.append(
             {"role": "user", "content": text, "api_content": correction}
         )

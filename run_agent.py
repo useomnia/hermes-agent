@@ -3205,6 +3205,31 @@ class AIAgent:
             self._pending_steer = None
         return text
 
+    def add_context_notes(self, notes: list[dict[str, str]]) -> None:
+        """Queue app facts, each ``{"id", "text"}``, for after the next tool batch.
+
+        Thread-safe: the gateway calls this from its loop while the run works.
+        A note never interrupts the model; it waits for a complete tool batch.
+        """
+        _lock = getattr(self, "_pending_context_notes_lock", None)
+        if _lock is None:
+            self._pending_context_notes = [*getattr(self, "_pending_context_notes", []), *notes]
+            return
+        with _lock:
+            self._pending_context_notes.extend(notes)
+
+    def _drain_pending_context_notes(self) -> list[dict[str, str]]:
+        """Return the queued app facts (possibly empty) and clear the slot."""
+        _lock = getattr(self, "_pending_context_notes_lock", None)
+        if _lock is None:
+            notes = getattr(self, "_pending_context_notes", [])
+            self._pending_context_notes = []
+            return notes
+        with _lock:
+            notes = self._pending_context_notes
+            self._pending_context_notes = []
+        return notes
+
     def _record_file_mutation_result(
         self,
         tool_name: str,
