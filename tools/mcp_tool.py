@@ -2878,6 +2878,21 @@ class MCPServerTask:
             "(e.g. https://host/mcp, not https://host/)."
         )
 
+    def _fail_stranded_http_calls(
+        self, guard: Any, failure: Optional[BaseException],
+    ) -> None:
+        """Fail calls still waiting on a Streamable HTTP session that ended."""
+        from tools.mcp_http_guard import describe_transport_failure
+
+        stranded = guard.close(failure)
+        if stranded:
+            logger.warning(
+                "MCP server '%s': HTTP transport ended with %d call(s) in "
+                "flight (%s); failing them instead of waiting for the tool "
+                "timeout", self.name, stranded,
+                describe_transport_failure(failure),
+            )
+
     def _reconnect_or_reraise_group(self, eg: BaseExceptionGroup) -> str:
         """Map an SDK transport TaskGroup failure to a clean ``"reconnect"``.
 
@@ -3070,6 +3085,7 @@ class MCPServerTask:
             from tools.mcp_http_guard import HTTPToolCallGuard
 
             call_guard = HTTPToolCallGuard()
+            transport_failure: Optional[BaseException] = None
             _original_url = httpx.URL(url)
 
             async def _strip_auth_on_cross_origin_redirect(response):
@@ -3129,7 +3145,16 @@ class MCPServerTask:
             except BaseExceptionGroup as _eg:
                 # Streamable-HTTP transport TaskGroup dropped: reconnect
                 # immediately instead of backoff/park (#66092).
+                transport_failure = _eg
                 reason = self._reconnect_or_reraise_group(_eg)
+            except BaseException as exc:
+                transport_failure = exc
+                raise
+            finally:
+                # The SDK never answers requests that were in flight on a
+                # torn-down session, and their read slots would hold off the
+                # reconnect's handshake until the tool timeout.
+                self._fail_stranded_http_calls(call_guard, transport_failure)
             return reason
         else:
             # Deprecated API (mcp < 1.24.0): manages httpx client internally.
@@ -4167,6 +4192,14 @@ def _is_session_expired_error(exc: BaseException) -> bool:
         )
     except ImportError:  # pragma: no cover - AnyIO is supplied by the MCP SDK
         transport_error_types = ()
+    try:
+        from tools.mcp_http_guard import MCPRateLimitedError, MCPTransportFailedError
+
+        # The HTTP guard failed these calls on purpose; replaying them could
+        # repeat work the server already accepted.
+        unreplayable_types: tuple = (MCPRateLimitedError, MCPTransportFailedError)
+    except ImportError:  # pragma: no cover - httpx is supplied by the MCP SDK
+        unreplayable_types = ()
 
     # ExceptionGroup trees can be arbitrarily deep or even cyclic when custom
     # exceptions expose ``exceptions``, and chained exceptions
@@ -4195,6 +4228,8 @@ def _is_session_expired_error(exc: BaseException) -> bool:
 
         if isinstance(current, InterruptedError):
             return False
+        if unreplayable_types and isinstance(current, unreplayable_types):
+            return False
         if isinstance(current, transport_error_types):
             transport_error_found = True
 
@@ -4211,6 +4246,15 @@ def _is_session_expired_error(exc: BaseException) -> bool:
         stack.append(getattr(current, "__context__", None))
 
     return transport_error_found
+
+
+def _is_failed_http_transport(exc: BaseException) -> bool:
+    """Return True if the HTTP guard failed this call because its session ended."""
+    try:
+        from tools.mcp_http_guard import MCPTransportFailedError
+    except ImportError:  # pragma: no cover - httpx is supplied by the MCP SDK
+        return False
+    return isinstance(exc, MCPTransportFailedError)
 
 
 def _handle_session_expired_and_retry(
@@ -5019,7 +5063,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             if recovered is not None:
                 return recovered
 
-            _bump_server_error(server_name)
+            # One failed transport fails every call in flight at once; the
+            # reconnect, not that many copies of one failure, decides
+            # whether the server is healthy.
+            if not _is_failed_http_transport(exc):
+                _bump_server_error(server_name)
             logger.error(
                 "MCP tool %s/%s call failed: %s",
                 server_name, tool_name, exc,
