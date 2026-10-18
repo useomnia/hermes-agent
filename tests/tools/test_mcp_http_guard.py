@@ -9,7 +9,9 @@ from tools.mcp_http_guard import (
     HTTPToolCallGuard,
     MCPRateLimitedError,
     MCPTransportFailedError,
+    RequestScopedFailureClient,
     describe_transport_failure,
+    gateway_status_of,
 )
 
 
@@ -192,3 +194,69 @@ def test_transport_failure_found_through_exception_chaining():
             raise RuntimeError("wrapped") from exc
     except RuntimeError as exc:
         assert describe_transport_failure(exc) == "ConnectError: refused"
+
+
+def _isolating_client(status):
+    async def respond(request):
+        return httpx.Response(status, text="upstream says no")
+
+    return RequestScopedFailureClient(transport=httpx.MockTransport(respond))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [500, 502, 503, 504, 401])
+async def test_failed_tool_call_is_answered_with_its_own_jsonrpc_error(status):
+    async with _isolating_client(status) as client:
+        response = await client.post(
+            "https://mcp.example/mcp", json={"jsonrpc": "2.0", "id": 7, "method": "tools/call"},
+        )
+    body = response.json()
+    assert response.status_code == 200
+    assert body["id"] == 7
+    assert f"HTTP {status}" in body["error"]["message"]
+    assert body["error"]["data"] == {"httpStatus": status}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,payload", [
+    (404, {"jsonrpc": "2.0", "id": 1, "method": "tools/call"}),
+    (429, {"jsonrpc": "2.0", "id": 1, "method": "tools/call"}),
+    (502, {"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+    (502, {"jsonrpc": "2.0", "method": "notifications/initialized"}),
+])
+async def test_other_requests_keep_their_existing_handling(status, payload):
+    async with _isolating_client(status) as client:
+        response = await client.post("https://mcp.example/mcp", json=payload)
+    assert response.status_code == status
+
+
+@pytest.mark.asyncio
+async def test_transport_error_on_a_tool_call_is_answered_without_raising():
+    async def reset(request):
+        raise httpx.ReadError("connection reset by peer")
+
+    async with RequestScopedFailureClient(transport=httpx.MockTransport(reset)) as client:
+        response = await client.post(
+            "https://mcp.example/mcp", json={"jsonrpc": "2.0", "id": 3, "method": "tools/call"},
+        )
+    error = response.json()["error"]
+    assert "ReadError: connection reset by peer" in error["message"]
+    assert gateway_status_of(_McpLikeError(error["data"])) is None
+
+
+class _McpLikeError(Exception):
+    def __init__(self, data):
+        super().__init__("error")
+        self.error = type("ErrorData", (), {"data": data})()
+
+
+@pytest.mark.parametrize("data,status", [
+    ({"httpStatus": 502}, 502),
+    ({"httpStatus": 503}, 503),
+    ({"httpStatus": 504}, 504),
+    ({"httpStatus": 500}, None),
+    ({"httpStatus": 401}, None),
+    (None, None),
+])
+def test_only_gateway_statuses_are_retryable(data, status):
+    assert gateway_status_of(_McpLikeError(data)) == status

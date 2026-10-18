@@ -3082,7 +3082,7 @@ class MCPServerTask:
             # matching the SDK's own create_mcp_http_client defaults.
             import httpx
 
-            from tools.mcp_http_guard import HTTPToolCallGuard
+            from tools.mcp_http_guard import HTTPToolCallGuard, RequestScopedFailureClient
 
             call_guard = HTTPToolCallGuard()
             transport_failure: Optional[BaseException] = None
@@ -3116,7 +3116,7 @@ class MCPServerTask:
             # Caller owns the client lifecycle — the SDK skips cleanup when
             # http_client is provided, so we wrap in async-with.
             try:
-                async with httpx.AsyncClient(**client_kwargs) as http_client:
+                async with RequestScopedFailureClient(**client_kwargs) as http_client:
                     async with streamable_http_client(url, http_client=http_client) as (
                         read_stream, write_stream, _get_session_id,
                     ):
@@ -4193,13 +4193,19 @@ def _is_session_expired_error(exc: BaseException) -> bool:
     except ImportError:  # pragma: no cover - AnyIO is supplied by the MCP SDK
         transport_error_types = ()
     try:
-        from tools.mcp_http_guard import MCPRateLimitedError, MCPTransportFailedError
+        from tools.mcp_http_guard import (
+            MCPRateLimitedError,
+            MCPTransportFailedError,
+            is_isolated_request_failure,
+        )
 
-        # The HTTP guard failed these calls on purpose; replaying them could
-        # repeat work the server already accepted.
+        # The HTTP guard failed these calls on purpose, and an isolated request
+        # failure left the session intact; replaying either could repeat work
+        # the server already accepted.
         unreplayable_types: tuple = (MCPRateLimitedError, MCPTransportFailedError)
     except ImportError:  # pragma: no cover - httpx is supplied by the MCP SDK
         unreplayable_types = ()
+        is_isolated_request_failure = None
 
     # ExceptionGroup trees can be arbitrarily deep or even cyclic when custom
     # exceptions expose ``exceptions``, and chained exceptions
@@ -4230,6 +4236,8 @@ def _is_session_expired_error(exc: BaseException) -> bool:
             return False
         if unreplayable_types and isinstance(current, unreplayable_types):
             return False
+        if is_isolated_request_failure is not None and is_isolated_request_failure(current):
+            return False
         if isinstance(current, transport_error_types):
             transport_error_found = True
 
@@ -4255,6 +4263,22 @@ def _is_failed_http_transport(exc: BaseException) -> bool:
     except ImportError:  # pragma: no cover - httpx is supplied by the MCP SDK
         return False
     return isinstance(exc, MCPTransportFailedError)
+
+
+def _retryable_read_gateway_status(
+    exc: BaseException, server_name: str, tool_name: str,
+) -> Optional[int]:
+    """Return the gateway status that makes this read-only call retryable."""
+    try:
+        from tools.mcp_http_guard import gateway_status_of
+    except ImportError:  # pragma: no cover - httpx is supplied by the MCP SDK
+        return None
+    status = gateway_status_of(exc)
+    if status is None:
+        return None
+    if not is_mcp_tool_parallel_read_safe(mcp_prefixed_tool_name(server_name, tool_name)):
+        return None
+    return status
 
 
 def _handle_session_expired_and_retry(
@@ -5029,8 +5053,23 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         def _call_once():
             return _run_on_mcp_loop(_call, timeout=tool_timeout)
 
+        def _call_retrying_read_once():
+            try:
+                return _call_once()
+            except Exception as exc:
+                status = _retryable_read_gateway_status(exc, server_name, tool_name)
+                if status is None:
+                    raise
+                # A gateway failed before the server answered. Replaying is
+                # safe only for a known read-only call; a write never is.
+                logger.warning(
+                    "MCP tool %s/%s: gateway answered HTTP %d; retrying this "
+                    "read-only call once", server_name, tool_name, status,
+                )
+                return _call_once()
+
         try:
-            result = _call_once()
+            result = _call_retrying_read_once()
             # The RPC round-trip completed, so the server is reachable —
             # even when the payload is an application-level tool error
             # (``result.isError``, e.g. a "not found" lookup). Only the
