@@ -54,6 +54,19 @@ def test_is_session_expired_detects_session_terminated():
     assert _is_session_expired_error(RuntimeError("Session terminated")) is True
 
 
+def test_calls_failed_by_the_http_guard_are_never_replayed():
+    """The guard fails calls whose request may already have been accepted;
+    a transport-sounding cause must not route them through the retry."""
+    from tools.mcp_http_guard import MCPRateLimitedError, MCPTransportFailedError
+    from tools.mcp_tool import _is_session_expired_error
+
+    assert _is_session_expired_error(MCPTransportFailedError(
+        "MCP HTTP transport failed before the call completed "
+        "(WriteError: [Errno 32] Broken pipe); the request was not replayed."
+    )) is False
+    assert _is_session_expired_error(MCPRateLimitedError("connection closed")) is False
+
+
 def test_is_session_expired_detects_stale_pipe_and_closed_transport_variants():
     """Stdio/AnyIO stale-pipe failures usually surface as closed-resource
     or broken-pipe text, not an HTTP session-expired JSON-RPC error."""

@@ -2037,7 +2037,7 @@ class TestHTTPConfig:
             captured.clear()
             with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", True), \
                  patch("tools.mcp_tool._MCP_NEW_HTTP", new_http), \
-                 patch("httpx.AsyncClient", DummyAsyncClient), \
+                 patch("tools.mcp_http_guard.RequestScopedFailureClient", DummyAsyncClient), \
                  patch("tools.mcp_tool.streamable_http_client", return_value=DummyTransportCtx()), \
                  patch("tools.mcp_tool.streamablehttp_client", side_effect=lambda url, **kwargs: DummyLegacyTransportCtx(**kwargs)), \
                  patch("tools.mcp_tool.ClientSession", DummySession), \
