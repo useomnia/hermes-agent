@@ -167,7 +167,17 @@ def test_transport_error_leaves_the_calls_beside_it_running(mock_server):
 def test_write_is_never_retried_after_a_gateway_error(mock_server):
     result = json.loads(_handler("update-brand")({"brand": "unavailable"}))
     assert "HTTP 503 Service Unavailable" in result["error"]
+    assert "outcome_uncertain" not in result
     assert mock_server.attempts == {"unavailable": 1}
+    assert mock_server.initialized == 1
+
+
+def test_write_answered_by_a_gateway_reports_an_uncertain_outcome(mock_server):
+    """A 502 or 504 can come back after the server already ran the write."""
+    result = json.loads(_handler("update-brand")({"brand": "bad"}))
+    assert result.get("outcome_uncertain") is True, result
+    assert "HTTP 502 Bad Gateway" in result["error"]
+    assert mock_server.attempts == {"bad": 1}
     assert mock_server.initialized == 1
 
 

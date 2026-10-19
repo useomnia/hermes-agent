@@ -277,7 +277,11 @@ class _IsolatedFailure(Exception):
     (_IsolatedFailure({"transportError": "ReadTimeout"}), True),
     (_IsolatedFailure({"transportError": "ConnectError"}), False),
     (_IsolatedFailure({"transportError": "ConnectTimeout"}), False),
-    (_IsolatedFailure({"httpStatus": 502}), False),
+    (_IsolatedFailure({"httpStatus": 502}), True),
+    (_IsolatedFailure({"httpStatus": 504}), True),
+    (_IsolatedFailure({"httpStatus": 503}), False),
+    (_IsolatedFailure({"httpStatus": 500}), False),
+    (_IsolatedFailure({"httpStatus": 429}), False),
     (RuntimeError("tool raised"), False),
 ])
 def test_outcome_is_unknown_only_when_the_request_may_have_reached_the_server(failure, unknown):

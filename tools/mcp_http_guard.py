@@ -97,13 +97,19 @@ def _isolated_failure_data(error: BaseException) -> Optional[dict]:
 
 # Transport errors raised before the request left Hermes: the outcome is known.
 _NOT_SENT_TRANSPORT_ERRORS = frozenset({"ConnectError", "ConnectTimeout", "PoolTimeout"})
+# A gateway answered for a server it reached (or timed out waiting for), so the
+# request may have run. A 503 or another status is the server's own answer.
+_MAYBE_LANDED_STATUSES = frozenset({502, 504})
 
 
 def outcome_may_be_unknown(error: BaseException) -> bool:
     """Return True if the call failed after its request may have reached the server."""
     if isinstance(error, MCPTransportFailedError):
         return True
-    name = (_isolated_failure_data(error) or {}).get("transportError")
+    data = _isolated_failure_data(error) or {}
+    if data.get("httpStatus") in _MAYBE_LANDED_STATUSES:
+        return True
+    name = data.get("transportError")
     return name is not None and name not in _NOT_SENT_TRANSPORT_ERRORS
 
 
