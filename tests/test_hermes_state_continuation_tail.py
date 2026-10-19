@@ -296,3 +296,147 @@ class TestContextNotes:
         assert close(db, {"kind": "answer", "tool_call_id": "unknown", "content": "yes"},
                      notes=["alpha"], continuation_id="turn-1")[0] == "not_found"
         assert len(db.get_messages_as_conversation("s1")) == 2
+
+
+def _describe(late):
+    return f"late {late['kind']} for {late['tool_call_id']} ({late['tool_name']})"
+
+
+def moved_on(db, *calls):
+    """A tool-call block left open, then a later message and its finished reply."""
+    assistant_calls(db, *calls)
+    db.append_message("s1", "user", "never mind, change the list")
+    db.append_message("s1", "assistant", "Changed it.")
+
+
+def close_late(db, step, **kwargs):
+    kwargs.setdefault("continuation_id", "turn-late")
+    return close(db, step, describe_late_close=_describe, **kwargs)
+
+
+class TestPastTail:
+    ANSWER = {"kind": "answer", "tool_call_id": "q1", "content": '{"status": "answered"}'}
+
+    def test_answer_closes_an_open_question_the_conversation_moved_past(self, db):
+        from agent.context_notes import context_note_message
+
+        moved_on(db, _call("q1", "request_user_input"))
+
+        status, info = close_late(db, self.ANSWER)
+
+        assert status == "ok"
+        assert info["tail"] == "past_tail"
+        assert info["closed"] == ["q1"]
+        assert info["late"]["tool_name"] == "request_user_input"
+        assert info["notes"] == ["late answer for q1 (request_user_input)"]
+        rows = db.get_messages_as_conversation("s1")
+        assert tool_rows(db) == []
+        late = rows[1]["display_metadata"]["_omnio_late_closes"]["q1"]
+        assert late["content"] == '{"status": "answered"}'
+        assert rows[-1]["role"] == "user"
+        assert rows[-1]["content"] == context_note_message(info["notes"][0])["content"]
+
+    def test_without_a_note_writer_the_tail_rule_holds(self, db):
+        moved_on(db, _call("q1", "request_user_input"))
+
+        status, info = close(db, self.ANSWER)
+
+        assert (status, info["reason"]) == ("not_resumable", "final_assistant_message")
+
+    def test_replaying_the_same_continuation_adds_nothing(self, db):
+        moved_on(db, _call("q1", "request_user_input"))
+        close_late(db, self.ANSWER)
+        count = len(db.get_messages_as_conversation("s1"))
+
+        status, info = close_late(db, self.ANSWER)
+
+        assert status == "ok" and info["replayed"] is True
+        assert info["late"]["tool_call_id"] == "q1"
+        assert len(db.get_messages_as_conversation("s1")) == count
+
+    def test_a_different_answer_for_a_closed_call_conflicts(self, db):
+        moved_on(db, _call("q1", "request_user_input"))
+        close_late(db, self.ANSWER)
+
+        other = {**self.ANSWER, "content": '{"status": "other"}'}
+        assert close_late(db, other, continuation_id="turn-2")[0] == "conflict"
+
+    def test_a_call_with_a_stored_result_is_not_answered_again(self, db):
+        assistant_calls(db, _call("q1", "request_user_input"))
+        db.append_message("s1", "tool", INTERRUPTED, tool_call_id="q1", tool_name="request_user_input")
+        db.append_message("s1", "user", "later")
+        db.append_message("s1", "assistant", "done")
+
+        assert close_late(db, self.ANSWER)[0] == "conflict"
+
+    def test_the_close_must_match_the_call(self, db):
+        moved_on(db, _call("q1", "request_user_input"))
+
+        step = {"kind": "approval", "tool_call_id": "q1", "scope": "once", "content": None}
+        assert close_late(db, step) == ("not_found", {"reason": "wrong_call_kind"})
+
+    def test_an_unknown_call_keeps_the_existing_refusal(self, db):
+        moved_on(db, _call("q1", "request_user_input"))
+
+        step = {**self.ANSWER, "tool_call_id": "missing"}
+        status, info = close_late(db, step)
+
+        assert (status, info["reason"]) == ("not_resumable", "final_assistant_message")
+
+    def test_a_late_approval_records_that_the_call_has_not_run(self, db):
+        from agent.late_answers import LATE_APPROVAL_RESULT
+
+        moved_on(db, _call("w1", "mcp_write", '{"x": 1}'))
+
+        step = {"kind": "approval", "tool_call_id": "w1", "scope": "once", "content": None}
+        status, info = close_late(db, step)
+
+        assert status == "ok"
+        assert info["late"] == {"tool_call_id": "w1", "tool_name": "mcp_write", "arguments": '{"x": 1}'}
+        rows = db.get_messages_as_conversation("s1")
+        assert rows[1]["display_metadata"]["_omnio_late_closes"]["w1"]["content"] == LATE_APPROVAL_RESULT
+
+    def test_a_late_denial_records_its_reason(self, db):
+        moved_on(db, _call("w1", "mcp_write"))
+
+        step = {"kind": "approval", "tool_call_id": "w1", "scope": "deny", "content": "declined"}
+        assert close_late(db, step)[0] == "ok"
+        rows = db.get_messages_as_conversation("s1")
+        assert rows[1]["display_metadata"]["_omnio_late_closes"]["w1"]["content"] == "declined"
+
+    def test_another_open_card_at_the_tail_stays_open(self, db):
+        moved_on(db, _call("q1", "request_user_input"))
+        db.append_message("s1", "user", "and one more")
+        db.append_message("s1", "assistant", "", tool_calls=[_call("q2", "request_user_input")])
+
+        status, info = close_late(db, self.ANSWER)
+
+        assert status == "ok" and info["closed"] == ["q1"]
+        assert tool_rows(db) == []
+
+
+class TestLateCloseResults:
+    def test_late_answers_stand_in_for_their_calls_in_call_order(self):
+        from agent.late_answers import late_close_results
+
+        message = {
+            "role": "assistant",
+            "tool_calls": [_call("q1", "request_user_input"), _call("q2", "request_user_input")],
+            "display_metadata": {
+                "_omnio_late_closes": {
+                    "q2": {"tool_name": "request_user_input", "content": "b"},
+                    "q1": {"tool_name": "request_user_input", "content": "a"},
+                }
+            },
+        }
+
+        assert [(r["tool_call_id"], r["content"]) for r in late_close_results(message)] == [
+            ("q1", "a"),
+            ("q2", "b"),
+        ]
+
+    def test_other_messages_have_none(self):
+        from agent.late_answers import late_close_results
+
+        assert late_close_results({"role": "assistant", "content": "hi"}) == []
+        assert late_close_results({"role": "user", "content": "hi"}) == []

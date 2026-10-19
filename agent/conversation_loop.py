@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from agent import apply_patch_tool
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.late_answers import late_close_results
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -1591,6 +1592,9 @@ def run_conversation(
             # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
             # The signature field helps maintain reasoning continuity
             api_messages.append(api_msg)
+            # A call the User answered after the conversation moved on has its
+            # answer on its own row; it goes back next to the call here.
+            api_messages.extend(late_close_results(msg))
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).

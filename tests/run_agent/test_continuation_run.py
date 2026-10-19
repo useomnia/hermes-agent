@@ -158,3 +158,32 @@ def test_continuation_shared_state_follows_closed_history_without_persisting(run
     assert [message["role"] for message in sent] == ["user", "assistant", "tool", "user"]
     assert sent[-1]["content"] == state["content"]
     assert all(message.get("content") != state["content"] for message in result["messages"])
+
+
+def test_a_late_answer_reaches_the_model_next_to_its_call(run):
+    history = [
+        {"role": "user", "content": "pick a colour"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [_call("q1", "request_user_input")],
+            "display_metadata": {
+                "_omnio_late_closes": {
+                    "q1": {"tool_name": "request_user_input", "content": '{"status": "answered"}'}
+                }
+            },
+        },
+        {"role": "user", "content": "also suggest a font"},
+        {"role": "assistant", "content": "Inter would work."},
+        {"role": "user", "content": "[note] The user has now answered your earlier request."},
+    ]
+    _, requests, _ = run(history)
+
+    sent = [m for m in requests[0] if m["role"] != "system"]
+    assert [(m["role"], m.get("tool_call_id")) for m in sent[:3]] == [
+        ("user", None),
+        ("assistant", None),
+        ("tool", "q1"),
+    ]
+    assert sent[2]["content"] == '{"status": "answered"}'
+    assert all("display_metadata" not in m for m in sent)

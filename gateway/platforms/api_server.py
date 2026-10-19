@@ -177,7 +177,9 @@ def _complete_brand_setup_succeeded(function_result: Any) -> bool:
 
 
 # 3: continuations carry durable application notes after their closing results.
-TURN_CONTINUATION_API_VERSION = 3
+# 4: a late answer or approval closes its open call even after the conversation
+#    moved on past it.
+TURN_CONTINUATION_API_VERSION = 4
 _CONTINUATION_APPROVAL_SCOPES = frozenset({"once", "session", "always", "deny"})
 _CONTINUATION_INTERRUPTED_RESULT = json.dumps(
     {
@@ -189,6 +191,28 @@ _CONTINUATION_INTERRUPTED_RESULT = json.dumps(
     },
     ensure_ascii=False,
 )
+
+
+def _late_close_note(late: Dict[str, Any]) -> str:
+    """What the model is told when the User closes a call the conversation moved past."""
+    name, call_id = late["tool_name"], late["tool_call_id"]
+    if late["kind"] == "answer":
+        return (
+            f"The user has now answered your earlier request `{name}` (call {call_id}), "
+            "which timed out before they replied. Their answer is recorded as that "
+            "call's result. Carry on from it, taking into account everything that "
+            "happened since."
+        )
+    if late.get("scope") == "deny":
+        return (
+            f"After its approval request timed out, the user declined `{name}` "
+            f"(call {call_id}). It was not performed."
+        )
+    return (
+        f"After its approval request timed out, the user approved `{name}` (call {call_id}). "
+        "It has not run yet. The approval applies to the same arguments if the call "
+        "is still needed."
+    )
 
 
 def _pending_call(value: Any) -> Optional[Dict[str, Any]]:
@@ -4066,6 +4090,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 notes=[*(notes or []), *([generated_note] if generated_note else [])],
                 continuation_id=continuation_id,
                 request_key=request_key,
+                describe_late_close=_late_close_note,
             )
 
         status, info = await asyncio.to_thread(_close, close)
@@ -4113,6 +4138,25 @@ class APIServerAdapter(BasePlatformAdapter):
                         nested_arguments,
                         close["scope"],
                     )
+        late = info.get("late") if status == "ok" else None
+        if (
+            isinstance(late, dict)
+            and close is not None
+            and close.get("kind") == "approval"
+            and close.get("scope") != "deny"
+        ):
+            # The approved call is no longer the tail, so the continuation
+            # cannot re-dispatch it: the model's next matching call is granted.
+            try:
+                late_arguments = json.loads(late.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                late_arguments = {}
+            record_late_approval(
+                grant_session_key,
+                late["tool_name"],
+                late_arguments if isinstance(late_arguments, dict) else {},
+                close["scope"],
+            )
         if status == "ok":
             saved_notes = info.get("notes") or []
             if len(saved_notes) > len(notes or []):
@@ -4125,7 +4169,7 @@ class APIServerAdapter(BasePlatformAdapter):
             closed: List[Dict[str, Any]] = []
             target_id = close.get("tool_call_id") if isinstance(close, dict) else None
             closed_ids = list(info.get("closed") or [])
-            if note is not None and target_id is not None:
+            if note is not None and target_id is not None and target_id not in closed_ids:
                 closed_ids.append(target_id)
             for call_id in closed_ids:
                 entry: Dict[str, Any] = {"tool_call_id": call_id, "kind": "interrupted"}

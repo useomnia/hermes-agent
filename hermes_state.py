@@ -27,6 +27,7 @@ import threading
 import time
 from pathlib import Path
 
+from agent.late_answers import LATE_APPROVAL_RESULT, LATE_CLOSES_KEY
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
 from agent.skill_commands import (
@@ -6788,6 +6789,7 @@ class SessionDB:
         notes: Optional[List[str]] = None,
         continuation_id: Optional[str] = None,
         request_key: Optional[str] = None,
+        describe_late_close: Optional[Callable[[Dict[str, Any]], str]] = None,
     ) -> tuple[str, Dict[str, Any]]:
         """Make a session's durable tail resumable for a no-user continuation.
 
@@ -6813,6 +6815,12 @@ class SessionDB:
         interrupted. Replaying the same closing step is idempotent; a
         different decision for an already-closed call is a conflict.
 
+        With ``describe_late_close``, an answer or approval may also close an
+        open call the conversation has since moved past. Its assistant row
+        records the answer (see ``agent.late_answers``), its siblings stay as
+        they are, and the note ``describe_late_close`` writes for it follows
+        the current tail, which the continuation then resumes from.
+
         Returns ``("ok" | "not_resumable" | "not_found" | "conflict", info)``.
         """
         kind = close.get("kind") if isinstance(close, dict) else None
@@ -6825,17 +6833,18 @@ class SessionDB:
             {"close": close, "notes": notes}, sort_keys=True, ensure_ascii=False
         )
 
-        def _with_notes(conn, anchor, info, *, deferred=False):
-            if not notes:
+        def _with_notes(conn, anchor, info, *, deferred=False, extra_notes=()):
+            all_notes = [*notes, *extra_notes]
+            if not all_notes:
                 return "ok", info
             from agent.context_notes import context_note_message
 
-            info = {**info, "notes": notes}
+            info = {**info, "notes": all_notes}
             metadata = self._decode_display_metadata(anchor["display_metadata"]) or {}
             receipts = metadata.setdefault("_omnio_continuation_notes", {})
             receipts[continuation_id] = {
                 "request_key": request_key,
-                "notes": notes,
+                "notes": all_notes,
                 "deferred": deferred,
                 "info": info,
             }
@@ -6844,7 +6853,7 @@ class SessionDB:
                 (self._encode_display_metadata(metadata), anchor["id"]),
             )
             if not deferred:
-                for note in notes:
+                for note in all_notes:
                     conn.execute(
                         "INSERT INTO messages "
                         "(session_id, role, content, timestamp, observed, active, display_kind) "
@@ -6853,7 +6862,7 @@ class SessionDB:
                     )
                 conn.execute(
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
-                    (len(notes), session_id),
+                    (len(all_notes), session_id),
                 )
             return "ok", info
 
@@ -6885,6 +6894,81 @@ class SessionDB:
                 (session_id,),
             )
 
+        def _close_past_tail(conn, rows, tail_idx):
+            """Close an open call earlier than the tail block; None when there is none."""
+            owner = None
+            for row in reversed(rows[:tail_idx]):
+                if row["role"] != "assistant":
+                    continue
+                call = next(
+                    (call for call in _calls(row["tool_calls"]) if call.get("id") == target_id),
+                    None,
+                )
+                if call is not None:
+                    owner = (row, call)
+                    break
+            if owner is None:
+                return None
+            row, call = owner
+            name = _call_name(call)
+            if name is None:
+                return "not_found", {"reason": "unknown_call"}
+            if (kind == "answer") != is_interaction_tool(name):
+                return "not_found", {"reason": "wrong_call_kind"}
+            if not continuation_id:
+                raise ValueError("continuation_id is required to close a call past the tail")
+            granted = kind == "approval" and close.get("scope") != "deny"
+            content = LATE_APPROVAL_RESULT if granted else close.get("content")
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False)
+            recorded = {
+                "kind": kind,
+                "tool_name": name,
+                "content": content,
+                "scope": close.get("scope"),
+            }
+            metadata = self._decode_display_metadata(row["display_metadata"]) or {}
+            closes = metadata.get(LATE_CLOSES_KEY)
+            if not isinstance(closes, dict):
+                closes = {}
+            existing = closes.get(target_id)
+            stored = next(
+                (other for other in rows if other["role"] == "tool" and other["tool_call_id"] == target_id),
+                None,
+            )
+            if existing is not None or stored is not None:
+                same = (
+                    existing == recorded
+                    if existing is not None
+                    else stored["content"] == self._encode_content(content)
+                )
+                return ("ok", {"replayed": True}) if same else ("conflict", {"replayed": True})
+            closes[target_id] = recorded
+            metadata[LATE_CLOSES_KEY] = closes
+            conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                (self._encode_display_metadata(metadata), row["id"]),
+            )
+            raw_arguments = (call.get("function") or {}).get("arguments")
+            arguments = raw_arguments if isinstance(raw_arguments, str) else "{}"
+            note = describe_late_close({
+                "kind": kind,
+                "tool_call_id": target_id,
+                "tool_name": name,
+                "arguments": arguments,
+                "scope": close.get("scope"),
+            })
+            tail = conn.execute(
+                "SELECT id, display_metadata FROM messages WHERE id = ?", (rows[tail_idx]["id"],)
+            ).fetchone()
+            late = {"tool_call_id": target_id, "tool_name": name, "arguments": arguments}
+            return _with_notes(
+                conn,
+                tail,
+                {"tail": "past_tail", "closed": [target_id], "late": late},
+                extra_notes=[note],
+            )
+
         def _do(conn):
             rows = conn.execute(
                 "SELECT id, role, content, tool_call_id, tool_calls, display_metadata "
@@ -6913,6 +6997,15 @@ class SessionDB:
             if assistant_idx is None:
                 return "not_resumable", {"reason": "orphan_tool_results"}
             anchor = rows[assistant_idx]
+            if (
+                describe_late_close is not None
+                and kind in ("answer", "approval")
+                and isinstance(target_id, str)
+                and not any(call.get("id") == target_id for call in _calls(anchor["tool_calls"]))
+            ):
+                past = _close_past_tail(conn, rows, assistant_idx)
+                if past is not None:
+                    return past
             if anchor["role"] == "user":
                 if assistant_idx != len(rows) - 1:
                     return "not_resumable", {"reason": "orphan_tool_results"}

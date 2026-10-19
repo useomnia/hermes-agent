@@ -657,3 +657,51 @@ async def test_continuation_notes_reach_history_without_changing_instructions(ad
 def test_continuation_rejects_invalid_notes(notes):
     with pytest.raises(ValueError):
         _parse_continuation({"notes": notes})
+
+
+@pytest.mark.asyncio
+async def test_late_answer_closes_a_question_the_conversation_moved_past(adapter, db):
+    db.append_message(SESSION, "user", "pick a colour")
+    db.append_message(SESSION, "assistant", "", tool_calls=[_call("q1", "request_user_input")])
+    db.append_message(SESSION, "user", "actually, also suggest a font")
+    db.append_message(SESSION, "assistant", "Inter would work.")
+    agent = _agent()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            response = await client.post(
+                "/v1/runs",
+                headers=AUTH,
+                json=_continue({"kind": "answer", "tool_call_id": "q1", "response": "Blue"}),
+            )
+            kwargs = await _wait_for_run(agent)
+
+    assert response.status == 202
+    history = kwargs["conversation_history"]
+    assert [m["role"] for m in history] == ["user", "assistant", "user", "assistant", "user"]
+    late = history[1]["display_metadata"]["_omnio_late_closes"]["q1"]
+    assert json.loads(late["content"]) == {"status": "answered", "response": "Blue"}
+    assert "has now answered your earlier request `request_user_input`" in history[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_late_approval_past_the_tail_grants_the_next_matching_call(adapter, db):
+    db.append_message(SESSION, "user", "write it")
+    db.append_message(
+        SESSION, "assistant", "", tool_calls=[_call("w1", "mcp_connectors_write", '{"id": 7}')]
+    )
+    db.append_message(SESSION, "user", "something else first")
+    db.append_message(SESSION, "assistant", "Done.")
+    grant_key = adapter._scoped_tool_approval_session_key(SESSION, adapter._effective_request_profile())
+    agent = _agent()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            response = await client.post(
+                "/v1/runs",
+                headers=AUTH,
+                json=_continue({"kind": "approval", "tool_call_id": "w1", "scope": "once"}),
+            )
+            kwargs = await _wait_for_run(agent)
+
+    assert response.status == 202
+    assert "approved `mcp_connectors_write` (call w1)" in kwargs["conversation_history"][-1]["content"]
+    assert tool_approval.consume_once_approval(grant_key, "w2", "mcp_connectors_write", {"id": 7})

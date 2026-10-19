@@ -31,6 +31,7 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH, VALID
 from agent import apply_patch_tool
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
+from agent.late_answers import late_close_results
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint, is_openrouter_preset_model
@@ -2173,6 +2174,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                             _sanitize_model = _agg_slot["model"]
                 agent._sanitize_tool_calls_for_strict_api(api_msg, model=_sanitize_model)
             api_messages.append(api_msg)
+            api_messages.extend(late_close_results(msg))
 
         effective_system = agent._cached_system_prompt or ""
         if agent.ephemeral_system_prompt:
