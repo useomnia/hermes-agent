@@ -138,7 +138,7 @@ _OMNIO_APPROVALS_AGENT_WAIT_TIMEOUT_SECONDS = (
 _OMNIO_TURN_FINALIZE_HOOK_ENV = "OMNIO_TURN_FINALIZE_HOOK"
 _OMNIO_TURN_FINALIZE_TIMEOUT_ENV = "OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS"
 # Set by the Omnio proxy launcher (not a user setting). Called once when a
-# background memory review changed something, after the turn already closed.
+# background memory review changed a memory store, after the turn already closed.
 _OMNIO_MEMORY_UPDATED_HOOK_ENV = "OMNIO_MEMORY_UPDATED_HOOK"
 _OMNIO_MEMORY_UPDATED_TIMEOUT_SECONDS = 5.0
 # The hook may persist deliverables to durable storage before returning, so its
@@ -9323,11 +9323,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent = await self._run_in_executor_tracked(_build_agent)
                 agent.context_notes_callback = _context_notes_cb
 
-                def _memory_review_cb(_summary: str) -> None:
+                def _memory_review_cb(summary: str) -> None:
                     # Runs in the background-review thread, after this turn's
                     # terminal event: tell the proxy over its own hook instead.
+                    # ``summary`` is a ReviewSummary carrying the memory stores
+                    # the review changed; a skill-only review has none.
                     hook_url = os.environ.get(_OMNIO_MEMORY_UPDATED_HOOK_ENV)
-                    if not hook_url:
+                    targets = list(getattr(summary, "memory_targets", ()) or ())
+                    if not hook_url or not targets:
                         return
                     coro = _notify_memory_updated(
                         hook_url,
@@ -9335,6 +9338,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             "run_id": run_id,
                             "turn_id": turn_id,
                             "session_id": session_id,
+                            "targets": targets,
                         },
                     )
                     try:

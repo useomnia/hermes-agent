@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from agent.thread_scoped_output import thread_scoped_silence
 
@@ -605,6 +605,79 @@ def summarize_background_review_actions(
     return actions
 
 
+class ReviewSummary(str):
+    """Review summary text that also carries which memory stores changed.
+
+    A plain ``str`` for every existing ``background_review_callback``; callers
+    that need structured data read ``memory_targets`` instead of parsing text.
+    """
+
+    memory_targets: Tuple[str, ...] = ()
+
+    def __new__(cls, text: str, memory_targets: Iterable[str] = ()) -> "ReviewSummary":
+        obj = super().__new__(cls, text)
+        obj.memory_targets = tuple(memory_targets)
+        return obj
+
+
+def changed_memory_targets(
+    review_messages: List[Dict],
+    prior_snapshot: List[Dict],
+) -> List[str]:
+    """Return the distinct memory stores (``memory``/``user``) a review changed.
+
+    Pairs each ``memory`` tool call with its successful result, skipping tool
+    messages already in ``prior_snapshot`` (same stale-result rule as
+    ``summarize_background_review_actions``, issue #14944). Duplicate-entry
+    no-ops and read-only/failed calls are not changes. Independent of
+    ``notification_mode`` and of the summary wording.
+    """
+    prior_ids = {
+        m.get("tool_call_id")
+        for m in prior_snapshot or []
+        if isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id")
+    }
+
+    memory_calls: Dict[str, Dict[str, Any]] = {}
+    for msg in review_messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls", []) or []:
+            if not isinstance(tc, dict) or not tc.get("id"):
+                continue
+            fn = tc.get("function", {}) or {}
+            if fn.get("name") != "memory":
+                continue
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            memory_calls[tc["id"]] = args if isinstance(args, dict) else {}
+
+    targets: List[str] = []
+    for msg in review_messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        tcid = msg.get("tool_call_id")
+        if not tcid or tcid in prior_ids or tcid not in memory_calls:
+            continue
+        try:
+            data = json.loads(msg.get("content", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(data, dict) or not data.get("success"):
+            continue
+        if "no duplicate added" in str(data.get("message", "")).lower():
+            continue
+        args = memory_calls[tcid]
+        if not (args.get("operations") or args.get("action") in {"add", "replace", "remove"}):
+            continue
+        target = data.get("target") or args.get("target") or "memory"
+        if target in {"memory", "user"} and target not in targets:
+            targets.append(target)
+    return targets
+
+
 def build_memory_write_metadata(
     agent: Any,
     *,
@@ -935,8 +1008,17 @@ def _run_review_in_thread(
             _bg_cb = agent.background_review_callback
             if _bg_cb:
                 try:
+                    try:
+                        _memory_targets = changed_memory_targets(
+                            review_messages, messages_snapshot
+                        )
+                    except Exception:
+                        _memory_targets = []
                     _bg_cb(
-                        f"💾 Self-improvement review: {summary}"
+                        ReviewSummary(
+                            f"💾 Self-improvement review: {summary}",
+                            _memory_targets,
+                        )
                     )
                 except Exception:
                     pass
@@ -1005,5 +1087,7 @@ __all__ = [
     "_COMBINED_REVIEW_PROMPT",
     "spawn_background_review_thread",
     "summarize_background_review_actions",
+    "changed_memory_targets",
+    "ReviewSummary",
     "build_memory_write_metadata",
 ]
