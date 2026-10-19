@@ -66,6 +66,56 @@ async def test_call_started_after_the_transport_ended_keeps_the_sdk_error():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("message", [
+    "SSE stream failed: ReadError",
+    "SSE stream ended without a response",
+    "SSE stream ended and reconnection attempts were exhausted",
+])
+async def test_call_whose_response_stream_broke_is_not_replayed(message):
+    from mcp.shared.exceptions import MCPError
+
+    guard = HTTPToolCallGuard()
+
+    async def abandoned():
+        raise MCPError(code=-32000, message=message)
+
+    with pytest.raises(MCPTransportFailedError, match="not replayed"):
+        await guard.call(abandoned)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", [
+    "Quota exhausted: upgrade your plan",
+    "Invalid or expired session",
+])
+async def test_server_error_with_the_same_code_keeps_its_own_error(message):
+    from mcp.shared.exceptions import MCPError
+
+    guard = HTTPToolCallGuard()
+
+    async def server_error():
+        raise MCPError(code=-32000, message=message)
+
+    with pytest.raises(MCPError, match=message) as raised:
+        await guard.call(server_error)
+    assert not isinstance(raised.value, MCPTransportFailedError)
+
+
+@pytest.mark.asyncio
+async def test_server_connection_closed_error_with_data_keeps_its_own_error():
+    from mcp.shared.exceptions import MCPError
+
+    guard = HTTPToolCallGuard()
+
+    async def server_error():
+        raise MCPError(code=-32000, message="Connection closed", data={"detail": "upstream"})
+
+    with pytest.raises(MCPError) as raised:
+        await guard.call(server_error)
+    assert not isinstance(raised.value, MCPTransportFailedError)
+
+
+@pytest.mark.asyncio
 async def test_isolated_transport_error_keeps_its_own_error():
     from mcp.shared.exceptions import MCPError
 
