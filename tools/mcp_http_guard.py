@@ -19,8 +19,10 @@ logger = logging.getLogger(__name__)
 _Result = TypeVar("_Result")
 
 # JSON-RPC code the SDK resolves a waiting request with once its connection
-# closes (mcp.types.CONNECTION_CLOSED).
+# closes (mcp.types.CONNECTION_CLOSED), and the messages it uses when the
+# response stream of a sent request breaks.
 _JSONRPC_CONNECTION_CLOSED = -32000
+_SDK_STREAM_ABANDONED_PREFIXES = ("SSE stream failed: ", "SSE stream ended ")
 
 
 class MCPTransportFailedError(RuntimeError):
@@ -142,9 +144,16 @@ class RequestScopedFailureClient(httpx.AsyncClient):
 
 
 def _closed_with_its_connection(error: BaseException) -> bool:
-    """Return True if the SDK resolved this call because its connection closed."""
-    code = getattr(getattr(error, "error", None), "code", None)
-    return code == _JSONRPC_CONNECTION_CLOSED and not is_isolated_request_failure(error)
+    """Return True if the SDK, not the server, resolved this call because its connection closed.
+
+    Servers also answer with -32000, so the SDK's own closure is recognised by
+    its fixed messages and absent data; a server's error keeps its handling.
+    """
+    data = getattr(error, "error", None)
+    if getattr(data, "code", None) != _JSONRPC_CONNECTION_CLOSED or getattr(data, "data", None) is not None:
+        return False
+    message = getattr(data, "message", "")
+    return message == "Connection closed" or message.startswith(_SDK_STREAM_ABANDONED_PREFIXES)
 
 
 class HTTPToolCallGuard:
