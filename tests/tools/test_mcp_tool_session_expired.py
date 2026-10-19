@@ -394,6 +394,8 @@ def test_call_tool_handler_rebuilds_configured_server_transport(
 
     try:
         assert transport_ready.wait(3), "server lifecycle did not establish transport"
+        # Only a tool annotated readOnlyHint=True is replayed after session expiry.
+        mcp_tool._mcp_tool_read_only_hints[mcp_tool.mcp_prefixed_tool_name("resumed", "health")] = True
         handler = _make_tool_handler("resumed", "health", 10.0)
         parsed = json.loads(handler({}))
 
@@ -406,6 +408,7 @@ def test_call_tool_handler_rebuilds_configured_server_transport(
     finally:
         loop.call_soon_threadsafe(server._shutdown_event.set)
         run_future.result(timeout=5)
+        mcp_tool._mcp_tool_read_only_hints.pop(mcp_tool.mcp_prefixed_tool_name("resumed", "health"), None)
         mcp_tool._servers.pop("resumed", None)
         mcp_tool._server_error_counts.pop("resumed", None)
         mcp_tool._server_breaker_opened_at.pop("resumed", None)
@@ -442,6 +445,8 @@ def test_call_tool_handler_reconnects_on_session_expired(monkeypatch, tmp_path):
     server.session.call_tool = _call_sequence
 
     try:
+        # Only a tool annotated readOnlyHint=True is replayed after session expiry.
+        mcp_tool._mcp_tool_read_only_hints[mcp_tool.mcp_prefixed_tool_name("wpcom", "wpcom-mcp-content-authoring")] = True
         handler = _make_tool_handler("wpcom", "wpcom-mcp-content-authoring", 10.0)
         out = handler({"slug": "hello"})
         parsed = json.loads(out)
@@ -459,6 +464,7 @@ def test_call_tool_handler_reconnects_on_session_expired(monkeypatch, tmp_path):
             f"Expected 1 original + 1 retry = 2 calls; got {call_count['n']}"
         )
     finally:
+        mcp_tool._mcp_tool_read_only_hints.pop(mcp_tool.mcp_prefixed_tool_name("wpcom", "wpcom-mcp-content-authoring"), None)
         mcp_tool._servers.pop("wpcom", None)
         mcp_tool._server_error_counts.pop("wpcom", None)
 
@@ -530,12 +536,15 @@ def test_session_expired_retry_waits_for_new_session(monkeypatch, tmp_path):
     )
 
     try:
+        # Only a tool annotated readOnlyHint=True is replayed after session expiry.
+        mcp_tool._mcp_tool_read_only_hints[mcp_tool.mcp_prefixed_tool_name("hindsight", "get_bank")] = True
         handler = _make_tool_handler("hindsight", "get_bank", 10.0)
         parsed = json.loads(handler({}))
         assert parsed.get("result") == "bank ok", parsed
         assert mcp_tool._server_error_counts.get("hindsight", 0) == 0
         assert "hindsight" not in mcp_tool._server_breaker_opened_at
     finally:
+        mcp_tool._mcp_tool_read_only_hints.pop(mcp_tool.mcp_prefixed_tool_name("hindsight", "get_bank"), None)
         mcp_tool._servers.pop("hindsight", None)
         mcp_tool._server_error_counts.pop("hindsight", None)
         mcp_tool._server_breaker_opened_at.pop("hindsight", None)
@@ -606,6 +615,17 @@ def test_session_expired_handler_returns_none_without_loop(monkeypatch):
             "Without an event loop, session-expired handler must fall "
             "through to caller's generic error path — not hang or raise."
         )
+        # A write-capable call still gets the outcome-uncertain verdict: a
+        # generic "call failed" would invite a replay of a write that may
+        # already have landed.
+        out = _handle_session_expired_and_retry(
+            "srv-noloop",
+            RuntimeError("Invalid or expired session"),
+            lambda: '{"ok": true}',
+            "tools/call",
+            call_may_have_side_effects=True,
+        )
+        assert out is not None and json.loads(out).get("outcome_uncertain") is True
     finally:
         mcp_tool._servers.pop("srv-noloop", None)
 
@@ -727,3 +747,198 @@ def test_non_tool_handlers_also_reconnect_on_session_expired(
     finally:
         mcp_tool._servers.pop(f"srv-{op_label}", None)
         mcp_tool._server_error_counts.pop(f"srv-{op_label}", None)
+
+
+# ---------------------------------------------------------------------------
+# At-most-once guard for write-capable tools: a session-expired/transport
+# failure on a call that may already have executed server-side must NOT be
+# auto-retried. The transport is healed and an outcome_uncertain error tells
+# the model to verify first. Only readOnlyHint=True tools keep the retry.
+# ---------------------------------------------------------------------------
+
+
+def _session_terminated_once(call_count):
+    async def _sequence(*a, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("Session terminated")
+        result = MagicMock()
+        result.is_error = False
+        result.content = [MagicMock(type="text", text="fresh data")]
+        result.structured_content = None
+        return result
+
+    return _sequence
+
+
+@pytest.mark.parametrize("read_only", [False, True], ids=["write-capable", "read-only"])
+def test_session_expired_retry_only_for_read_only_tools(monkeypatch, tmp_path, read_only):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    server, reconnect_flag = _install_stub_server("srv")
+    call_count = {"n": 0}
+    server.session.call_tool = _session_terminated_once(call_count)
+    mcp_tool._servers["srv"] = server
+    mcp_tool._server_error_counts.pop("srv", None)
+    tool = mcp_tool.mcp_prefixed_tool_name("srv", "tool")
+    if read_only:
+        mcp_tool._mcp_tool_read_only_hints[tool] = True
+    # else: no readOnlyHint entry -> fails safe to write-capable.
+
+    try:
+        parsed = json.loads(_make_tool_handler("srv", "tool", 10.0)({}))
+        assert reconnect_flag.is_set()  # transport healed either way
+        if read_only:
+            assert parsed.get("result") == "fresh data", parsed
+            assert call_count["n"] == 2  # original + one retry
+        else:
+            assert parsed.get("outcome_uncertain") is True, parsed
+            assert "may or may not have taken effect" in parsed["error"]
+            assert call_count["n"] == 1  # exactly one dispatch
+            # Successful reconnect clears breaker state (session-state failure, not server health).
+            assert mcp_tool._server_error_counts.get("srv", 0) == 0
+    finally:
+        mcp_tool._servers.pop("srv", None)
+        mcp_tool._server_error_counts.pop("srv", None)
+        mcp_tool._server_breaker_opened_at.pop("srv", None)
+        mcp_tool._mcp_tool_read_only_hints.pop(tool, None)
+
+
+def test_tool_annotated_as_a_write_is_not_replayed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    server, _ = _install_stub_server("srv-write")
+    call_count = {"n": 0}
+    server.session.call_tool = _session_terminated_once(call_count)
+    mcp_tool._servers["srv-write"] = server
+    tool = mcp_tool.mcp_prefixed_tool_name("srv-write", "discard")
+    mcp_tool._mcp_tool_read_only_hints[tool] = False
+
+    try:
+        parsed = json.loads(_make_tool_handler("srv-write", "discard", 10.0)({}))
+        assert parsed.get("outcome_uncertain") is True, parsed
+        assert call_count["n"] == 1
+    finally:
+        mcp_tool._servers.pop("srv-write", None)
+        mcp_tool._server_error_counts.pop("srv-write", None)
+        mcp_tool._mcp_tool_read_only_hints.pop(tool, None)
+
+
+# ---------------------------------------------------------------------------
+# Bounded recovery: the wait for a rebuilt session (handshake and discovery)
+# never exceeds the recovery budget or the caller's remaining deadline.
+# ---------------------------------------------------------------------------
+
+
+def test_session_recovery_wait_defaults_to_the_budget():
+    from tools.mcp_tool import _SESSION_RECOVERY_WAIT_SECONDS, _session_recovery_wait
+
+    assert _session_recovery_wait(None) == _SESSION_RECOVERY_WAIT_SECONDS
+
+
+def test_session_recovery_wait_is_capped_by_the_callers_deadline():
+    import time
+
+    from tools.mcp_tool import _session_recovery_wait
+
+    assert 1.5 < _session_recovery_wait(time.monotonic() + 2) <= 2
+
+
+def test_session_recovery_wait_is_zero_once_the_deadline_passed():
+    import time
+
+    from tools.mcp_tool import _session_recovery_wait
+
+    assert _session_recovery_wait(time.monotonic() - 1) == 0.0
+
+
+def test_read_is_not_replayed_once_the_callers_deadline_passed(monkeypatch):
+    import time
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _handle_session_expired_and_retry
+
+    server, reconnect_flag = _install_stub_server("srv-late")
+    mcp_tool._servers["srv-late"] = server
+    retried = []
+
+    try:
+        out = _handle_session_expired_and_retry(
+            "srv-late",
+            RuntimeError("Session terminated"),
+            lambda: retried.append(True) or '{"ok": true}',
+            "tools/call",
+            deadline=time.monotonic() - 1,
+        )
+        assert out is None
+        assert retried == []
+        assert not reconnect_flag.is_set()
+    finally:
+        mcp_tool._servers.pop("srv-late", None)
+
+
+def test_reconnect_wait_uses_the_callers_remaining_deadline(monkeypatch):
+    import time
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _handle_session_expired_and_retry
+
+    server, _ = _install_stub_server("srv-budget")
+    mcp_tool._servers["srv-budget"] = server
+    waits = []
+    monkeypatch.setattr(
+        mcp_tool, "_signal_reconnect_and_wait",
+        lambda name, srv, *, op_description, timeout: waits.append(timeout) or True,
+    )
+
+    try:
+        out = _handle_session_expired_and_retry(
+            "srv-budget",
+            RuntimeError("Session terminated"),
+            lambda: '{"ok": true}',
+            "tools/call",
+            deadline=time.monotonic() + 3,
+        )
+        assert out == '{"ok": true}'
+        assert len(waits) == 1 and 2.5 < waits[0] <= 3
+    finally:
+        mcp_tool._servers.pop("srv-budget", None)
+        mcp_tool._server_error_counts.pop("srv-budget", None)
+
+
+def test_replayed_read_gets_only_the_time_left_on_its_deadline(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    server, _ = _install_stub_server("srv-left")
+    call_count = {"n": 0}
+    server.session.call_tool = _session_terminated_once(call_count)
+    mcp_tool._servers["srv-left"] = server
+    tool = mcp_tool.mcp_prefixed_tool_name("srv-left", "read")
+    mcp_tool._mcp_tool_read_only_hints[tool] = True
+    timeouts = []
+    real_run = mcp_tool._run_on_mcp_loop
+
+    def _recording_run(coro_factory, *, timeout):
+        timeouts.append(timeout)
+        return real_run(coro_factory, timeout=timeout)
+
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", _recording_run)
+
+    try:
+        parsed = json.loads(_make_tool_handler("srv-left", "read", 10.0)({}))
+        assert parsed.get("result") == "fresh data", parsed
+        assert timeouts[0] == 10.0
+        assert len(timeouts) == 2 and timeouts[1] < 10.0
+    finally:
+        mcp_tool._servers.pop("srv-left", None)
+        mcp_tool._server_error_counts.pop("srv-left", None)
+        mcp_tool._mcp_tool_read_only_hints.pop(tool, None)

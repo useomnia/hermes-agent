@@ -4573,11 +4573,31 @@ def _is_failed_http_transport(exc: BaseException) -> bool:
     return isinstance(exc, MCPTransportFailedError)
 
 
+_SESSION_RECOVERY_WAIT_SECONDS = 10.0
+
+_SESSION_OUTCOME_UNCERTAIN_MSG = (
+    "The MCP transport session to '{s}' expired while this write-capable call was in flight, so the outcome is "
+    "UNKNOWN — the operation may or may not have taken effect server-side. It was NOT automatically retried to "
+    "avoid a duplicate side effect. The connection has {state}. Verify whether the operation took effect (e.g. "
+    "with a read-only tool) before re-invoking it."
+)
+
+
+def _session_recovery_wait(deadline: Optional[float]) -> float:
+    """Seconds to wait for a rebuilt session: the recovery budget, capped by the caller's deadline."""
+    if deadline is None:
+        return _SESSION_RECOVERY_WAIT_SECONDS
+    return max(0.0, min(_SESSION_RECOVERY_WAIT_SECONDS, deadline - time.monotonic()))
+
+
 def _handle_session_expired_and_retry(
     server_name: str,
     exc: BaseException,
     retry_call,
     op_description: str,
+    *,
+    call_may_have_side_effects: bool = False,
+    deadline: Optional[float] = None,
 ):
     """Trigger a transport reconnect and retry once on session expiry.
 
@@ -4589,29 +4609,76 @@ def _handle_session_expired_and_retry(
     and rebuild them, reusing the existing OAuth provider instance.
     See #13383.
 
+    At-most-once for writes: a session-expired shape can be synthesized by
+    a proxy AFTER the upstream executed the request, and the transport
+    errors this classifier also matches (``ClosedResourceError``, broken
+    pipe) routinely fire mid-response. With ``call_may_have_side_effects``
+    the transport is still healed but the call is never re-run; the caller
+    gets an ``outcome_uncertain`` error instead. Callers pass True unless
+    the tool is positively read-only.
+
+    The wait for the rebuilt session (handshake and discovery) is bounded
+    by ``_SESSION_RECOVERY_WAIT_SECONDS`` and by ``deadline``, the caller's
+    own ``time.monotonic()`` deadline.
+
     Args:
         server_name: Name of the MCP server that raised.
         exc: The exception from the failed call.
         retry_call: Zero-arg callable that re-runs the operation,
             returning the same JSON string format as the handler.
         op_description: Human-readable name of the operation (logs).
+        call_may_have_side_effects: True unless the operation is known
+            to be read-only.
+        deadline: The caller's ``time.monotonic()`` deadline, if any.
 
     Returns:
         A JSON string if reconnect + retry was attempted and produced
-        a response, or ``None`` to fall through to the caller's
-        generic error path (not a session-expired error, no server
-        record, reconnect didn't ready in time, or retry also failed).
+        a response, the ``outcome_uncertain`` error for a write-capable
+        call, or ``None`` to fall through to the caller's generic error
+        path (not a session-expired error, no server record, reconnect
+        didn't ready in time, or retry also failed).
     """
     if not _is_session_expired_error(exc):
         return None
 
     with _lock:
         srv = _servers.get(server_name)
-    if srv is None or not hasattr(srv, "_reconnect_event"):
-        return None
-
     loop = _mcp_loop
-    if loop is None or not loop.is_running():
+    reconnectable = (
+        srv is not None and hasattr(srv, "_reconnect_event")
+        and loop is not None and loop.is_running()
+    )
+
+    if call_may_have_side_effects:
+        # Even without a reconnectable server the outcome is uncertain: a
+        # generic "call failed" would invite a replay of a write that may
+        # already have landed.
+        reconnected = reconnectable and _signal_reconnect_and_wait(
+            server_name,
+            srv,
+            op_description=f"{op_description} (write, no auto-retry)",
+            timeout=_session_recovery_wait(deadline),
+        )
+        if reconnected:  # session state failed, not server health: no breaker strike
+            _reset_server_error(server_name)
+        else:
+            _bump_server_error(server_name)
+        logger.warning(
+            "MCP server '%s': %s failed with a session-expired/transport error after the "
+            "request may have been dispatched; NOT auto-retrying a write-capable tool "
+            "(reconnect %s).",
+            server_name, op_description, "succeeded" if reconnected else "failed",
+        )
+        return json.dumps({
+            "error": _SESSION_OUTCOME_UNCERTAIN_MSG.format(
+                s=server_name,
+                state="been re-established" if reconnected else "not recovered yet",
+            ),
+            "outcome_uncertain": True,
+            "server": server_name,
+        }, ensure_ascii=False)
+
+    if not reconnectable:
         return None
 
     logger.info(
@@ -4622,16 +4689,17 @@ def _handle_session_expired_and_retry(
 
     # Trigger the same reconnect mechanism the OAuth recovery path
     # uses, then wait briefly for the new session to come back ready.
-    if not _signal_reconnect_and_wait(
+    wait = _session_recovery_wait(deadline)
+    if wait <= 0 or not _signal_reconnect_and_wait(
         server_name,
         srv,
         op_description=op_description,
-        timeout=15,
+        timeout=wait,
     ):
         logger.warning(
-            "MCP server '%s': reconnect did not ready within 15s after "
+            "MCP server '%s': reconnect did not ready within %.1fs after "
             "session-expired error; falling through to error response.",
-            server_name,
+            server_name, wait,
         )
         return None
 
@@ -5346,6 +5414,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         def _call_once():
             return _run_on_mcp_loop(_call, timeout=tool_timeout)
 
+        deadline = time.monotonic() + tool_timeout
+
+        def _call_within_deadline():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"MCP call deadline ({tool_timeout}s) passed during session recovery"
+                )
+            return _run_on_mcp_loop(_call, timeout=remaining)
+
         try:
             result = _call_once()
             # The RPC round-trip completed, so the server is reachable —
@@ -5373,9 +5451,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # Transport session expiry (#13383): same reconnect flow
             # but skips OAuth recovery because the access token is
             # still valid — only the server-side session is stale.
+            # Only a tool annotated readOnlyHint=True is replayed; a 401 is
+            # always pre-dispatch, so the auth path above retries every tool.
             recovered = _handle_session_expired_and_retry(
-                server_name, exc, _call_once,
+                server_name, exc, _call_within_deadline,
                 f"tools/call {tool_name}",
+                call_may_have_side_effects=not mcp_tool_is_read_only(
+                    mcp_prefixed_tool_name(server_name, tool_name)
+                ),
+                deadline=deadline,
             )
             if recovered is not None:
                 return recovered
