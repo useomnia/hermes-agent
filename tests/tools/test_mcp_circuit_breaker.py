@@ -340,11 +340,11 @@ def test_app_level_tool_errors_do_not_trip_breaker(monkeypatch, tmp_path):
     async def _call_tool_app_error(*a, **kw):
         call_count["n"] += 1
         result = MagicMock()
-        result.isError = True
+        result.is_error = True
         block = MagicMock()
         block.text = "Prompt not found"
         result.content = [block]
-        result.structuredContent = None
+        result.structured_content = None
         return result
 
     _install_stub_server(mcp_tool, "srv", _call_tool_app_error)
@@ -381,11 +381,11 @@ def test_app_level_tool_error_closes_partially_tripped_breaker(
 
     async def _call_tool_app_error(*a, **kw):
         result = MagicMock()
-        result.isError = True
+        result.is_error = True
         block = MagicMock()
         block.text = "Prompt not found"
         result.content = [block]
-        result.structuredContent = None
+        result.structured_content = None
         return result
 
     _install_stub_server(mcp_tool, "srv", _call_tool_app_error)
