@@ -220,3 +220,14 @@ class _McpLikeError(Exception):
 ])
 def test_only_gateway_statuses_are_retryable(data, status):
     assert gateway_status_of(_McpLikeError(data)) == status
+
+
+@pytest.mark.asyncio
+async def test_failed_lifecycle_request_names_its_status_in_the_log(caplog):
+    async with _isolating_client(503) as client:
+        with caplog.at_level("WARNING", logger="tools.mcp_http_guard"):
+            response = await client.post(
+                "https://mcp.example/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            )
+    assert response.status_code == 503
+    assert "MCP HTTP tools/list https://mcp.example/mcp answered HTTP 503" in caplog.text

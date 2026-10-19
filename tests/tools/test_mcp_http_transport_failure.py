@@ -187,3 +187,15 @@ def test_isolated_failure_that_sounds_like_session_loss_is_not_replayed(mock_ser
     assert "Broken pipe" in result["error"]
     assert mock_server.attempts == {"pipe": 1}
     assert mock_server.initialized == 1
+
+
+def test_read_only_annotations_survive_the_sdk_field_rename(mock_server):
+    """mcp 2.x exposes ``readOnlyHint`` as ``read_only_hint``; reading the old
+    name alone made every Omnia read a write (approvals, no parallel reads)."""
+    from tools import mcp_tool
+
+    read = mcp_tool.mcp_prefixed_tool_name("mockhttp", "get-brand")
+    write = mcp_tool.mcp_prefixed_tool_name("mockhttp", "update-brand")
+    assert mcp_tool.is_mcp_tool_parallel_read_safe(read) is True
+    assert mcp_tool.is_mcp_tool_parallel_read_safe(write) is False
+    assert mcp_tool.mcp_tool_has_read_only_hint(write) is True

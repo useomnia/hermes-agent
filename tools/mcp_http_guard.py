@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from typing import Any, Callable, Coroutine, Optional, TypeVar
 
 from tools.mcp_tool import sdk_httpx
@@ -12,6 +13,8 @@ httpx = sdk_httpx()
 if httpx is None:  # pragma: no cover - no SDK, so no HTTP MCP session either
     import httpx
 
+
+logger = logging.getLogger(__name__)
 
 _Result = TypeVar("_Result")
 
@@ -58,15 +61,25 @@ _JSONRPC_INTERNAL_ERROR = -32603
 _JSONRPC_TRANSPORT_ERROR = -32000
 
 
-def _tool_call_request_id(request: httpx.Request) -> Any:
-    """Return the JSON-RPC id of a ``tools/call`` POST, else None."""
+def _jsonrpc_message(request: httpx.Request) -> Optional[dict]:
     if request.method != "POST":
         return None
     try:
         message = json.loads(request.content)
     except (ValueError, httpx.RequestNotRead):
         return None
-    if not isinstance(message, dict) or message.get("method") != "tools/call":
+    return message if isinstance(message, dict) else None
+
+
+def _jsonrpc_method(request: httpx.Request) -> Optional[str]:
+    method = (_jsonrpc_message(request) or {}).get("method")
+    return method if isinstance(method, str) else None
+
+
+def _tool_call_request_id(request: httpx.Request) -> Any:
+    """Return the JSON-RPC id of a ``tools/call`` POST, else None."""
+    message = _jsonrpc_message(request)
+    if message is None or message.get("method") != "tools/call":
         return None
     return message.get("id")
 
@@ -112,7 +125,16 @@ class RequestScopedFailureClient(httpx.AsyncClient):
     async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
         request_id = _tool_call_request_id(request)
         if request_id is None:
-            return await super().send(request, **kwargs)
+            response = await super().send(request, **kwargs)
+            if request.method == "POST" and response.status_code >= 400:
+                # The SDK reports this only as "Server returned an error
+                # response"; name the status so a failing endpoint is visible.
+                logger.warning(
+                    "MCP HTTP %s %s answered HTTP %s %s",
+                    _jsonrpc_method(request) or "request", request.url,
+                    response.status_code, response.reason_phrase,
+                )
+            return response
         try:
             response = await super().send(request, **kwargs)
         except httpx.TransportError as exc:
