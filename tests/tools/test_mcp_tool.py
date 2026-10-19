@@ -18,6 +18,18 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _stop_reason(result):
+    """Read a sampling result's stop reason across the mcp 1.x -> 2.x rename.
+
+    ``CreateMessageResult.stopReason`` became ``.stop_reason`` in mcp 2.0
+    (camelCase survives only as the serialization alias, which pydantic does
+    not expose to attribute access).
+    """
+    from tools.mcp_tool import mcp_field
+
+    return mcp_field(result, "stop_reason", "stopReason")
+
+
 def _make_mcp_tool(name="read_file", description="Read a file", input_schema=None):
     """Create a fake MCP Tool object matching the SDK interface."""
     tool = SimpleNamespace()
@@ -1985,7 +1997,7 @@ class TestHTTPConfig:
         asyncio.run(_test())
 
     def test_http_seeds_initial_protocol_header(self):
-        from tools.mcp_tool import LATEST_PROTOCOL_VERSION, MCPServerTask
+        from tools.mcp_tool import LATEST_HANDSHAKE_VERSION, MCPServerTask
 
         server = MCPServerTask("remote")
         captured = {}
@@ -2039,13 +2051,13 @@ class TestHTTPConfig:
                  patch("tools.mcp_tool._MCP_NEW_HTTP", new_http), \
                  patch("tools.mcp_http_guard.RequestScopedFailureClient", DummyAsyncClient), \
                  patch("tools.mcp_tool.streamable_http_client", return_value=DummyTransportCtx()), \
-                 patch("tools.mcp_tool.streamablehttp_client", side_effect=lambda url, **kwargs: DummyLegacyTransportCtx(**kwargs)), \
+                 patch("tools.mcp_tool.streamablehttp_client", side_effect=lambda url, **kwargs: DummyLegacyTransportCtx(**kwargs), create=True), \
                  patch("tools.mcp_tool.ClientSession", DummySession), \
                  patch.object(MCPServerTask, "_discover_tools", _discover_tools):
                 await server._run_http(config)
 
         asyncio.run(_run({"url": "https://example.com/mcp"}, new_http=True))
-        assert captured["headers"]["mcp-protocol-version"] == LATEST_PROTOCOL_VERSION
+        assert captured["headers"]["mcp-protocol-version"] == LATEST_HANDSHAKE_VERSION
 
         asyncio.run(_run({
             "url": "https://example.com/mcp",
@@ -2061,7 +2073,7 @@ class TestHTTPConfig:
         assert "mcp-protocol-version" not in captured["headers"]
 
         asyncio.run(_run({"url": "https://example.com/mcp"}, new_http=False))
-        assert captured["legacy_headers"]["mcp-protocol-version"] == LATEST_PROTOCOL_VERSION
+        assert captured["legacy_headers"]["mcp-protocol-version"] == LATEST_HANDSHAKE_VERSION
 
         asyncio.run(_run({
             "url": "https://example.com/mcp",
@@ -3227,7 +3239,7 @@ class TestSamplingCallbackText:
         assert result.content.text == "Hello from LLM"
         assert result.model == "test-model"
         assert result.role == "assistant"
-        assert result.stopReason == "endTurn"
+        assert _stop_reason(result) == "endTurn"
 
     def test_system_prompt_prepended(self):
         """System prompt is inserted as the first message."""
@@ -3287,7 +3299,9 @@ class TestSamplingCallbackText:
             result = asyncio.run(self.handler(None, params))
 
         assert isinstance(result, CreateMessageResult)
-        assert result.stopReason == "maxTokens"
+        from tools.mcp_tool import mcp_field
+
+        assert mcp_field(result, "stop_reason", "stopReason") == "maxTokens"
 
 
 # ---------------------------------------------------------------------------
@@ -3311,7 +3325,7 @@ class TestSamplingCallbackToolUse:
             result = asyncio.run(self.handler(None, params))
 
         assert isinstance(result, CreateMessageResultWithTools)
-        assert result.stopReason == "toolUse"
+        assert _stop_reason(result) == "toolUse"
         assert result.model == "test-model"
         assert len(result.content) == 1
         tc = result.content[0]

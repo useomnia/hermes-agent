@@ -116,11 +116,11 @@ def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
     async def _call_tool_success(*a, **kw):
         call_count["n"] += 1
         result = MagicMock()
-        result.isError = False
+        result.is_error = False
         block = MagicMock()
         block.text = "ok"
         result.content = [block]
-        result.structuredContent = None
+        result.structured_content = None
         return result
 
     _install_stub_server(mcp_tool, "srv", _call_tool_success)
@@ -279,11 +279,11 @@ def test_half_open_dead_session_recovers_after_reconnect(monkeypatch, tmp_path):
 
     async def _call_tool_success(*a, **kw):
         result = MagicMock()
-        result.isError = False
+        result.is_error = False
         block = MagicMock()
         block.text = "ok"
         result.content = [block]
-        result.structuredContent = None
+        result.structured_content = None
         return result
 
     server = _install_stub_server(mcp_tool, "srv", _call_tool_success)
@@ -340,11 +340,11 @@ def test_app_level_tool_errors_do_not_trip_breaker(monkeypatch, tmp_path):
     async def _call_tool_app_error(*a, **kw):
         call_count["n"] += 1
         result = MagicMock()
-        result.isError = True
+        result.is_error = True
         block = MagicMock()
         block.text = "Prompt not found"
         result.content = [block]
-        result.structuredContent = None
+        result.structured_content = None
         return result
 
     _install_stub_server(mcp_tool, "srv", _call_tool_app_error)
@@ -381,11 +381,11 @@ def test_app_level_tool_error_closes_partially_tripped_breaker(
 
     async def _call_tool_app_error(*a, **kw):
         result = MagicMock()
-        result.isError = True
+        result.is_error = True
         block = MagicMock()
         block.text = "Prompt not found"
         result.content = [block]
-        result.structuredContent = None
+        result.structured_content = None
         return result
 
     _install_stub_server(mcp_tool, "srv", _call_tool_app_error)
