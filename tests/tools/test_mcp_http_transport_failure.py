@@ -3,10 +3,11 @@
 MCP SDK 1.x tore the whole session down when one HTTP request failed and
 never answered the requests still in flight, so every concurrent parallel read
 waited for the full tool timeout. SDK 2.x isolates a failed status itself but
-drops it, and resolves calls in flight on a closed session as "Connection
-closed", which must not be replayed. A failed tool call now fails on its own, a
-known read-only call is retried once after a gateway error, and a session that
-does end fails its in-flight calls at once instead of stranding them.
+drops it, still ends the session on one request's transport error, and
+resolves calls in flight on a closed session as "Connection closed", which
+must not be replayed. A failed tool call now fails on its own without a
+replay, and a session that does end fails its in-flight calls at once instead
+of stranding them.
 """
 
 import asyncio
@@ -70,7 +71,7 @@ class _MockMCPServer:
                 await asyncio.Event().wait()
             if brand == "slow":
                 await asyncio.sleep(0.5)
-            if brand == "bad" or (brand == "flaky" and attempt == 1):
+            if brand == "bad":
                 return httpx.Response(502, text="Bad Gateway")
             if brand == "unavailable":
                 return httpx.Response(503, text="Service Unavailable")
@@ -127,22 +128,37 @@ def _handler(tool="get-brand"):
     return mcp_tool._make_tool_handler("mockhttp", tool, TOOL_TIMEOUT)
 
 
-def test_gateway_error_fails_only_its_own_read_and_retries_it_once(mock_server):
+def test_gateway_error_fails_only_its_own_read_without_a_retry(mock_server):
     read = _handler()
-    with concurrent.futures.ThreadPoolExecutor(5) as pool:
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
         started = time.monotonic()
         beside = [pool.submit(read, {"brand": "slow"}) for _ in range(3)]
         failed = pool.submit(read, {"brand": "bad"})
-        flaky = pool.submit(read, {"brand": "flaky"})
-        results = [future.result(timeout=TOOL_TIMEOUT) for future in [*beside, failed, flaky]]
+        results = [future.result(timeout=TOOL_TIMEOUT) for future in [*beside, failed]]
         elapsed = time.monotonic() - started
 
     assert elapsed < 10, f"reads waited {elapsed:.1f}s"
     for result in results[:3]:
         assert json.loads(result) == {"result": "slow"}
     assert "HTTP 502 Bad Gateway" in json.loads(results[3])["error"]
-    assert json.loads(results[4]) == {"result": "flaky"}
-    assert mock_server.attempts == {"slow": 3, "bad": 2, "flaky": 2}
+    assert mock_server.attempts == {"slow": 3, "bad": 1}
+    assert mock_server.initialized == 1
+
+
+def test_transport_error_leaves_the_calls_beside_it_running(mock_server):
+    """SDK 2.x ends the whole session on one POST's transport error; the
+    request-scoped client keeps that failure to its own call."""
+    read = _handler()
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
+        beside = [pool.submit(read, {"brand": "slow"}) for _ in range(3)]
+        time.sleep(0.1)
+        reset = pool.submit(read, {"brand": "reset"})
+        results = [future.result(timeout=TOOL_TIMEOUT) for future in [*beside, reset]]
+
+    for result in results[:3]:
+        assert json.loads(result) == {"result": "slow"}
+    assert "ReadError" in json.loads(results[3])["error"]
+    assert mock_server.attempts == {"slow": 3, "reset": 1}
     assert mock_server.initialized == 1
 
 

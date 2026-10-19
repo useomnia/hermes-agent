@@ -9,7 +9,6 @@ from tools.mcp_http_guard import (
     MCPTransportFailedError,
     RequestScopedFailureClient,
     describe_transport_failure,
-    gateway_status_of,
     httpx,
 )
 
@@ -201,25 +200,7 @@ async def test_transport_error_on_a_tool_call_is_answered_without_raising():
         )
     error = response.json()["error"]
     assert "ReadError: connection reset by peer" in error["message"]
-    assert gateway_status_of(_McpLikeError(error["data"])) is None
-
-
-class _McpLikeError(Exception):
-    def __init__(self, data):
-        super().__init__("error")
-        self.error = type("ErrorData", (), {"data": data})()
-
-
-@pytest.mark.parametrize("data,status", [
-    ({"httpStatus": 502}, 502),
-    ({"httpStatus": 503}, 503),
-    ({"httpStatus": 504}, 504),
-    ({"httpStatus": 500}, None),
-    ({"httpStatus": 401}, None),
-    (None, None),
-])
-def test_only_gateway_statuses_are_retryable(data, status):
-    assert gateway_status_of(_McpLikeError(data)) == status
+    assert error["data"] == {"transportError": "ReadError"}
 
 
 @pytest.mark.asyncio

@@ -52,11 +52,6 @@ def describe_transport_failure(failure: Optional[BaseException]) -> str:
     return type(first_leaf or failure).__name__
 
 
-# A gateway between Hermes and the MCP server failed; the server may never
-# have seen the request. Only these statuses make a read-only call retryable.
-# The SDK answers every failed status with one generic "Server returned an
-# error response", so the client below keeps the status on the call's error.
-RETRYABLE_GATEWAY_STATUSES = frozenset({502, 503, 504})
 _JSONRPC_INTERNAL_ERROR = -32603
 _JSONRPC_TRANSPORT_ERROR = -32000
 
@@ -103,23 +98,16 @@ def is_isolated_request_failure(error: BaseException) -> bool:
     return _isolated_failure_data(error) is not None
 
 
-def gateway_status_of(error: BaseException) -> Optional[int]:
-    """Return the retryable gateway status an isolated tool call failed with."""
-    status = (_isolated_failure_data(error) or {}).get("httpStatus")
-    return status if status in RETRYABLE_GATEWAY_STATUSES else None
-
-
 class RequestScopedFailureClient(httpx.AsyncClient):
-    """Fail one tool call's HTTP request on its own and keep its HTTP status.
+    """Fail one tool call's HTTP request on its own and name its failure.
 
-    MCP SDK 2.x already answers a failed request with that request's own
-    JSON-RPC error, but as a generic "Server returned an error response"
-    without the status, and a transport error on one POST still escapes into
-    the session's task group. A failed ``tools/call`` POST is instead answered
-    with an error that names its status or transport error, so the call fails
-    alone, is never replayed, and a gateway status can still be retried for a
-    read. An HTTP 404 (session expiry) and lifecycle requests keep the SDK's
-    own handling.
+    MCP SDK 2.x fails a request that gets an error status on its own, but as a
+    generic "Server returned an error response"; a transport error (connection
+    reset, broken pipe) on one POST still ends the whole session and fails
+    every call in flight beside it. A failed ``tools/call`` POST is instead
+    answered with that call's own JSON-RPC error naming its status or transport
+    error, so the call fails alone and is never replayed. An HTTP 404 (session
+    expiry) and lifecycle requests keep the SDK's own handling.
     """
 
     async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:

@@ -4573,22 +4573,6 @@ def _is_failed_http_transport(exc: BaseException) -> bool:
     return isinstance(exc, MCPTransportFailedError)
 
 
-def _retryable_read_gateway_status(
-    exc: BaseException, server_name: str, tool_name: str,
-) -> Optional[int]:
-    """Return the gateway status that makes this read-only call retryable."""
-    try:
-        from tools.mcp_http_guard import gateway_status_of
-    except ImportError:  # pragma: no cover - httpx is supplied by the MCP SDK
-        return None
-    status = gateway_status_of(exc)
-    if status is None:
-        return None
-    if not is_mcp_tool_parallel_read_safe(mcp_prefixed_tool_name(server_name, tool_name)):
-        return None
-    return status
-
-
 def _handle_session_expired_and_retry(
     server_name: str,
     exc: BaseException,
@@ -5362,23 +5346,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         def _call_once():
             return _run_on_mcp_loop(_call, timeout=tool_timeout)
 
-        def _call_retrying_read_once():
-            try:
-                return _call_once()
-            except Exception as exc:
-                status = _retryable_read_gateway_status(exc, server_name, tool_name)
-                if status is None:
-                    raise
-                # A gateway failed before the server answered. Replaying is
-                # safe only for a known read-only call; a write never is.
-                logger.warning(
-                    "MCP tool %s/%s: gateway answered HTTP %d; retrying this "
-                    "read-only call once", server_name, tool_name, status,
-                )
-                return _call_once()
-
         try:
-            result = _call_retrying_read_once()
+            result = _call_once()
             # The RPC round-trip completed, so the server is reachable —
             # even when the payload is an application-level tool error
             # (``result.isError``, e.g. a "not found" lookup). Only the
