@@ -79,6 +79,8 @@ class _MockMCPServer:
                 raise httpx.ReadError("connection reset by peer")
             if brand == "pipe":
                 raise httpx.WriteError("[Errno 32] Broken pipe")
+            if brand == "refused":
+                raise httpx.ConnectError("[Errno 111] Connection refused")
             result = {"content": [{"type": "text", "text": brand}], "isError": False}
         else:
             result = {}
@@ -215,3 +217,39 @@ def test_read_only_annotations_survive_the_sdk_field_rename(mock_server):
     assert mcp_tool.is_mcp_tool_parallel_read_safe(read) is True
     assert mcp_tool.is_mcp_tool_parallel_read_safe(write) is False
     assert mcp_tool.mcp_tool_has_read_only_hint(write) is True
+
+
+@pytest.mark.parametrize("brand,error", [("reset", "ReadError"), ("pipe", "WriteError")])
+def test_write_whose_request_failed_mid_flight_reports_an_uncertain_outcome(mock_server, brand, error):
+    result = json.loads(_handler("update-brand")({"brand": brand}))
+    assert result.get("outcome_uncertain") is True, result
+    assert error in result["error"]
+    assert "Verify whether the operation took effect" in result["error"]
+    assert mock_server.attempts == {brand: 1}
+
+
+def test_write_that_could_not_connect_fails_without_an_uncertain_outcome(mock_server):
+    result = json.loads(_handler("update-brand")({"brand": "refused"}))
+    assert "ConnectError" in result["error"]
+    assert "outcome_uncertain" not in result
+    assert mock_server.attempts == {"refused": 1}
+
+
+def test_read_whose_request_failed_mid_flight_fails_without_an_uncertain_outcome(mock_server):
+    result = json.loads(_handler()({"brand": "reset"}))
+    assert "ReadError" in result["error"]
+    assert "outcome_uncertain" not in result
+
+
+def test_write_in_flight_when_its_session_ends_reports_an_uncertain_outcome(mock_server):
+    from tools import mcp_tool
+
+    write = _handler("update-brand")
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        in_flight = pool.submit(write, {"brand": "hang"})
+        _wait_for(lambda: mock_server.hanging == 1)
+        assert mcp_tool._signal_reconnect(mcp_tool._servers["mockhttp"])
+        result = json.loads(in_flight.result(timeout=TOOL_TIMEOUT))
+
+    assert result.get("outcome_uncertain") is True, result
+    assert mock_server.attempts == {"hang": 1}

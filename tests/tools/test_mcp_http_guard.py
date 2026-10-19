@@ -262,3 +262,25 @@ async def test_failed_lifecycle_request_names_its_status_in_the_log(caplog):
             )
     assert response.status_code == 503
     assert "MCP HTTP tools/list https://mcp.example/mcp answered HTTP 503" in caplog.text
+
+
+class _IsolatedFailure(Exception):
+    def __init__(self, data):
+        super().__init__("isolated")
+        self.error = type("ErrorData", (), {"data": data})()
+
+
+@pytest.mark.parametrize("failure,unknown", [
+    (MCPTransportFailedError("ended"), True),
+    (_IsolatedFailure({"transportError": "ReadError"}), True),
+    (_IsolatedFailure({"transportError": "WriteError"}), True),
+    (_IsolatedFailure({"transportError": "ReadTimeout"}), True),
+    (_IsolatedFailure({"transportError": "ConnectError"}), False),
+    (_IsolatedFailure({"transportError": "ConnectTimeout"}), False),
+    (_IsolatedFailure({"httpStatus": 502}), False),
+    (RuntimeError("tool raised"), False),
+])
+def test_outcome_is_unknown_only_when_the_request_may_have_reached_the_server(failure, unknown):
+    from tools.mcp_http_guard import outcome_may_be_unknown
+
+    assert outcome_may_be_unknown(failure) is unknown

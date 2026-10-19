@@ -4564,6 +4564,23 @@ def _is_session_expired_error(exc: BaseException) -> bool:
     return transport_error_found
 
 
+def _write_outcome_unknown(server_name: str, exc: BaseException) -> Optional[str]:
+    """The ``outcome_uncertain`` result for a write whose request may have reached the server, else None."""
+    try:
+        from tools.mcp_http_guard import outcome_may_be_unknown
+    except ImportError:  # pragma: no cover - httpx is supplied by the MCP SDK
+        return None
+    if not outcome_may_be_unknown(exc):
+        return None
+    return json.dumps({
+        "error": _TRANSPORT_OUTCOME_UNCERTAIN_MSG.format(
+            s=server_name, detail=_sanitize_error(_exc_str(exc)),
+        ),
+        "outcome_uncertain": True,
+        "server": server_name,
+    }, ensure_ascii=False)
+
+
 def _is_failed_http_transport(exc: BaseException) -> bool:
     """Return True if the HTTP guard failed this call because its session ended."""
     try:
@@ -4574,6 +4591,13 @@ def _is_failed_http_transport(exc: BaseException) -> bool:
 
 
 _SESSION_RECOVERY_WAIT_SECONDS = 10.0
+
+_TRANSPORT_OUTCOME_UNCERTAIN_MSG = (
+    "The MCP request to '{s}' failed after it may have reached the server ({detail}), so the outcome is "
+    "UNKNOWN — the operation may or may not have taken effect server-side. It was NOT automatically retried to "
+    "avoid a duplicate side effect. Verify whether the operation took effect (e.g. with a read-only tool) "
+    "before re-invoking it."
+)
 
 _SESSION_OUTCOME_UNCERTAIN_MSG = (
     "The MCP transport session to '{s}' expired while this write-capable call was in flight, so the outcome is "
@@ -5453,12 +5477,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # still valid — only the server-side session is stale.
             # Only a tool annotated readOnlyHint=True is replayed; a 401 is
             # always pre-dispatch, so the auth path above retries every tool.
+            may_have_side_effects = not mcp_tool_is_read_only(
+                mcp_prefixed_tool_name(server_name, tool_name)
+            )
             recovered = _handle_session_expired_and_retry(
                 server_name, exc, _call_within_deadline,
                 f"tools/call {tool_name}",
-                call_may_have_side_effects=not mcp_tool_is_read_only(
-                    mcp_prefixed_tool_name(server_name, tool_name)
-                ),
+                call_may_have_side_effects=may_have_side_effects,
                 deadline=deadline,
             )
             if recovered is not None:
@@ -5469,6 +5494,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # whether the server is healthy.
             if not _is_failed_http_transport(exc):
                 _bump_server_error(server_name)
+            uncertain = _write_outcome_unknown(server_name, exc) if may_have_side_effects else None
+            if uncertain is not None:
+                logger.warning(
+                    "MCP tool %s/%s failed after its request may have reached the "
+                    "server; NOT retrying a write-capable tool: %s",
+                    server_name, tool_name, exc,
+                )
+                return uncertain
             logger.error(
                 "MCP tool %s/%s call failed: %s",
                 server_name, tool_name, exc,

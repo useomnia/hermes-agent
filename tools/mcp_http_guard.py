@@ -95,6 +95,18 @@ def _isolated_failure_data(error: BaseException) -> Optional[dict]:
     return None
 
 
+# Transport errors raised before the request left Hermes: the outcome is known.
+_NOT_SENT_TRANSPORT_ERRORS = frozenset({"ConnectError", "ConnectTimeout", "PoolTimeout"})
+
+
+def outcome_may_be_unknown(error: BaseException) -> bool:
+    """Return True if the call failed after its request may have reached the server."""
+    if isinstance(error, MCPTransportFailedError):
+        return True
+    name = (_isolated_failure_data(error) or {}).get("transportError")
+    return name is not None and name not in _NOT_SENT_TRANSPORT_ERRORS
+
+
 def is_isolated_request_failure(error: BaseException) -> bool:
     """Return True if this tool call's own HTTP request failed (the session is intact)."""
     return _isolated_failure_data(error) is not None
