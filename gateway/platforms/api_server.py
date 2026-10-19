@@ -137,6 +137,10 @@ _OMNIO_APPROVALS_AGENT_WAIT_TIMEOUT_SECONDS = (
 )
 _OMNIO_TURN_FINALIZE_HOOK_ENV = "OMNIO_TURN_FINALIZE_HOOK"
 _OMNIO_TURN_FINALIZE_TIMEOUT_ENV = "OMNIO_TURN_FINALIZE_TIMEOUT_SECONDS"
+# Set by the Omnio proxy launcher (not a user setting). Called once when a
+# background memory review changed something, after the turn already closed.
+_OMNIO_MEMORY_UPDATED_HOOK_ENV = "OMNIO_MEMORY_UPDATED_HOOK"
+_OMNIO_MEMORY_UPDATED_TIMEOUT_SECONDS = 5.0
 # The hook may persist deliverables to durable storage before returning, so its
 # budget covers uploads, not just the path scan.
 _OMNIO_TURN_FINALIZE_TIMEOUT_DEFAULT_SECONDS = 30.0
@@ -329,6 +333,34 @@ async def _request_turn_finalize_annotations(
         )
         return []
     return [annotation for annotation in annotations if isinstance(annotation, dict)]
+
+
+async def _notify_memory_updated(hook_url: str, payload: Dict[str, Any]) -> None:
+    """Best-effort POST telling the Omnio proxy a memory review made changes.
+
+    The response body is ignored; failures are logged and never raised.
+    """
+    timeout = aiohttp.ClientTimeout(total=_OMNIO_MEMORY_UPDATED_TIMEOUT_SECONDS)
+    headers = {
+        "X-Omnio-Service-Token": os.environ.get("OMNIO_INTERNAL_TOKEN", ""),
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                hook_url, headers=headers, json=payload
+            ) as response:
+                if response.status != 200:
+                    logger.info(
+                        "Memory updated hook returned status=%s for run=%s",
+                        response.status,
+                        payload.get("run_id"),
+                    )
+    except Exception:
+        logger.info(
+            "Memory updated hook failed for run=%s",
+            payload.get("run_id"),
+            exc_info=True,
+        )
 
 
 def _parse_omnio_connector_toolkit_approvals(
@@ -9290,6 +9322,32 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 agent = await self._run_in_executor_tracked(_build_agent)
                 agent.context_notes_callback = _context_notes_cb
+
+                def _memory_review_cb(_summary: str) -> None:
+                    # Runs in the background-review thread, after this turn's
+                    # terminal event: tell the proxy over its own hook instead.
+                    hook_url = os.environ.get(_OMNIO_MEMORY_UPDATED_HOOK_ENV)
+                    if not hook_url:
+                        return
+                    coro = _notify_memory_updated(
+                        hook_url,
+                        {
+                            "run_id": run_id,
+                            "turn_id": turn_id,
+                            "session_id": session_id,
+                        },
+                    )
+                    try:
+                        asyncio.run_coroutine_threadsafe(coro, loop)
+                    except Exception:
+                        coro.close()
+                        logger.info(
+                            "Memory updated hook not scheduled for run=%s",
+                            run_id,
+                            exc_info=True,
+                        )
+
+                agent.background_review_callback = _memory_review_cb
                 await self._publish_run_agent(run_id, agent)
                 if run_id in self._stopping_run_ids:
                     missed_steer = await self._close_run_steering(run_id, agent)
