@@ -1304,7 +1304,8 @@ class TestLazyMcpInstall:
     def test_feature_registered_in_allowlist(self):
         from tools import lazy_deps
         assert lazy_deps.feature_specs("tool.computer_use") == (
-            "mcp==1.26.0",
+            "mcp==2.3.0",
+            "httpx2==2.12.0",
             "starlette==1.3.1",
         )
 
@@ -2844,12 +2845,14 @@ class TestImageMimeTypePropagation:
         image_part = MagicMock()
         image_part.type = "image"
         image_part.data = "/9j/4AAQ..."
-        # Simulate the field being absent on the SDK object.
+        # Simulate the field being absent on the SDK object, under both
+        # the mcp 2.x (snake_case) and 1.x (camelCase) spellings.
+        del image_part.mime_type
         del image_part.mimeType
 
         result = MagicMock()
-        result.isError = False
-        result.structuredContent = None
+        result.is_error = False
+        result.structured_content = None
         result.content = [image_part]
 
         out = _extract_tool_result(result)

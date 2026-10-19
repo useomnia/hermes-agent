@@ -57,14 +57,13 @@ def test_is_session_expired_detects_session_terminated():
 def test_calls_failed_by_the_http_guard_are_never_replayed():
     """The guard fails calls whose request may already have been accepted;
     a transport-sounding cause must not route them through the retry."""
-    from tools.mcp_http_guard import MCPRateLimitedError, MCPTransportFailedError
+    from tools.mcp_http_guard import MCPTransportFailedError
     from tools.mcp_tool import _is_session_expired_error
 
     assert _is_session_expired_error(MCPTransportFailedError(
         "MCP HTTP transport failed before the call completed "
         "(WriteError: [Errno 32] Broken pipe); the request was not replayed."
     )) is False
-    assert _is_session_expired_error(MCPRateLimitedError("connection closed")) is False
 
 
 def test_is_session_expired_detects_stale_pipe_and_closed_transport_variants():
@@ -435,9 +434,9 @@ def test_call_tool_handler_reconnects_on_session_expired(monkeypatch, tmp_path):
             raise RuntimeError("Invalid params: Invalid or expired session")
         # Second call: mimic the MCP SDK's structured success response.
         result = MagicMock()
-        result.isError = False
+        result.is_error = False
         result.content = [MagicMock(type="text", text="tool completed")]
-        result.structuredContent = None
+        result.structured_content = None
         return result
 
     server.session.call_tool = _call_sequence

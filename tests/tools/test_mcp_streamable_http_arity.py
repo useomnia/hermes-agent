@@ -23,9 +23,9 @@ import pytest
 
 
 def _patch_sdk_async_client(dummy):
-    from tools.mcp_tool import sdk_httpx
-
-    return patch.object(sdk_httpx(), "AsyncClient", dummy)
+    # The fork hands the SDK its own request-scoped client (built on the
+    # SDK's httpx flavour) rather than a bare AsyncClient.
+    return patch("tools.mcp_http_guard.RequestScopedFailureClient", dummy)
 
 
 class _DummyAsyncClient:

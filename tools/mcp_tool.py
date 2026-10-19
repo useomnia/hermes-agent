@@ -3391,9 +3391,7 @@ class MCPServerTask:
                 "follow_redirects": True,
                 "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                 "verify": ssl_verify,
-                "event_hooks": {"response": [
-                    _strip_auth_on_cross_origin_redirect, call_guard.observe_response,
-                ]},
+                "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
             }
             if headers:
                 client_kwargs["headers"] = headers
@@ -3443,9 +3441,9 @@ class MCPServerTask:
                 transport_failure = exc
                 raise
             finally:
-                # The SDK never answers requests that were in flight on a
-                # torn-down session, and their read slots would hold off the
-                # reconnect's handshake until the tool timeout.
+                # Calls still in flight on the ended session may already have
+                # reached the server: fail them now, unreplayed, so their read
+                # slots do not hold off the reconnect's handshake.
                 self._fail_stranded_http_calls(call_guard, transport_failure)
             return reason
         else:
@@ -4505,7 +4503,6 @@ def _is_session_expired_error(exc: BaseException) -> bool:
         transport_error_types = ()
     try:
         from tools.mcp_http_guard import (
-            MCPRateLimitedError,
             MCPTransportFailedError,
             is_isolated_request_failure,
         )
@@ -4513,7 +4510,7 @@ def _is_session_expired_error(exc: BaseException) -> bool:
         # The HTTP guard failed these calls on purpose, and an isolated request
         # failure left the session intact; replaying either could repeat work
         # the server already accepted.
-        unreplayable_types: tuple = (MCPRateLimitedError, MCPTransportFailedError)
+        unreplayable_types: tuple = (MCPTransportFailedError,)
     except ImportError:  # pragma: no cover - httpx is supplied by the MCP SDK
         unreplayable_types = ()
         is_isolated_request_failure = None
@@ -6358,7 +6355,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         tool_meta = getattr(mcp_tool, "meta", None)
         _track_mcp_tool_metadata(
             tool_name_prefixed,
-            read_only_hint=getattr(annotations, "readOnlyHint", None),
+            # mcp 2.x exposes the annotation as ``read_only_hint``; a bare
+            # camelCase getattr reads None there, which fails every Omnia read
+            # closed as a write (approval prompts, no parallel reads, no retry).
+            read_only_hint=mcp_field(annotations, "read_only_hint", "readOnlyHint"),
             credits=(
                 tool_meta.get("omnia/credits")
                 if isinstance(tool_meta, dict)

@@ -1,17 +1,16 @@
 import asyncio
 import json
 
-import httpx
 import pytest
 from anyio import ClosedResourceError
 
 from tools.mcp_http_guard import (
     HTTPToolCallGuard,
-    MCPRateLimitedError,
     MCPTransportFailedError,
     RequestScopedFailureClient,
     describe_transport_failure,
     gateway_status_of,
+    httpx,
 )
 
 
@@ -22,68 +21,63 @@ def _http_error(status):
 
 
 @pytest.mark.asyncio
-async def test_http_429_wakes_all_pending_calls_without_replay():
+async def test_completed_result_wins_a_transport_failure_that_follows():
     guard = HTTPToolCallGuard()
-    entered = []
-    stopped = []
-    requests = []
 
-    async def waiting(index):
-        entered.append(index)
-        try:
-            await asyncio.Event().wait()
-        finally:
-            stopped.append(index)
+    async def completed():
+        guard.close(ExceptionGroup("unhandled errors in a TaskGroup", [_http_error(502)]))
+        return "already completed"
 
-    async def respond(request):
-        requests.append(request)
-        return httpx.Response(429, headers={"Retry-After": "1"})
+    assert await guard.call(completed) == "already completed"
 
-    calls = [asyncio.create_task(guard.call(lambda i=i: waiting(i))) for i in range(2)]
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(respond),
-        event_hooks={"response": [guard.observe_response]},
-    ) as client:
-        await client.post("https://mcp.example/mcp", json={"method": "tools/call", "id": 1})
-    results = await asyncio.wait_for(asyncio.gather(*calls, return_exceptions=True), 1)
-    assert sorted(entered) == sorted(stopped) == [0, 1]
-    assert all(isinstance(result, MCPRateLimitedError) for result in results)
-    assert len(requests) == 1
-    with pytest.raises(MCPRateLimitedError, match="429"):
-        await guard.call(lambda: waiting(2))
-    assert entered == [0, 1]
+
+def _connection_closed():
+    from mcp.shared.exceptions import MCPError
+
+    return MCPError(code=-32000, message="Connection closed")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status,method,payload", [
-    (200, "POST", {"method": "tools/call"}),
-    (401, "POST", {"method": "tools/call"}),
-    (403, "POST", {"method": "tools/call"}),
-    (500, "POST", {"method": "tools/call"}),
-    (429, "GET", {"method": "tools/call"}),
-    (429, "POST", {"method": "ping"}),
-    (429, "POST", []),
-])
-async def test_other_responses_preserve_their_existing_handling(status, method, payload):
+async def test_call_the_sdk_resolved_as_connection_closed_is_not_replayed():
+    """SDK 2.x wakes in-flight calls with "Connection closed" when the
+    transport ends; the call may already have reached the server."""
+    from tools.mcp_tool import _is_session_expired_error
+
     guard = HTTPToolCallGuard()
-    response = httpx.Response(status, request=httpx.Request(
-        method, "https://mcp.example/mcp", content=json.dumps(payload),
-    ))
-    await guard.observe_response(response)
-    assert await guard.call(lambda: asyncio.sleep(0, result="unchanged")) == "unchanged"
+
+    async def closed_in_flight():
+        raise _connection_closed()
+
+    with pytest.raises(MCPTransportFailedError, match="not replayed") as raised:
+        await guard.call(closed_in_flight)
+    assert _is_session_expired_error(raised.value) is False
 
 
 @pytest.mark.asyncio
-async def test_malformed_or_unread_request_cannot_trip_the_guard():
+async def test_call_started_after_the_transport_ended_keeps_the_sdk_error():
     guard = HTTPToolCallGuard()
-    for request in [
-        httpx.Request("POST", "https://mcp.example/mcp", content=b"invalid"),
-        httpx.Request("POST", "https://mcp.example/mcp", stream=httpx.ByteStream(b"{}")),
-    ]:
-        await guard.observe_response(httpx.Response(429, request=request))
-    assert await guard.call(lambda: asyncio.sleep(0, result=True))
+    guard.close()
+
+    async def closed_session():
+        raise _connection_closed()
+
+    with pytest.raises(Exception, match="Connection closed") as raised:
+        await guard.call(closed_session)
+    assert not isinstance(raised.value, MCPTransportFailedError)
+
+
+@pytest.mark.asyncio
+async def test_isolated_transport_error_keeps_its_own_error():
+    from mcp.shared.exceptions import MCPError
+
+    guard = HTTPToolCallGuard()
+
+    async def isolated():
+        raise MCPError(code=-32000, message="MCP HTTP request failed (ReadError)",
+                       data={"transportError": "ReadError"})
+
+    with pytest.raises(MCPError, match="ReadError"):
+        await guard.call(isolated)
 
 
 @pytest.mark.asyncio
@@ -95,27 +89,6 @@ async def test_one_cancelled_caller_does_not_cancel_the_shared_guard():
     with pytest.raises(asyncio.CancelledError):
         await call
     assert await guard.call(lambda: asyncio.sleep(0, result="healthy")) == "healthy"
-
-
-@pytest.mark.asyncio
-async def test_new_session_does_not_inherit_the_failed_session():
-    old = HTTPToolCallGuard()
-    request = httpx.Request("POST", "https://mcp.example/mcp", json={"method": "tools/call"})
-    await old.observe_response(httpx.Response(429, request=request))
-    new = HTTPToolCallGuard()
-    assert await new.call(lambda: asyncio.sleep(0, result="recovered")) == "recovered"
-
-
-@pytest.mark.asyncio
-async def test_completed_result_wins_a_simultaneous_transport_failure():
-    guard = HTTPToolCallGuard()
-
-    async def completed():
-        request = httpx.Request("POST", "https://mcp.example/mcp", json={"method": "tools/call"})
-        await guard.observe_response(httpx.Response(429, request=request))
-        return "already completed"
-
-    assert await guard.call(completed) == "already completed"
 
 
 @pytest.mark.asyncio
@@ -163,18 +136,6 @@ async def test_closing_an_idle_session_reports_no_stranded_calls():
     assert guard.close() == 0
 
 
-@pytest.mark.asyncio
-async def test_rate_limit_keeps_its_error_when_the_transport_then_ends():
-    guard = HTTPToolCallGuard()
-    call = asyncio.create_task(guard.call(lambda: asyncio.Event().wait()))
-    await asyncio.sleep(0)
-    request = httpx.Request("POST", "https://mcp.example/mcp", json={"method": "tools/call"})
-    await guard.observe_response(httpx.Response(429, request=request))
-    guard.close(ExceptionGroup("unhandled errors in a TaskGroup", [_http_error(429)]))
-    with pytest.raises(MCPRateLimitedError):
-        await asyncio.wait_for(call, 1)
-
-
 @pytest.mark.parametrize("failure,description", [
     (None, "the session closed"),
     (ExceptionGroup("group", [_http_error(503)]), "HTTP 503 Service Unavailable"),
@@ -204,7 +165,7 @@ def _isolating_client(status):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [500, 502, 503, 504, 401])
+@pytest.mark.parametrize("status", [500, 502, 503, 504, 401, 429])
 async def test_failed_tool_call_is_answered_with_its_own_jsonrpc_error(status):
     async with _isolating_client(status) as client:
         response = await client.post(
@@ -220,7 +181,6 @@ async def test_failed_tool_call_is_answered_with_its_own_jsonrpc_error(status):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status,payload", [
     (404, {"jsonrpc": "2.0", "id": 1, "method": "tools/call"}),
-    (429, {"jsonrpc": "2.0", "id": 1, "method": "tools/call"}),
     (502, {"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
     (502, {"jsonrpc": "2.0", "method": "notifications/initialized"}),
 ])

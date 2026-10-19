@@ -1,8 +1,10 @@
 """A failed Streamable HTTP request must not take the session's other calls with it.
 
-MCP SDK 1.x tears the whole session down when one HTTP request fails and
-never answers the requests still in flight, so every concurrent parallel read
-waited for the full tool timeout. A failed tool call now fails on its own, a
+MCP SDK 1.x tore the whole session down when one HTTP request failed and
+never answered the requests still in flight, so every concurrent parallel read
+waited for the full tool timeout. SDK 2.x isolates a failed status itself but
+drops it, and resolves calls in flight on a closed session as "Connection
+closed", which must not be replayed. A failed tool call now fails on its own, a
 known read-only call is retried once after a gateway error, and a session that
 does end fails its in-flight calls at once instead of stranding them.
 """
@@ -13,10 +15,11 @@ import json
 import threading
 import time
 
-import httpx
 import pytest
 
 pytest.importorskip("mcp.client.streamable_http")
+
+from tools.mcp_http_guard import httpx  # the SDK's httpx flavour (httpx2 on mcp 2.x)
 
 TOOL_TIMEOUT = 30
 

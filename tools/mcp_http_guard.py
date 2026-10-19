@@ -4,14 +4,20 @@ import asyncio
 import json
 from typing import Any, Callable, Coroutine, Optional, TypeVar
 
-import httpx
+from tools.mcp_tool import sdk_httpx
+
+# The client below is handed to the SDK's transport, so it must come from the
+# httpx flavour the installed SDK imports (httpx2 on mcp >= 2.0).
+httpx = sdk_httpx()
+if httpx is None:  # pragma: no cover - no SDK, so no HTTP MCP session either
+    import httpx
 
 
 _Result = TypeVar("_Result")
 
-
-class MCPRateLimitedError(RuntimeError):
-    """The server rejected an HTTP tool request without a replay."""
+# JSON-RPC code the SDK resolves a waiting request with once its connection
+# closes (mcp.types.CONNECTION_CLOSED).
+_JSONRPC_CONNECTION_CLOSED = -32000
 
 
 class MCPTransportFailedError(RuntimeError):
@@ -45,6 +51,8 @@ def describe_transport_failure(failure: Optional[BaseException]) -> str:
 
 # A gateway between Hermes and the MCP server failed; the server may never
 # have seen the request. Only these statuses make a read-only call retryable.
+# The SDK answers every failed status with one generic "Server returned an
+# error response", so the client below keeps the status on the call's error.
 RETRYABLE_GATEWAY_STATUSES = frozenset({502, 503, 504})
 _JSONRPC_INTERNAL_ERROR = -32603
 _JSONRPC_TRANSPORT_ERROR = -32000
@@ -89,13 +97,16 @@ def gateway_status_of(error: BaseException) -> Optional[int]:
 
 
 class RequestScopedFailureClient(httpx.AsyncClient):
-    """Fail one tool call's HTTP request on its own, keeping the session open.
+    """Fail one tool call's HTTP request on its own and keep its HTTP status.
 
-    MCP SDK 1.x tears the whole Streamable HTTP session down when one request
-    gets a non-2xx status or a transport error, failing every call in flight
-    beside it. As SDK 2.x does, a failed ``tools/call`` POST is instead answered
-    with that call's own JSON-RPC error. An HTTP 404 (session expiry) and 429
-    (HTTPToolCallGuard) keep their existing handling, as do lifecycle requests.
+    MCP SDK 2.x already answers a failed request with that request's own
+    JSON-RPC error, but as a generic "Server returned an error response"
+    without the status, and a transport error on one POST still escapes into
+    the session's task group. A failed ``tools/call`` POST is instead answered
+    with an error that names its status or transport error, so the call fails
+    alone, is never replayed, and a gateway status can still be retried for a
+    read. An HTTP 404 (session expiry) and lifecycle requests keep the SDK's
+    own handling.
     """
 
     async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
@@ -110,7 +121,7 @@ class RequestScopedFailureClient(httpx.AsyncClient):
                 f"MCP HTTP request failed ({type(exc).__name__}: {exc})".replace(": )", ")"),
                 {"transportError": type(exc).__name__},
             )
-        if response.status_code < 400 or response.status_code in (404, 429):
+        if response.status_code < 400 or response.status_code == 404:
             return response
         await response.aclose()
         return _tool_call_error(
@@ -120,34 +131,25 @@ class RequestScopedFailureClient(httpx.AsyncClient):
         )
 
 
-class HTTPToolCallGuard:
-    """Wake callers before a failed transport strands them on its shared session.
+def _closed_with_its_connection(error: BaseException) -> bool:
+    """Return True if the SDK resolved this call because its connection closed."""
+    code = getattr(getattr(error, "error", None), "code", None)
+    return code == _JSONRPC_CONNECTION_CLOSED and not is_isolated_request_failure(error)
 
-    The guard belongs to one session. MCP SDK 1.x tears the whole session down
-    when one HTTP request fails and never answers the other requests still in
-    flight, so their callers would wait for the full tool timeout. An HTTP 429
-    fails them as soon as it is observed; any other failure fails the calls in
-    flight when the transport ends. A completed result wins a concurrent
-    failure. No operation is resubmitted.
+
+class HTTPToolCallGuard:
+    """Fail calls in flight on a session whose transport ended, without a replay.
+
+    The guard belongs to one session. When its transport ends, every call
+    still waiting on it fails at once, and a call the SDK resolved as
+    "Connection closed" is reported the same way: either may already have
+    reached the server, so neither is resubmitted. A completed result wins a
+    concurrent failure.
     """
 
     def __init__(self) -> None:
         self._failure: asyncio.Future[RuntimeError] = asyncio.get_running_loop().create_future()
         self._pending = 0
-
-    async def observe_response(self, response: httpx.Response) -> None:
-        if response.status_code != 429 or response.request.method != "POST":
-            return
-        try:
-            request = json.loads(response.request.content)
-        except (ValueError, httpx.RequestNotRead):
-            return
-        if not isinstance(request, dict) or request.get("method") != "tools/call":
-            return
-        if not self._failure.done():
-            self._failure.set_result(MCPRateLimitedError(
-                "MCP HTTP 429 Too Many Requests; the request was not replayed."
-            ))
 
     def close(self, failure: Optional[BaseException] = None) -> int:
         """Fail the calls still waiting on this session; return how many there were."""
@@ -159,19 +161,23 @@ class HTTPToolCallGuard:
         return self._pending
 
     async def call(self, factory: Callable[[], Coroutine[Any, Any, _Result]]) -> _Result:
-        failure = self._failure.result() if self._failure.done() else None
-        if isinstance(failure, MCPRateLimitedError):
-            raise failure
-        pending = asyncio.create_task(factory())
         # A call that starts after the transport ended was never sent; the
         # SDK's closed-session error keeps its existing reconnect and retry.
-        waiters = {pending} if failure is not None else {pending, self._failure}
+        started_live = not self._failure.done()
+        pending = asyncio.create_task(factory())
+        waiters = {pending, self._failure} if started_live else {pending}
         self._pending += 1
         try:
             done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-            if pending in done:
-                return pending.result()
-            raise self._failure.result()
+            if pending not in done:
+                raise self._failure.result()
+            error = pending.exception()
+            if error is not None and started_live and _closed_with_its_connection(error):
+                raise MCPTransportFailedError(
+                    "MCP HTTP transport closed before the call completed; "
+                    "the request was not replayed."
+                ) from error
+            return pending.result()
         finally:
             self._pending -= 1
             if not pending.done():

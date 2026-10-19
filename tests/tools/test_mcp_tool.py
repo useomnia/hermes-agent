@@ -1997,7 +1997,7 @@ class TestHTTPConfig:
         asyncio.run(_test())
 
     def test_http_seeds_initial_protocol_header(self):
-        from tools.mcp_tool import LATEST_PROTOCOL_VERSION, MCPServerTask
+        from tools.mcp_tool import LATEST_HANDSHAKE_VERSION, MCPServerTask
 
         server = MCPServerTask("remote")
         captured = {}
@@ -2051,13 +2051,13 @@ class TestHTTPConfig:
                  patch("tools.mcp_tool._MCP_NEW_HTTP", new_http), \
                  patch("tools.mcp_http_guard.RequestScopedFailureClient", DummyAsyncClient), \
                  patch("tools.mcp_tool.streamable_http_client", return_value=DummyTransportCtx()), \
-                 patch("tools.mcp_tool.streamablehttp_client", side_effect=lambda url, **kwargs: DummyLegacyTransportCtx(**kwargs)), \
+                 patch("tools.mcp_tool.streamablehttp_client", side_effect=lambda url, **kwargs: DummyLegacyTransportCtx(**kwargs), create=True), \
                  patch("tools.mcp_tool.ClientSession", DummySession), \
                  patch.object(MCPServerTask, "_discover_tools", _discover_tools):
                 await server._run_http(config)
 
         asyncio.run(_run({"url": "https://example.com/mcp"}, new_http=True))
-        assert captured["headers"]["mcp-protocol-version"] == LATEST_PROTOCOL_VERSION
+        assert captured["headers"]["mcp-protocol-version"] == LATEST_HANDSHAKE_VERSION
 
         asyncio.run(_run({
             "url": "https://example.com/mcp",
@@ -2073,7 +2073,7 @@ class TestHTTPConfig:
         assert "mcp-protocol-version" not in captured["headers"]
 
         asyncio.run(_run({"url": "https://example.com/mcp"}, new_http=False))
-        assert captured["legacy_headers"]["mcp-protocol-version"] == LATEST_PROTOCOL_VERSION
+        assert captured["legacy_headers"]["mcp-protocol-version"] == LATEST_HANDSHAKE_VERSION
 
         asyncio.run(_run({
             "url": "https://example.com/mcp",
@@ -3299,7 +3299,9 @@ class TestSamplingCallbackText:
             result = asyncio.run(self.handler(None, params))
 
         assert isinstance(result, CreateMessageResult)
-        assert result.stopReason == "maxTokens"
+        from tools.mcp_tool import mcp_field
+
+        assert mcp_field(result, "stop_reason", "stopReason") == "maxTokens"
 
 
 # ---------------------------------------------------------------------------
