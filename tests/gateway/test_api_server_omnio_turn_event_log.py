@@ -20,6 +20,7 @@ from aiohttp import ClientResponse, web
 from aiohttp.test_utils import TestClient, TestServer
 
 import tools.tool_approval as tool_approval
+from agent.background_review import ReviewSummary
 from gateway.config import GatewayConfig, PlatformConfig
 from gateway.platforms import api_server as api_server_module
 from gateway.platforms.api_server import APIServerAdapter, _api_request_profile
@@ -4086,3 +4087,182 @@ async def test_unstreamed_partial_answer_is_preserved_on_failure():
         _, events = await _run_without_http_server(adapter, {"input": "long answer"})
     assert events[-1]["type"] == "response.failed"
     assert any(event.get("delta") == "Here is the first part" for event in events)
+
+
+async def _run_and_fire_memory_review(
+    adapter: APIServerAdapter,
+    targets: tuple[str, ...] = ("user",),
+) -> tuple[Dict[str, Any], Any]:
+    """Complete a run, then fire the review callback from a non-loop thread."""
+    agent = _agent(lambda **_kwargs: {"final_response": "done", "messages": []})
+    with patch.object(adapter, "_create_agent", return_value=agent):
+        started, _events = await _run_without_http_server(
+            adapter,
+            {"input": "hi", "turn_id": "turn-1", "session_id": "session-1"},
+        )
+    # The review thread fires after the turn is terminal.
+    await asyncio.to_thread(
+        agent.background_review_callback,
+        ReviewSummary("💾 Self-improvement review: updated", targets),
+    )
+    return json.loads(started.text), agent
+
+
+async def _wait_until(predicate: Callable[[], bool], timeout: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    return predicate()
+
+
+@pytest.mark.asyncio
+async def test_memory_review_callback_posts_identity_and_token_to_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: List[Dict[str, Any]] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        received.append(
+            {
+                "token": request.headers.get("X-Omnio-Service-Token"),
+                "body": await request.json(),
+            }
+        )
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_post("/internal/memory-updated", handler)
+    async with TestServer(app) as server:
+        monkeypatch.setenv(
+            api_server_module._OMNIO_MEMORY_UPDATED_HOOK_ENV,
+            str(server.make_url("/internal/memory-updated")),
+        )
+        monkeypatch.setenv("OMNIO_INTERNAL_TOKEN", "svc-token")
+        run, _agent_obj = await _run_and_fire_memory_review(_make_adapter())
+        assert await _wait_until(lambda: bool(received))
+
+    assert received == [
+        {
+            "token": "svc-token",
+            "body": {
+                "run_id": run["run_id"],
+                "turn_id": "turn-1",
+                "session_id": "session-1",
+                "targets": ["user"],
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fired, expected",
+    [
+        (("memory",), ["memory"]),
+        (("user", "memory"), ["user", "memory"]),
+    ],
+)
+async def test_memory_review_callback_reports_changed_targets(
+    monkeypatch: pytest.MonkeyPatch,
+    fired: tuple[str, ...],
+    expected: List[str],
+) -> None:
+    received: List[Dict[str, Any]] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        received.append(await request.json())
+        return web.json_response({"recorded": True})
+
+    app = web.Application()
+    app.router.add_post("/internal/memory-updated", handler)
+    async with TestServer(app) as server:
+        monkeypatch.setenv(
+            api_server_module._OMNIO_MEMORY_UPDATED_HOOK_ENV,
+            str(server.make_url("/internal/memory-updated")),
+        )
+        await _run_and_fire_memory_review(_make_adapter(), fired)
+        assert await _wait_until(lambda: bool(received))
+
+    assert [sorted(r["targets"]) for r in received] == [sorted(expected)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("summary", [ReviewSummary("💾 skill only"), "plain text"])
+async def test_memory_review_callback_skips_post_without_memory_targets(
+    monkeypatch: pytest.MonkeyPatch,
+    summary: str,
+) -> None:
+    monkeypatch.setenv(
+        api_server_module._OMNIO_MEMORY_UPDATED_HOOK_ENV,
+        "http://127.0.0.1:1/internal/memory-updated",
+    )
+    notify = AsyncMock()
+    monkeypatch.setattr(api_server_module, "_notify_memory_updated", notify)
+    adapter = _make_adapter()
+    agent = _agent(lambda **_kwargs: {"final_response": "done", "messages": []})
+    with patch.object(adapter, "_create_agent", return_value=agent):
+        await _run_without_http_server(adapter, {"input": "hi"})
+
+    await asyncio.to_thread(agent.background_review_callback, summary)
+    await asyncio.sleep(0.05)
+
+    notify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_memory_review_callback_is_inert_when_hook_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(api_server_module._OMNIO_MEMORY_UPDATED_HOOK_ENV, raising=False)
+    notify = AsyncMock()
+    monkeypatch.setattr(api_server_module, "_notify_memory_updated", notify)
+
+    await _run_and_fire_memory_review(_make_adapter())
+    await asyncio.sleep(0.05)
+
+    notify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_memory_review_hook_non_200_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hits: List[int] = []
+
+    async def handler(_request: web.Request) -> web.Response:
+        hits.append(1)
+        return web.Response(status=500, text="boom")
+
+    app = web.Application()
+    app.router.add_post("/internal/memory-updated", handler)
+    async with TestServer(app) as server:
+        monkeypatch.setenv(
+            api_server_module._OMNIO_MEMORY_UPDATED_HOOK_ENV,
+            str(server.make_url("/internal/memory-updated")),
+        )
+        await _run_and_fire_memory_review(_make_adapter())
+        assert await _wait_until(lambda: bool(hits))
+        await asyncio.sleep(0.05)
+
+    assert hits == [1]  # no retries
+
+
+@pytest.mark.asyncio
+async def test_memory_review_hook_unreachable_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Bind then close a server so the port is known-refused.
+    async with TestServer(web.Application()) as server:
+        dead_url = str(server.make_url("/internal/memory-updated"))
+    monkeypatch.setenv(api_server_module._OMNIO_MEMORY_UPDATED_HOOK_ENV, dead_url)
+
+    # A raise in the review thread would propagate out of to_thread here.
+    await _run_and_fire_memory_review(_make_adapter())
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_notify_memory_updated_swallows_transport_errors() -> None:
+    await api_server_module._notify_memory_updated(
+        "http://127.0.0.1:1/unreachable", {"run_id": "r"}
+    )

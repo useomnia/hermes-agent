@@ -313,6 +313,77 @@ def test_background_review_summary_is_attributed_to_self_improvement_loop(monkey
     )
 
 
+def _run_review_and_capture_callback(monkeypatch, session_messages):
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = session_messages
+
+        def run_conversation(self, **kwargs):
+            pass
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+    agent = _bare_agent()
+    agent._safe_print = lambda *a, **kw: None
+    captured: list = []
+    agent.background_review_callback = captured.append
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hi"}],
+        review_memory=True,
+    )
+    return captured
+
+
+def _tool_exchange(call_id, tool, args, result):
+    import json
+
+    return [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "function": {"name": tool, "arguments": json.dumps(args)},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": call_id, "content": json.dumps(result)},
+    ]
+
+
+def test_background_review_callback_carries_changed_memory_targets(monkeypatch):
+    messages = _tool_exchange(
+        "u1",
+        "memory",
+        {"action": "add", "target": "user", "content": "likes tea"},
+        {"success": True, "message": "Entry added.", "target": "user"},
+    )
+    captured = _run_review_and_capture_callback(monkeypatch, messages)
+    assert len(captured) == 1
+    assert captured[0].startswith("💾 Self-improvement review:")
+    assert captured[0].memory_targets == ("user",)
+
+
+def test_background_review_callback_has_no_memory_targets_for_skill_only(monkeypatch):
+    messages = _tool_exchange(
+        "s1",
+        "skill_manage",
+        {"action": "create", "name": "x"},
+        {"success": True, "message": "Skill created."},
+    )
+    captured = _run_review_and_capture_callback(monkeypatch, messages)
+    assert len(captured) == 1
+    assert captured[0].memory_targets == ()
+
+
 def test_background_review_fork_skips_external_memory_plugins(monkeypatch):
     """The background review fork must NOT touch external memory plugins.
 
