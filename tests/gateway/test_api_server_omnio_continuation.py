@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -9,6 +10,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 import tools.tool_approval as tool_approval
+import tools.user_input as user_input
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     TURN_CONTINUATION_API_VERSION,
@@ -61,6 +63,7 @@ def _app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+    app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
 
 
@@ -87,6 +90,163 @@ async def _wait_for_run(agent: MagicMock) -> dict:
             return agent.run_conversation.call_args.kwargs
         await asyncio.sleep(0.01)
     raise AssertionError("the continuation never reached the agent")
+
+
+def _persistent_agent(db):
+    from run_agent import AIAgent
+
+    agent = object.__new__(AIAgent)
+    agent._persist_disabled = False
+    agent._session_db = db
+    agent._session_db_created = True
+    agent.session_id = SESSION
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = None
+    agent._persist_user_message_idx = None
+    agent._persist_user_message_override = None
+    agent._persist_user_message_timestamp = None
+    agent._session_persist_lock = None
+    return agent
+
+
+async def _stop_waiting_interaction(adapter, db, client, kind, position=0, release="stop"):
+    from agent.tool_executor import _mark_omnio_timeout_tool_result
+    from tools.approval import get_current_session_key
+    from tools.interrupt import set_interrupt
+
+    persistence = _persistent_agent(db)
+    ready = threading.Event()
+    execution = {}
+    tool_name = "request_user_input" if kind == "question" else "mcp_connectors_TEST_WRITE"
+    call_id = "nested-q1" if kind == "nested-approval" else "q1"
+    top_name = "execute_code" if kind == "nested-approval" else tool_name
+    calls = [_call("s1", "terminal"), _call("s2", "terminal")]
+    calls.insert(position, _call("q1", top_name, '{"record":7}'))
+
+    def build_agent(**callbacks):
+        agent = _agent()
+        agent._omnio_skip_persist_tool_call_ids = None
+
+        def run(**_kwargs):
+            execution["thread"] = threading.get_ident()
+            messages = [
+                {"role": "user", "content": "ask before continuing"},
+                {"role": "assistant", "content": "", "tool_calls": calls},
+            ]
+            persistence._flush_messages_to_session_db(messages, [])
+            callbacks["tool_start_callback"]("q1", top_name, {"record": 7})
+            assert ready.wait(5), "the call never reached the event log"
+            try:
+                if kind == "question":
+                    result = user_input.await_user_input(get_current_session_key(), call_id)
+                    assert result is None
+                    result = json.dumps({"status": "no_response"})
+                else:
+                    result = tool_approval.maybe_require_tool_approval(
+                        tool_name, call_id, {"record": 7}
+                    )
+                    assert json.loads(result)["status"] == "approval_no_response"
+                callbacks["tool_complete_callback"]("q1", top_name, {}, result)
+                for index, call in enumerate(calls):
+                    row = {
+                        "role": "tool", "tool_call_id": call["id"],
+                        "tool_name": call["function"]["name"],
+                        "content": result if call["id"] == "q1" else
+                        "completed once" if index < position else "not started",
+                    }
+                    _mark_omnio_timeout_tool_result(agent, row, call["id"])
+                    messages.append(row)
+                    persistence._flush_messages_to_session_db(messages, [])
+                return {"final_response": "", "messages": messages, "interrupted": True}
+            finally:
+                set_interrupt(False, execution["thread"])
+
+        agent.run_conversation.side_effect = run
+        agent.interrupt.side_effect = lambda _message=None: set_interrupt(
+            True, execution["thread"]
+        )
+        return agent
+
+    with (
+        patch.object(adapter, "_create_agent", side_effect=build_agent),
+        patch.object(tool_approval, "is_gated_tool", return_value=True),
+        patch.object(tool_approval, "mcp_tool_has_read_only_hint", return_value=True),
+    ):
+        started = await client.post(
+            "/v1/runs", headers=AUTH,
+            json={"input": "ask before continuing", "session_id": SESSION, "turn_id": "source"},
+        )
+        assert started.status == 202, await started.text()
+        run_id = (await started.json())["run_id"]
+        try:
+            async with asyncio.timeout(5):
+                while True:
+                    log = adapter._turn_event_logs.get_log(run_id)
+                    if log and any(b'"call_id":"q1"' in item.frame for item in log.events):
+                        break
+                    await asyncio.sleep(0.01)
+            ready.set()
+            registry = user_input._wait_registry if kind == "question" else tool_approval._wait_registry
+            async with asyncio.timeout(5):
+                while not registry.pending_count(run_id):
+                    await asyncio.sleep(0.01)
+            if release == "stop":
+                stopped = await client.post(f"/v1/runs/{run_id}/stop", headers=AUTH)
+                assert stopped.status == 200, await stopped.text()
+            else:
+                registry.clear(run_id)
+            response = await client.get(f"/v1/runs/{run_id}/events", headers=AUTH)
+            events = _sse_events(await response.text())
+        finally:
+            ready.set()
+    return call_id, events
+
+
+@pytest.mark.parametrize("position", [0, 1, 2])
+@pytest.mark.parametrize("release", ["stop", "disconnect"])
+@pytest.mark.asyncio
+async def test_stopped_question_accepts_late_answer_without_losing_siblings(
+    adapter, db, position, release
+):
+    async with TestClient(TestServer(_app(adapter))) as client:
+        call_id, events = await _stop_waiting_interaction(
+            adapter, db, client, "question", position, release
+        )
+        siblings = [m for m in db.get_messages(SESSION) if m["role"] == "tool" and m["tool_call_id"] != call_id]
+        assert len(siblings) == 2
+        resumed = _agent()
+        with patch.object(adapter, "_create_agent", return_value=resumed):
+            response = await client.post(
+                "/v1/runs", headers=AUTH,
+                json=_continue({"kind": "answer", "tool_call_id": call_id, "response": "Let's go"}),
+            )
+            assert response.status == 202, await response.text()
+            await _wait_for_run(resumed)
+    rows = db.get_messages(SESSION)
+    answers = [m for m in rows if m.get("tool_call_id") == call_id]
+    assert len(answers) == 1
+    assert json.loads(answers[0]["content"])["response"] == "Let's go"
+    assert [m for m in rows if m["role"] == "tool" and m["tool_call_id"] != call_id] == siblings
+    assert not any(e["type"] == "response.omnio.interaction_completed" for e in events)
+
+
+@pytest.mark.parametrize("scope", ["once", "deny"])
+@pytest.mark.parametrize("kind", ["approval", "nested-approval"])
+@pytest.mark.asyncio
+async def test_stopped_approval_accepts_late_decision(adapter, db, scope, kind):
+    async with TestClient(TestServer(_app(adapter))) as client:
+        call_id, events = await _stop_waiting_interaction(adapter, db, client, kind)
+        assert not any(e.get("timed_out") is True for e in events)
+        assert not any(m.get("tool_call_id") == "q1" for m in db.get_messages(SESSION))
+        resumed = _agent()
+        with patch.object(adapter, "_create_agent", return_value=resumed):
+            response = await client.post(
+                "/v1/runs", headers=AUTH,
+                json=_continue({"kind": "approval", "tool_call_id": call_id, "scope": scope}),
+            )
+            assert response.status == 202, await response.text()
+            await _wait_for_run(resumed)
 
 
 class TestParseContinuation:
