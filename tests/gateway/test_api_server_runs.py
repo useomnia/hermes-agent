@@ -11,6 +11,7 @@ Covers:
 import asyncio
 import builtins
 import json
+import sqlite3
 import threading
 import time
 from types import SimpleNamespace
@@ -2109,6 +2110,7 @@ class TestSteerIds:
             "steer_id": "subagent:delegate-1",
             "status": "accepted",
             "outcome": "queued",
+            "final": True,
         }
 
     @pytest.mark.asyncio
@@ -2124,6 +2126,7 @@ class TestSteerIds:
         assert status == 200
         assert body["status"] == "unknown"
         assert body["outcome"] is None
+        assert body["final"] is False
 
     @pytest.mark.asyncio
     async def test_ended_run_keeps_answering_for_its_accepted_steer(self, adapter):
@@ -2145,7 +2148,7 @@ class TestSteerIds:
             assert replay.status == 200
             assert await replay.json() == {"status": "queued"}
         assert (status, body["status"]) == (200, "accepted")
-        assert (unknown_status, unknown["status"]) == (200, "unknown")
+        assert (unknown_status, unknown["status"], unknown["final"]) == (200, "unknown", True)
         agent.steer.assert_called_once()
 
     @pytest.mark.asyncio
@@ -2158,22 +2161,79 @@ class TestSteerIds:
         assert status == 404
         assert body["error"]["code"] == "run_not_found"
 
+    @staticmethod
+    def _forget_the_process(adapter, run_id="run_steer"):
+        """What a gateway restart forgets: every in-memory record of the run."""
+        adapter._run_lifecycles.pop(run_id, None)
+        adapter._active_run_agents.pop(run_id, None)
+        adapter._active_run_tasks.pop(run_id, None)
+        adapter._run_statuses.pop(run_id, None)
+        adapter._run_steer_outcomes.clear()
+
     @pytest.mark.asyncio
-    async def test_swept_run_forgets_its_steer_ids(self, adapter):
+    async def test_accepted_steer_id_survives_a_gateway_restart(self, adapter):
         app = _create_runs_app(adapter)
         agent = self._make_active_agent(adapter)
         agent.steer.return_value = True
 
         async with TestClient(TestServer(app)) as cli:
             await self._steer(cli, "subagent:delegate-1")
-            adapter._run_lifecycles.pop("run_steer")
-            adapter._run_statuses["run_steer"].update(status="completed", updated_at=0)
-            adapter._sweep_orphaned_runs_once(adapter._RUN_STATUS_TTL + 1)
+            self._forget_the_process(adapter)
 
-            status, _body = await self._status(cli, "subagent:delegate-1")
+            status, body = await self._status(cli, "subagent:delegate-1")
+            replay = await self._steer(cli, "subagent:delegate-1")
+            replay_data = await replay.json()
 
-        assert status == 404
-        assert "run_steer" not in adapter._run_steer_outcomes
+        assert (status, body["status"], body["final"]) == (200, "accepted", True)
+        assert replay_data == {"status": "queued"}
+        agent.steer.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_restarted_gateway_answers_final_unknown_for_a_reserved_run(self, adapter):
+        app = _create_runs_app(adapter)
+        adapter._run_idempotency.reserve(
+            turn_id="turn-1",
+            run_id="run_steer",
+            request_fingerprint="fingerprint",
+            session_id="s",
+            owner_profile=None,
+        )
+
+        async with TestClient(TestServer(app)) as cli:
+            status, body = await self._status(cli, "subagent:delegate-1")
+
+        assert (status, body["status"], body["final"]) == (200, "unknown", True)
+
+    @pytest.mark.asyncio
+    async def test_steer_still_answers_when_its_id_cannot_be_kept(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = self._make_active_agent(adapter)
+        agent.steer.return_value = True
+
+        with patch.object(
+            adapter._run_idempotency, "record_steer", side_effect=sqlite3.OperationalError("disk")
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await self._steer(cli, "subagent:delegate-1")
+                response_data = await response.json()
+                replay = await self._steer(cli, "subagent:delegate-1")
+                status, body = await self._status(cli, "subagent:delegate-1")
+
+        assert response_data == {"status": "queued"}
+        assert replay.status == 200
+        assert (status, body["status"]) == (200, "accepted")
+        agent.steer.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_status_is_final_once_the_run_stops_accepting_steers(self, adapter):
+        app = _create_runs_app(adapter)
+        self._make_active_agent(adapter)
+        adapter._run_lifecycles["run_steer"]["accepting"] = False
+
+        async with TestClient(TestServer(app)) as cli:
+            status, body = await self._status(cli, "subagent:delegate-1")
+
+        assert (status, body["status"], body["final"]) == (200, "unknown", True)
 
     @pytest.mark.asyncio
     async def test_steer_latched_before_publication_is_recorded_as_accepted(self, adapter):

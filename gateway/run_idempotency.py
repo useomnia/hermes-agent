@@ -24,6 +24,9 @@ from hermes_state_errors import is_sqlite_lock_error
 
 
 _TABLE = "api_run_idempotency"
+# Steers a run accepted, by caller steer id. Kept as long as the run's row, so
+# a caller can learn after a gateway restart whether a steer reached the run.
+_STEER_TABLE = "api_run_steers"
 
 
 class RunIdempotencyMismatch(ValueError):
@@ -92,6 +95,15 @@ class RunIdempotencyStore:
                     failure_reason TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
+                )"""
+            )
+            self._conn.execute(
+                f"""CREATE TABLE IF NOT EXISTS {_STEER_TABLE} (
+                    run_id TEXT NOT NULL,
+                    steer_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    accepted_at REAL NOT NULL,
+                    PRIMARY KEY (run_id, steer_id)
                 )"""
             )
             for suffix in ("", "-wal", "-shm"):
@@ -231,6 +243,35 @@ class RunIdempotencyStore:
                 (turn_id,),
             ).fetchone()
         return self._record(row) if row is not None else None
+
+    def has_run(self, run_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT 1 FROM {_TABLE} WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return row is not None
+
+    def record_steer(self, *, run_id: str, steer_id: str, outcome: str) -> str:
+        """Keep the first outcome a run gave a steer id, and return it."""
+        with self._transaction() as conn:
+            conn.execute(
+                f"""INSERT OR IGNORE INTO {_STEER_TABLE} (run_id, steer_id, outcome, accepted_at)
+                    VALUES (?, ?, ?, ?)""",
+                (run_id, steer_id, outcome, time.time()),
+            )
+            row = conn.execute(
+                f"SELECT outcome FROM {_STEER_TABLE} WHERE run_id = ? AND steer_id = ?",
+                (run_id, steer_id),
+            ).fetchone()
+        return row["outcome"]
+
+    def steer_outcome(self, run_id: str, steer_id: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT outcome FROM {_STEER_TABLE} WHERE run_id = ? AND steer_id = ?",
+                (run_id, steer_id),
+            ).fetchone()
+        return row["outcome"] if row is not None else None
 
     def close(self) -> None:
         with self._lock:

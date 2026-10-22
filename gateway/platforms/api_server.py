@@ -1809,9 +1809,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
-        # Accepted steers by run and caller steer id, kept as long as the run's
-        # status: a repeated id is answered without steering again, and a
-        # caller can ask whether its steer was accepted.
+        # Accepted steers by run and caller steer id, cached for this process.
+        # The profile's run store keeps them durably for a later process.
         self._run_steer_outcomes: Dict[str, Dict[str, str]] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
@@ -3801,7 +3800,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_steer_context_notes": {"apiVersion": 1},
                 # Steers may carry a caller id: a repeated id is not delivered
                 # twice, and GET /v1/runs/{run_id}/steers/{steer_id} answers
-                # whether the run accepted it.
+                # whether the run accepted it, across gateway restarts.
                 "run_steer_ids": {"apiVersion": 1},
                 "run_approval_response": True,
                 "tool_progress_events": True,
@@ -7835,27 +7834,55 @@ class APIServerAdapter(BasePlatformAdapter):
         """Accept and deliver one steer without blocking the aiohttp loop.
 
         A steer id the run already accepted answers with its first outcome
-        and is not delivered again, including after the run ended.
+        and is not delivered again, including after the run ended or the
+        gateway restarted.
         """
-        accepted = self._accepted_steer_outcome(run_id, steer_id)
+        accepted = await self._accepted_steer_outcome(run_id, steer_id)
         if accepted is not None:
             return accepted
         lifecycle = self._run_lifecycles.get(run_id)
         if lifecycle is None:
             return "not_found"
         async with lifecycle["lock"]:
-            accepted = self._accepted_steer_outcome(run_id, steer_id)
+            accepted = await self._accepted_steer_outcome(run_id, steer_id)
             if accepted is not None:
                 return accepted
             outcome = await self._steer_live_run(run_id, lifecycle, text, mode)
             if steer_id is not None and outcome in {"redirected", "queued"}:
-                self._run_steer_outcomes.setdefault(run_id, {})[steer_id] = outcome
+                await self._record_accepted_steer(run_id, steer_id, outcome)
             return outcome
 
-    def _accepted_steer_outcome(self, run_id: str, steer_id: Optional[str]) -> Optional[str]:
+    async def _accepted_steer_outcome(
+        self, run_id: str, steer_id: Optional[str]
+    ) -> Optional[str]:
         if steer_id is None:
             return None
-        return self._run_steer_outcomes.get(run_id, {}).get(steer_id)
+        cached = self._run_steer_outcomes.get(run_id, {}).get(steer_id)
+        if cached is not None:
+            return cached
+        return await self._run_reservation_io(
+            self._effective_request_profile(), "steer_outcome", run_id, steer_id
+        )
+
+    async def _record_accepted_steer(self, run_id: str, steer_id: str, outcome: str) -> None:
+        """Keep an accepted steer id; the run already holds the steer.
+
+        A failed durable write keeps the id for this process only, so a
+        restarted gateway can no longer answer for it.
+        """
+        self._run_steer_outcomes.setdefault(run_id, {})[steer_id] = outcome
+        try:
+            await self._run_reservation_io(
+                self._effective_request_profile(),
+                "record_steer",
+                run_id=run_id,
+                steer_id=steer_id,
+                outcome=outcome,
+            )
+        except Exception:
+            logger.exception(
+                "[api_server] could not keep steer id for run %s", run_id
+            )
 
     async def _steer_live_run(
         self,
@@ -10744,7 +10771,10 @@ class APIServerAdapter(BasePlatformAdapter):
         """GET /v1/runs/{run_id}/steers/{steer_id} — whether the run accepted a steer.
 
         Waits for a steer of the run that is still being delivered, so the
-        answer is final for every request the run received before it.
+        answer covers every request the run received before it. ``final`` is
+        False while the run still accepts steers: an ``unknown`` id may yet
+        arrive. Once the run stops accepting, including across a gateway
+        restart, an ``unknown`` id can never be accepted.
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -10753,12 +10783,16 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = request.match_info["run_id"]
         steer_id = request.match_info["steer_id"]
         lifecycle = self._run_lifecycles.get(run_id)
+        accepting = False
         if lifecycle is not None:
             async with lifecycle["lock"]:
-                outcome = self._accepted_steer_outcome(run_id, steer_id)
+                outcome = await self._accepted_steer_outcome(run_id, steer_id)
+                accepting = (
+                    self._run_lifecycles.get(run_id) is lifecycle and lifecycle["accepting"]
+                )
         else:
-            outcome = self._accepted_steer_outcome(run_id, steer_id)
-        if outcome is None and run_id not in self._run_statuses:
+            outcome = await self._accepted_steer_outcome(run_id, steer_id)
+        if outcome is None and not accepting and not await self._run_is_known(run_id):
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
@@ -10770,7 +10804,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 "steer_id": steer_id,
                 "status": "accepted" if outcome is not None else "unknown",
                 "outcome": outcome,
+                "final": outcome is not None or not accepting,
             }
+        )
+
+    async def _run_is_known(self, run_id: str) -> bool:
+        if run_id in self._run_statuses:
+            return True
+        return bool(
+            await self._run_reservation_io(
+                self._effective_request_profile(), "has_run", run_id
+            )
         )
 
     @staticmethod
