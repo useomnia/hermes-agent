@@ -5288,12 +5288,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             "answered": parsed.get("response", "")
                         }
                     if isinstance(parsed, dict) and parsed.get("status") == "no_response":
-                        try:
-                            timed_out = self._keep_unanswered_user_input(
-                                agent_ref[0], tool_call_id, session_id
-                            )
-                        except Exception:
-                            timed_out = False
+                        timed_out = self._keep_unanswered_user_input(
+                            agent_ref[0], tool_call_id, session_id
+                        )
                         if timed_out:
                             completed.setdefault("interaction", {})["timed_out"] = True
                     turn_ending = isinstance(parsed, dict) and parsed.get("status") in {
@@ -7940,12 +7937,15 @@ class APIServerAdapter(BasePlatformAdapter):
     @staticmethod
     def _keep_unanswered_user_input(agent, tool_call_id: str, session_key: str) -> bool:
         """Preserve a released question for a late answer; report expiry only."""
-        from tools.user_input import consume_user_input_completion_reason
+        try:
+            from tools.user_input import consume_user_input_completion_reason
 
-        reason = consume_user_input_completion_reason(session_key)
-        if reason in {"expired", "cancelled"}:
-            APIServerAdapter._leave_interaction_open(agent, tool_call_id)
-        return reason == "expired"
+            reason = consume_user_input_completion_reason(session_key)
+            if reason in {"expired", "cancelled"}:
+                APIServerAdapter._leave_interaction_open(agent, tool_call_id)
+            return reason == "expired"
+        except Exception:
+            return False
 
     @staticmethod
     def _interrupt_for_unanswered_tool_approval(
@@ -9154,14 +9154,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 # path; only the silent expiry has no other recorder.
                 completion_fields: Optional[Dict[str, Any]] = None
                 if status == "no_response":
-                    try:
-                        timed_out = self._keep_unanswered_user_input(
-                            self._active_run_agents.get(run_id),
-                            normalized_tool_call_id,
-                            approval_session_key,
-                        )
-                    except Exception:
-                        timed_out = False
+                    timed_out = self._keep_unanswered_user_input(
+                        self._active_run_agents.get(run_id),
+                        normalized_tool_call_id,
+                        approval_session_key,
+                    )
                     # Only an expired wait closes the card; a stop or disconnect
                     # leaves it open and answerable.
                     if timed_out:
