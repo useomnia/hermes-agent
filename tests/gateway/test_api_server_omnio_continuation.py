@@ -328,6 +328,20 @@ def test_user_input_keeps_only_released_waits_open(reason):
     )
 
 
+@pytest.mark.asyncio
+async def test_question_completion_survives_missing_wait_metadata(adapter, db):
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch(
+            "tools.user_input.consume_user_input_completion_reason",
+            side_effect=RuntimeError("wait metadata unavailable"),
+        ):
+            call_id, events = await _stop_waiting_interaction(adapter, db, client, "question")
+    results = [m for m in db.get_messages(SESSION) if m.get("tool_call_id") == call_id]
+    assert len(results) == 1
+    assert json.loads(results[0]["content"])["status"] == "no_response"
+    assert not any(e["type"] == "response.omnio.interaction_completed" for e in events)
+
+
 class TestParseContinuation:
     def test_no_close(self):
         assert _parse_continuation({}) is None
