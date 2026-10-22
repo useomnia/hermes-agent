@@ -452,6 +452,14 @@ def _parse_steer_notes(value: Any) -> List[Dict[str, str]]:
     return [{"id": note_id, "text": text} for note_id, text in zip(ids, texts)]
 
 
+_MAX_STEER_ID_LENGTH = 200
+
+
+def _is_valid_steer_id(value: Any) -> bool:
+    """A caller steer id: a string of 1 to 200 characters, like a note id."""
+    return isinstance(value, str) and 0 < len(value) <= _MAX_STEER_ID_LENGTH
+
+
 def _redact_response_extension_value(value: Any) -> Any:
     """Recursively redact string values before they enter a Turn extension."""
     if isinstance(value, str):
@@ -1801,6 +1809,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # Accepted steers by run and caller steer id, cached for this process.
+        # The profile's run store keeps them durably for a later process.
+        self._run_steer_outcomes: Dict[str, Dict[str, str]] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -2484,6 +2495,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
             ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
+            ("GET", "/v1/runs/{run_id}/steers/{steer_id}", self._handle_run_steer_status),
             ("POST", "/v1/runs/{run_id}/user-input", self._handle_run_user_input),
             # Authenticated Omnio handover contract. The operation-in-body
             # route is canonical; explicit aliases keep control-plane clients
@@ -3786,6 +3798,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_steer": True,
                 # Steers may carry app facts that wait for the next tool batch.
                 "run_steer_context_notes": {"apiVersion": 1},
+                # Steers may carry a caller id: a repeated id is not delivered
+                # twice, and GET /v1/runs/{run_id}/steers/{steer_id} answers
+                # whether the run accepted it, across gateway restarts.
+                "run_steer_ids": {"apiVersion": 1},
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -7813,85 +7829,142 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id: str,
         text: str,
         mode: str = "redirect",
+        steer_id: Optional[str] = None,
     ) -> str:
-        """Accept and deliver one steer without blocking the aiohttp loop."""
+        """Accept and deliver one steer without blocking the aiohttp loop.
+
+        A steer id the run already accepted answers with its first outcome
+        and is not delivered again, including after the run ended or the
+        gateway restarted.
+        """
+        accepted = await self._accepted_steer_outcome(run_id, steer_id)
+        if accepted is not None:
+            return accepted
         lifecycle = self._run_lifecycles.get(run_id)
         if lifecycle is None:
             return "not_found"
         async with lifecycle["lock"]:
-            if self._run_lifecycles.get(run_id) is not lifecycle:
-                return "not_found"
-            agent = self._active_run_agents.get(run_id)
-            task = self._active_run_tasks.get(run_id)
+            accepted = await self._accepted_steer_outcome(run_id, steer_id)
+            if accepted is not None:
+                return accepted
+            outcome = await self._steer_live_run(run_id, lifecycle, text, mode)
+            if steer_id is not None and outcome in {"redirected", "queued"}:
+                await self._record_accepted_steer(run_id, steer_id, outcome)
+            return outcome
 
-            if not lifecycle["accepting"]:
-                return "not_found"
-            published_agent = lifecycle.get("agent")
-            if published_agent is not None and published_agent is not agent:
-                return "not_found"
-            if task is None or task.done():
-                return "not_found"
+    async def _accepted_steer_outcome(
+        self, run_id: str, steer_id: Optional[str]
+    ) -> Optional[str]:
+        if steer_id is None:
+            return None
+        cached = self._run_steer_outcomes.get(run_id, {}).get(steer_id)
+        if cached is not None:
+            return cached
+        return await self._run_reservation_io(
+            self._effective_request_profile(), "steer_outcome", run_id, steer_id
+        )
 
-            if agent is None:
-                lifecycle["pending"].append(text)
-                return "queued"
+    async def _record_accepted_steer(self, run_id: str, steer_id: str, outcome: str) -> None:
+        """Keep an accepted steer id; the run already holds the steer.
 
-            if published_agent is None:
-                lifecycle["agent"] = agent
-
-            is_codex_app_server = (
-                getattr(agent, "api_mode", None) == "codex_app_server"
+        A failed durable write keeps the id for this process only, so a
+        restarted gateway can no longer answer for it.
+        """
+        self._run_steer_outcomes.setdefault(run_id, {})[steer_id] = outcome
+        try:
+            await self._run_reservation_io(
+                self._effective_request_profile(),
+                "record_steer",
+                run_id=run_id,
+                steer_id=steer_id,
+                outcome=outcome,
             )
-            native_soft_steer = mode == "steer" and is_codex_app_server
-            should_redirect = native_soft_steer or (
-                mode == "redirect"
-                and getattr(agent, "_supports_active_turn_redirect", False)
-            )
-            redirect_degraded_to_steer = (
-                mode == "redirect"
-                and not is_codex_app_server
-                and bool(getattr(agent, "_executing_tools", False))
+        except Exception:
+            logger.exception(
+                "[api_server] could not keep steer id for run %s", run_id
             )
 
-            redirected = False
-            if should_redirect:
-                try:
-                    redirected = bool(await asyncio.to_thread(agent.redirect, text))
-                except Exception:
-                    logger.warning(
-                        "[api_server] active-turn redirect failed for run %s",
-                        run_id,
-                        exc_info=True,
-                    )
-            if redirected:
-                outcome = (
-                    "queued"
-                    if native_soft_steer or redirect_degraded_to_steer
-                    else "redirected"
+    async def _steer_live_run(
+        self,
+        run_id: str,
+        lifecycle: Dict[str, Any],
+        text: str,
+        mode: str,
+    ) -> str:
+        """Deliver one steer to a run; the caller holds the run's lifecycle lock."""
+        if self._run_lifecycles.get(run_id) is not lifecycle:
+            return "not_found"
+        agent = self._active_run_agents.get(run_id)
+        task = self._active_run_tasks.get(run_id)
+
+        if not lifecycle["accepting"]:
+            return "not_found"
+        published_agent = lifecycle.get("agent")
+        if published_agent is not None and published_agent is not agent:
+            return "not_found"
+        if task is None or task.done():
+            return "not_found"
+
+        if agent is None:
+            lifecycle["pending"].append(text)
+            return "queued"
+
+        if published_agent is None:
+            lifecycle["agent"] = agent
+
+        is_codex_app_server = (
+            getattr(agent, "api_mode", None) == "codex_app_server"
+        )
+        native_soft_steer = mode == "steer" and is_codex_app_server
+        should_redirect = native_soft_steer or (
+            mode == "redirect"
+            and getattr(agent, "_supports_active_turn_redirect", False)
+        )
+        redirect_degraded_to_steer = (
+            mode == "redirect"
+            and not is_codex_app_server
+            and bool(getattr(agent, "_executing_tools", False))
+        )
+
+        redirected = False
+        if should_redirect:
+            try:
+                redirected = bool(await asyncio.to_thread(agent.redirect, text))
+            except Exception:
+                logger.warning(
+                    "[api_server] active-turn redirect failed for run %s",
+                    run_id,
+                    exc_info=True,
                 )
-            elif native_soft_steer:
-                outcome = "failed"
-            else:
-                try:
-                    accepted = bool(await asyncio.to_thread(agent.steer, text))
-                except Exception:
-                    logger.warning(
-                        "[api_server] steer failed for run %s",
-                        run_id,
-                        exc_info=True,
-                    )
-                    accepted = False
-                outcome = "queued" if accepted else "failed"
-
-            # Re-check the identity/state after the off-loop call.  A stale
-            # success must not turn into a 200 for a finished or replaced run.
-            still_live = (
-                lifecycle["accepting"]
-                and self._active_run_agents.get(run_id) is agent
-                and lifecycle.get("agent") is agent
-                and not task.done()
+        if redirected:
+            outcome = (
+                "queued"
+                if native_soft_steer or redirect_degraded_to_steer
+                else "redirected"
             )
-            return outcome if still_live else "not_found"
+        elif native_soft_steer:
+            outcome = "failed"
+        else:
+            try:
+                accepted = bool(await asyncio.to_thread(agent.steer, text))
+            except Exception:
+                logger.warning(
+                    "[api_server] steer failed for run %s",
+                    run_id,
+                    exc_info=True,
+                )
+                accepted = False
+            outcome = "queued" if accepted else "failed"
+
+        # Re-check the identity/state after the off-loop call.  A stale
+        # success must not turn into a 200 for a finished or replaced run.
+        still_live = (
+            lifecycle["accepting"]
+            and self._active_run_agents.get(run_id) is agent
+            and lifecycle.get("agent") is agent
+            and not task.done()
+        )
+        return outcome if still_live else "not_found"
 
     def _interrupt_run(
         self,
@@ -10669,6 +10742,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
+        steer_id = body.get("steer_id") if isinstance(body, dict) else None
+        if steer_id is not None and not _is_valid_steer_id(steer_id):
+            return web.json_response(
+                _openai_error(
+                    f"Invalid 'steer_id'; expected 1-{_MAX_STEER_ID_LENGTH} characters",
+                    code="steer_invalid_id",
+                ),
+                status=400,
+            )
 
         if notes:
             noted = await self._queue_run_context_notes(run_id, notes)
@@ -10682,8 +10764,58 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             if noted == "not_found" or not text:
                 return self._steer_outcome_response(run_id, noted)
-        outcome = await self._steer_run_off_loop(run_id, text, mode)
+        outcome = await self._steer_run_off_loop(run_id, text, mode, steer_id=steer_id)
         return self._steer_outcome_response(run_id, outcome)
+
+    async def _handle_run_steer_status(self, request: "web.Request") -> "web.Response":
+        """GET /v1/runs/{run_id}/steers/{steer_id} — whether the run accepted a steer.
+
+        Waits for a steer of the run that is still being delivered, so the
+        answer covers every request the run received before it. ``final`` is
+        False while the run still accepts steers: an ``unknown`` id may yet
+        arrive. Once the run stops accepting, including across a gateway
+        restart, an ``unknown`` id can never be accepted.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        steer_id = request.match_info["steer_id"]
+        lifecycle = self._run_lifecycles.get(run_id)
+        accepting = False
+        if lifecycle is not None:
+            async with lifecycle["lock"]:
+                outcome = await self._accepted_steer_outcome(run_id, steer_id)
+                accepting = (
+                    self._run_lifecycles.get(run_id) is lifecycle and lifecycle["accepting"]
+                )
+        else:
+            outcome = await self._accepted_steer_outcome(run_id, steer_id)
+        if outcome is None and not accepting and not await self._run_is_known(run_id):
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+        return web.json_response(
+            {
+                "object": "hermes.run_steer",
+                "run_id": run_id,
+                "steer_id": steer_id,
+                "status": "accepted" if outcome is not None else "unknown",
+                "outcome": outcome,
+                "final": outcome is not None or not accepting,
+            }
+        )
+
+    async def _run_is_known(self, run_id: str) -> bool:
+        if run_id in self._run_statuses:
+            return True
+        return bool(
+            await self._run_reservation_io(
+                self._effective_request_profile(), "has_run", run_id
+            )
+        )
 
     @staticmethod
     def _steer_outcome_response(run_id: str, outcome: str) -> "web.Response":
@@ -10748,6 +10880,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_steer_outcomes.pop(run_id, None)
             self._user_input_resolutions.pop(run_id, None)
 
     # ------------------------------------------------------------------
