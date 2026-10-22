@@ -116,6 +116,9 @@ async def _stop_waiting_interaction(adapter, db, client, kind, position=0, relea
     from tools.interrupt import set_interrupt
 
     persistence = _persistent_agent(db)
+    tool_approval.clear_session(
+        adapter._scoped_tool_approval_session_key(SESSION, adapter._effective_request_profile())
+    )
     ready = threading.Event()
     execution = {}
     tool_name = "request_user_input" if kind == "question" else "mcp_connectors_TEST_WRITE"
@@ -247,6 +250,82 @@ async def test_stopped_approval_accepts_late_decision(adapter, db, scope, kind):
             )
             assert response.status == 202, await response.text()
             await _wait_for_run(resumed)
+    if kind == "nested-approval":
+        grant_key = adapter._scoped_tool_approval_session_key(SESSION, adapter._effective_request_profile())
+        assert tool_approval.consume_once_approval(
+            grant_key, "next-call", "mcp_connectors_TEST_WRITE", {"record": 7}
+        ) is (scope == "once")
+        assert not tool_approval.consume_once_approval(
+            grant_key, "next-call", "mcp_connectors_TEST_WRITE", {"record": 7}
+        )
+
+
+@pytest.mark.asyncio
+async def test_continue_after_stop_closes_the_question_as_interrupted(adapter, db):
+    async with TestClient(TestServer(_app(adapter))) as client:
+        call_id, _events = await _stop_waiting_interaction(adapter, db, client, "question")
+        resumed = _agent()
+        with patch.object(adapter, "_create_agent", return_value=resumed):
+            response = await client.post(
+                "/v1/runs", headers=AUTH, json=_continue({"kind": "interrupted"})
+            )
+            assert response.status == 202, await response.text()
+            await _wait_for_run(resumed)
+    results = [m for m in db.get_messages(SESSION) if m.get("tool_call_id") == call_id]
+    assert len(results) == 1
+    assert json.loads(results[0]["content"])["status"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_stopped_question_history_accepts_a_new_user_message(adapter, db):
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        call_id, _events = await _stop_waiting_interaction(adapter, db, client, "question")
+    saved = db.get_messages_as_conversation(SESSION)
+    new_message = {"role": "user", "content": "Work on something else instead"}
+    outgoing = sanitize_api_messages([*saved, new_message])
+    assert outgoing[-1] == new_message
+    pending = [m for m in outgoing if m.get("tool_call_id") == call_id]
+    assert len(pending) == 1
+    assert json.loads(pending[0]["content"])["status"] == "pending"
+    assert db.get_messages_as_conversation(SESSION) == saved
+
+
+@pytest.mark.asyncio
+async def test_late_answer_after_stop_replays_once_and_refuses_a_changed_answer(adapter, db):
+    async with TestClient(TestServer(_app(adapter))) as client:
+        call_id, _events = await _stop_waiting_interaction(adapter, db, client, "question")
+        answer = {"kind": "answer", "tool_call_id": call_id, "response": "Blue"}
+        with patch.object(adapter, "_create_agent", return_value=_agent()):
+            response = await client.post("/v1/runs", headers=AUTH, json=_continue(answer))
+            assert response.status == 202, await response.text()
+            run_id = (await response.json())["run_id"]
+            stream = await client.get(f"/v1/runs/{run_id}/events", headers=AUTH)
+            await stream.text()
+            replay = await client.post("/v1/runs", headers=AUTH, json=_continue(answer))
+            assert replay.status == 202, await replay.text()
+            assert (await replay.json())["run_id"] == run_id
+            conflict = await client.post(
+                "/v1/runs", headers=AUTH,
+                json=_continue({**answer, "response": "Red"}, turn_id="changed-answer"),
+            )
+            assert conflict.status == 409
+            assert (await conflict.json())["error"]["code"] == "continuation_conflict"
+    answers = [m for m in db.get_messages(SESSION) if m.get("tool_call_id") == call_id]
+    assert len(answers) == 1
+    assert json.loads(answers[0]["content"])["response"] == "Blue"
+
+
+@pytest.mark.parametrize("reason", ["expired", "cancelled", "no_surface", None])
+def test_user_input_keeps_only_released_waits_open(reason):
+    agent = _agent()
+    agent._omnio_skip_persist_tool_call_ids = None
+    with patch("tools.user_input.consume_user_input_completion_reason", return_value=reason):
+        assert APIServerAdapter._keep_unanswered_user_input(agent, "q1", SESSION) is (reason == "expired")
+    assert agent._omnio_skip_persist_tool_call_ids == (
+        {"q1"} if reason in {"expired", "cancelled"} else None
+    )
 
 
 class TestParseContinuation:
@@ -585,7 +664,7 @@ async def test_late_approval_for_an_unknown_call_is_refused(adapter, db):
 def test_expired_approval_leaves_its_call_open():
     agent = MagicMock()
     agent._omnio_skip_persist_tool_call_ids = None
-    APIServerAdapter._interrupt_for_expired_tool_approval(
+    APIServerAdapter._interrupt_for_unanswered_tool_approval(
         agent, {"toolCallId": "w1", "interaction": {"timed_out": True}}
     )
     assert agent._omnio_skip_persist_tool_call_ids == {"w1"}
@@ -595,7 +674,7 @@ def test_expired_approval_leaves_its_call_open():
 def test_answered_approval_is_not_left_open():
     agent = MagicMock()
     agent._omnio_skip_persist_tool_call_ids = None
-    APIServerAdapter._interrupt_for_expired_tool_approval(
+    APIServerAdapter._interrupt_for_unanswered_tool_approval(
         agent, {"toolCallId": "w1", "interaction": {"timed_out": False}}
     )
     assert agent._omnio_skip_persist_tool_call_ids is None

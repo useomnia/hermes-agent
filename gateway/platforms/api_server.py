@@ -4103,7 +4103,7 @@ class APIServerAdapter(BasePlatformAdapter):
         status, info = await asyncio.to_thread(_close, close)
         note: Optional[str] = None
         # A gated call nested inside execute_code has no call of its own in
-        # history; the gate remembered what it asked when the wait expired.
+        # history; the gate remembered what it asked when the wait ended.
         expired = (
             take_expired_approval(grant_session_key, close["tool_call_id"])
             if status == "not_found"
@@ -4124,16 +4124,16 @@ class APIServerAdapter(BasePlatformAdapter):
             expired = (close["gated"]["tool"], close["gated"]["arguments"])
         if expired is not None:
             nested_name, nested_arguments = expired
-            # The enclosing script was cut short by the expiry and stays open;
+            # The enclosing script was cut short by the wait and stays open;
             # close it as interrupted so the model can decide to run it again.
             if close["scope"] == "deny":
                 note = (
-                    f"After its approval request timed out, the user declined `{nested_name}`. "
+                    f"After the approval wait ended, the user declined `{nested_name}`. "
                     "It was not performed."
                 )
             else:
                 note = (
-                    f"After its approval request timed out, the user approved `{nested_name}`. "
+                    f"After the approval wait ended, the user approved `{nested_name}`. "
                     "It has not run yet. The approval applies to the same arguments if the call is still needed."
                 )
             status, info = await asyncio.to_thread(_close, {"kind": "interrupted"}, note)
@@ -5289,16 +5289,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                     if isinstance(parsed, dict) and parsed.get("status") == "no_response":
                         try:
-                            from tools.user_input import (
-                                consume_user_input_completion_reason,
-                            )
-
-                            completion_reason = consume_user_input_completion_reason(
-                                session_id
+                            timed_out = self._keep_unanswered_user_input(
+                                agent_ref[0], tool_call_id, session_id
                             )
                         except Exception:
-                            completion_reason = None
-                        if completion_reason == "expired":
+                            timed_out = False
+                        if timed_out:
                             completed.setdefault("interaction", {})["timed_out"] = True
                     turn_ending = isinstance(parsed, dict) and parsed.get("status") in {
                         "presented",
@@ -5352,7 +5348,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     _stream_q.put_nowait(("__tool_progress__", event))
                 except Exception:
                     pass
-                self._interrupt_for_expired_tool_approval(agent_ref[0], event)
+                self._interrupt_for_unanswered_tool_approval(agent_ref[0], event)
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -7927,7 +7923,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _leave_interaction_open(agent, tool_call_id: Any) -> None:
-        """Keep a timed-out interaction's call unresolved in SessionDB.
+        """Keep an unanswered interaction's call unresolved in SessionDB.
 
         The live sentinel still ends the run, but it is not the call's real
         result: a late answer or decision closes the call through a no-user
@@ -7942,10 +7938,20 @@ class APIServerAdapter(BasePlatformAdapter):
         pending.add(tool_call_id)
 
     @staticmethod
-    def _interrupt_for_expired_tool_approval(
+    def _keep_unanswered_user_input(agent, tool_call_id: str, session_key: str) -> bool:
+        """Preserve a released question for a late answer; report expiry only."""
+        from tools.user_input import consume_user_input_completion_reason
+
+        reason = consume_user_input_completion_reason(session_key)
+        if reason in {"expired", "cancelled"}:
+            APIServerAdapter._leave_interaction_open(agent, tool_call_id)
+        return reason == "expired"
+
+    @staticmethod
+    def _interrupt_for_unanswered_tool_approval(
         agent, event: Dict[str, Any], enclosing_call_ids: Iterable[str] = ()
     ) -> None:
-        """End the run on an expired approval, leaving its call open.
+        """End the run on an unanswered approval, leaving its call open.
 
         A gated call nested inside ``execute_code`` has no call of its own in
         history: the call left open for the late decision is the enclosing
@@ -7955,17 +7961,18 @@ class APIServerAdapter(BasePlatformAdapter):
         if (
             agent is None
             or not isinstance(interaction, dict)
-            or interaction.get("timed_out") is not True
+            or not (interaction.get("timed_out") is True or interaction.get("cancelled") is True)
         ):
             return
         enclosing = [call_id for call_id in enclosing_call_ids if call_id]
         for call_id in enclosing or [event.get("toolCallId")]:
             APIServerAdapter._leave_interaction_open(agent, call_id)
         try:
-            agent.interrupt("awaiting user approval (tool approval timed out)")
+            reason = "timed out" if interaction.get("timed_out") is True else "cancelled"
+            agent.interrupt(f"awaiting user approval (tool approval {reason})")
         except Exception:
             logger.warning(
-                "[api_server] failed to interrupt expired tool approval "
+                "[api_server] failed to interrupt unanswered tool approval "
                 "(tool_call_id=%s)", event.get("toolCallId"), exc_info=True,
             )
 
@@ -9079,7 +9086,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 **event,
             )
             approval_call_id = event.get("toolCallId")
-            self._interrupt_for_expired_tool_approval(
+            self._interrupt_for_unanswered_tool_approval(
                 self._active_run_agents.get(run_id),
                 event,
                 ()
@@ -9148,28 +9155,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 completion_fields: Optional[Dict[str, Any]] = None
                 if status == "no_response":
                     try:
-                        from tools.user_input import (
-                            consume_user_input_completion_reason,
-                        )
-
-                        # The wait is registered under the run's approval
-                        # key, not the conversation's session id.
-                        reason = consume_user_input_completion_reason(
-                            approval_session_key
-                        )
-                    except Exception:
-                        reason = None
-                    # Only an expired wait closes the card; a stop or disconnect
-                    # leaves it open and answerable.
-                    if reason == "expired":
-                        completion_fields = {"timed_out": True}
-                        # The late answer closes this call through a
-                        # continuation, so its sentinel must not become the
-                        # call's durable result.
-                        self._leave_interaction_open(
+                        timed_out = self._keep_unanswered_user_input(
                             self._active_run_agents.get(run_id),
                             normalized_tool_call_id,
+                            approval_session_key,
                         )
+                    except Exception:
+                        timed_out = False
+                    # Only an expired wait closes the card; a stop or disconnect
+                    # leaves it open and answerable.
+                    if timed_out:
+                        completion_fields = {"timed_out": True}
                 # The question is now waiting on the chat, not on this run: the
                 # card stays answerable and a late answer closes the call
                 # through a continuation, so the run must end instead of
