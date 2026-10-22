@@ -1010,7 +1010,7 @@ def _remember_expired_approval(
 
 
 def take_expired_approval(session_key: str, tool_call_id: str) -> Optional[tuple[str, dict]]:
-    """The tool and arguments an unanswered approval asked about, consumed once."""
+    """The tool and arguments a timed-out approval asked about, consumed once."""
     with _lock:
         return _EXPIRED_APPROVALS.pop((session_key, tool_call_id), None)
 
@@ -1027,8 +1027,6 @@ def _complete_tool_approval(
     if notify is None:
         return
     interaction: dict[str, object] = {"timed_out": reason == "expired"}
-    if reason == "cancelled":
-        interaction["cancelled"] = True
     if decision is not None:
         interaction["answered"] = decision
     try:

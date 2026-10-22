@@ -234,30 +234,16 @@ async def test_stopped_question_accepts_late_answer_without_losing_siblings(
     assert not any(e["type"] == "response.omnio.interaction_completed" for e in events)
 
 
-@pytest.mark.parametrize("scope", ["once", "deny"])
 @pytest.mark.parametrize("kind", ["approval", "nested-approval"])
 @pytest.mark.asyncio
-async def test_stopped_approval_accepts_late_decision(adapter, db, scope, kind):
+async def test_stopped_approval_stays_closed(adapter, db, kind):
+    """Stop declines a pending approval: Omnia collapses its card, so the gated
+    call keeps its saved result instead of waiting for a late decision."""
     async with TestClient(TestServer(_app(adapter))) as client:
-        call_id, events = await _stop_waiting_interaction(adapter, db, client, kind)
-        assert not any(e.get("timed_out") is True for e in events)
-        assert not any(m.get("tool_call_id") == "q1" for m in db.get_messages(SESSION))
-        resumed = _agent()
-        with patch.object(adapter, "_create_agent", return_value=resumed):
-            response = await client.post(
-                "/v1/runs", headers=AUTH,
-                json=_continue({"kind": "approval", "tool_call_id": call_id, "scope": scope}),
-            )
-            assert response.status == 202, await response.text()
-            await _wait_for_run(resumed)
-    if kind == "nested-approval":
-        grant_key = adapter._scoped_tool_approval_session_key(SESSION, adapter._effective_request_profile())
-        assert tool_approval.consume_once_approval(
-            grant_key, "next-call", "mcp_connectors_TEST_WRITE", {"record": 7}
-        ) is (scope == "once")
-        assert not tool_approval.consume_once_approval(
-            grant_key, "next-call", "mcp_connectors_TEST_WRITE", {"record": 7}
-        )
+        await _stop_waiting_interaction(adapter, db, client, kind)
+    results = [m for m in db.get_messages(SESSION) if m.get("tool_call_id") == "q1"]
+    assert len(results) == 1
+    assert json.loads(results[0]["content"])["status"] == "approval_no_response"
 
 
 @pytest.mark.asyncio
@@ -678,7 +664,7 @@ async def test_late_approval_for_an_unknown_call_is_refused(adapter, db):
 def test_expired_approval_leaves_its_call_open():
     agent = MagicMock()
     agent._omnio_skip_persist_tool_call_ids = None
-    APIServerAdapter._interrupt_for_unanswered_tool_approval(
+    APIServerAdapter._interrupt_for_expired_tool_approval(
         agent, {"toolCallId": "w1", "interaction": {"timed_out": True}}
     )
     assert agent._omnio_skip_persist_tool_call_ids == {"w1"}
@@ -688,7 +674,7 @@ def test_expired_approval_leaves_its_call_open():
 def test_answered_approval_is_not_left_open():
     agent = MagicMock()
     agent._omnio_skip_persist_tool_call_ids = None
-    APIServerAdapter._interrupt_for_unanswered_tool_approval(
+    APIServerAdapter._interrupt_for_expired_tool_approval(
         agent, {"toolCallId": "w1", "interaction": {"timed_out": False}}
     )
     assert agent._omnio_skip_persist_tool_call_ids is None
