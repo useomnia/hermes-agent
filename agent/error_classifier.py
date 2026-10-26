@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -566,6 +567,31 @@ _SSL_TRANSIENT_PATTERNS = [
     # Python ssl module prefix, e.g. "[SSL: BAD_RECORD_MAC]"
     "[ssl:",
 ]
+
+# Reasoning wire-field names, longest first. Standalone only: never a model-id
+# segment ("kimi-k2-thinking") nor the adjective in "... with reasoning models".
+_REASONING_FIELD_TOKEN = re.compile(
+    r"(?<![\w\-/])(?:reasoning_effort|thinking_config|thinking_budget|enable_thinking|thinkingconfig"
+    r"|thinkingbudget|reasoning|thinking|think)(?![\w\-/])(?!\s+models?\b)"
+)
+
+_REASONING_REQUIRED_MARKERS = (
+    "mandatory", "cannot be disabled", "can't be disabled", "must be enabled", "is required",
+    "always enabled", "cannot be turned off",
+)
+
+
+def is_reasoning_required_rejection(error_msg: str) -> bool:
+    """Provider 400 saying the model's reasoning cannot be switched OFF ("Reasoning is mandatory for
+    this endpoint and cannot be disabled", OpenRouter on openai/gpt-6.1-sol). The field is understood,
+    only the *disable* is refused, so the right reaction is to step the effort up to the lowest level
+    (agent/auxiliary_reasoning_floor.py) rather than drop the field."""
+    msg = (error_msg or "").lower()
+    token = _REASONING_FIELD_TOKEN.search(msg)
+    if token is None:
+        return False
+    near = msg[max(0, token.start() - 48):token.end() + 96]
+    return any(m in near for m in _REASONING_REQUIRED_MARKERS)
 
 
 # ── Classification pipeline ─────────────────────────────────────────────
