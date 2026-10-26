@@ -104,7 +104,13 @@ class _OpenAIProxy:
 
 OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
+from agent.auxiliary_reasoning_floor import (
+    known_reasoning_floor,
+    remember_reasoning_floor,
+    with_reasoning_floor,
+)
 from agent.credential_pool import load_pool
+from agent.error_classifier import is_reasoning_required_rejection
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
@@ -3408,6 +3414,16 @@ def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
         "unrecognized parameter",
         "invalid parameter",
     ))
+
+
+def _is_reasoning_required_rejection(exc: Exception) -> bool:
+    """Provider 400 refusing to switch reasoning OFF ("Reasoning is mandatory for this endpoint and cannot
+    be disabled"): the field is understood, only the disable is refused, so the retry steps the effort up
+    to the floor instead of dropping the field (agent/auxiliary_reasoning_floor.py)."""
+    status = getattr(exc, "status_code", None)
+    if status is not None and status not in {400, 422}:
+        return False
+    return is_reasoning_required_rejection(str(exc))
 
 
 def _is_unsupported_temperature_error(exc: Exception) -> bool:
@@ -7152,7 +7168,9 @@ def _build_call_kwargs(
         ):
             kwargs["_reasoning_config"] = dict(reasoning_config)
 
-    return kwargs
+    # A route that already refused a reasoning disable in this process gets the
+    # floor up front instead of the guaranteed 400.
+    return known_reasoning_floor(kwargs, provider, base_url, task)
 
 
 def _validate_llm_response(
@@ -7882,6 +7900,43 @@ def call_llm(
                 first_err = retry_err
                 kwargs = retry_kwargs
 
+        # The endpoint refuses the *disable* rather than the field (OpenRouter
+        # on openai/gpt-6.1-sol: "Reasoning is mandatory ... cannot be
+        # disabled"): step the effort up to the floor and remember the route so
+        # the next thinking-off aux call starts there.
+        floored_kwargs = (
+            with_reasoning_floor(kwargs) if _is_reasoning_required_rejection(first_err) else None
+        )
+        if floored_kwargs is not None:
+            logger.info(
+                "Auxiliary %s: provider requires reasoning; retrying at the floor effort: %s",
+                task or "call", first_err,
+            )
+            try:
+                response = _validate_llm_response(
+                    _create_with_progress(
+                        client, floored_kwargs, task,
+                        force_stream=_provider_requires_stream(
+                            resolved_provider, _base_info or resolved_base_url,
+                        ),
+                    ), task)
+            except Exception as retry_err:
+                retry_err_str = str(retry_err)
+                if not (
+                    _is_payment_error(retry_err)
+                    or _is_connection_error(retry_err)
+                    or _is_auth_error(retry_err)
+                    or _is_rate_limit_error(retry_err)
+                    or "max_tokens" in retry_err_str
+                    or "unsupported_parameter" in retry_err_str
+                ):
+                    raise
+                first_err = retry_err
+                kwargs = floored_kwargs
+            else:
+                remember_reasoning_floor(resolved_provider, _base_info or resolved_base_url, kwargs)
+                return response
+
         err_str = str(first_err)
         # ZAI vision models (glm-4v-flash etc.) return error code 1210
         # ("API 调用参数有误") when max_tokens is passed on multimodal
@@ -8475,6 +8530,38 @@ async def async_call_llm(
                     raise
                 first_err = retry_err
                 kwargs = retry_kwargs
+
+        # The endpoint refuses the *disable* rather than the field (OpenRouter
+        # on openai/gpt-6.1-sol: "Reasoning is mandatory ... cannot be
+        # disabled"): step the effort up to the floor and remember the route so
+        # the next thinking-off aux call starts there.
+        floored_kwargs = (
+            with_reasoning_floor(kwargs) if _is_reasoning_required_rejection(first_err) else None
+        )
+        if floored_kwargs is not None:
+            logger.info(
+                "Auxiliary %s (async): provider requires reasoning; retrying at the floor effort: %s",
+                task or "call", first_err,
+            )
+            try:
+                response = _validate_llm_response(
+                    await _acreate(floored_kwargs), task)
+            except Exception as retry_err:
+                retry_err_str = str(retry_err)
+                if not (
+                    _is_payment_error(retry_err)
+                    or _is_connection_error(retry_err)
+                    or _is_auth_error(retry_err)
+                    or _is_rate_limit_error(retry_err)
+                    or "max_tokens" in retry_err_str
+                    or "unsupported_parameter" in retry_err_str
+                ):
+                    raise
+                first_err = retry_err
+                kwargs = floored_kwargs
+            else:
+                remember_reasoning_floor(resolved_provider, _client_base or resolved_base_url, kwargs)
+                return response
 
         err_str = str(first_err)
         # ZAI vision models (glm-4v-flash etc.) return error code 1210
