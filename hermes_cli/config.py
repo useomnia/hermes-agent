@@ -1044,6 +1044,10 @@ DEFAULT_CONFIG = {
         "terminal_backend_hint": True,
         "model_info_hint": True,
         "agent_help_guidance": True,
+        # Instructions to capture workflows as skills and patch skills
+        # unprompted. Embedders that create skills only on explicit request
+        # set this False; the skill safety rules stay either way.
+        "skill_learning_guidance": True,
         "fallback_identity": "",
         # Embedder-supplied environment description appended to the system
         # prompt's environment-hints block. Lets a host that wraps Hermes
@@ -2547,6 +2551,9 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Top-level skill categories the system-prompt index lists by name
+        # only, without descriptions. The skills still load normally.
+        "compact_categories": [],
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled

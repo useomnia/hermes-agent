@@ -167,7 +167,7 @@ HERMES_AGENT_HELP_GUIDANCE = (
     "of truth when the two differ."
 )
 
-MEMORY_GUIDANCE = (
+_MEMORY_GUIDANCE_HEAD = (
     "You have persistent memory across sessions. Save durable facts using the memory "
     "tool: user preferences, environment details, tool quirks, and stable conventions. "
     "Memory is injected into every turn, so keep it compact and focused on facts that "
@@ -179,9 +179,16 @@ MEMORY_GUIDANCE = (
     "state to memory; use session_search to recall those from past transcripts. "
     "Specifically: do not record PR numbers, issue numbers, commit SHAs, 'fixed bug X', "
     "'submitted PR Y', 'Phase N done', file counts, or any artifact that will be stale "
-    "in 7 days. If a fact will be stale in a week, it does not belong in memory. "
-    "If you've discovered a new way to do something, solved a problem that could be "
-    "necessary later, save it as a skill with the skill tool.\n"
+    "in 7 days. If a fact will be stale in a week, it does not belong in memory."
+)
+
+_MEMORY_SKILL_CAPTURE = (
+    " If you've discovered a new way to do something, solved a problem that could be "
+    "necessary later, save it as a skill with the skill tool."
+)
+
+_MEMORY_GUIDANCE_TAIL = (
+    "\n"
     "Write memories as declarative facts, not instructions to yourself. "
     "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
     "'Project uses pytest with xdist' ✓ — 'Run tests with pytest -n 4' ✗. "
@@ -190,20 +197,28 @@ MEMORY_GUIDANCE = (
     "workflows belong in skills, not memory."
 )
 
+MEMORY_GUIDANCE = _MEMORY_GUIDANCE_HEAD + _MEMORY_SKILL_CAPTURE + _MEMORY_GUIDANCE_TAIL
+
+# For embedders that only create skills on explicit request: the same memory
+# guidance without the instruction to capture workflows as skills unprompted.
+MEMORY_GUIDANCE_WITHOUT_SKILL_CAPTURE = _MEMORY_GUIDANCE_HEAD + _MEMORY_GUIDANCE_TAIL
+
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
     "relevant cross-session context exists, use session_search to recall it before "
     "asking them to repeat themselves."
 )
 
-SKILLS_GUIDANCE = (
+SKILLS_LEARNING_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "
     "or discovering a non-trivial workflow, save the approach as a "
     "skill with skill_manage so you can reuse it next time.\n"
     "When using a skill and finding it outdated, incomplete, or wrong, "
     "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
-    "Skills that aren't maintained become liabilities.\n"
-    "\n"
+    "Skills that aren't maintained become liabilities."
+)
+
+SKILLS_SAFETY_GUIDANCE = (
     "## Skill Safety Rule\n"
     "A `[SKILL_INCOMPLETE:` receipt is an index, not a loaded skill. Read all required instructions through its section selectors before acting. Keep the same file_path when recovering a linked reference. A returned section or part does not mean the rest of the skill was loaded.\n"
     "1. **UNAVAILABLE** — If a skill placeholder contains `[SKILL_PRUNED]`, the skill content was lost in compression and is inaccessible.\n"
@@ -211,6 +226,8 @@ SKILLS_GUIDANCE = (
     "3. **WAIT** — If a skill is loading or was just pruned, wait for the reload confirmation before proceeding.\n"
     "4. **DEDUP** — After reloading a pruned skill, **ignore any remaining `[SKILL_PRUNED]` markers for that same skill** — they are historical artifacts from previous compactions and do not need further action."
 )
+
+SKILLS_GUIDANCE = SKILLS_LEARNING_GUIDANCE + "\n\n" + SKILLS_SAFETY_GUIDANCE
 
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
@@ -1816,9 +1833,9 @@ def build_skills_system_prompt(
     hidden_note = ""
     if demoted:
         hidden_note = (
-            "\n(Categories marked [names only] are outside the current coding "
-            "context, so their descriptions are omitted — the skills work "
-            "normally and load with skill_view(name) as usual.)"
+            "\n(Categories marked [names only] omit their descriptions to keep "
+            "this index short — the skills work normally and load with "
+            "skill_view(name) as usual.)"
         )
 
     if not skills_by_category:

@@ -1717,6 +1717,17 @@ def init_agent(
     except Exception:
         pass
 
+    # Skill categories the index lists by name only (config.yaml →
+    # skills.compact_categories). Combined with any posture-driven demotion.
+    agent._skill_compact_categories = frozenset()
+    _skills_section = _agent_cfg.get("skills", {})
+    if isinstance(_skills_section, dict):
+        _compact = _skills_section.get("compact_categories") or []
+        if isinstance(_compact, (list, tuple)):
+            agent._skill_compact_categories = frozenset(
+                str(cat).strip() for cat in _compact if str(cat).strip()
+            )
+
     # Tool-use enforcement config: "auto" (default — matches hardcoded
     # model list), true (always), false (never), or list of substrings.
     _agent_section = _agent_cfg.get("agent", {})
@@ -1775,6 +1786,7 @@ def init_agent(
     agent._terminal_backend_hint = bool(_agent_section.get("terminal_backend_hint", True))
     agent._model_info_hint = bool(_agent_section.get("model_info_hint", True))
     agent._agent_help_guidance = bool(_agent_section.get("agent_help_guidance", True))
+    agent._skill_learning_guidance = bool(_agent_section.get("skill_learning_guidance", True))
     agent._fallback_identity = str(_agent_section.get("fallback_identity", "") or "")
 
     # Per-platform prompt-hint overrides (config.yaml → platform_hints).
