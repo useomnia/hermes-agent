@@ -16,6 +16,7 @@ from agent.tool_dispatch_helpers import (
     _is_untrusted_tool,
     _maybe_wrap_untrusted,
     _plan_tool_batch_segments,
+    _should_parallelize_tool_batch,
     make_tool_result_message,
 )
 
@@ -118,6 +119,35 @@ def test_configured_parallel_safe_tools_cannot_admit_interactive_tools():
 
     assert [kind for kind, _ in segments] == ["sequential"]
     assert segments[0][1] == calls
+
+
+def test_interactive_tool_behind_the_tool_call_bridge_stays_a_barrier(monkeypatch):
+    """The barrier applies to the unwrapped name, not only the bridge name."""
+    import json
+
+    from tools import tool_search
+
+    monkeypatch.setattr(tool_search, "is_deferrable_tool_name", lambda name: True)
+    wrapped = SimpleNamespace(
+        function=SimpleNamespace(
+            name="tool_call",
+            arguments=json.dumps({"name": "request_user_input", "arguments": {}}),
+        )
+    )
+    calls = [_named_call("web_read"), wrapped, _named_call("web_read")]
+
+    segments = _plan_tool_batch_segments(
+        calls, extra_parallel_safe=frozenset({"web_read", "request_user_input"})
+    )
+
+    assert [kind for kind, _ in segments] == ["sequential"]
+
+
+def test_homogeneous_batch_view_honours_configured_tools():
+    calls = [_named_call("web_read"), _named_call("web_read")]
+
+    assert _should_parallelize_tool_batch(calls) is False
+    assert _should_parallelize_tool_batch(calls, extra_parallel_safe=frozenset({"web_read"})) is True
 
 
 # =========================================================================

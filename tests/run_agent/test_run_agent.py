@@ -2748,12 +2748,12 @@ class TestRetryAfterCap:
 class TestToolDispatchConfig:
     """config.yaml ``agent.tool_delay`` and ``agent.parallel_safe_tools``."""
 
-    def _make_agent(self, agent_cfg):
+    def _make_agent(self, agent_cfg, config=None, **agent_kwargs):
         with (
             patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
-            patch("hermes_cli.config.load_config", return_value={"agent": agent_cfg}),
+            patch("hermes_cli.config.load_config", return_value=config or {"agent": agent_cfg}),
         ):
             a = AIAgent(
                 api_key="test-key-1234567890",
@@ -2761,6 +2761,7 @@ class TestToolDispatchConfig:
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
+                **agent_kwargs,
             )
             a.client = MagicMock()
             return a
@@ -2775,18 +2776,53 @@ class TestToolDispatchConfig:
     def test_configured_tool_delay_is_applied(self, configured, expected):
         assert self._make_agent({"tool_delay": configured}).tool_delay == expected
 
-    @pytest.mark.parametrize("configured", [-1, "0", True, None, [0]])
-    def test_invalid_tool_delay_keeps_default(self, configured):
-        assert self._make_agent({"tool_delay": configured}).tool_delay == 1.0
+    @pytest.mark.parametrize(
+        "configured", [-1, 61, float("inf"), float("nan"), "0", True, [0]]
+    )
+    def test_invalid_tool_delay_keeps_default_and_warns(self, configured, caplog):
+        with caplog.at_level(logging.WARNING):
+            agent = self._make_agent({"tool_delay": configured})
 
-    def test_parallel_safe_tools_keeps_only_named_strings(self):
-        agent = self._make_agent({"parallel_safe_tools": ["web_read", " web_map ", "", 3, None]})
+        assert agent.tool_delay == 1.0
+        assert "Ignoring agent.tool_delay" in caplog.text
+
+    def test_constructor_tool_delay_wins_over_default_config(self):
+        """load_config always merges DEFAULT_CONFIG, so agent.tool_delay is always set."""
+        import copy
+
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        agent = self._make_agent({}, config=copy.deepcopy(DEFAULT_CONFIG), tool_delay=0)
+
+        assert agent.tool_delay == 0
+
+    def test_constructor_tool_delay_wins_over_configured_value(self):
+        assert self._make_agent({"tool_delay": 2}, tool_delay=0.5).tool_delay == 0.5
+
+    def test_parallel_safe_tools_keeps_only_named_plugin_tools(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            agent = self._make_agent({"parallel_safe_tools": ["web_read", " web_map ", "", 3]})
 
         assert agent._parallel_safe_tools == frozenset({"web_read", "web_map"})
+        assert "Ignoring agent.parallel_safe_tools entry" in caplog.text
+
+    @pytest.mark.parametrize(
+        "name", ["terminal", "execute_code", "todo", "memory", "browser_click", "request_user_input", "clarify"]
+    )
+    def test_parallel_safe_tools_refuses_builtin_and_interactive_tools(self, name, caplog):
+        with caplog.at_level(logging.WARNING):
+            agent = self._make_agent({"parallel_safe_tools": [name, "web_read"]})
+
+        assert agent._parallel_safe_tools == frozenset({"web_read"})
+        assert f"Ignoring agent.parallel_safe_tools entry '{name}'" in caplog.text
 
     @pytest.mark.parametrize("configured", ["web_read", {"web_read": True}, 1])
-    def test_non_list_parallel_safe_tools_is_ignored(self, configured):
-        assert self._make_agent({"parallel_safe_tools": configured})._parallel_safe_tools == frozenset()
+    def test_non_list_parallel_safe_tools_is_ignored_and_warns(self, configured, caplog):
+        with caplog.at_level(logging.WARNING):
+            agent = self._make_agent({"parallel_safe_tools": configured})
+
+        assert agent._parallel_safe_tools == frozenset()
+        assert "expected a list of tool names" in caplog.text
 
     def test_configured_plugin_batch_routes_to_concurrent_path(self):
         agent = self._make_agent({"parallel_safe_tools": ["web_read"]})

@@ -233,7 +233,7 @@ def _plan_tool_batch_segments(
         tool_name, function_args = _resolve_planner_tool_call(
             raw_tool_name, function_args
         )
-        if tool_name is None or function_args is None:
+        if tool_name is None or function_args is None or tool_name in _NEVER_PARALLEL_TOOLS:
             _add_sequential(tool_call)
             continue
 
@@ -273,7 +273,9 @@ def _plan_tool_batch_segments(
     return [(kind, calls) for kind, calls in normalized]
 
 
-def _should_parallelize_tool_batch(tool_calls) -> bool:
+def _should_parallelize_tool_batch(
+    tool_calls, *, extra_parallel_safe: frozenset[str] = frozenset()
+) -> bool:
     """Return True when the WHOLE tool-call batch is safe to run concurrently.
 
     Thin view over ``_plan_tool_batch_segments`` kept for callers/tests that
@@ -282,7 +284,7 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
     """
     if len(tool_calls) <= 1:
         return False
-    segments = _plan_tool_batch_segments(tool_calls)
+    segments = _plan_tool_batch_segments(tool_calls, extra_parallel_safe=extra_parallel_safe)
     return len(segments) == 1 and segments[0][0] == "parallel"
 
 
