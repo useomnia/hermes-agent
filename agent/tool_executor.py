@@ -1833,7 +1833,11 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     if segments is None:
         _active_env = get_active_env(effective_task_id)
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
-        segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
+        segments = _plan_tool_batch_segments(
+            assistant_message.tool_calls,
+            execution_cwd=_exec_cwd,
+            extra_parallel_safe=getattr(agent, "_parallel_safe_tools", frozenset()),
+        )
 
     for kind, calls in segments:
         segment_message = SimpleNamespace(tool_calls=list(calls))

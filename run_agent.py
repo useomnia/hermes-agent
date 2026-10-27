@@ -6761,7 +6761,11 @@ class AIAgent:
             from agent.tool_dispatch_helpers import _plan_tool_batch_segments
             _active_env = get_active_env(effective_task_id)
             _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
-            segments = _plan_tool_batch_segments(tool_calls, execution_cwd=_exec_cwd)
+            segments = _plan_tool_batch_segments(
+                tool_calls,
+                execution_cwd=_exec_cwd,
+                extra_parallel_safe=getattr(self, "_parallel_safe_tools", frozenset()),
+            )
 
             if len(segments) == 1:
                 kind = segments[0][0]

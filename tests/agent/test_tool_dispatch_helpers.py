@@ -87,6 +87,39 @@ def test_request_user_input_is_an_ordered_parallelism_barrier():
     assert segments[1][1] == [calls[2]]
 
 
+def _named_call(name: str):
+    return SimpleNamespace(function=SimpleNamespace(name=name, arguments="{}"))
+
+
+def test_tool_search_bridge_reads_share_one_parallel_segment():
+    """Catalog reads have no side effects, so a describe fan-out runs at once."""
+    calls = [_named_call("tool_search"), *(_named_call("tool_describe") for _ in range(3))]
+
+    segments = _plan_tool_batch_segments(calls)
+
+    assert segments == [("parallel", calls)]
+
+
+def test_configured_plugin_tool_joins_a_parallel_segment():
+    calls = [_named_call("web_read"), _named_call("web_read")]
+
+    assert [kind for kind, _ in _plan_tool_batch_segments(calls)] == ["sequential"]
+    assert _plan_tool_batch_segments(
+        calls, extra_parallel_safe=frozenset({"web_read"})
+    ) == [("parallel", calls)]
+
+
+def test_configured_parallel_safe_tools_cannot_admit_interactive_tools():
+    calls = [_named_call("web_read"), _named_call("request_user_input"), _named_call("web_read")]
+
+    segments = _plan_tool_batch_segments(
+        calls, extra_parallel_safe=frozenset({"web_read", "request_user_input"})
+    )
+
+    assert [kind for kind, _ in segments] == ["sequential"]
+    assert segments[0][1] == calls
+
+
 # =========================================================================
 # Delimiter wrapping
 # =========================================================================

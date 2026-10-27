@@ -2745,6 +2745,83 @@ class TestRetryAfterCap:
         assert "Waiting 600.0s" in status
 
 
+class TestToolDispatchConfig:
+    """config.yaml ``agent.tool_delay`` and ``agent.parallel_safe_tools``."""
+
+    def _make_agent(self, agent_cfg):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("hermes_cli.config.load_config", return_value={"agent": agent_cfg}),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a.client = MagicMock()
+            return a
+
+    def test_defaults_keep_historical_pacing_and_safe_set(self):
+        agent = self._make_agent({})
+
+        assert agent.tool_delay == 1.0
+        assert agent._parallel_safe_tools == frozenset()
+
+    @pytest.mark.parametrize("configured, expected", [(0, 0.0), (0.25, 0.25), (2, 2.0)])
+    def test_configured_tool_delay_is_applied(self, configured, expected):
+        assert self._make_agent({"tool_delay": configured}).tool_delay == expected
+
+    @pytest.mark.parametrize("configured", [-1, "0", True, None, [0]])
+    def test_invalid_tool_delay_keeps_default(self, configured):
+        assert self._make_agent({"tool_delay": configured}).tool_delay == 1.0
+
+    def test_parallel_safe_tools_keeps_only_named_strings(self):
+        agent = self._make_agent({"parallel_safe_tools": ["web_read", " web_map ", "", 3, None]})
+
+        assert agent._parallel_safe_tools == frozenset({"web_read", "web_map"})
+
+    @pytest.mark.parametrize("configured", ["web_read", {"web_read": True}, 1])
+    def test_non_list_parallel_safe_tools_is_ignored(self, configured):
+        assert self._make_agent({"parallel_safe_tools": configured})._parallel_safe_tools == frozenset()
+
+    def test_configured_plugin_batch_routes_to_concurrent_path(self):
+        agent = self._make_agent({"parallel_safe_tools": ["web_read"]})
+        calls = [
+            _mock_tool_call(name="web_read", arguments='{"url":"https://a.test"}', call_id="c1"),
+            _mock_tool_call(name="web_read", arguments='{"url":"https://b.test"}', call_id="c2"),
+        ]
+        mock_msg = _mock_assistant_msg(content="", tool_calls=calls)
+
+        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
+            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
+                agent._execute_tool_calls(mock_msg, [], "task-1")
+
+        mock_con.assert_called_once()
+        mock_seq.assert_not_called()
+
+    @pytest.mark.parametrize("tool_delay, expected_sleeps", [(0, 0), (1.0, 2)])
+    def test_sequential_calls_sleep_only_when_tool_delay_is_positive(self, tool_delay, expected_sleeps):
+        agent = self._make_agent({"tool_delay": tool_delay})
+        calls = [
+            _mock_tool_call(name="web_search", arguments='{"q":"x"}', call_id=f"c{i}")
+            for i in range(3)
+        ]
+        mock_msg = _mock_assistant_msg(content="", tool_calls=calls)
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success": true}'),
+            patch("agent.tool_executor.time.sleep") as mock_sleep,
+        ):
+            agent._execute_tool_calls_sequential(mock_msg, [], "task-1")
+
+        delay_sleeps = [c for c in mock_sleep.call_args_list if c.args == (tool_delay,)]
+        assert len(delay_sleeps) == expected_sleeps
+
+
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
 
