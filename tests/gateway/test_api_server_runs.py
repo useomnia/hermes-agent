@@ -2366,7 +2366,6 @@ async def test_should_emit_one_missed_steer_when_stop_interrupts_a_real_tool_bat
     agent._use_prompt_caching = False
     agent.compression_enabled = False
     agent.save_trajectories = False
-    agent.tool_delay = 0
     tool_running = threading.Event()
     stop_seen = threading.Event()
     requests = []

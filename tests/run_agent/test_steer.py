@@ -680,7 +680,6 @@ def steering_loop(loop_agent):
     loop_agent._disable_streaming = True
     loop_agent._cached_system_prompt = "You are helpful."
     loop_agent._use_prompt_caching = False
-    loop_agent.tool_delay = 0
     loop_agent.compression_enabled = False
     loop_agent.save_trajectories = False
     return loop_agent

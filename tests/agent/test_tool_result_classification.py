@@ -41,3 +41,10 @@ def test_side_effect_classification_keeps_session_mutations():
     assert tool_may_have_side_effect("mcp_unknown") is True
     assert tool_may_have_side_effect("read_file") is False
     assert tool_may_have_side_effect("web_search") is False
+
+
+def test_tool_search_bridge_reads_have_no_side_effect():
+    from agent.tool_result_classification import tool_may_have_side_effect
+
+    assert tool_may_have_side_effect("tool_search") is False
+    assert tool_may_have_side_effect("tool_describe") is False

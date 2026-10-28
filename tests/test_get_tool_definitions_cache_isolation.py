@@ -113,3 +113,38 @@ class TestQuietModeCacheIsolation:
         explains why the bug only hit Gateway."""
         model_tools.get_tool_definitions(quiet_mode=False)
         assert len(model_tools._tool_defs_cache) == 0
+
+
+class TestConcurrentCacheMisses:
+
+    def test_concurrent_misses_at_the_cap_stay_bounded(self, monkeypatch):
+        """Parallel tool calls can all miss at once; eviction must not race."""
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        start = threading.Barrier(16)
+
+        def compute(*_args, **_kwargs):
+            start.wait(timeout=5)
+            time.sleep(0.001)
+            return []
+
+        monkeypatch.setattr(model_tools, "_compute_tool_definitions", compute)
+        cap = model_tools._TOOL_DEFS_CACHE_MAX
+        for i in range(cap):
+            model_tools._tool_defs_cache[("prefill", i)] = []
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            futures = [
+                pool.submit(
+                    model_tools.get_tool_definitions,
+                    enabled_toolsets=[f"concurrent_toolset_{i}"],
+                    quiet_mode=True,
+                )
+                for i in range(16)
+            ]
+            results = [future.result() for future in futures]
+
+        assert results == [[]] * 16
+        assert len(model_tools._tool_defs_cache) == cap

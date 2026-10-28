@@ -1030,6 +1030,11 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # Extra tool names (typically plugin tools) that are read-only and
+        # free of shared session state, so a batch of them may run
+        # concurrently like the built-in parallel-safe tools.  Interactive
+        # tools (clarify, request_user_input) are never admitted.
+        "parallel_safe_tools": [],
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP

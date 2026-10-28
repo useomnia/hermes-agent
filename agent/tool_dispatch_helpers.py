@@ -52,6 +52,8 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "session_search",
     "skill_view",
     "skills_list",
+    "tool_describe",
+    "tool_search",
     "vision_analyze",
     "web_extract",
     "web_search",
@@ -149,7 +151,12 @@ def _resolve_planner_tool_call(tool_name: str, function_args: dict):
     return underlying_name, underlying_args
 
 
-def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> List[tuple]:
+def _plan_tool_batch_segments(
+    tool_calls,
+    *,
+    execution_cwd: Optional[Path] = None,
+    extra_parallel_safe: frozenset[str] = frozenset(),
+) -> List[tuple]:
     """Split a tool-call batch into ordered ``(kind, calls)`` segments.
 
     ``kind`` is ``"parallel"`` (a maximal contiguous run of parallel-safe
@@ -167,7 +174,8 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
       parallel run only when their target path does not overlap another
       path already reserved in the same run; an overlap closes the run so
       the conflicting call starts a NEW run after the first completes.
-    * Anything not in ``_PARALLEL_SAFE_TOOLS`` and not an opted-in MCP
+    * Anything not in ``_PARALLEL_SAFE_TOOLS`` or *extra_parallel_safe*
+      (the ``agent.parallel_safe_tools`` config list) and not an opted-in MCP
       tool → barrier. MCP tools can use either the legacy server-wide
       ``supports_parallel_tool_calls`` opt-in or the narrower
       ``supports_parallel_read_tool_calls`` opt-in, whose metadata gate
@@ -225,7 +233,7 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
         tool_name, function_args = _resolve_planner_tool_call(
             raw_tool_name, function_args
         )
-        if tool_name is None or function_args is None:
+        if tool_name is None or function_args is None or tool_name in _NEVER_PARALLEL_TOOLS:
             _add_sequential(tool_call)
             continue
 
@@ -242,7 +250,11 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
             current.append(tool_call)
             continue
 
-        if tool_name in _PARALLEL_SAFE_TOOLS or _is_mcp_tool_parallel_safe(tool_name):
+        if (
+            tool_name in _PARALLEL_SAFE_TOOLS
+            or tool_name in extra_parallel_safe
+            or _is_mcp_tool_parallel_safe(tool_name)
+        ):
             current.append(tool_call)
             continue
 
@@ -261,7 +273,9 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
     return [(kind, calls) for kind, calls in normalized]
 
 
-def _should_parallelize_tool_batch(tool_calls) -> bool:
+def _should_parallelize_tool_batch(
+    tool_calls, *, extra_parallel_safe: frozenset[str] = frozenset()
+) -> bool:
     """Return True when the WHOLE tool-call batch is safe to run concurrently.
 
     Thin view over ``_plan_tool_batch_segments`` kept for callers/tests that
@@ -270,7 +284,7 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
     """
     if len(tool_calls) <= 1:
         return False
-    segments = _plan_tool_batch_segments(tool_calls)
+    segments = _plan_tool_batch_segments(tool_calls, extra_parallel_safe=extra_parallel_safe)
     return len(segments) == 1 and segments[0][0] == "parallel"
 
 

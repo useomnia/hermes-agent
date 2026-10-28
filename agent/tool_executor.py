@@ -1788,9 +1788,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             break
 
-        if agent.tool_delay > 0 and i < len(assistant_message.tool_calls):
-            time.sleep(agent.tool_delay)
-
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools_seq = len(assistant_message.tool_calls)
     if finalize and num_tools_seq > 0:
@@ -1833,7 +1830,11 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     if segments is None:
         _active_env = get_active_env(effective_task_id)
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
-        segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
+        segments = _plan_tool_batch_segments(
+            assistant_message.tool_calls,
+            execution_cwd=_exec_cwd,
+            extra_parallel_safe=getattr(agent, "_parallel_safe_tools", frozenset()),
+        )
 
     for kind, calls in segments:
         segment_message = SimpleNamespace(tool_calls=list(calls))

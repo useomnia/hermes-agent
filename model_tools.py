@@ -277,12 +277,18 @@ _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 # serves) while keeping the cap small. (#19251)
 _TOOL_DEFS_CACHE_MAX = 8
 
+# Guards eviction + insert. Concurrent tool calls (parallel tool_describe
+# batches, several gateway sessions) can miss at once; unguarded, two
+# evictions race on the same oldest key.
+_tool_defs_cache_lock = threading.Lock()
+
 
 def _clear_tool_defs_cache() -> None:
     """Drop memoized get_tool_definitions() results. Called when dynamic
     schema dependencies change (e.g. discord capability cache reset,
     execute_code sandbox reconfigured)."""
-    _tool_defs_cache.clear()
+    with _tool_defs_cache_lock:
+        _tool_defs_cache.clear()
 
 
 def get_tool_definitions(
@@ -357,9 +363,10 @@ def get_tool_definitions(
         # Bound the cache with LRU eviction so a long-lived Gateway process
         # doesn't accumulate entries unboundedly across the many distinct
         # toolset/config fingerprints it sees over its lifetime (#19251).
-        if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
-            _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
-        _tool_defs_cache[cache_key] = result
+        with _tool_defs_cache_lock:
+            if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
+                _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
+            _tool_defs_cache[cache_key] = result
         return list(result)
     return result
 

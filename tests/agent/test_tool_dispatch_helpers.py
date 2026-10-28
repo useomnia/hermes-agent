@@ -16,6 +16,7 @@ from agent.tool_dispatch_helpers import (
     _is_untrusted_tool,
     _maybe_wrap_untrusted,
     _plan_tool_batch_segments,
+    _should_parallelize_tool_batch,
     make_tool_result_message,
 )
 
@@ -85,6 +86,68 @@ def test_request_user_input_is_an_ordered_parallelism_barrier():
         "parallel",
     ]
     assert segments[1][1] == [calls[2]]
+
+
+def _named_call(name: str):
+    return SimpleNamespace(function=SimpleNamespace(name=name, arguments="{}"))
+
+
+def test_tool_search_bridge_reads_share_one_parallel_segment():
+    """Catalog reads have no side effects, so a describe fan-out runs at once."""
+    calls = [_named_call("tool_search"), *(_named_call("tool_describe") for _ in range(3))]
+
+    segments = _plan_tool_batch_segments(calls)
+
+    assert segments == [("parallel", calls)]
+
+
+def test_configured_plugin_tool_joins_a_parallel_segment():
+    calls = [_named_call("web_read"), _named_call("web_read")]
+
+    assert [kind for kind, _ in _plan_tool_batch_segments(calls)] == ["sequential"]
+    assert _plan_tool_batch_segments(
+        calls, extra_parallel_safe=frozenset({"web_read"})
+    ) == [("parallel", calls)]
+
+
+def test_configured_parallel_safe_tools_cannot_admit_interactive_tools():
+    calls = [_named_call("web_read"), _named_call("request_user_input"), _named_call("web_read")]
+
+    segments = _plan_tool_batch_segments(
+        calls, extra_parallel_safe=frozenset({"web_read", "request_user_input"})
+    )
+
+    assert [kind for kind, _ in segments] == ["sequential"]
+    assert segments[0][1] == calls
+
+
+def test_interactive_tool_behind_the_tool_call_bridge_stays_a_barrier(monkeypatch):
+    """The barrier applies to the unwrapped name, not only the bridge name."""
+    import json
+
+    from tools import tool_search
+
+    monkeypatch.setattr(tool_search, "is_deferrable_tool_name", lambda name: True)
+    wrapped = SimpleNamespace(
+        function=SimpleNamespace(
+            name="tool_call",
+            arguments=json.dumps({"name": "request_user_input", "arguments": {}}),
+        )
+    )
+    calls = [_named_call("web_read"), wrapped, _named_call("web_read")]
+
+    segments = _plan_tool_batch_segments(
+        calls, extra_parallel_safe=frozenset({"web_read", "request_user_input"})
+    )
+
+    assert [kind for kind, _ in segments] == ["sequential"]
+
+
+def test_homogeneous_batch_view_honours_configured_tools():
+    calls = [_named_call("web_read"), _named_call("web_read")]
+
+    assert _should_parallelize_tool_batch(calls) is False
+    assert _should_parallelize_tool_batch(calls, extra_parallel_safe=frozenset({"web_read"})) is True
 
 
 # =========================================================================

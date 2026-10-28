@@ -2745,6 +2745,102 @@ class TestRetryAfterCap:
         assert "Waiting 600.0s" in status
 
 
+class TestToolDispatchConfig:
+    """Parallel-tool configuration and retired sequential pacing."""
+
+    def _make_agent(self, agent_cfg, **agent_kwargs):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("hermes_cli.config.load_config", return_value={"agent": agent_cfg}),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                **agent_kwargs,
+            )
+            a.client = MagicMock()
+            return a
+
+    def test_defaults_keep_safe_set(self):
+        agent = self._make_agent({})
+
+        assert agent._parallel_safe_tools == frozenset()
+
+    @pytest.mark.parametrize("tool_delay", [0, 0.5, 2])
+    def test_constructor_tool_delay_is_a_deprecated_noop(self, tool_delay):
+        with pytest.warns(DeprecationWarning, match="tool_delay.*deprecated and ignored"):
+            agent = self._make_agent({}, tool_delay=tool_delay)
+
+        assert not hasattr(agent, "tool_delay")
+
+    def test_parallel_safe_tools_keeps_only_named_plugin_tools(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            agent = self._make_agent({"parallel_safe_tools": ["web_read", " web_map ", "", 3]})
+
+        assert agent._parallel_safe_tools == frozenset({"web_read", "web_map"})
+        assert "Ignoring agent.parallel_safe_tools entry" in caplog.text
+
+    @pytest.mark.parametrize(
+        "name", ["terminal", "execute_code", "todo", "memory", "browser_click", "request_user_input", "clarify"]
+    )
+    def test_parallel_safe_tools_refuses_builtin_and_interactive_tools(self, name, caplog):
+        with caplog.at_level(logging.WARNING):
+            agent = self._make_agent({"parallel_safe_tools": [name, "web_read"]})
+
+        assert agent._parallel_safe_tools == frozenset({"web_read"})
+        assert f"Ignoring agent.parallel_safe_tools entry '{name}'" in caplog.text
+
+    @pytest.mark.parametrize("configured", ["web_read", {"web_read": True}, 1])
+    def test_non_list_parallel_safe_tools_is_ignored_and_warns(self, configured, caplog):
+        with caplog.at_level(logging.WARNING):
+            agent = self._make_agent({"parallel_safe_tools": configured})
+
+        assert agent._parallel_safe_tools == frozenset()
+        assert "expected a list of tool names" in caplog.text
+
+    def test_configured_plugin_batch_routes_to_concurrent_path(self):
+        agent = self._make_agent({"parallel_safe_tools": ["web_read"]})
+        calls = [
+            _mock_tool_call(name="web_read", arguments='{"url":"https://a.test"}', call_id="c1"),
+            _mock_tool_call(name="web_read", arguments='{"url":"https://b.test"}', call_id="c2"),
+        ]
+        mock_msg = _mock_assistant_msg(content="", tool_calls=calls)
+
+        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
+            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
+                agent._execute_tool_calls(mock_msg, [], "task-1")
+
+        mock_con.assert_called_once()
+        mock_seq.assert_not_called()
+
+    @pytest.mark.parametrize("agent_cfg", [{}, {"tool_delay": 1.0}, {"tool_delay": 60}])
+    def test_sequential_calls_run_in_order_without_sleep(self, agent_cfg):
+        """Defaults and stale pacing config cannot insert a pause between calls."""
+        agent = self._make_agent(agent_cfg)
+        calls = [
+            _mock_tool_call(name="web_search", arguments='{"query":"x"}', call_id=f"c{i}")
+            for i in range(3)
+        ]
+        mock_msg = _mock_assistant_msg(content="", tool_calls=calls)
+        messages = []
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success": true}') as mock_dispatch,
+            patch("agent.tool_executor.time.sleep") as mock_sleep,
+        ):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert mock_dispatch.call_count == 3
+        mock_sleep.assert_not_called()
+        assert [call.kwargs["tool_call_id"] for call in mock_dispatch.call_args_list] == ["c0", "c1", "c2"]
+        assert [message["tool_call_id"] for message in messages if message["role"] == "tool"] == ["c0", "c1", "c2"]
+
+
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
 
@@ -4307,7 +4403,6 @@ class TestRunConversation:
         """Common setup for run_conversation tests."""
         agent._cached_system_prompt = "You are helpful."
         agent._use_prompt_caching = False
-        agent.tool_delay = 0
         agent.compression_enabled = False
         agent.save_trajectories = False
 
@@ -6641,7 +6736,6 @@ class TestRetryExhaustion:
     def _setup_agent(self, agent):
         agent._cached_system_prompt = "You are helpful."
         agent._use_prompt_caching = False
-        agent.tool_delay = 0
         agent.compression_enabled = False
         agent.save_trajectories = False
 
@@ -8536,7 +8630,6 @@ class TestReasoningReplayForStrictProviders:
     def _setup_agent(self, agent):
         agent._cached_system_prompt = "You are helpful."
         agent._use_prompt_caching = False
-        agent.tool_delay = 0
         agent.compression_enabled = False
         agent.save_trajectories = False
 

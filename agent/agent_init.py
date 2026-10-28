@@ -106,6 +106,40 @@ def _relay_moa_reference_event(agent: Any, event: str, **kwargs: Any) -> None:
         pass
 
 
+def _resolve_parallel_safe_tools(configured: Any) -> frozenset[str]:
+    """Return the plugin tool names listed in ``agent.parallel_safe_tools``.
+
+    Built-in tools are refused: the read-only ones are already parallel-safe,
+    and the rest (terminal, execute_code, todo, browser_*) mutate shared state
+    that concurrent calls would race on. Interactive tools are refused too.
+    """
+    if configured is None:
+        return frozenset()
+    if not isinstance(configured, (list, tuple)):
+        logger.warning(
+            "Ignoring agent.parallel_safe_tools=%r: expected a list of tool names", configured
+        )
+        return frozenset()
+
+    from agent.tool_dispatch_helpers import _NEVER_PARALLEL_TOOLS
+    from toolsets import _HERMES_CORE_TOOLS
+
+    names = set()
+    for entry in configured:
+        name = entry.strip() if isinstance(entry, str) else ""
+        if not name:
+            logger.warning("Ignoring agent.parallel_safe_tools entry %r: expected a tool name", entry)
+        elif name in _HERMES_CORE_TOOLS or name in _NEVER_PARALLEL_TOOLS:
+            logger.warning(
+                "Ignoring agent.parallel_safe_tools entry %r: built-in and interactive tools "
+                "cannot be listed",
+                name,
+            )
+        else:
+            names.add(name)
+    return frozenset(names)
+
+
 def _normalize_route_base_url(base_url: Any) -> str:
     """Canonicalize an endpoint URL for model-route identity comparisons."""
     return normalize_route_base_url(base_url)
@@ -456,7 +490,6 @@ def init_agent(
     args: list[str] | None = None,
     model: str = "",
     max_iterations: int = 500,  # Default tool-calling iterations (shared with subagents)
-    tool_delay: float = 1.0,
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
     save_trajectories: bool = False,
@@ -532,7 +565,6 @@ def init_agent(
         api_mode (str): API mode override: "chat_completions" or "codex_responses"
         model (str): Model name to use (default: "anthropic/claude-opus-4.6")
         max_iterations (int): Maximum number of tool calling iterations (default: 500)
-        tool_delay (float): Delay between tool calls in seconds (default: 1.0)
         enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
         disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
         save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
@@ -578,7 +610,6 @@ def init_agent(
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
-    agent.tool_delay = tool_delay
     agent.save_trajectories = save_trajectories
     agent.verbose_logging = verbose_logging
     agent.quiet_mode = quiet_mode
@@ -1751,6 +1782,9 @@ def init_agent(
     # the other.  Steers the model to batch independent tool calls into a
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
+
+    # Embedders can opt plugin tools into the existing parallel-safe set.
+    agent._parallel_safe_tools = _resolve_parallel_safe_tools(_agent_section.get("parallel_safe_tools"))
 
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt

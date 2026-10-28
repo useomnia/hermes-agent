@@ -109,7 +109,6 @@ def agent():
     a._cached_system_prompt = "You are helpful."
     a._use_prompt_caching = False
     a._disable_streaming = True
-    a.tool_delay = 0
     a.save_trajectories = False
     a.compression_enabled = True
     a.context_compressor = _quiet_compressor()
