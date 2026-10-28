@@ -86,9 +86,9 @@ from agent.retry_utils import (
 )
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import (
-    estimate_usage_cost,
     extract_provider_cost_usd,
     normalize_usage,
+    resolve_usage_cost,
 )
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -3283,13 +3283,18 @@ def run_conversation(
                         _agg_cost_model = _agg_slot["model"]
                         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
                         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
-                    cost_result = estimate_usage_cost(
+                    cost_result = resolve_usage_cost(
                         _agg_cost_model,
                         aggregator_usage,
+                        response_usage=response.usage,
                         provider=_agg_cost_provider,
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
+                    # This legacy-named in-memory counter is the total consumed
+                    # by displays, turn results and delegated-child rollups.
+                    # Its persisted counterpart also serves existing readers;
+                    # both keep the selected amount without another lookup.
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each
@@ -3324,8 +3329,6 @@ def run_conversation(
                         agent.session_actual_cost_usd = (
                             agent.session_actual_cost_usd or 0.0
                         ) + reported_cost_usd
-                        agent.session_cost_status = "actual"
-                        agent.session_cost_source = "provider_cost_api"
                     elif (
                         _agg_cost_provider == "openrouter"
                         or base_url_host_matches(
@@ -3381,16 +3384,8 @@ def run_conversation(
                                     or _advisor_cost_delta is not None
                                 ) else None,
                                 actual_cost_usd=billable_cost_delta,
-                                cost_status=(
-                                    "actual"
-                                    if reported_cost_usd is not None
-                                    else cost_result.status
-                                ),
-                                cost_source=(
-                                    "provider_cost_api"
-                                    if reported_cost_usd is not None
-                                    else cost_result.source
-                                ),
+                                cost_status=cost_result.status,
+                                cost_source=cost_result.source,
                                 billing_provider=agent.provider,
                                 billing_base_url=agent.base_url,
                                 billing_mode="subscription_included"
