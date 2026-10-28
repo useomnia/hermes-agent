@@ -2746,14 +2746,14 @@ class TestRetryAfterCap:
 
 
 class TestToolDispatchConfig:
-    """config.yaml ``agent.tool_delay`` and ``agent.parallel_safe_tools``."""
+    """Parallel-tool configuration and retired sequential pacing."""
 
-    def _make_agent(self, agent_cfg, config=None, **agent_kwargs):
+    def _make_agent(self, agent_cfg, **agent_kwargs):
         with (
             patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
-            patch("hermes_cli.config.load_config", return_value=config or {"agent": agent_cfg}),
+            patch("hermes_cli.config.load_config", return_value={"agent": agent_cfg}),
         ):
             a = AIAgent(
                 api_key="test-key-1234567890",
@@ -2766,38 +2766,17 @@ class TestToolDispatchConfig:
             a.client = MagicMock()
             return a
 
-    def test_defaults_keep_historical_pacing_and_safe_set(self):
+    def test_defaults_keep_safe_set(self):
         agent = self._make_agent({})
 
-        assert agent.tool_delay == 1.0
         assert agent._parallel_safe_tools == frozenset()
 
-    @pytest.mark.parametrize("configured, expected", [(0, 0.0), (0.25, 0.25), (2, 2.0)])
-    def test_configured_tool_delay_is_applied(self, configured, expected):
-        assert self._make_agent({"tool_delay": configured}).tool_delay == expected
+    @pytest.mark.parametrize("tool_delay", [0, 0.5, 2])
+    def test_constructor_tool_delay_is_a_deprecated_noop(self, tool_delay):
+        with pytest.warns(DeprecationWarning, match="tool_delay.*deprecated and ignored"):
+            agent = self._make_agent({}, tool_delay=tool_delay)
 
-    @pytest.mark.parametrize(
-        "configured", [-1, 61, float("inf"), float("nan"), "0", True, [0]]
-    )
-    def test_invalid_tool_delay_keeps_default_and_warns(self, configured, caplog):
-        with caplog.at_level(logging.WARNING):
-            agent = self._make_agent({"tool_delay": configured})
-
-        assert agent.tool_delay == 1.0
-        assert "Ignoring agent.tool_delay" in caplog.text
-
-    def test_constructor_tool_delay_wins_over_default_config(self):
-        """load_config always merges DEFAULT_CONFIG, so agent.tool_delay is always set."""
-        import copy
-
-        from hermes_cli.config import DEFAULT_CONFIG
-
-        agent = self._make_agent({}, config=copy.deepcopy(DEFAULT_CONFIG), tool_delay=0)
-
-        assert agent.tool_delay == 0
-
-    def test_constructor_tool_delay_wins_over_configured_value(self):
-        assert self._make_agent({"tool_delay": 2}, tool_delay=0.5).tool_delay == 0.5
+        assert not hasattr(agent, "tool_delay")
 
     def test_parallel_safe_tools_keeps_only_named_plugin_tools(self, caplog):
         with caplog.at_level(logging.WARNING):
@@ -2839,23 +2818,27 @@ class TestToolDispatchConfig:
         mock_con.assert_called_once()
         mock_seq.assert_not_called()
 
-    @pytest.mark.parametrize("tool_delay, expected_sleeps", [(0, 0), (1.0, 2)])
-    def test_sequential_calls_sleep_only_when_tool_delay_is_positive(self, tool_delay, expected_sleeps):
-        agent = self._make_agent({"tool_delay": tool_delay})
+    @pytest.mark.parametrize("agent_cfg", [{}, {"tool_delay": 1.0}, {"tool_delay": 60}])
+    def test_sequential_calls_run_in_order_without_sleep(self, agent_cfg):
+        """Defaults and stale pacing config cannot insert a pause between calls."""
+        agent = self._make_agent(agent_cfg)
         calls = [
-            _mock_tool_call(name="web_search", arguments='{"q":"x"}', call_id=f"c{i}")
+            _mock_tool_call(name="web_search", arguments='{"query":"x"}', call_id=f"c{i}")
             for i in range(3)
         ]
         mock_msg = _mock_assistant_msg(content="", tool_calls=calls)
+        messages = []
 
         with (
-            patch("run_agent.handle_function_call", return_value='{"success": true}'),
+            patch("run_agent.handle_function_call", return_value='{"success": true}') as mock_dispatch,
             patch("agent.tool_executor.time.sleep") as mock_sleep,
         ):
-            agent._execute_tool_calls_sequential(mock_msg, [], "task-1")
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
-        delay_sleeps = [c for c in mock_sleep.call_args_list if c.args == (tool_delay,)]
-        assert len(delay_sleeps) == expected_sleeps
+        assert mock_dispatch.call_count == 3
+        mock_sleep.assert_not_called()
+        assert [call.kwargs["tool_call_id"] for call in mock_dispatch.call_args_list] == ["c0", "c1", "c2"]
+        assert [message["tool_call_id"] for message in messages if message["role"] == "tool"] == ["c0", "c1", "c2"]
 
 
 class TestConcurrentToolExecution:
@@ -4420,7 +4403,6 @@ class TestRunConversation:
         """Common setup for run_conversation tests."""
         agent._cached_system_prompt = "You are helpful."
         agent._use_prompt_caching = False
-        agent.tool_delay = 0
         agent.compression_enabled = False
         agent.save_trajectories = False
 
@@ -6754,7 +6736,6 @@ class TestRetryExhaustion:
     def _setup_agent(self, agent):
         agent._cached_system_prompt = "You are helpful."
         agent._use_prompt_caching = False
-        agent.tool_delay = 0
         agent.compression_enabled = False
         agent.save_trajectories = False
 
@@ -8649,7 +8630,6 @@ class TestReasoningReplayForStrictProviders:
     def _setup_agent(self, agent):
         agent._cached_system_prompt = "You are helpful."
         agent._use_prompt_caching = False
-        agent.tool_delay = 0
         agent.compression_enabled = False
         agent.save_trajectories = False
 

@@ -1030,10 +1030,6 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
-        # Seconds to sleep between tool calls that run one after another on
-        # the sequential path.  Embedders whose tools need no pacing set 0 so
-        # a batch of sequential calls is not padded by a fixed delay.
-        "tool_delay": 1.0,
         # Extra tool names (typically plugin tools) that are read-only and
         # free of shared session state, so a batch of them may run
         # concurrently like the built-in parallel-safe tools.  Interactive

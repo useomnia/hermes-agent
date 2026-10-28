@@ -45,6 +45,7 @@ import tempfile
 import time
 import threading
 import uuid
+import warnings
 from typing import List, Dict, Any, Optional, Callable
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
@@ -442,7 +443,7 @@ class AIAgent:
         args: list[str] | None = None,
         model: str = "",
         max_iterations: int = 500,  # Default tool-calling iterations (shared with subagents)
-        tool_delay: Optional[float] = None,
+        tool_delay: Optional[float] = None,  # Deprecated: accepted for compatibility, ignored.
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
         save_trajectories: bool = False,
@@ -508,6 +509,13 @@ class AIAgent:
         tool_gen_event_aborted_callback: callable = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
+        if tool_delay is not None:
+            warnings.warn(
+                "tool_delay is deprecated and ignored; sequential tool calls "
+                "no longer sleep between executions.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         from agent.agent_init import init_agent
         init_agent(
             self,
@@ -522,7 +530,6 @@ class AIAgent:
             args=args,
             model=model,
             max_iterations=max_iterations,
-            tool_delay=tool_delay,
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
             save_trajectories=save_trajectories,

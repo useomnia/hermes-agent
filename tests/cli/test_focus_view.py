@@ -463,7 +463,6 @@ def _make_agent(tool_progress_mode: str):
             tool_progress_mode=tool_progress_mode,
         )
     agent.client = MagicMock()
-    agent.tool_delay = 0
     agent._flush_messages_to_session_db = MagicMock()
     return agent
 

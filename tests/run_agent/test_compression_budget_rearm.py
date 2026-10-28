@@ -111,7 +111,6 @@ def test_pre_api_compression_budget_rearms_only_after_pressure_clears(
     agent._cached_system_prompt = "You are helpful."
     agent._use_prompt_caching = False
     agent._disable_streaming = True
-    agent.tool_delay = 0
     agent.save_trajectories = False
     agent.max_compression_attempts = 1
 

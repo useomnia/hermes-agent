@@ -20,7 +20,6 @@ preserved.
 from __future__ import annotations
 
 import logging
-import math
 import os
 import re
 import sys
@@ -105,29 +104,6 @@ def _relay_moa_reference_event(agent: Any, event: str, **kwargs: Any) -> None:
             )
     except Exception:
         pass
-
-
-_DEFAULT_TOOL_DELAY_SECONDS = 1.0
-_MAX_TOOL_DELAY_SECONDS = 60.0
-
-
-def _resolve_tool_delay(configured: Any) -> float:
-    """Return ``agent.tool_delay`` when it is a finite number of seconds in range."""
-    if configured is None:
-        return _DEFAULT_TOOL_DELAY_SECONDS
-    if (
-        isinstance(configured, bool)
-        or not isinstance(configured, (int, float))
-        or not math.isfinite(configured)
-        or not 0 <= configured <= _MAX_TOOL_DELAY_SECONDS
-    ):
-        logger.warning(
-            "Ignoring agent.tool_delay=%r: expected seconds between 0 and %s",
-            configured,
-            _MAX_TOOL_DELAY_SECONDS,
-        )
-        return _DEFAULT_TOOL_DELAY_SECONDS
-    return float(configured)
 
 
 def _resolve_parallel_safe_tools(configured: Any) -> frozenset[str]:
@@ -514,7 +490,6 @@ def init_agent(
     args: list[str] | None = None,
     model: str = "",
     max_iterations: int = 500,  # Default tool-calling iterations (shared with subagents)
-    tool_delay: Optional[float] = None,
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
     save_trajectories: bool = False,
@@ -590,8 +565,6 @@ def init_agent(
         api_mode (str): API mode override: "chat_completions" or "codex_responses"
         model (str): Model name to use (default: "anthropic/claude-opus-4.6")
         max_iterations (int): Maximum number of tool calling iterations (default: 500)
-        tool_delay (float): Seconds between sequential tool calls; None reads
-            config ``agent.tool_delay`` (default: 1.0)
         enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
         disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
         save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
@@ -637,7 +610,6 @@ def init_agent(
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
-    agent.tool_delay = tool_delay if tool_delay is not None else _DEFAULT_TOOL_DELAY_SECONDS
     agent.save_trajectories = save_trajectories
     agent.verbose_logging = verbose_logging
     agent.quiet_mode = quiet_mode
@@ -1811,12 +1783,7 @@ def init_agent(
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
 
-    # Sequential-path pacing and extra parallel-safe tools.  Both default to
-    # the historical behaviour (1s between sequential calls, built-in safe
-    # set only) so only an embedder that opts in sees a change.  A delay
-    # passed to the constructor wins over config.
-    if tool_delay is None:
-        agent.tool_delay = _resolve_tool_delay(_agent_section.get("tool_delay"))
+    # Embedders can opt plugin tools into the existing parallel-safe set.
     agent._parallel_safe_tools = _resolve_parallel_safe_tools(_agent_section.get("parallel_safe_tools"))
 
     # Local Python toolchain probe toggle.  Default True.  When False,
