@@ -101,9 +101,9 @@ def record_aux_usage(
             return
 
         from agent.usage_pricing import (
-            estimate_usage_cost,
             extract_provider_cost_usd,
             normalize_usage,
+            resolve_usage_cost,
         )
 
         usage = normalize_usage(raw_usage, provider=provider)
@@ -119,10 +119,10 @@ def record_aux_usage(
         estimated_status = None
         estimated_source = None
         try:
-            cost = estimate_usage_cost(
-                model, usage, provider=provider, base_url=base_url
+            cost = resolve_usage_cost(
+                model, usage, response_usage=raw_usage, provider=provider, base_url=base_url
             )
-            if cost.amount_usd is not None:
+            if cost.status != "actual" and cost.amount_usd is not None:
                 estimated_cost = float(cost.amount_usd)
                 estimated_status = cost.status
                 estimated_source = cost.source

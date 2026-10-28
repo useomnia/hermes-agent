@@ -235,7 +235,7 @@ class TestAmbientAccountingContext:
             reset_accounting_context(token)
 
         row = _usage_rows(db, "s1")[0]
-        assert row["estimated_cost_usd"] == pytest.approx(0.0012)
+        assert row["estimated_cost_usd"] == 0
         assert row["actual_cost_usd"] == pytest.approx(0.0033)
         assert row["cost_status"] == "actual"
         assert row["cost_source"] == "provider_cost_api"

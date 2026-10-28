@@ -1312,6 +1312,30 @@ def extract_provider_cost_usd(response_usage: Any) -> Optional[float]:
     return _finite_nonneg_number(cost)
 
 
+def resolve_usage_cost(
+    model_name: str,
+    usage: CanonicalUsage,
+    *,
+    response_usage: Any,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> CostResult:
+    """Use reported dollars directly; consult prices only when cost is absent."""
+    reported = extract_provider_cost_usd(response_usage)
+    if reported is not None:
+        amount = Decimal(str(reported))
+        return CostResult(
+            amount_usd=amount,
+            status="actual",
+            source="provider_cost_api",
+            label=f"${amount}",
+        )
+    return estimate_usage_cost(
+        model_name, usage, provider=provider, base_url=base_url, api_key=api_key,
+    )
+
+
 def has_known_pricing(
     model_name: str,
     provider: Optional[str] = None,

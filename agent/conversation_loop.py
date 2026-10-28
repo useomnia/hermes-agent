@@ -86,9 +86,9 @@ from agent.retry_utils import (
 )
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import (
-    estimate_usage_cost,
     extract_provider_cost_usd,
     normalize_usage,
+    resolve_usage_cost,
 )
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -3283,14 +3283,15 @@ def run_conversation(
                         _agg_cost_model = _agg_slot["model"]
                         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
                         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
-                    cost_result = estimate_usage_cost(
+                    cost_result = resolve_usage_cost(
                         _agg_cost_model,
                         aggregator_usage,
+                        response_usage=response.usage,
                         provider=_agg_cost_provider,
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
-                    if cost_result.amount_usd is not None:
+                    if cost_result.status != "actual" and cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each
                     # advisor's own model rate) on top of the aggregator cost.
@@ -3304,7 +3305,7 @@ def run_conversation(
 
                     _estimated_cost_delta = (
                         float(cost_result.amount_usd)
-                        if cost_result.amount_usd is not None
+                        if cost_result.status != "actual" and cost_result.amount_usd is not None
                         else None
                     )
                     _advisor_cost_delta = None
