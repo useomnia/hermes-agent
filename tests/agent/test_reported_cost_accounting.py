@@ -94,6 +94,10 @@ def test_main_loop_skips_unavailable_prices(monkeypatch, tmp_path, cost, advisor
         assert row["actual_cost_usd"] is None
     else:
         assert row["actual_cost_usd"] == pytest.approx(expected)
+    # Hermes' legacy-named result counter carries total spend for displays and
+    # delegated-child rollups. The DB estimate remains separate from actual.
+    assert result["estimated_cost_usd"] == pytest.approx(expected or 0)
+    assert agent.session_estimated_cost_usd == pytest.approx(expected or 0)
     assert row["estimated_cost_usd"] == pytest.approx(advisor_cost or 0)
     assert row["cost_status"] == ("unknown" if cost is None else "actual")
     assert row["input_tokens"] == 70 + (7 if advisor_cost is not None else 0)

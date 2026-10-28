@@ -3291,7 +3291,10 @@ def run_conversation(
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
-                    if cost_result.status != "actual" and cost_result.amount_usd is not None:
+                    # This legacy-named in-memory counter is the total consumed
+                    # by displays, turn results and delegated-child rollups.
+                    # Keep that contract; only persistence separates estimates.
+                    if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each
                     # advisor's own model rate) on top of the aggregator cost.
