@@ -107,11 +107,10 @@ def record_aux_usage(
         )
 
         usage = normalize_usage(raw_usage, provider=provider)
-        if not (
-            usage.input_tokens or usage.output_tokens
-            or usage.cache_read_tokens or usage.cache_write_tokens
-            or usage.reasoning_tokens
-        ):
+        if not any((
+            usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
+            usage.cache_write_tokens, usage.reasoning_tokens,
+        )):
             return
 
         model = str(getattr(response, "model", "") or "") or "unknown"

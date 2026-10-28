@@ -3325,8 +3325,6 @@ def run_conversation(
                         agent.session_actual_cost_usd = (
                             agent.session_actual_cost_usd or 0.0
                         ) + reported_cost_usd
-                        agent.session_cost_status = "actual"
-                        agent.session_cost_source = "provider_cost_api"
                     elif (
                         _agg_cost_provider == "openrouter"
                         or base_url_host_matches(
@@ -3382,16 +3380,8 @@ def run_conversation(
                                     or _advisor_cost_delta is not None
                                 ) else None,
                                 actual_cost_usd=billable_cost_delta,
-                                cost_status=(
-                                    "actual"
-                                    if reported_cost_usd is not None
-                                    else cost_result.status
-                                ),
-                                cost_source=(
-                                    "provider_cost_api"
-                                    if reported_cost_usd is not None
-                                    else cost_result.source
-                                ),
+                                cost_status=cost_result.status,
+                                cost_source=cost_result.source,
                                 billing_provider=agent.provider,
                                 billing_base_url=agent.base_url,
                                 billing_mode="subscription_included"
