@@ -3293,7 +3293,8 @@ def run_conversation(
                     )
                     # This legacy-named in-memory counter is the total consumed
                     # by displays, turn results and delegated-child rollups.
-                    # Keep that contract; only persistence separates estimates.
+                    # Its persisted counterpart also serves existing readers;
+                    # both keep the selected amount without another lookup.
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each
@@ -3308,7 +3309,7 @@ def run_conversation(
 
                     _estimated_cost_delta = (
                         float(cost_result.amount_usd)
-                        if cost_result.status != "actual" and cost_result.amount_usd is not None
+                        if cost_result.amount_usd is not None
                         else None
                     )
                     _advisor_cost_delta = None

@@ -44,7 +44,7 @@ def test_auxiliary_cost_skips_unavailable_prices(monkeypatch, tmp_path, cost):
     assert len(rows) == 1
     row = dict(rows[0])
     assert row["actual_cost_usd"] == pytest.approx(cost)
-    assert row["estimated_cost_usd"] == 0
+    assert row["estimated_cost_usd"] == pytest.approx(cost)
     assert row["cost_status"] == "actual"
     assert row["input_tokens"] == 70
     assert row["output_tokens"] == 20
@@ -95,10 +95,10 @@ def test_main_loop_skips_unavailable_prices(monkeypatch, tmp_path, cost, advisor
     else:
         assert row["actual_cost_usd"] == pytest.approx(expected)
     # Hermes' legacy-named result counter carries total spend for displays and
-    # delegated-child rollups. The DB estimate remains separate from actual.
+    # delegated-child rollups. Its persisted counterpart serves saved reports.
     assert result["estimated_cost_usd"] == pytest.approx(expected or 0)
     assert agent.session_estimated_cost_usd == pytest.approx(expected or 0)
-    assert row["estimated_cost_usd"] == pytest.approx(advisor_cost or 0)
+    assert row["estimated_cost_usd"] == pytest.approx(expected or 0)
     assert row["cost_status"] == ("unknown" if cost is None else "actual")
     assert row["input_tokens"] == 70 + (7 if advisor_cost is not None else 0)
     assert row["output_tokens"] == 20 + (3 if advisor_cost is not None else 0)

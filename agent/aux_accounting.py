@@ -121,7 +121,7 @@ def record_aux_usage(
             cost = resolve_usage_cost(
                 model, usage, response_usage=raw_usage, provider=provider, base_url=base_url
             )
-            if cost.status != "actual" and cost.amount_usd is not None:
+            if cost.amount_usd is not None:
                 estimated_cost = float(cost.amount_usd)
                 estimated_status = cost.status
                 estimated_source = cost.source

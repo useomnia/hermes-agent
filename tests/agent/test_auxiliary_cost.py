@@ -60,7 +60,7 @@ def test_should_prefer_provider_reported_cost_for_complete_billable_cost(monkeyp
         reset_accounting_context(token)
 
     call = db.record_auxiliary_usage.call_args
-    assert call.kwargs["estimated_cost_usd"] is None
+    assert call.kwargs["estimated_cost_usd"] == pytest.approx(0.0033)
     assert call.kwargs["actual_cost_usd"] == pytest.approx(0.0033)
     assert call.kwargs["cost_status"] == "actual"
     assert call.kwargs["cost_source"] == "provider_cost_api"
