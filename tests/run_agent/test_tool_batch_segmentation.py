@@ -389,6 +389,105 @@ def agent():
 
 
 class TestSegmentedDispatchIntegration:
+    def test_default_search_root_before_first_tool_uses_configured_workspace(self, agent, tmp_path, monkeypatch):
+        """A fresh session can have a file cwd different from the process cwd."""
+        from tools import terminal_tool
+
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        monkeypatch.setattr(terminal_tool, "_active_environments", {})
+        monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+        calls = [
+            _tc("search_files", '{"pattern":"x"}'),
+            _tc("write_file", json.dumps({"path": str(tmp_path / "a"), "content": "x"})),
+        ]
+        with (
+            patch.object(agent, "_execute_tool_calls_concurrent") as concurrent,
+            patch.object(agent, "_execute_tool_calls_sequential") as sequential,
+        ):
+            agent._execute_tool_calls(SimpleNamespace(tool_calls=calls), [], "default")
+
+        sequential.assert_called_once()
+        concurrent.assert_not_called()
+
+    @pytest.mark.parametrize("default_search_root", [False, True])
+    def test_real_file_reads_overlap_and_search_waits_for_write(
+        self, agent, tmp_path, monkeypatch, default_search_root
+    ):
+        """Exercise the dispatcher, registered tools and real local file I/O."""
+        import run_agent
+        from tools import file_tools, terminal_tool
+        from tools.file_operations import ShellFileOperations
+
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        monkeypatch.setattr(terminal_tool, "_active_environments", {})
+        monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+        monkeypatch.setattr(file_tools, "_file_ops_cache", {})
+        monkeypatch.setattr(file_tools, "_read_tracker", {})
+        file_tools._get_file_ops("default")
+        target = tmp_path / "data.txt"
+        target.write_text("before-one\nbefore-two\n", encoding="utf-8")
+        search_args = {"pattern": "after"}
+        if not default_search_root:
+            search_args["path"] = str(tmp_path)
+        calls = [
+            _tc("read_file", json.dumps({"path": str(target), "offset": offset, "limit": 1}), call_id=f"r{offset}")
+            for offset in (1, 2)
+        ] + [
+            _tc("write_file", json.dumps({"path": str(target), "content": "after\n"}), call_id="w"),
+            _tc("search_files", json.dumps(search_args), call_id="s"),
+            _tc("read_file", json.dumps({"path": str(target)}), call_id="r3"),
+        ]
+        rendezvous = threading.Barrier(2, timeout=10)
+        real_read = ShellFileOperations.read_file
+        real_handle = run_agent.handle_function_call
+        lock = threading.Lock()
+        read_count = 0
+        events = []
+
+        def observed_read(ops, *args, **kwargs):
+            nonlocal read_count
+            with lock:
+                read_count += 1
+                initial = read_count <= 2
+            if initial:
+                rendezvous.wait()
+            return real_read(ops, *args, **kwargs)
+
+        def observed_handle(name, args, task_id, **kwargs):
+            call_id = kwargs["tool_call_id"]
+            with lock:
+                events.append(("start", call_id))
+            result = real_handle(name, args, task_id, **kwargs)
+            with lock:
+                events.append(("end", call_id))
+            return result
+
+        messages = []
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        try:
+            with (
+                patch.object(ShellFileOperations, "read_file", observed_read),
+                patch("run_agent.handle_function_call", side_effect=observed_handle),
+            ):
+                agent._execute_tool_calls(SimpleNamespace(tool_calls=calls), messages, "default")
+        finally:
+            for env in terminal_tool._active_environments.values():
+                env.cleanup()
+
+        assert [m["tool_call_id"] for m in messages] == ["r1", "r2", "w", "s", "r3"]
+        assert "before-one" in messages[0]["content"]
+        assert "before-two" in messages[1]["content"]
+        assert '"error"' not in messages[2]["content"]
+        assert "after" in messages[3]["content"] and "data.txt" in messages[3]["content"]
+        assert "after" in messages[4]["content"]
+        assert target.read_text(encoding="utf-8") == "after\n"
+        assert str(target) in agent._turn_file_mutation_paths
+        assert agent._turn_failed_file_mutations == {}
+        assert events.index(("start", "w")) > max(events.index(("end", r)) for r in ("r1", "r2"))
+        assert events.index(("start", "s")) > events.index(("end", "w"))
+
     def test_mixed_batch_runs_safe_prefix_concurrently_and_barrier_after(self, agent):
         """Two web_search calls must overlap in time; terminal must start only
         after both finish; results land in the model's emission order."""

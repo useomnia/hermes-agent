@@ -59,8 +59,10 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "web_search",
 })
 
-# File tools can run concurrently when they target independent paths.
-_PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
+# Readers can share a subtree; any overlapping writer closes the run.
+_PATH_SCOPED_READERS = frozenset({"read_file", "search_files"})
+_PATH_SCOPED_WRITERS = frozenset({"write_file", "patch"})
+_PATH_SCOPED_TOOLS = _PATH_SCOPED_READERS | _PATH_SCOPED_WRITERS
 
 # Patterns that indicate a terminal command may modify/delete files.
 _DESTRUCTIVE_PATTERNS = re.compile(
@@ -170,10 +172,10 @@ def _plan_tool_batch_segments(
 
     * ``_NEVER_PARALLEL_TOOLS`` (interactive tools) → barrier.
     * Unparseable / non-dict arguments → barrier.
-    * Path-scoped tools (``read_file``/``write_file``/``patch``) join a
-      parallel run only when their target path does not overlap another
-      path already reserved in the same run; an overlap closes the run so
-      the conflicting call starts a NEW run after the first completes.
+    * Path-scoped readers (``read_file``/``search_files``) may share a
+      subtree. Any overlapping writer (``write_file``/``patch``) closes
+      the run so the conflicting call starts a NEW run after the first
+      completes. Every target of a multi-file patch reserves its scope.
     * Anything not in ``_PARALLEL_SAFE_TOOLS`` or *extra_parallel_safe*
       (the ``agent.parallel_safe_tools`` config list) and not an opted-in MCP
       tool → barrier. MCP tools can use either the legacy server-wide
@@ -187,7 +189,7 @@ def _plan_tool_batch_segments(
     """
     segments: list[list] = []  # [kind, calls] pairs, normalized to tuples on return
     current: list = []
-    reserved_paths: list[Path] = []
+    reserved_paths: list[tuple[Path, bool]] = []
 
     def _close_parallel() -> None:
         nonlocal current, reserved_paths
@@ -238,15 +240,20 @@ def _plan_tool_batch_segments(
             continue
 
         if tool_name in _PATH_SCOPED_TOOLS:
-            scoped_path = _extract_parallel_scope_path(tool_name, function_args, execution_cwd=execution_cwd)
-            if scoped_path is None:
+            scoped_paths = _extract_parallel_scope_paths(tool_name, function_args, execution_cwd=execution_cwd)
+            if not scoped_paths:
                 _add_sequential(tool_call)
                 continue
-            if any(_paths_overlap(scoped_path, existing) for existing in reserved_paths):
+            is_writer = tool_name in _PATH_SCOPED_WRITERS
+            if any(
+                (is_writer or existing_is_writer) and _paths_overlap(scoped_path, existing)
+                for scoped_path in scoped_paths
+                for existing, existing_is_writer in reserved_paths
+            ):
                 # Same-subtree conflict inside this run: close it so this
                 # call starts a fresh run AFTER the conflicting one lands.
                 _close_parallel()
-            reserved_paths.append(scoped_path)
+            reserved_paths.extend((path, is_writer) for path in scoped_paths)
             current.append(tool_call)
             continue
 
@@ -304,26 +311,62 @@ def _canonical_path(raw_path: str, execution_cwd: Optional[Path] = None) -> Path
     return Path(resolved)
 
 
+def _extract_parallel_scope_paths(
+    tool_name: str,
+    function_args: dict,
+    execution_cwd: Optional[Path] = None,
+) -> list[Path]:
+    """Return every canonical scope, or an empty list for an unknown scope.
+
+    *execution_cwd* should be the working directory that the tool will
+    actually use at runtime; otherwise the process cwd is used. Search
+    defaults to that directory only when the path argument is omitted.
+    V4A targets come from the same parser the executor uses, including
+    both move endpoints, rather than an optional, unrelated ``path``.
+    """
+    if tool_name not in _PATH_SCOPED_TOOLS:
+        return []
+
+    if tool_name == "patch":
+        mode = function_args.get("mode", "replace")
+        if mode == "patch":
+            from tools.patch_parser import parse_v4a_patch
+
+            body = function_args.get("patch")
+            if not isinstance(body, str):
+                return []
+            operations, error = parse_v4a_patch(body)
+            if error:
+                return []
+            raw_paths = [path for op in operations for path in (op.file_path, op.new_path) if path is not None]
+        elif mode == "replace":
+            raw_paths = [function_args.get("path")]
+        else:
+            return []
+    else:
+        raw_paths = [function_args.get("path", "." if tool_name == "search_files" else None)]
+
+    paths: list[Path] = []
+    try:
+        for path in raw_paths:
+            if not isinstance(path, str) or not path.strip() or "\x00" in path:
+                return []
+            paths.append(_canonical_path(path, execution_cwd))
+    except (OSError, ValueError, RuntimeError):
+        # A failed expansion or canonicalisation must not crash planning or
+        # admit a partial scope. The sequential tool path reports the error.
+        return []
+    return list(dict.fromkeys(paths))
+
+
 def _extract_parallel_scope_path(
     tool_name: str,
     function_args: dict,
     execution_cwd: Optional[Path] = None,
 ) -> Optional[Path]:
-    """Return the canonical file target for path-scoped tools.
-
-    *execution_cwd* should be the working directory that the tool will
-    actually use at runtime.  When omitted the process cwd is used,
-    which may differ from the tool execution environment on some
-    platforms (e.g. WSL, sandboxed sub-processes).
-    """
-    if tool_name not in _PATH_SCOPED_TOOLS:
-        return None
-
-    raw_path = function_args.get("path")
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        return None
-
-    return _canonical_path(raw_path, execution_cwd)
+    """Return the primary target, retained for existing callers."""
+    paths = _extract_parallel_scope_paths(tool_name, function_args, execution_cwd)
+    return paths[0] if paths else None
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -714,6 +757,7 @@ __all__ = [
     "_should_parallelize_tool_batch",
     "_canonical_path",
     "_extract_parallel_scope_path",
+    "_extract_parallel_scope_paths",
     "_paths_overlap",
     "_is_multimodal_tool_result",
     "_multimodal_text_summary",
