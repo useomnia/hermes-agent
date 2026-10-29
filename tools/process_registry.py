@@ -41,6 +41,8 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
+from tools.process_registry_env_log import log_delta_command
+
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
@@ -1173,7 +1175,7 @@ class ProcessRegistry:
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
-        prev_output_len = 0  # track delta for watch pattern scanning
+        prev_output_bytes = 0  # The shell measures bytes, not decoded characters.
         consecutive_backend_failures = 0
         dead_without_exit_marker = 0
         while not session.exited:
@@ -1193,17 +1195,26 @@ class ProcessRegistry:
                     recorded_exit = int(exit_str.splitlines()[-1].strip())
                 except (ValueError, IndexError):
                     recorded_exit = None
-                # Read new output from the log file
-                result = env.execute(f"cat {quoted_log_path} 2>/dev/null", timeout=10)
-                new_output = result.get("output", "")
-                if new_output:
-                    # Compute delta for watch pattern scanning
-                    delta = new_output[prev_output_len:] if len(new_output) > prev_output_len else ""
-                    prev_output_len = len(new_output)
+                # Read only newly appended bytes. Keep the fork's exit-marker
+                # and liveness handling below, even when this read is unusable.
+                result = env.execute(
+                    log_delta_command(quoted_log_path, prev_output_bytes), timeout=10
+                )
+                header, separator, delta = result.get("output", "").partition("\n")
+                try:
+                    new_size, used_offset = map(int, header.split())
+                    valid = bool(separator) and 0 <= used_offset <= new_size
+                    valid = valid and used_offset in (0, prev_output_bytes)
+                except ValueError:
+                    valid = False
+                if valid:
                     with session._lock:
-                        session.output_buffer = new_output
+                        if used_offset < prev_output_bytes:
+                            session.output_buffer = ""  # Truncated or rotated.
+                        session.output_buffer += delta
                         if len(session.output_buffer) > session.max_output_chars:
                             session.output_buffer = session.output_buffer[-session.max_output_chars:]
+                    prev_output_bytes = new_size
                     if delta:
                         self._check_watch_patterns(session, delta)
                         self._emit_output(session, delta)

@@ -521,3 +521,24 @@ class TestStreamDiagSummary:
     def test_should_report_no_first_chunk_and_tolerate_missing_diag(self):
         assert "first_chunk=none" in stream_diag_summary({"started_at": 1.0}, now=2.0)
         assert stream_diag_summary(None) == "none"
+
+
+@pytest.mark.parametrize("parts", [
+    ['{"x":"', "\\", "n", "\\r" * 1100],
+    ['{"x":"', "distinct-prefix-" * 2500, "abcd" * 10000],
+    ['{"x":"'] + [f"line-{i:04d} unique value\\n" for i in range(2000)],
+])
+def test_buffered_arguments_keep_existing_guard_decisions(parts):
+    from agent.chat_completion_helpers import _ToolArgumentBuffer, _flag_runaway_tool_arguments, _tool_arg_sample
+
+    old = {"function": {"name": "write_file", "arguments": ""}}
+    buffered = {"function": {"name": "write_file", "arguments": ""}, "_argument_buffer": _ToolArgumentBuffer()}
+    old_progress = {"runaway": None, "checked": {}, "blank": {}}
+    new_progress = {"runaway": None, "checked": {}, "blank": {}}
+    for part in parts:
+        old["function"]["arguments"] += part
+        buffered["_argument_buffer"].append(part)
+        _flag_runaway_tool_arguments(old_progress, 0, old, part)
+        _flag_runaway_tool_arguments(new_progress, 0, buffered, part)
+        assert new_progress == old_progress
+        assert _tool_arg_sample(buffered) == _tool_arg_sample(old)

@@ -877,10 +877,10 @@ class TestSpawnEnvSanitization:
                 self.commands = []
                 self._responses = iter([
                     {"output": ""},
-                    {"output": "hello\n"},
+                    {"output": "6 0\nhello\n"},
                     {"output": "1\n"},
                     {"output": "0\n"},
-                    {"output": "hello\n"},
+                    {"output": "6 6\n"},
                 ])
 
             def execute(self, command, **kwargs):
@@ -900,10 +900,12 @@ class TestSpawnEnvSanitization:
             )
 
         assert env.commands[0][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
-        assert env.commands[1][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
+        assert "'/path with spaces/hermes_bg.log'" in env.commands[1][0]
+        assert env.commands[1][0].startswith("O=0;")
         assert env.commands[2][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
         assert env.commands[3][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
-        assert env.commands[4][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
+        assert "'/path with spaces/hermes_bg.log'" in env.commands[4][0]
+        assert env.commands[4][0].startswith("O=6;")
 
     def test_env_poller_prefers_durable_exit_marker(self, registry):
         session = _make_session(sid="proc_exit_marker")
@@ -914,7 +916,7 @@ class TestSpawnEnvSanitization:
                 if "hermes_bg.exit" in command:
                     return {"output": "7\n"}
                 if "job.log" in command:
-                    return {"output": "finished output\n"}
+                    return {"output": "16 0\nfinished output\n"}
                 raise AssertionError(f"unexpected command: {command}")
 
         with patch("tools.process_registry.time.sleep", return_value=None), \
@@ -942,7 +944,7 @@ class TestSpawnEnvSanitization:
                 if "hermes_bg.exit" in command:
                     return {"output": "0\n"}
                 if "job.log" in command:
-                    return {"output": "done after reconnect\n"}
+                    return {"output": "21 0\ndone after reconnect\n"}
                 raise AssertionError(f"unexpected command: {command}")
 
         with patch("tools.process_registry.time.sleep", return_value=None), \

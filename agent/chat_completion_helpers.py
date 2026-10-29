@@ -31,6 +31,7 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH, VALID
 from agent import apply_patch_tool
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
+from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint, is_openrouter_preset_model
@@ -337,10 +338,53 @@ _TOOL_ARG_SAMPLE_HEAD_CHARS = 160
 _TOOL_ARG_SAMPLE_TAIL_CHARS = 600
 
 
+class _ToolArgumentBuffer:
+    """Append-only fragments with bounded reads for live argument diagnostics."""
+
+    def __init__(self):
+        self.parts: list[str] = []
+        self.size = 0
+
+    def append(self, delta: str) -> None:
+        self.parts.append(delta)
+        self.size += len(delta)
+
+    def text(self) -> str:
+        return "".join(self.parts)
+
+    def head(self, count: int) -> str:
+        pieces = []
+        remaining = count
+        for part in self.parts:
+            pieces.append(part[:remaining])
+            remaining -= len(pieces[-1])
+            if not remaining:
+                break
+        return "".join(pieces)
+
+    def tail(self, count: int) -> str:
+        pieces = []
+        remaining = count
+        for part in reversed(self.parts):
+            pieces.append(part[-remaining:])
+            remaining -= len(pieces[-1])
+            if not remaining:
+                break
+        return "".join(reversed(pieces))
+
+
 def _tool_arg_sample(entry) -> str:
     """Bounded head and tail of a tool call's arguments for a diagnostic log."""
     if not isinstance(entry, dict):
         return "none"
+    buffer = entry.get("_argument_buffer")
+    if buffer is not None:
+        if buffer.size <= _TOOL_ARG_SAMPLE_HEAD_CHARS + _TOOL_ARG_SAMPLE_TAIL_CHARS:
+            return repr(buffer.text())
+        return (
+            f"head={buffer.head(_TOOL_ARG_SAMPLE_HEAD_CHARS)!r} "
+            f"tail={buffer.tail(_TOOL_ARG_SAMPLE_TAIL_CHARS)!r}"
+        )
     arguments = entry["function"]["arguments"]
     if len(arguments) <= _TOOL_ARG_SAMPLE_HEAD_CHARS + _TOOL_ARG_SAMPLE_TAIL_CHARS:
         return repr(arguments)
@@ -353,15 +397,16 @@ def _tool_arg_sample(entry) -> str:
 def _flag_runaway_tool_arguments(progress: dict, idx, entry: dict, delta: str) -> None:
     """Mark the stream when a tool call's growing arguments are a whitespace,
     repetition or line-cycle loop."""
+    buffer = entry.get("_argument_buffer")
     arguments = entry["function"]["arguments"]
-    size = len(arguments)
+    size = buffer.size if buffer is not None else len(arguments)
     if progress["runaway"] is not None:
         return
     # Length of the blank run ending the arguments, updated from the new delta.
     # The window keeps the two characters before it so an escape split across
     # deltas (``\`` then ``n``) still reads as blank, and a trailing lone
     # backslash is held back until the next delta shows what it escapes.
-    window = arguments[-(len(delta) + 2):]
+    window = buffer.tail(len(delta) + 2) if buffer is not None else arguments[-(len(delta) + 2):]
     grown = len(delta)
     if window.endswith("\\") and not window.endswith("\\\\"):
         window, grown = window[:-1], grown - 1
@@ -378,6 +423,10 @@ def _flag_runaway_tool_arguments(progress: dict, idx, entry: dict, delta: str) -
     if size - checked.get(idx, 0) < _TOOL_ARG_RUNAWAY_STEP_CHARS:
         return
     checked[idx] = size
+    # Preserve the fork's whole-argument repetition policy and scan cadence.
+    # Ordinary deltas and bounded diagnostics never join the growing history.
+    if buffer is not None:
+        arguments = buffer.text()
     if is_repetition_dominated(arguments):
         progress["runaway"] = (entry["function"]["name"] or "?", size, "repetition")
     elif is_line_cycle(arguments[-_TOOL_ARG_LINE_CYCLE_TAIL_CHARS:]):
@@ -579,7 +628,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         # OpenAI client from the virtual runtime metadata.
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
-    return request_client.chat.completions.create(**api_kwargs)
+    return request_client.chat.completions.create(**bypass_chat_sdk_request_transform(api_kwargs, request_client))
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -2318,7 +2367,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     agent, summary_kwargs,
                     f"{getattr(agent, '_current_api_request_id', 'turn')}:summary",
                 )
-                summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
+                summary_client = agent._ensure_primary_openai_client(reason="iteration_limit_summary")
+                summary_response = summary_client.chat.completions.create(
+                    **bypass_chat_sdk_request_transform(summary_kwargs, summary_client)
+                )
                 _summary_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_summary_result.content or "").strip()
 
@@ -2365,7 +2417,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     agent, summary_kwargs,
                     f"{getattr(agent, '_current_api_request_id', 'turn')}:summary-retry",
                 )
-                summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry").chat.completions.create(**summary_kwargs)
+                summary_client = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry")
+                summary_response = summary_client.chat.completions.create(
+                    **bypass_chat_sdk_request_transform(summary_kwargs, summary_client)
+                )
                 _retry_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_retry_result.content or "").strip()
 
@@ -3013,7 +3068,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # ``request_client_holder["diag"]`` for closure access.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
-        stream = request_client.chat.completions.create(**stream_kwargs)
+        stream = request_client.chat.completions.create(**bypass_chat_sdk_request_transform(stream_kwargs, request_client))
         if agent.provider == "moa":
             # The MoA facade is a shared singleton — abort/close of the
             # registered client is a no-op, so register the stream handle
@@ -3226,6 +3281,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             "type": "function",
                             "function": {"name": "", "arguments": ""},
                             "extra_content": None,
+                            "_argument_buffer": _ToolArgumentBuffer(),
                         }
                     entry = tool_calls_acc[idx]
                     if tc_delta.id is not None:
@@ -3253,7 +3309,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 entry["function"]["name"] = apply_patch_tool.INTERNAL_TOOL_NAME
                             tool_arg_progress.update(t=time.time(), entry=entry)
                         if tc_delta.function.arguments:
-                            entry["function"]["arguments"] += tc_delta.function.arguments
+                            entry["_argument_buffer"].append(tc_delta.function.arguments)
                             tool_arg_progress.update(t=time.time(), entry=entry)
                             _flag_runaway_tool_arguments(
                                 tool_arg_progress, idx, entry, tc_delta.function.arguments
@@ -3315,6 +3371,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             mock_tool_calls = []
             for idx in sorted(tool_calls_acc):
                 tc = tool_calls_acc[idx]
+                tc["function"]["arguments"] = tc.pop("_argument_buffer").text()
                 arguments = tc["function"]["arguments"]
                 tool_name = tc["function"]["name"] or "?"
                 if idx in apply_patch_slots:
