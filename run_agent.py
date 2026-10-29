@@ -6791,8 +6791,10 @@ class AIAgent:
                 )
 
             from agent.tool_dispatch_helpers import _plan_tool_batch_segments
+            from tools.file_tools import _resolve_base_dir
+
             _active_env = get_active_env(effective_task_id)
-            _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
+            _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else Path(_resolve_base_dir(effective_task_id))
             segments = _plan_tool_batch_segments(
                 tool_calls,
                 execution_cwd=_exec_cwd,
