@@ -23,6 +23,7 @@ import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.sdk_transform_bypass import bypass_responses_sdk_request_transform
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
@@ -1282,7 +1283,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         attempt_early_function_call_ids.clear()
 
         try:
-            event_stream = active_client.responses.create(**stream_kwargs)
+            event_stream = active_client.responses.create(**bypass_responses_sdk_request_transform(stream_kwargs, active_client))
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
             if attempt < max_stream_retries:
                 logger.debug(
