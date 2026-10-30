@@ -2503,12 +2503,16 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
             "instead of filling your context, so you can fetch across a whole list and "
             "print only what you concluded."
         )
-    if mcp_tools or {"web_search", "web_extract"}.intersection(enabled_sandbox_tools):
+    parallel_reads = ["independent read-only MCP calls"] if mcp_tools else []
+    native_reads = sorted({"web_search", "web_extract"}.intersection(enabled_sandbox_tools))
+    if native_reads:
+        parallel_reads.append("independent Firecrawl-backed " + ", ".join(native_reads) + " calls")
+    if parallel_reads:
         parallel_read_guidance = (
             " For a small set of independent reads whose full results you need, "
             "emit normal tool calls together. For a batch you will process inside "
             "a script, use concurrent.futures.ThreadPoolExecutor(max_workers=8) "
-            "for independent web_search, web_extract, or read-only MCP calls. "
+            f"for {' and '.join(parallel_reads)}. "
             "A plain loop is sequential. "
             "The runtime enforces eligibility and concurrency limits; unsupported "
             "tools or backends may serialize calls. Keep dependent reads in order "

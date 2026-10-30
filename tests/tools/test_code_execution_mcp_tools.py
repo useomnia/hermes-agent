@@ -196,6 +196,8 @@ class TestSchemaDescription(_WithMcpTool):
             description = schema["description"]
             self.assertIn(f"all {len(many)} MCP tools", description)
             self.assertIn("independent read-only MCP calls", description)
+            self.assertNotIn("web_search", description)
+            self.assertNotIn("web_extract", description)
             self.assertIn("ThreadPoolExecutor(max_workers=8)", description)
             # One example name is fine; forty would be a per-turn context tax.
             listed = sum(1 for name in many if name in description)
