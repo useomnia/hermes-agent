@@ -1,8 +1,10 @@
 """Deadline, Stop and checkpoint recovery through real script processes."""
 
 import json
+import os
 import threading
 
+import psutil
 import pytest
 
 import tools.code_execution_tool as execution
@@ -108,6 +110,34 @@ print(web_search(query="remaining")["value"])
     assert second["status"] == "success", second
     assert "remaining" in second["output"]
     assert runtime == ["first", "remaining"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Requires POSIX signal handling")
+def test_local_deadline_kills_a_script_that_ignores_sigterm(runtime, tmp_path):
+    pid_file = tmp_path / "script.pid"
+    process = None
+    try:
+        result = run("local", f"""
+import os, signal, time
+from pathlib import Path
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path({str(pid_file)!r}).write_text(str(os.getpid()))
+print("saved progress")
+time.sleep(999)
+""")
+        try:
+            process = psutil.Process(int(pid_file.read_text()))
+        except psutil.NoSuchProcess:
+            pass
+        else:
+            assert not process.is_running() or process.status() == psutil.STATUS_ZOMBIE
+        assert result["status"] == "timeout", result
+        assert result["termination_reason"] == "timeout"
+        assert "saved progress" in result["output"]
+    finally:
+        if process is not None and process.is_running():
+            process.kill()
+            process.wait(timeout=5)
 
 
 @pytest.mark.parametrize("transport", ["local", "files"])

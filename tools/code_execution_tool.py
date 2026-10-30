@@ -2051,7 +2051,7 @@ def execute_code(
         while proc.poll() is None:
             reason = execution.termination_reason()
             if reason is not None:
-                _kill_process_group(proc)
+                _kill_process_group(proc, escalate=reason == "timeout")
                 termination_reason = reason
                 status = "timeout" if reason == "timeout" else "interrupted"
                 break
