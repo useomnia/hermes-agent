@@ -7,7 +7,7 @@ import pytest
 
 import tools.code_execution_tool as execution
 from tools.environments.local import LocalEnvironment
-from tools.interrupt import ToolExecutionScope, bind_execution_scope, set_interrupt
+from tools.interrupt import ToolExecutionScope, bind_execution_scope, current_execution_scope, set_interrupt
 
 
 @pytest.fixture
@@ -51,6 +51,32 @@ def test_ended_execution_rejects_nested_admission_with_true_cause(runtime, reaso
     assert result["status"] == ("timeout" if reason == "timeout" else "interrupted")
     assert runtime == []
     assert log == [] and counter == [0]
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 124, 130])
+@pytest.mark.parametrize("reason", ["timeout", "interrupted"])
+def test_backend_exit_does_not_replace_recorded_cause(runtime, monkeypatch, exit_code, reason):
+    env, _ = execution._get_or_create_env("runtime-test")
+    execute = env.execute
+
+    def finish_with_cause(command, **kwargs):
+        if "python3 -u" in command:
+            scope = current_execution_scope()
+            assert scope is not None
+            if reason == "timeout":
+                scope.start(0)
+            else:
+                set_interrupt(True)
+            assert scope.termination_reason() == reason
+            return {"output": "retained progress", "returncode": exit_code}
+        return execute(command, **kwargs)
+
+    monkeypatch.setattr(env, "execute", finish_with_cause)
+    result = run("files", "print('not executed by the backend boundary fixture')")
+    assert result["status"] == reason, result
+    assert result["termination_reason"] == reason
+    assert "retained progress" in result["output"]
+    assert result["tool_calls_made"] == 0
 
 
 @pytest.mark.parametrize("transport", ["local", "files"])

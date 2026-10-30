@@ -1445,7 +1445,7 @@ def _open_remote_code_rpc(env, token, transport):
 
 def _script_timeout_message(timeout: float) -> str:
     return (
-        f"Script timed out and was killed (configured limit: {timeout}s). "
+        f"Script execution timed out (configured limit: {timeout}s). "
         "Printed output and files saved outside the temporary script directory are retained. "
         "Continue from saved progress; do not repeat completed calls."
     )
@@ -1602,13 +1602,10 @@ def _execute_remote(
         status = "success"
 
         # Check for timeout/interrupt from the backend
-        termination_reason = None
-        if exit_code in {124, 130}:
-            termination_reason = (
-                script_result.get("termination_reason")
-                or execution.termination_reason()
-                or ("timeout" if exit_code == 124 else "interrupted")
-            )
+        termination_reason = script_result.get("termination_reason") or execution.termination_reason()
+        if termination_reason is None and exit_code in {124, 130}:
+            termination_reason = "timeout" if exit_code == 124 else "interrupted"
+        if termination_reason is not None:
             status = "timeout" if termination_reason == "timeout" else "interrupted"
 
     except Exception as exc:
@@ -2078,6 +2075,9 @@ def execute_code(
             poll_interval = min(0.2, poll_interval * 1.5)
 
         # Wait for readers to finish draining
+        termination_reason = termination_reason or execution.termination_reason()
+        if termination_reason is not None:
+            status = "timeout" if termination_reason == "timeout" else "interrupted"
         stdout_reader.join(timeout=3)
         stderr_reader.join(timeout=3)
 
