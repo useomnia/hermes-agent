@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from agent.web_search_provider import WebSearchProvider
@@ -55,6 +56,7 @@ from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
+_client_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -253,16 +255,18 @@ def _get_firecrawl_client() -> Any:
             managed_gateway.nous_user_token,
         )
 
-    cached = getattr(_wt, "_firecrawl_client", None)
-    cached_config = getattr(_wt, "_firecrawl_client_config", None)
-    if cached is not None and cached_config == client_config:
-        return cached
+    # The client and its credential/configuration key form one cache entry.
+    # Other workers must never observe only half of a replacement.
+    with _client_lock:
+        cached = getattr(_wt, "_firecrawl_client", None)
+        cached_config = getattr(_wt, "_firecrawl_client_config", None)
+        if cached is not None and cached_config == client_config:
+            return cached
 
-    # Construct via the re-exported Firecrawl proxy on tools.web_tools so
-    # unit tests patching ``tools.web_tools.Firecrawl`` see their mock.
-    _wt._firecrawl_client = _wt.Firecrawl(**kwargs)
-    _wt._firecrawl_client_config = client_config
-    return _wt._firecrawl_client
+        client = _wt.Firecrawl(**kwargs)
+        _wt._firecrawl_client = client
+        _wt._firecrawl_client_config = client_config
+        return client
 
 
 def _reset_client_for_tests() -> None:
