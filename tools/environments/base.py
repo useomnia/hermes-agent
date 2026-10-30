@@ -23,7 +23,7 @@ from typing import IO, Callable, Protocol
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
-from tools.interrupt import is_interrupted
+from tools.interrupt import interruption_reason, is_interrupted
 from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
@@ -984,6 +984,7 @@ class BaseEnvironment(ABC):
             while proc.poll() is None:
                 _iter_count += 1
                 if is_interrupted():
+                    reason = interruption_reason() or "interrupted"
                     if _DEBUG_INTERRUPT:
                         logger.info(
                             "[interrupt-debug] _wait_for_process INTERRUPT DETECTED "
@@ -993,8 +994,12 @@ class BaseEnvironment(ABC):
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
                     return {
-                        "output": output.render(suffix="\n[Command interrupted]"),
-                        "returncode": 130,
+                        "output": output.render(suffix=(
+                            "\n[Command timed out: execution deadline expired]"
+                            if reason == "timeout" else "\n[Command interrupted]"
+                        )),
+                        "returncode": 124 if reason == "timeout" else 130,
+                        "termination_reason": reason,
                     }
                 if time.monotonic() > deadline:
                     if _DEBUG_INTERRUPT:

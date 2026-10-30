@@ -8,8 +8,29 @@ Covers two robustness gaps left unaddressed when #54843 merged:
 from __future__ import annotations
 
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import tools.web_tools as wt
+
+
+def test_concurrent_snapshots_of_same_url_keep_their_content(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    rendezvous = threading.Barrier(8)
+
+    def store(index):
+        content = f"snapshot {index}\n" * 1000
+        rendezvous.wait(timeout=5)
+        path = wt._store_full_text("https://example.com/page", content)
+        assert path is not None
+        assert Path(path).read_text() == content
+        return path
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        paths = list(pool.map(store, range(8)))
+    assert len(set(paths)) == 8
+    assert not list(Path(paths[0]).parent.glob(".extract-*"))
 
 
 def test_store_full_text_is_bounded(tmp_path, monkeypatch):

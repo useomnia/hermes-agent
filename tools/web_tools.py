@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import asyncio
+import tempfile
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_tools.httpx
 # After the web-provider plugin migration (PR #25182), the Firecrawl SDK
@@ -495,7 +496,9 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
 
         host = (urlparse(url).hostname or "page").replace(":", "_")
         slug = re.sub(r"[^A-Za-z0-9._-]", "-", host)[:60].strip("-") or "page"
-        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+        # Concurrent extractions of one URL may return different snapshots.
+        # Each result must keep a path to its own content.
+        digest = hashlib.sha256((url + "\0" + content).encode("utf-8")).hexdigest()[:20]
         path = cache_dir / f"{slug}-{digest}.md"
         # Bound the stored copy so a pathologically large page can't write
         # unbounded bytes to disk. If capped, append a marker so a reader of
@@ -506,7 +509,14 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
                 + f"\n\n[... stored copy truncated at {MAX_STORED_TEXT_CHARS:,} chars "
                 f"of {len(content):,}; re-extract a more specific URL for the rest ...]"
             )
-        path.write_text(content, encoding="utf-8")
+        fd, temporary = tempfile.mkstemp(dir=cache_dir, prefix=".extract-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stored:
+                stored.write(content)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
         return str(path)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Failed to store full web_extract text for %s: %s", url, exc)

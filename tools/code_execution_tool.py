@@ -884,8 +884,13 @@ class _NestedToolDispatcher:
                     f"Tool call limit reached ({self.limit}). "
                     "No more tool calls allowed in this execution."
                 )})
-            if self.execution.is_cancelled():
-                return json.dumps({"status": "interrupted", "error": "Script execution ended."})
+            reason = self.execution.termination_reason()
+            if reason is not None:
+                return json.dumps({
+                    "status": "timeout" if reason == "timeout" else "interrupted",
+                    "termination_reason": reason,
+                    "error": "Script execution ended.",
+                })
             call_id = f"nested_{self.namespace}_{self.counter[0]}"
             self.counter[0] += 1
             # Cancellation may flush usage before a slow external operation
@@ -1438,6 +1443,14 @@ def _open_remote_code_rpc(env, token, transport):
     return "file", None, None
 
 
+def _script_timeout_message(timeout: float) -> str:
+    return (
+        f"Script timed out and was killed (configured limit: {timeout}s). "
+        "Printed output and files saved outside the temporary script directory are retained. "
+        "Continue from saved progress; do not repeat completed calls."
+    )
+
+
 def _execute_remote(
     code: str,
     task_id: Optional[str],
@@ -1523,7 +1536,7 @@ def _execute_remote(
         # routing (#33057).
         if transport == "stream":
             from tools.code_execution_stream import StreamDispatcher
-            from tools.mcp_tool import is_mcp_tool_parallel_read_safe
+            from agent.tool_dispatch_helpers import is_code_execution_read_safe
             dispatcher = _NestedToolDispatcher(
                 effective_task_id, tool_call_log, tool_call_counter,
                 max_tool_calls, sandbox_tools, execution,
@@ -1531,7 +1544,7 @@ def _execute_remote(
             stream = StreamDispatcher(
                 connection, dispatcher.dispatch, execution,
                 concurrency=_cfg.get("rpc_concurrency", 8),
-                read_safe=is_mcp_tool_parallel_read_safe,
+                read_safe=is_code_execution_read_safe,
             )
             stream.start()
         else:
@@ -1580,7 +1593,7 @@ def _execute_remote(
         from tools.interrupt import bind_execution_scope
         with bind_execution_scope(execution):
             script_result = env.execute(
-                f"{cd_prefix}{env_prefix} python3 {quoted_script_path}",
+                f"{cd_prefix}{env_prefix} python3 -u {quoted_script_path}",
                 timeout=timeout,
             )
 
@@ -1589,10 +1602,14 @@ def _execute_remote(
         status = "success"
 
         # Check for timeout/interrupt from the backend
-        if exit_code == 124:
-            status = "timeout"
-        elif exit_code == 130:
-            status = "interrupted"
+        termination_reason = None
+        if exit_code in {124, 130}:
+            termination_reason = (
+                script_result.get("termination_reason")
+                or execution.termination_reason()
+                or ("timeout" if exit_code == 124 else "interrupted")
+            )
+            status = "timeout" if termination_reason == "timeout" else "interrupted"
 
     except Exception as exc:
         duration = round(time.monotonic() - exec_start, 2)
@@ -1669,9 +1686,11 @@ def _execute_remote(
         # (tools/tool_result_storage.py), which would silently drop this field.
         result["inner_tool_calls"] = _inner_counts
     result.update(stdout_metadata)
+    if termination_reason is not None:
+        result["termination_reason"] = termination_reason
 
     if status == "timeout":
-        timeout_msg = f"Script timed out after {timeout}s and was killed."
+        timeout_msg = _script_timeout_message(timeout)
         result["error"] = timeout_msg
         # Include timeout message in output so the LLM always surfaces it
         # to the user (see local path comment — same reasoning, #10807).
@@ -1685,7 +1704,7 @@ def _execute_remote(
         )
     elif status == "interrupted":
         result["output"] = (
-            stdout_text + "\n[execution interrupted — user sent a new message]"
+            stdout_text + "\n[execution interrupted]"
         )
     elif exit_code != 0:
         result["status"] = "error"
@@ -1769,9 +1788,6 @@ def execute_code(
         return _execute_remote(code, task_id, enabled_tools)
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
-
-    # Import per-thread interrupt check (cooperative cancellation)
-    from tools.interrupt import is_interrupted as _is_interrupted
 
     # Resolve config
     _cfg = _load_config()
@@ -1933,7 +1949,7 @@ def execute_code(
 
         execution.start(timeout)
         proc = subprocess.Popen(
-            [_child_python, _script_path],
+            [_child_python, "-u", _script_path],
             cwd=_child_cwd,
             env=child_env,
             stdout=subprocess.PIPE,
@@ -2025,6 +2041,7 @@ def execute_code(
         stderr_reader.start()
 
         status = "success"
+        termination_reason = None
         _activity_state = {
             "last_touch": time.monotonic(),
             "start": exec_start,
@@ -2035,13 +2052,16 @@ def execute_code(
             touch_activity_if_due = None
         poll_interval = 0.005
         while proc.poll() is None:
-            if _is_interrupted():
+            reason = execution.termination_reason()
+            if reason is not None:
                 _kill_process_group(proc)
-                status = "interrupted"
+                termination_reason = reason
+                status = "timeout" if reason == "timeout" else "interrupted"
                 break
             now = time.monotonic()
             if now > deadline:
                 _kill_process_group(proc, escalate=True)
+                termination_reason = "timeout"
                 status = "timeout"
                 break
             # Periodic activity touch so the gateway's inactivity timeout
@@ -2112,9 +2132,11 @@ def execute_code(
             # the accounting record.
             result["inner_tool_calls"] = _inner_counts
         result.update(stdout_metadata)
+        if termination_reason is not None:
+            result["termination_reason"] = termination_reason
 
         if status == "timeout":
-            timeout_msg = f"Script timed out after {timeout}s and was killed."
+            timeout_msg = _script_timeout_message(timeout)
             result["error"] = timeout_msg
             # Include timeout message in output so the LLM always surfaces it
             # to the user.  When output is empty, models often treat the result
@@ -2129,7 +2151,7 @@ def execute_code(
                 duration, timeout, tool_call_counter[0],
             )
         elif status == "interrupted":
-            result["output"] = stdout_text + "\n[execution interrupted — user sent a new message]"
+            result["output"] = stdout_text + "\n[execution interrupted]"
         elif exit_code != 0:
             result["status"] = "error"
             result["error"] = stderr_text or f"Script exited with code {exit_code}"
@@ -2481,16 +2503,21 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
             "instead of filling your context, so you can fetch across a whole list and "
             "print only what you concluded."
         )
+    if mcp_tools or {"web_search", "web_extract"}.intersection(enabled_sandbox_tools):
         parallel_read_guidance = (
             " For a small set of independent reads whose full results you need, "
             "emit normal tool calls together. For a batch you will process inside "
             "a script, use concurrent.futures.ThreadPoolExecutor(max_workers=8) "
-            "for independent read-only MCP calls. A plain loop is sequential. "
+            "for independent web_search, web_extract, or read-only MCP calls. "
+            "A plain loop is sequential. "
             "The runtime enforces eligibility and concurrency limits; unsupported "
             "tools or backends may serialize calls. Keep dependent reads in order "
             "and keep writes, approval-gated actions, and tools with unknown side "
             "effects out of the pool. Reduce concurrency if throttled and respect "
             "the service's retry guidance."
+            " Print completed progress and save checkpoints outside the temporary "
+            "script directory during long batches. If a deadline ends the script, "
+            "inspect that progress and continue only the unfinished work."
         )
 
     # Build example import list from enabled tools
