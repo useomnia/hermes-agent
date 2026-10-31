@@ -18,7 +18,7 @@ from tools.interrupt import ToolExecutionScope, bind_execution_scope, current_ex
 def runtime(monkeypatch, tmp_path):
     monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
-    monkeypatch.setattr(execution, "_load_config", lambda: {"timeout": 1, "mode": "strict"})
+    monkeypatch.setattr(execution, "_load_config", lambda: {"timeout": 1, "max_timeout": 1200, "mode": "strict"})
     monkeypatch.setattr("tools.approval.check_execute_code_guard", lambda *_a, **_kw: {"approved": True})
     env = LocalEnvironment(cwd=str(tmp_path))
     monkeypatch.setattr(execution, "_get_or_create_env", lambda _task: (env, "ssh"))
@@ -40,7 +40,7 @@ def run(transport, code, **kwargs):
 
 
 @pytest.mark.parametrize("transport", ["local", "files"])
-@pytest.mark.parametrize("requested", [0, -1, True, "600", float("inf"), float("nan"), 1201, 10**1000])
+@pytest.mark.parametrize("requested", [0, -1, 1.5, True, "600", float("inf"), float("nan"), 1201, 10**1000])
 def test_invalid_allowance_starts_no_script(runtime, tmp_path, transport, requested):
     marker = tmp_path / "must-not-exist"
     result = run(transport, f"from pathlib import Path; Path({str(marker)!r}).touch()", timeout=requested)
@@ -59,7 +59,7 @@ def test_requested_allowance_can_extend_the_default(runtime, transport):
 @pytest.mark.parametrize("transport", ["local", "files"])
 def test_requested_allowance_can_shorten_the_default(runtime, monkeypatch, transport):
     monkeypatch.setattr(execution, "_load_config", lambda: {"timeout": 30, "mode": "strict"})
-    result = run(transport, 'import time; print("before requested deadline"); time.sleep(999)', timeout=0.25)
+    result = run(transport, 'import time; print("before requested deadline"); time.sleep(999)', timeout=1)
     assert result["status"] == "timeout", result
     assert result["termination_reason"] == "timeout"
     assert "before requested deadline" in result["output"]
@@ -72,11 +72,21 @@ def test_maximum_allowance_is_accepted(runtime, transport):
     assert "accepted maximum" in result["output"]
 
 
+@pytest.mark.parametrize("transport", ["local", "files"])
+def test_legacy_host_ceiling_rejects_unadvertised_extensions(runtime, monkeypatch, tmp_path, transport):
+    monkeypatch.setattr(execution, "_load_config", lambda: {"timeout": 900})
+    marker = tmp_path / "must-not-run"
+    result = run(transport, f"from pathlib import Path; Path({str(marker)!r}).touch()", timeout=901)
+    assert "900" in result["error"], result
+    assert not marker.exists()
+
+
 @pytest.mark.parametrize("requested, config, expected", [
     (None, {}, 300), (None, {"timeout": 450}, 450), (None, {"timeout": 5000}, 1200),
     (None, {"timeout": 0}, 300), (None, {"timeout": "bad"}, 300),
     (None, {"timeout": True}, 300), (None, {"timeout": float("nan")}, 300),
-    (600, {"timeout": 1}, 600), (1200, {"timeout": 1}, 1200),
+    (600, {"timeout": 1, "max_timeout": 1200}, 600), (1200, {"timeout": 1, "max_timeout": 1200}, 1200),
+    (600.0, {"timeout": 1, "max_timeout": 1200}, 600),
 ])
 def test_registered_tool_forwards_the_requested_allowance(runtime, monkeypatch, requested, config, expected):
     from tools.registry import registry
@@ -102,7 +112,7 @@ def test_registered_tool_forwards_the_requested_allowance(runtime, monkeypatch, 
 
 @pytest.mark.parametrize("transport", ["local", "files"])
 def test_printed_progress_does_not_renew_the_deadline(runtime, transport):
-    result = run(transport, 'import time\nwhile True:\n print("progress")\n time.sleep(0.02)', timeout=0.5)
+    result = run(transport, 'import time\nwhile True:\n print("progress")\n time.sleep(0.02)', timeout=1)
     assert result["status"] == "timeout", result
     assert "progress" in result["output"]
     assert result["duration_seconds"] < 10
@@ -252,7 +262,7 @@ time.sleep(999)
 
 @pytest.mark.parametrize("transport", ["local", "files"])
 def test_enclosing_deadline_is_not_an_interrupt(runtime, monkeypatch, transport):
-    monkeypatch.setattr(execution, "_load_config", lambda: {"timeout": 30, "mode": "strict"})
+    monkeypatch.setattr(execution, "_load_config", lambda: {"timeout": 30, "max_timeout": 1200, "mode": "strict"})
     parent = ToolExecutionScope(threading.Event())
     parent.start(1)
     with bind_execution_scope(parent):

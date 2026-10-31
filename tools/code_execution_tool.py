@@ -1444,16 +1444,23 @@ def _open_remote_code_rpc(env, token, transport):
     return "file", None, None
 
 
-def _execution_timeout(requested: Optional[float], config: dict) -> float:
+def _execution_timeout_limits(config: dict) -> tuple[int, int]:
+    """Retain a legacy configured ceiling until a host opts into larger allowances."""
+    configured = config.get("timeout", DEFAULT_TIMEOUT)
+    default = min(configured, MAX_TIMEOUT) if type(configured) is int and configured > 0 else DEFAULT_TIMEOUT
+    ceiling = config.get("max_timeout", config.get("timeout", MAX_TIMEOUT))
+    maximum = min(ceiling, MAX_TIMEOUT) if type(ceiling) is int and ceiling > 0 else default
+    return min(default, maximum), maximum
+
+
+def _execution_timeout(requested: Optional[int], config: dict) -> int:
     """Resolve one finite script allowance before allocating execution resources."""
+    default, maximum = _execution_timeout_limits(config)
     if requested is None:
-        configured = config.get("timeout", DEFAULT_TIMEOUT)
-        if type(configured) in (int, float) and configured > 0:
-            return min(configured, MAX_TIMEOUT)
-        return DEFAULT_TIMEOUT
-    if type(requested) not in (int, float) or not 0 < requested <= MAX_TIMEOUT:
-        raise ValueError(f"timeout must be a finite number greater than 0 and at most {MAX_TIMEOUT} seconds.")
-    return requested
+        return default
+    if type(requested) not in (int, float) or not 1 <= requested <= maximum or requested != int(requested):
+        raise ValueError(f"timeout must be an integer from 1 to {maximum} seconds.")
+    return int(requested)
 
 
 def _script_timeout_message(timeout: float) -> str:
@@ -1468,7 +1475,7 @@ def _execute_remote(
     code: str,
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
-    timeout: Optional[float] = None,
+    timeout: Optional[int] = None,
 ) -> str:
     """Run a script remotely with transport selected before execution.
 
@@ -1738,7 +1745,7 @@ def execute_code(
     code: str,
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
-    timeout: Optional[float] = None,
+    timeout: Optional[int] = None,
 ) -> str:
     """
     Run a Python script in a sandboxed child process with RPC access
@@ -2563,7 +2570,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     # telling the model the default, and the model would plan around the wrong
     # ceiling (splitting one script into several, or overrunning mid-loop).
     _limits_cfg = _load_config()
-    _timeout_s = _execution_timeout(None, _limits_cfg)
+    _timeout_s, _timeout_max = _execution_timeout_limits(_limits_cfg)
     _max_calls = int(
         _limits_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS) or DEFAULT_MAX_TOOL_CALLS
     )
@@ -2572,7 +2579,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     )
     limits_note = (
         f"{_timeout_note} timeout by default; set timeout in seconds for a shorter or longer "
-        f"script, up to {MAX_TIMEOUT}s ({MAX_TIMEOUT // 60} minutes). An earlier enclosing "
+        f"script, up to {_timeout_max}s. An earlier enclosing "
         "deadline still applies; progress does not extend the deadline. "
         f"{MAX_STDOUT_BYTES // 1000}KB inline stdout head/tail "
         f"(larger captured output is saved to a recovery artifact, up to "
@@ -2657,12 +2664,12 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
                     ),
                 },
                 "timeout": {
-                    "type": "number",
-                    "exclusiveMinimum": 0,
-                    "maximum": MAX_TIMEOUT,
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": _timeout_max,
                     "description": (
                         "Optional wall-clock allowance for this script in seconds. "
-                        f"Omit to use the {_timeout_s:g}s default; request up to {MAX_TIMEOUT}s "
+                        f"Omit to use the {_timeout_s:g}s default; request up to {_timeout_max}s "
                         "when the expected work needs more time. Progress does not renew it."
                     ),
                 },
