@@ -8,6 +8,7 @@ turns once the gateway starts draining.
 """
 
 import asyncio
+import importlib
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -211,6 +212,9 @@ class TestDrainWaitsForApiWork:
     @pytest.mark.asyncio
     async def test_drain_waits_for_real_queued_run_before_agent_creation(self):
         """A live /v1/runs task must block drain before it has an agent."""
+        # Initialize prompt dependencies before measuring the drain window.
+        importlib.import_module("tools.tool_approval")
+        importlib.import_module("tools.user_input")
         runner, _adapter = make_restart_runner()
         api = APIServerAdapter(PlatformConfig(enabled=True))
         runner.adapters = {Platform.API_SERVER: api}
