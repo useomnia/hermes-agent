@@ -275,7 +275,7 @@ def test_execute_code_remote_clears_stale_bit(monkeypatch):
 
     captured = {}
 
-    def fake_remote(code, task_id, enabled_tools):
+    def fake_remote(code, task_id, enabled_tools, *, timeout=None):
         captured["interrupted"] = is_interrupted()
         return json.dumps({"status": "success", "output": ""})
 
