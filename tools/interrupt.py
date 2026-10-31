@@ -56,6 +56,7 @@ class ToolExecutionScope:
         self._owner = threading.get_ident()
         self._parent = _execution_scope.get()
         self._deadline: float | None = None
+        self._reason: str | None = None
         self._lock = threading.RLock()
 
     def start(self, timeout: float) -> None:
@@ -64,18 +65,30 @@ class ToolExecutionScope:
 
     def cancel(self) -> None:
         with self._lock:
+            # Cleanup must not replace an expiry or Stop already observed.
+            self._reason = self.termination_reason() or "cancelled"
             self._stop.set()
 
-    def is_cancelled(self) -> bool:
+    def termination_reason(self) -> str | None:
+        """Return the first observed cause, including an enclosing execution."""
         with self._lock:
+            if self._reason is not None:
+                return self._reason
             with _lock:
                 interrupted = self._owner in _interrupted_threads
-            return (
-                self._stop.is_set()
-                or interrupted
-                or (self._deadline is not None and time.monotonic() >= self._deadline)
-                or (self._parent is not None and self._parent.is_cancelled())
-            )
+            if self._parent is not None:
+                self._reason = self._parent.termination_reason()
+            if self._reason is None:
+                if interrupted:
+                    self._reason = "interrupted"
+                elif self._deadline is not None and time.monotonic() >= self._deadline:
+                    self._reason = "timeout"
+                elif self._stop.is_set():
+                    self._reason = "cancelled"
+            return self._reason
+
+    def is_cancelled(self) -> bool:
+        return self.termination_reason() is not None
 
     def admit(self) -> bool:
         with self._lock:
@@ -124,11 +137,20 @@ def is_interrupted() -> bool:
     Safe to call from any thread — each thread only sees its own
     interrupt state.
     """
+    return interruption_reason() is not None
+
+
+def interruption_reason() -> str | None:
+    """Distinguish deadline expiry from interruption without weakening fences."""
+    scope = _execution_scope.get()
+    if scope is not None:
+        reason = scope.termination_reason()
+        if reason is not None:
+            return reason
     tid = threading.current_thread().ident
     with _lock:
         interrupted = tid in _interrupted_threads
-    scope = _execution_scope.get()
-    return interrupted or (scope is not None and scope.is_cancelled())
+    return "interrupted" if interrupted else None
 
 
 def clear_current_thread_interrupt() -> None:

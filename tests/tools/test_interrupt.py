@@ -16,6 +16,37 @@ import pytest
 class TestInterruptModule:
     """Tests for tools/interrupt.py"""
 
+    @pytest.mark.parametrize("reason", ["timeout", "interrupted", "cancelled"])
+    def test_scope_preserves_observed_cause_through_cleanup(self, reason):
+        from tools.interrupt import ToolExecutionScope, set_interrupt
+        stop = threading.Event()
+        scope = ToolExecutionScope(stop)
+        try:
+            if reason == "timeout":
+                scope.start(0)
+            elif reason == "interrupted":
+                set_interrupt(True)
+            else:
+                stop.set()
+            assert scope.termination_reason() == reason
+            assert not scope.admit()
+            scope.cancel()
+            set_interrupt(True)
+            assert scope.termination_reason() == reason
+        finally:
+            set_interrupt(False)
+
+    def test_child_inherits_parent_expiry(self):
+        from tools.interrupt import ToolExecutionScope, bind_execution_scope, interruption_reason
+        parent = ToolExecutionScope(threading.Event())
+        parent.start(0)
+        with bind_execution_scope(parent):
+            child = ToolExecutionScope(threading.Event())
+        child.start(100)
+        with bind_execution_scope(child):
+            assert interruption_reason() == "timeout"
+            assert not child.admit()
+
     def test_set_and_check(self):
         from tools.interrupt import set_interrupt, is_interrupted
         set_interrupt(False)

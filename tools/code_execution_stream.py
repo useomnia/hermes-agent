@@ -21,7 +21,7 @@ def _call(tool_name, args):
     if len(raw) > 1024 * 1024:
         raise ValueError("Tool request exceeds 1 MiB")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(300)
+        client.settimeout(_RPC_TIMEOUT)
         client.connect(os.environ["HERMES_RPC_SOCKET"])
         client.sendall(raw)
         with client.makefile("rb") as reader:

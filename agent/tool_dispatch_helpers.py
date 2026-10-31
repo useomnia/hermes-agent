@@ -43,7 +43,8 @@ logger = logging.getLogger(__name__)
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify", "request_user_input"})
 
 # Read-only tools with no shared mutable session state.
-_PARALLEL_SAFE_TOOLS = frozenset({
+_PARALLEL_WEB_READ_TOOLS = frozenset({"web_extract", "web_search"})
+_PARALLEL_SAFE_TOOLS = _PARALLEL_WEB_READ_TOOLS | frozenset({
     "ha_get_state",
     "ha_list_entities",
     "ha_list_services",
@@ -55,14 +56,34 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "tool_describe",
     "tool_search",
     "vision_analyze",
-    "web_extract",
-    "web_search",
 })
 
 # Readers can share a subtree; any overlapping writer closes the run.
 _PATH_SCOPED_READERS = frozenset({"read_file", "search_files"})
 _PATH_SCOPED_WRITERS = frozenset({"write_file", "patch"})
 _PATH_SCOPED_TOOLS = _PATH_SCOPED_READERS | _PATH_SCOPED_WRITERS
+
+
+def is_code_execution_read_safe(tool_name: str) -> bool:
+    """Reuse native web-read and MCP read opt-ins for the nested stream.
+
+    Filesystem tools stay ordered: this dispatcher has no path reservations.
+    Plugin batch opt-ins do not establish read safety for nested execution.
+    """
+    from tools.mcp_tool import is_mcp_tool_parallel_read_safe
+
+    if tool_name in _PARALLEL_WEB_READ_TOOLS:
+        from tools.web_tools import _get_extract_backend, _get_search_backend
+
+        try:
+            backend = _get_extract_backend() if tool_name == "web_extract" else _get_search_backend()
+        except Exception:
+            logger.debug("Could not classify nested web read %s", tool_name, exc_info=True)
+            return False
+        # Other providers can cache loop-bound async clients across workers.
+        return backend == "firecrawl"
+    return is_mcp_tool_parallel_read_safe(tool_name)
+
 
 # Patterns that indicate a terminal command may modify/delete files.
 _DESTRUCTIVE_PATTERNS = re.compile(

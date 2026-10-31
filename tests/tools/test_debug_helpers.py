@@ -2,6 +2,8 @@
 
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from tools.debug_helpers import DebugSession
@@ -49,6 +51,21 @@ class TestDebugSessionEnabled:
             ds = DebugSession("test_tool", env_var="TEST_DEBUG")
         ds.log_dir = tmp_path
         return ds
+
+    def test_concurrent_calls_save_complete_matching_entries(self, tmp_path):
+        ds = self._make_enabled(tmp_path)
+        barrier = threading.Barrier(8)
+
+        def record(index):
+            barrier.wait(timeout=5)
+            ds.log_call("web_extract", {"index": index})
+            ds.save()
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(record, range(8)))
+        data = json.loads(next(tmp_path.glob("*.json")).read_text())
+        assert data["total_calls"] == 8
+        assert sorted(call["index"] for call in data["tool_calls"]) == list(range(8))
 
     def test_active_when_env_set(self, tmp_path):
         ds = self._make_enabled(tmp_path)

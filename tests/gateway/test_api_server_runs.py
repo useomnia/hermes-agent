@@ -184,6 +184,8 @@ class TestStartRun:
     async def test_interaction_policy_controls_prompt_tools_and_surfaces(
         self, adapter, request_policy, expected_interactive
     ):
+        from tools import tool_approval, user_input
+
         app = _create_runs_app(adapter)
         captured = {}
         body = {"input": "finish the task", "instructions": "Caller context."}
@@ -195,8 +197,6 @@ class TestStartRun:
                 mock_agent = MagicMock()
 
                 def _capture_run(*_args, **_kwargs):
-                    from tools import tool_approval, user_input
-
                     session_key = approval_mod.get_current_session_key()
                     surface_key = tool_approval.get_current_tool_approval_surface_key()
                     captured.update(

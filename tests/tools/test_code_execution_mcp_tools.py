@@ -196,6 +196,8 @@ class TestSchemaDescription(_WithMcpTool):
             description = schema["description"]
             self.assertIn(f"all {len(many)} MCP tools", description)
             self.assertIn("independent read-only MCP calls", description)
+            self.assertNotIn("web_search", description)
+            self.assertNotIn("web_extract", description)
             self.assertIn("ThreadPoolExecutor(max_workers=8)", description)
             # One example name is fine; forty would be a per-turn context tax.
             listed = sum(1 for name in many if name in description)
@@ -233,6 +235,28 @@ class TestSchemaDescription(_WithMcpTool):
         ):
             schema = build_execute_code_schema({"terminal"}, mode="project")
         self.assertIn("90s timeout", schema["description"])
+
+    def test_allowance_schema_advertises_default_and_host_ceiling(self):
+        import jsonschema
+
+        with patch("tools.code_execution_tool._load_config", return_value={}):
+            schema = build_execute_code_schema({"terminal"}, mode="project")
+        self.assertIn("5-minute timeout by default", schema["description"])
+        self.assertIn("earlier enclosing deadline", schema["description"])
+        parameters = schema["parameters"]
+        for args in ({"code": "pass"}, {"code": "pass", "timeout": 1}, {"code": "pass", "timeout": 1200}):
+            jsonschema.validate(args, parameters)
+        for value in (0, -1, 0.5, True, "600", 1201):
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate({"code": "pass", "timeout": value}, parameters)
+
+    def test_legacy_host_ceiling_is_preserved_until_opted_into_larger_allowances(self):
+        with patch("tools.code_execution_tool._load_config", return_value={"timeout": 900}):
+            legacy = build_execute_code_schema({"terminal"}, mode="project")
+        with patch("tools.code_execution_tool._load_config", return_value={"timeout": 300, "max_timeout": 1200}):
+            current = build_execute_code_schema({"terminal"}, mode="project")
+        self.assertEqual(legacy["parameters"]["properties"]["timeout"]["maximum"], 900)
+        self.assertEqual(current["parameters"]["properties"]["timeout"]["maximum"], 1200)
 
 
 # ---------------------------------------------------------------------------

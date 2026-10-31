@@ -112,6 +112,7 @@ def _sandbox_module_name() -> str:
 
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
+MAX_TIMEOUT = 1200           # 20 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
@@ -574,7 +575,7 @@ def _mcp_stub_source(tool_name: str) -> Optional[str]:
 
 
 def generate_hermes_tools_module(enabled_tools: List[str],
-                                 transport: str = "uds") -> str:
+                                 transport: str = "uds", timeout: float = DEFAULT_TIMEOUT) -> str:
     """
     Build the source code for the hermes_tools.py stub module.
 
@@ -627,7 +628,7 @@ def generate_hermes_tools_module(enabled_tools: List[str],
         "    return list(__all__)\n"
     )
 
-    return header + "\n".join(stub_functions) + footer
+    return header + f"\n_RPC_TIMEOUT = {timeout!r}\n" + "\n".join(stub_functions) + footer
 
 
 # ---- Shared helpers section (embedded in both transport headers) ----------
@@ -746,7 +747,7 @@ def _connect():
         else:
             _sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             _sock.connect(endpoint)
-        _sock.settimeout(300)
+        _sock.settimeout(_RPC_TIMEOUT)
     return _sock
 
 def _call(tool_name, args):
@@ -817,11 +818,11 @@ def _call(tool_name, args):
     os.rename(tmp, req_file)
 
     # Wait for response with adaptive polling
-    deadline = time.monotonic() + 300  # 5-minute timeout per tool call
+    deadline = time.monotonic() + _RPC_TIMEOUT
     poll_interval = 0.05  # Start at 50ms
     while not os.path.exists(res_file):
         if time.monotonic() > deadline:
-            raise RuntimeError(f"RPC timeout: no response for {tool_name} after 300s")
+            raise RuntimeError(f"RPC timeout: no response for {tool_name} after {_RPC_TIMEOUT:g}s")
         time.sleep(poll_interval)
         poll_interval = min(poll_interval * 1.2, 0.25)  # Back off to 250ms
 
@@ -884,8 +885,13 @@ class _NestedToolDispatcher:
                     f"Tool call limit reached ({self.limit}). "
                     "No more tool calls allowed in this execution."
                 )})
-            if self.execution.is_cancelled():
-                return json.dumps({"status": "interrupted", "error": "Script execution ended."})
+            reason = self.execution.termination_reason()
+            if reason is not None:
+                return json.dumps({
+                    "status": "timeout" if reason == "timeout" else "interrupted",
+                    "termination_reason": reason,
+                    "error": "Script execution ended.",
+                })
             call_id = f"nested_{self.namespace}_{self.counter[0]}"
             self.counter[0] += 1
             # Cancellation may flush usage before a slow external operation
@@ -948,14 +954,14 @@ def _rpc_server_loop(
                 continue
         if conn is None:
             return
-        conn.settimeout(300)
+        conn.settimeout(0.2)
 
         buf = b""
-        while True:
+        while not stop_event.is_set():
             try:
                 chunk = conn.recv(65536)
             except socket.timeout:
-                break
+                continue
             if not chunk:
                 break
             buf += chunk
@@ -1438,10 +1444,38 @@ def _open_remote_code_rpc(env, token, transport):
     return "file", None, None
 
 
+def _execution_timeout_limits(config: dict) -> tuple[int, int]:
+    """Retain a legacy configured ceiling until a host opts into larger allowances."""
+    configured = config.get("timeout", DEFAULT_TIMEOUT)
+    default = min(configured, MAX_TIMEOUT) if type(configured) is int and configured > 0 else DEFAULT_TIMEOUT
+    ceiling = config.get("max_timeout", config.get("timeout", MAX_TIMEOUT))
+    maximum = min(ceiling, MAX_TIMEOUT) if type(ceiling) is int and ceiling > 0 else default
+    return min(default, maximum), maximum
+
+
+def _execution_timeout(requested: Optional[int], config: dict) -> int:
+    """Resolve one finite script allowance before allocating execution resources."""
+    default, maximum = _execution_timeout_limits(config)
+    if requested is None:
+        return default
+    if type(requested) not in (int, float) or not 1 <= requested <= maximum or requested != int(requested):
+        raise ValueError(f"timeout must be an integer from 1 to {maximum} seconds.")
+    return int(requested)
+
+
+def _script_timeout_message(timeout: float) -> str:
+    return (
+        f"Script execution timed out (script limit: {timeout:g}s). "
+        "Printed output and files saved outside the temporary script directory are retained. "
+        "Continue from saved progress; do not repeat completed calls."
+    )
+
+
 def _execute_remote(
     code: str,
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
+    timeout: Optional[int] = None,
 ) -> str:
     """Run a script remotely with transport selected before execution.
 
@@ -1450,7 +1484,10 @@ def _execute_remote(
     """
 
     _cfg = _load_config()
-    timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
+    try:
+        timeout = _execution_timeout(timeout, _cfg)
+    except ValueError as exc:
+        return tool_error(str(exc))
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     sandbox_tools = _resolve_sandbox_tools(enabled_tools)
@@ -1513,7 +1550,7 @@ def _execute_remote(
 
         # Generate and ship files
         tools_src = generate_hermes_tools_module(
-            list(sandbox_tools), transport=transport,
+            list(sandbox_tools), transport=transport, timeout=timeout,
         )
         _ship_file_to_remote(env, f"{sandbox_dir}/{_sandbox_module_name()}.py", tools_src)
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
@@ -1523,7 +1560,7 @@ def _execute_remote(
         # routing (#33057).
         if transport == "stream":
             from tools.code_execution_stream import StreamDispatcher
-            from tools.mcp_tool import is_mcp_tool_parallel_read_safe
+            from agent.tool_dispatch_helpers import is_code_execution_read_safe
             dispatcher = _NestedToolDispatcher(
                 effective_task_id, tool_call_log, tool_call_counter,
                 max_tool_calls, sandbox_tools, execution,
@@ -1531,7 +1568,7 @@ def _execute_remote(
             stream = StreamDispatcher(
                 connection, dispatcher.dispatch, execution,
                 concurrency=_cfg.get("rpc_concurrency", 8),
-                read_safe=is_mcp_tool_parallel_read_safe,
+                read_safe=is_code_execution_read_safe,
             )
             stream.start()
         else:
@@ -1580,7 +1617,7 @@ def _execute_remote(
         from tools.interrupt import bind_execution_scope
         with bind_execution_scope(execution):
             script_result = env.execute(
-                f"{cd_prefix}{env_prefix} python3 {quoted_script_path}",
+                f"{cd_prefix}{env_prefix} python3 -u {quoted_script_path}",
                 timeout=timeout,
             )
 
@@ -1589,10 +1626,11 @@ def _execute_remote(
         status = "success"
 
         # Check for timeout/interrupt from the backend
-        if exit_code == 124:
-            status = "timeout"
-        elif exit_code == 130:
-            status = "interrupted"
+        termination_reason = script_result.get("termination_reason") or execution.termination_reason()
+        if termination_reason is None and exit_code in {124, 130}:
+            termination_reason = "timeout" if exit_code == 124 else "interrupted"
+        if termination_reason is not None:
+            status = "timeout" if termination_reason == "timeout" else "interrupted"
 
     except Exception as exc:
         duration = round(time.monotonic() - exec_start, 2)
@@ -1669,9 +1707,11 @@ def _execute_remote(
         # (tools/tool_result_storage.py), which would silently drop this field.
         result["inner_tool_calls"] = _inner_counts
     result.update(stdout_metadata)
+    if termination_reason is not None:
+        result["termination_reason"] = termination_reason
 
     if status == "timeout":
-        timeout_msg = f"Script timed out after {timeout}s and was killed."
+        timeout_msg = _script_timeout_message(timeout)
         result["error"] = timeout_msg
         # Include timeout message in output so the LLM always surfaces it
         # to the user (see local path comment — same reasoning, #10807).
@@ -1685,7 +1725,7 @@ def _execute_remote(
         )
     elif status == "interrupted":
         result["output"] = (
-            stdout_text + "\n[execution interrupted — user sent a new message]"
+            stdout_text + "\n[execution interrupted]"
         )
     elif exit_code != 0:
         result["status"] = "error"
@@ -1705,6 +1745,7 @@ def execute_code(
     code: str,
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    timeout: Optional[int] = None,
 ) -> str:
     """
     Run a Python script in a sandboxed child process with RPC access
@@ -1718,6 +1759,7 @@ def execute_code(
         task_id:       Session task ID for tool isolation (terminal env, etc.).
         enabled_tools: Tool names enabled in the current session. The sandbox
                        gets the intersection with SANDBOX_ALLOWED_TOOLS.
+        timeout:       Optional positive script allowance in seconds, up to MAX_TIMEOUT.
 
     Returns:
         JSON string with execution results.
@@ -1730,6 +1772,12 @@ def execute_code(
 
     if not code or not code.strip():
         return tool_error("No code provided.")
+
+    _cfg = _load_config()
+    try:
+        timeout = _execution_timeout(timeout, _cfg)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
@@ -1766,16 +1814,11 @@ def execute_code(
         clear_current_thread_interrupt()
 
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools)
+        return _execute_remote(code, task_id, enabled_tools, timeout=timeout)
 
-    # --- Local execution path (UDS) --- below this line is unchanged ---
-
-    # Import per-thread interrupt check (cooperative cancellation)
-    from tools.interrupt import is_interrupted as _is_interrupted
+    # --- Local execution path (UDS) ---
 
     # Resolve config
-    _cfg = _load_config()
-    timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
@@ -1824,7 +1867,7 @@ def execute_code(
         # Python source files are decoded as UTF-8 by default (PEP 3120).
         # sandbox_tools is already the correct set (intersection with session
         # tools, or SANDBOX_ALLOWED_TOOLS as fallback — see lines above).
-        tools_src = generate_hermes_tools_module(list(sandbox_tools))
+        tools_src = generate_hermes_tools_module(list(sandbox_tools), timeout=timeout)
         with open(os.path.join(tmpdir, f"{_sandbox_module_name()}.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)
 
@@ -1933,7 +1976,7 @@ def execute_code(
 
         execution.start(timeout)
         proc = subprocess.Popen(
-            [_child_python, _script_path],
+            [_child_python, "-u", _script_path],
             cwd=_child_cwd,
             env=child_env,
             stdout=subprocess.PIPE,
@@ -2025,6 +2068,7 @@ def execute_code(
         stderr_reader.start()
 
         status = "success"
+        termination_reason = None
         _activity_state = {
             "last_touch": time.monotonic(),
             "start": exec_start,
@@ -2035,13 +2079,16 @@ def execute_code(
             touch_activity_if_due = None
         poll_interval = 0.005
         while proc.poll() is None:
-            if _is_interrupted():
-                _kill_process_group(proc)
-                status = "interrupted"
+            reason = execution.termination_reason()
+            if reason is not None:
+                _kill_process_group(proc, escalate=reason == "timeout")
+                termination_reason = reason
+                status = "timeout" if reason == "timeout" else "interrupted"
                 break
             now = time.monotonic()
             if now > deadline:
                 _kill_process_group(proc, escalate=True)
+                termination_reason = "timeout"
                 status = "timeout"
                 break
             # Periodic activity touch so the gateway's inactivity timeout
@@ -2058,6 +2105,9 @@ def execute_code(
             poll_interval = min(0.2, poll_interval * 1.5)
 
         # Wait for readers to finish draining
+        termination_reason = termination_reason or execution.termination_reason()
+        if termination_reason is not None:
+            status = "timeout" if termination_reason == "timeout" else "interrupted"
         stdout_reader.join(timeout=3)
         stderr_reader.join(timeout=3)
 
@@ -2112,9 +2162,11 @@ def execute_code(
             # the accounting record.
             result["inner_tool_calls"] = _inner_counts
         result.update(stdout_metadata)
+        if termination_reason is not None:
+            result["termination_reason"] = termination_reason
 
         if status == "timeout":
-            timeout_msg = f"Script timed out after {timeout}s and was killed."
+            timeout_msg = _script_timeout_message(timeout)
             result["error"] = timeout_msg
             # Include timeout message in output so the LLM always surfaces it
             # to the user.  When output is empty, models often treat the result
@@ -2129,7 +2181,7 @@ def execute_code(
                 duration, timeout, tool_call_counter[0],
             )
         elif status == "interrupted":
-            result["output"] = stdout_text + "\n[execution interrupted — user sent a new message]"
+            result["output"] = stdout_text + "\n[execution interrupted]"
         elif exit_code != 0:
             result["status"] = "error"
             result["error"] = stderr_text or f"Script exited with code {exit_code}"
@@ -2481,16 +2533,25 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
             "instead of filling your context, so you can fetch across a whole list and "
             "print only what you concluded."
         )
+    parallel_reads = ["independent read-only MCP calls"] if mcp_tools else []
+    native_reads = sorted({"web_search", "web_extract"}.intersection(enabled_sandbox_tools))
+    if native_reads:
+        parallel_reads.append("independent Firecrawl-backed " + ", ".join(native_reads) + " calls")
+    if parallel_reads:
         parallel_read_guidance = (
             " For a small set of independent reads whose full results you need, "
             "emit normal tool calls together. For a batch you will process inside "
             "a script, use concurrent.futures.ThreadPoolExecutor(max_workers=8) "
-            "for independent read-only MCP calls. A plain loop is sequential. "
+            f"for {' and '.join(parallel_reads)}. "
+            "A plain loop is sequential. "
             "The runtime enforces eligibility and concurrency limits; unsupported "
             "tools or backends may serialize calls. Keep dependent reads in order "
             "and keep writes, approval-gated actions, and tools with unknown side "
             "effects out of the pool. Reduce concurrency if throttled and respect "
             "the service's retry guidance."
+            " Print completed progress and save checkpoints outside the temporary "
+            "script directory during long batches. If a deadline ends the script, "
+            "inspect that progress and continue only the unfinished work."
         )
 
     # Build example import list from enabled tools
@@ -2509,15 +2570,18 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     # telling the model the default, and the model would plan around the wrong
     # ceiling (splitting one script into several, or overrunning mid-loop).
     _limits_cfg = _load_config()
-    _timeout_s = int(_limits_cfg.get("timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT)
+    _timeout_s, _timeout_max = _execution_timeout_limits(_limits_cfg)
     _max_calls = int(
         _limits_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS) or DEFAULT_MAX_TOOL_CALLS
     )
     _timeout_note = (
-        f"{_timeout_s // 60}-minute" if _timeout_s % 60 == 0 else f"{_timeout_s}s"
+        f"{_timeout_s / 60:g}-minute" if _timeout_s % 60 == 0 else f"{_timeout_s:g}s"
     )
     limits_note = (
-        f"{_timeout_note} timeout, {MAX_STDOUT_BYTES // 1000}KB inline stdout head/tail "
+        f"{_timeout_note} timeout by default; set timeout in seconds for a shorter or longer "
+        f"script, up to {_timeout_max}s. An earlier enclosing "
+        "deadline still applies; progress does not extend the deadline. "
+        f"{MAX_STDOUT_BYTES // 1000}KB inline stdout head/tail "
         f"(larger captured output is saved to a recovery artifact, up to "
         f"{MAX_SPILLED_STDOUT_BYTES // 1_000_000}MB; inspect the returned path "
         f"instead of repeating successful calls. Parse saved JSON to select "
@@ -2599,6 +2663,16 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
                         "and print your final result to stdout."
                     ),
                 },
+                "timeout": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": _timeout_max,
+                    "description": (
+                        "Optional wall-clock allowance for this script in seconds. "
+                        f"Omit to use the {_timeout_s:g}s default; request up to {_timeout_max}s "
+                        "when the expected work needs more time. Progress does not renew it."
+                    ),
+                },
             },
             "required": ["code"],
         },
@@ -2619,6 +2693,7 @@ registry.register(
     schema=EXECUTE_CODE_SCHEMA,
     handler=lambda args, **kw: execute_code(
         code=args.get("code", ""),
+        timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         enabled_tools=kw.get("enabled_tools")),
     check_fn=check_sandbox_requirements,

@@ -13,6 +13,9 @@ import json
 import os
 import sys
 import types
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 
@@ -62,6 +65,49 @@ class TestFirecrawlClientConfig:
             p.stop()
 
     # ── Configuration matrix ─────────────────────────────────────────
+
+    def test_concurrent_clients_keep_their_credential_configuration(self, monkeypatch):
+        import tools.web_tools as web
+        from plugins.web.firecrawl import provider
+
+        credential = ContextVar("firecrawl-test-credential")
+        ready = threading.Barrier(8)
+        monkeypatch.setattr(provider, "_get_direct_firecrawl_config", lambda: (
+            {"api_key": credential.get()}, ("direct", None, credential.get())
+        ))
+        monkeypatch.setattr(web, "prefers_gateway", lambda _section: False)
+        monkeypatch.setattr(web, "Firecrawl", lambda **kwargs: types.SimpleNamespace(**kwargs))
+
+        def get_client(index):
+            token = credential.set(f"fixture-key-{index}")
+            try:
+                ready.wait(timeout=5)
+                for _ in range(100):
+                    assert web._get_firecrawl_client().api_key == credential.get()
+            finally:
+                credential.reset(token)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(get_client, range(8)))
+
+    def test_concurrent_reads_share_one_cached_client(self, monkeypatch):
+        import tools.web_tools as web
+        from plugins.web.firecrawl import provider
+
+        ready = threading.Barrier(8)
+        monkeypatch.setattr(provider, "_get_direct_firecrawl_config", lambda: (
+            {"api_key": "fixture-key"}, ("direct", None, "fixture-key")
+        ))
+        monkeypatch.setattr(web, "prefers_gateway", lambda _section: False)
+        monkeypatch.setattr(web, "Firecrawl", lambda **kwargs: types.SimpleNamespace(**kwargs))
+
+        def get_client(_index):
+            ready.wait(timeout=5)
+            return web._get_firecrawl_client()
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            clients = list(pool.map(get_client, range(8)))
+        assert all(client is clients[0] for client in clients)
 
     def test_no_config_raises_with_helpful_message(self):
         """Neither key nor URL → ValueError with guidance."""

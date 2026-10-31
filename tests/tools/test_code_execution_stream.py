@@ -52,6 +52,63 @@ def make_stream(dispatch, concurrency=2):
     return stream, connection
 
 
+@pytest.mark.parametrize("tool", ["web_extract", "web_search"])
+def test_native_web_reads_overlap_and_keep_each_result(tool, monkeypatch):
+    from agent.tool_dispatch_helpers import is_code_execution_read_safe
+    monkeypatch.setattr("tools.web_tools._get_extract_backend", lambda: "firecrawl")
+    monkeypatch.setattr("tools.web_tools._get_search_backend", lambda: "firecrawl")
+
+    rendezvous = threading.Barrier(2)
+    calls = []
+
+    def dispatch(name, args):
+        calls.append((name, args["value"]))
+        rendezvous.wait(timeout=5)
+        return json.dumps({"value": args["value"]})
+
+    connection = Connection()
+    stream = StreamDispatcher(
+        connection, dispatch, ToolExecutionScope(threading.Event()),
+        concurrency=2, read_safe=is_code_execution_read_safe,
+    )
+    stream.start()
+    try:
+        connection.call("first", tool, value=1)
+        connection.call("second", tool, value=2)
+        results = [connection.outgoing.get(timeout=6) for _ in range(2)]
+        assert {r["id"]: json.loads(r["result"])["value"] for r in results} == {
+            "first": 1, "second": 2,
+        }
+        assert sorted(calls) == [(tool, 1), (tool, 2)]
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("tool", ["terminal", "write_file", "read_file", "patch", "clarify", "unknown"])
+def test_nested_read_gate_keeps_stateful_tools_ordered(tool):
+    from agent.tool_dispatch_helpers import is_code_execution_read_safe
+    assert not is_code_execution_read_safe(tool)
+
+
+@pytest.mark.parametrize("backend", ["parallel", "custom"])
+def test_unverified_web_providers_remain_ordered(backend, monkeypatch):
+    from agent.tool_dispatch_helpers import is_code_execution_read_safe
+    monkeypatch.setattr("tools.web_tools._get_extract_backend", lambda: backend)
+    monkeypatch.setattr("tools.web_tools._get_search_backend", lambda: backend)
+    assert not is_code_execution_read_safe("web_extract")
+    assert not is_code_execution_read_safe("web_search")
+
+
+def test_web_classification_failure_keeps_calls_ordered(monkeypatch):
+    from agent.tool_dispatch_helpers import is_code_execution_read_safe
+
+    def unavailable():
+        raise RuntimeError("configuration unavailable")
+
+    monkeypatch.setattr("tools.web_tools._get_extract_backend", unavailable)
+    assert not is_code_execution_read_safe("web_extract")
+
+
 def test_parallel_reads_preserve_response_ids_and_parent_context():
     context = contextvars.ContextVar("stream-test-context")
     token = context.set("session-a")

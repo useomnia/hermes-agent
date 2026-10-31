@@ -25,6 +25,7 @@ import datetime
 import json
 import logging
 import os
+import threading
 import uuid
 from typing import Any, Dict
 
@@ -46,6 +47,7 @@ class DebugSession:
         self.session_id = str(uuid.uuid4()) if self.enabled else ""
         self.log_dir = get_hermes_home() / "logs"
         self._calls: list[Dict[str, Any]] = []
+        self._lock = threading.RLock()
         self._start_time = datetime.datetime.now().isoformat() if self.enabled else ""
 
         if self.enabled:
@@ -61,16 +63,21 @@ class DebugSession:
         """Append a tool-call entry to the in-memory log."""
         if not self.enabled:
             return
-        self._calls.append({
-            "timestamp": datetime.datetime.now().isoformat(),
-            "tool_name": call_name,
-            **call_data,
-        })
+        with self._lock:
+            self._calls.append({
+                "timestamp": datetime.datetime.now().isoformat(),
+                "tool_name": call_name,
+                **call_data,
+            })
 
     def save(self) -> None:
         """Flush the in-memory log to a JSON file in the logs directory."""
         if not self.enabled:
             return
+        with self._lock:
+            self._save()
+
+    def _save(self) -> None:
         try:
             filename = f"{self.tool_name}_debug_{self.session_id}.json"
             filepath = self.log_dir / filename
