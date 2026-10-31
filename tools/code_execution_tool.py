@@ -112,6 +112,7 @@ def _sandbox_module_name() -> str:
 
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
+MAX_TIMEOUT = 1200           # 20 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
@@ -574,7 +575,7 @@ def _mcp_stub_source(tool_name: str) -> Optional[str]:
 
 
 def generate_hermes_tools_module(enabled_tools: List[str],
-                                 transport: str = "uds") -> str:
+                                 transport: str = "uds", timeout: float = DEFAULT_TIMEOUT) -> str:
     """
     Build the source code for the hermes_tools.py stub module.
 
@@ -627,7 +628,7 @@ def generate_hermes_tools_module(enabled_tools: List[str],
         "    return list(__all__)\n"
     )
 
-    return header + "\n".join(stub_functions) + footer
+    return header + f"\n_RPC_TIMEOUT = {timeout!r}\n" + "\n".join(stub_functions) + footer
 
 
 # ---- Shared helpers section (embedded in both transport headers) ----------
@@ -746,7 +747,7 @@ def _connect():
         else:
             _sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             _sock.connect(endpoint)
-        _sock.settimeout(300)
+        _sock.settimeout(_RPC_TIMEOUT)
     return _sock
 
 def _call(tool_name, args):
@@ -817,11 +818,11 @@ def _call(tool_name, args):
     os.rename(tmp, req_file)
 
     # Wait for response with adaptive polling
-    deadline = time.monotonic() + 300  # 5-minute timeout per tool call
+    deadline = time.monotonic() + _RPC_TIMEOUT
     poll_interval = 0.05  # Start at 50ms
     while not os.path.exists(res_file):
         if time.monotonic() > deadline:
-            raise RuntimeError(f"RPC timeout: no response for {tool_name} after 300s")
+            raise RuntimeError(f"RPC timeout: no response for {tool_name} after {_RPC_TIMEOUT:g}s")
         time.sleep(poll_interval)
         poll_interval = min(poll_interval * 1.2, 0.25)  # Back off to 250ms
 
@@ -953,14 +954,14 @@ def _rpc_server_loop(
                 continue
         if conn is None:
             return
-        conn.settimeout(300)
+        conn.settimeout(0.2)
 
         buf = b""
-        while True:
+        while not stop_event.is_set():
             try:
                 chunk = conn.recv(65536)
             except socket.timeout:
-                break
+                continue
             if not chunk:
                 break
             buf += chunk
@@ -1443,9 +1444,21 @@ def _open_remote_code_rpc(env, token, transport):
     return "file", None, None
 
 
+def _execution_timeout(requested: Optional[float], config: dict) -> float:
+    """Resolve one finite script allowance before allocating execution resources."""
+    if requested is None:
+        configured = config.get("timeout", DEFAULT_TIMEOUT)
+        if type(configured) in (int, float) and configured > 0:
+            return min(configured, MAX_TIMEOUT)
+        return DEFAULT_TIMEOUT
+    if type(requested) not in (int, float) or not 0 < requested <= MAX_TIMEOUT:
+        raise ValueError(f"timeout must be a finite number greater than 0 and at most {MAX_TIMEOUT} seconds.")
+    return requested
+
+
 def _script_timeout_message(timeout: float) -> str:
     return (
-        f"Script execution timed out (configured limit: {timeout}s). "
+        f"Script execution timed out (script limit: {timeout:g}s). "
         "Printed output and files saved outside the temporary script directory are retained. "
         "Continue from saved progress; do not repeat completed calls."
     )
@@ -1455,6 +1468,7 @@ def _execute_remote(
     code: str,
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
+    timeout: Optional[float] = None,
 ) -> str:
     """Run a script remotely with transport selected before execution.
 
@@ -1463,7 +1477,10 @@ def _execute_remote(
     """
 
     _cfg = _load_config()
-    timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
+    try:
+        timeout = _execution_timeout(timeout, _cfg)
+    except ValueError as exc:
+        return tool_error(str(exc))
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     sandbox_tools = _resolve_sandbox_tools(enabled_tools)
@@ -1526,7 +1543,7 @@ def _execute_remote(
 
         # Generate and ship files
         tools_src = generate_hermes_tools_module(
-            list(sandbox_tools), transport=transport,
+            list(sandbox_tools), transport=transport, timeout=timeout,
         )
         _ship_file_to_remote(env, f"{sandbox_dir}/{_sandbox_module_name()}.py", tools_src)
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
@@ -1721,6 +1738,7 @@ def execute_code(
     code: str,
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    timeout: Optional[float] = None,
 ) -> str:
     """
     Run a Python script in a sandboxed child process with RPC access
@@ -1734,6 +1752,7 @@ def execute_code(
         task_id:       Session task ID for tool isolation (terminal env, etc.).
         enabled_tools: Tool names enabled in the current session. The sandbox
                        gets the intersection with SANDBOX_ALLOWED_TOOLS.
+        timeout:       Optional positive script allowance in seconds, up to MAX_TIMEOUT.
 
     Returns:
         JSON string with execution results.
@@ -1746,6 +1765,12 @@ def execute_code(
 
     if not code or not code.strip():
         return tool_error("No code provided.")
+
+    _cfg = _load_config()
+    try:
+        timeout = _execution_timeout(timeout, _cfg)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
@@ -1782,13 +1807,11 @@ def execute_code(
         clear_current_thread_interrupt()
 
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools)
+        return _execute_remote(code, task_id, enabled_tools, timeout=timeout)
 
-    # --- Local execution path (UDS) --- below this line is unchanged ---
+    # --- Local execution path (UDS) ---
 
     # Resolve config
-    _cfg = _load_config()
-    timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
@@ -1837,7 +1860,7 @@ def execute_code(
         # Python source files are decoded as UTF-8 by default (PEP 3120).
         # sandbox_tools is already the correct set (intersection with session
         # tools, or SANDBOX_ALLOWED_TOOLS as fallback — see lines above).
-        tools_src = generate_hermes_tools_module(list(sandbox_tools))
+        tools_src = generate_hermes_tools_module(list(sandbox_tools), timeout=timeout)
         with open(os.path.join(tmpdir, f"{_sandbox_module_name()}.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)
 
@@ -2540,15 +2563,18 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     # telling the model the default, and the model would plan around the wrong
     # ceiling (splitting one script into several, or overrunning mid-loop).
     _limits_cfg = _load_config()
-    _timeout_s = int(_limits_cfg.get("timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT)
+    _timeout_s = _execution_timeout(None, _limits_cfg)
     _max_calls = int(
         _limits_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS) or DEFAULT_MAX_TOOL_CALLS
     )
     _timeout_note = (
-        f"{_timeout_s // 60}-minute" if _timeout_s % 60 == 0 else f"{_timeout_s}s"
+        f"{_timeout_s / 60:g}-minute" if _timeout_s % 60 == 0 else f"{_timeout_s:g}s"
     )
     limits_note = (
-        f"{_timeout_note} timeout, {MAX_STDOUT_BYTES // 1000}KB inline stdout head/tail "
+        f"{_timeout_note} timeout by default; set timeout in seconds for a shorter or longer "
+        f"script, up to {MAX_TIMEOUT}s ({MAX_TIMEOUT // 60} minutes). An earlier enclosing "
+        "deadline still applies; progress does not extend the deadline. "
+        f"{MAX_STDOUT_BYTES // 1000}KB inline stdout head/tail "
         f"(larger captured output is saved to a recovery artifact, up to "
         f"{MAX_SPILLED_STDOUT_BYTES // 1_000_000}MB; inspect the returned path "
         f"instead of repeating successful calls. Parse saved JSON to select "
@@ -2630,6 +2656,16 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
                         "and print your final result to stdout."
                     ),
                 },
+                "timeout": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "maximum": MAX_TIMEOUT,
+                    "description": (
+                        "Optional wall-clock allowance for this script in seconds. "
+                        f"Omit to use the {_timeout_s:g}s default; request up to {MAX_TIMEOUT}s "
+                        "when the expected work needs more time. Progress does not renew it."
+                    ),
+                },
             },
             "required": ["code"],
         },
@@ -2650,6 +2686,7 @@ registry.register(
     schema=EXECUTE_CODE_SCHEMA,
     handler=lambda args, **kw: execute_code(
         code=args.get("code", ""),
+        timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         enabled_tools=kw.get("enabled_tools")),
     check_fn=check_sandbox_requirements,

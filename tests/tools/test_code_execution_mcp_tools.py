@@ -236,6 +236,20 @@ class TestSchemaDescription(_WithMcpTool):
             schema = build_execute_code_schema({"terminal"}, mode="project")
         self.assertIn("90s timeout", schema["description"])
 
+    def test_allowance_schema_advertises_default_and_host_ceiling(self):
+        import jsonschema
+
+        with patch("tools.code_execution_tool._load_config", return_value={}):
+            schema = build_execute_code_schema({"terminal"}, mode="project")
+        self.assertIn("5-minute timeout by default", schema["description"])
+        self.assertIn("earlier enclosing deadline", schema["description"])
+        parameters = schema["parameters"]
+        for args in ({"code": "pass"}, {"code": "pass", "timeout": 0.5}, {"code": "pass", "timeout": 1200}):
+            jsonschema.validate(args, parameters)
+        for value in (0, -1, True, "600", 1201):
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate({"code": "pass", "timeout": value}, parameters)
+
 
 # ---------------------------------------------------------------------------
 # End to end

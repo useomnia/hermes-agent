@@ -2,7 +2,9 @@
 
 import json
 import os
+import socket
 import threading
+import time
 
 import psutil
 import pytest
@@ -32,9 +34,117 @@ def runtime(monkeypatch, tmp_path):
     env.cleanup()
 
 
-def run(transport, code):
+def run(transport, code, **kwargs):
     runner = execution.execute_code if transport == "local" else execution._execute_remote
-    return json.loads(runner(code, "runtime-test", ["web_search"]))
+    return json.loads(runner(code, "runtime-test", ["web_search"], **kwargs))
+
+
+@pytest.mark.parametrize("transport", ["local", "files"])
+@pytest.mark.parametrize("requested", [0, -1, True, "600", float("inf"), float("nan"), 1201, 10**1000])
+def test_invalid_allowance_starts_no_script(runtime, tmp_path, transport, requested):
+    marker = tmp_path / "must-not-exist"
+    result = run(transport, f"from pathlib import Path; Path({str(marker)!r}).touch()", timeout=requested)
+    assert "timeout" in result["error"] and "1200" in result["error"], result
+    assert not marker.exists()
+    assert runtime == []
+
+
+@pytest.mark.parametrize("transport", ["local", "files"])
+def test_requested_allowance_can_extend_the_default(runtime, transport):
+    result = run(transport, 'import time; print("started"); time.sleep(1.2); print("completed")', timeout=5)
+    assert result["status"] == "success", result
+    assert "completed" in result["output"]
+
+
+@pytest.mark.parametrize("transport", ["local", "files"])
+def test_requested_allowance_can_shorten_the_default(runtime, monkeypatch, transport):
+    monkeypatch.setattr(execution, "_load_config", lambda: {"timeout": 30, "mode": "strict"})
+    result = run(transport, 'import time; print("before requested deadline"); time.sleep(999)', timeout=0.25)
+    assert result["status"] == "timeout", result
+    assert result["termination_reason"] == "timeout"
+    assert "before requested deadline" in result["output"]
+
+
+@pytest.mark.parametrize("transport", ["local", "files"])
+def test_maximum_allowance_is_accepted(runtime, transport):
+    result = run(transport, 'print("accepted maximum")', timeout=1200)
+    assert result["status"] == "success", result
+    assert "accepted maximum" in result["output"]
+
+
+@pytest.mark.parametrize("requested, config, expected", [
+    (None, {}, 300), (None, {"timeout": 450}, 450), (None, {"timeout": 5000}, 1200),
+    (None, {"timeout": 0}, 300), (None, {"timeout": "bad"}, 300),
+    (None, {"timeout": True}, 300), (None, {"timeout": float("nan")}, 300),
+    (600, {"timeout": 1}, 600), (1200, {"timeout": 1}, 1200),
+])
+def test_registered_tool_forwards_the_requested_allowance(runtime, monkeypatch, requested, config, expected):
+    from tools.registry import registry
+
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setattr(execution, "_load_config", lambda: config)
+    seen = []
+
+    def execute(command, **kwargs):
+        if "python3 -u" in command:
+            seen.append(kwargs["timeout"])
+        return {"output": "OK", "returncode": 0}
+
+    env, _ = execution._get_or_create_env("runtime-test")
+    monkeypatch.setattr(env, "execute", execute)
+    args = {"code": "print('ok')"}
+    if requested is not None:
+        args["timeout"] = requested
+    result = registry.dispatch("execute_code", args, enabled_tools=[])
+    assert json.loads(result)["status"] == "success", result
+    assert seen == [expected]
+
+
+@pytest.mark.parametrize("transport", ["local", "files"])
+def test_printed_progress_does_not_renew_the_deadline(runtime, transport):
+    result = run(transport, 'import time\nwhile True:\n print("progress")\n time.sleep(0.02)', timeout=0.5)
+    assert result["status"] == "timeout", result
+    assert "progress" in result["output"]
+    assert result["duration_seconds"] < 10
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Requires Unix domain sockets")
+@pytest.mark.parametrize("transport", ["uds", "stream", "file"])
+def test_rpc_wait_uses_the_script_allowance(monkeypatch, tmp_path, transport):
+    # Keep the peer connected without returning a result; the generated client
+    # must use its allowance rather than a separate fixed five-minute wait.
+    endpoint = f"/tmp/code-timeout-{os.getpid()}-{transport}.sock"
+    done = threading.Event()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(endpoint)
+    server.listen(1)
+    server.settimeout(3)
+    monkeypatch.setenv("HERMES_RPC_SOCKET", endpoint)
+    monkeypatch.setenv("HERMES_RPC_DIR", str(tmp_path))
+    monkeypatch.setenv("HERMES_RPC_TOKEN", "test")
+
+    def hold():
+        if transport != "file":
+            with server.accept()[0] as client:
+                done.wait(5)
+
+    peer = threading.Thread(target=hold)
+    peer.start()
+    namespace = {}
+    started = time.monotonic()
+    try:
+        exec(execution.generate_hermes_tools_module(["web_search"], transport=transport, timeout=0.05), namespace)
+        with pytest.raises((TimeoutError, RuntimeError)):
+            namespace["web_search"](query="blocked")
+        assert time.monotonic() - started < 2
+    finally:
+        done.set()
+        peer.join(timeout=4)
+        if namespace.get("_sock") is not None:
+            namespace["_sock"].close()
+        server.close()
+        os.unlink(endpoint)
+    assert not peer.is_alive()
 
 
 @pytest.mark.parametrize("reason", ["timeout", "interrupted", "cancelled"])
@@ -146,7 +256,7 @@ def test_enclosing_deadline_is_not_an_interrupt(runtime, monkeypatch, transport)
     parent = ToolExecutionScope(threading.Event())
     parent.start(1)
     with bind_execution_scope(parent):
-        result = run(transport, 'import time; print("before deadline"); time.sleep(999)')
+        result = run(transport, 'import time; print("before deadline"); time.sleep(999)', timeout=1200)
     assert result["status"] == "timeout", result
     assert result["termination_reason"] == "timeout"
     assert "before deadline" in result["output"]
