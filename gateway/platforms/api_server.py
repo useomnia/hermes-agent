@@ -5304,18 +5304,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         completed["interaction"] = {
                             "answered": parsed.get("response", "")
                         }
-                    if isinstance(parsed, dict) and parsed.get("status") == "no_response":
-                        reason = self._user_input_completion_reason(
-                            agent_ref[0], tool_call_id, session_id
-                        )
-                        if reason == "expired":
-                            completed.setdefault("interaction", {})["timed_out"] = True
-                        if reason == "superseded":
-                            parsed["status"] = "superseded"
-                    turn_ending = isinstance(parsed, dict) and parsed.get("status") in {
-                        "presented",
-                        "no_response",
-                    }
+                    turn_ending, completion = self._user_input_wait_outcome(
+                        agent_ref[0], tool_call_id, session_id, parsed,
+                    )
+                    if completion:
+                        completed["interaction"] = completion
                 elif function_name == "todo":
                     todos = parsed.get("todos") if isinstance(parsed, dict) else None
                     if isinstance(todos, list):
@@ -7952,7 +7945,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 accepted = False
             outcome = "queued" if accepted else "failed"
 
-        # Re-check the identity/state after the off-loop call.  A stale
+        return self._settle_live_steer(run_id, lifecycle, agent, task, outcome)
+
+    def _settle_live_steer(
+        self, run_id: str, lifecycle: Dict[str, Any], agent: Any,
+        task: "asyncio.Task", outcome: str,
+    ) -> str:
+        # Re-check the identity/state after the off-loop call. A stale
         # success must not turn into a 200 for a finished or replaced run.
         still_live = (
             lifecycle["accepting"]
@@ -8049,6 +8048,17 @@ class APIServerAdapter(BasePlatformAdapter):
             return reason
         except Exception:
             return None
+
+    def _user_input_wait_outcome(
+        self, agent: Any, call_id: str, session_key: str, result: Any,
+    ) -> tuple[bool, Optional[Dict[str, bool]]]:
+        status = result.get("status") if isinstance(result, dict) else None
+        if status != "no_response":
+            return status == "presented", None
+        reason = self._user_input_completion_reason(agent, call_id, session_key)
+        if reason == "superseded":
+            return False, None
+        return True, {"timed_out": True} if reason == "expired" else None
 
     @staticmethod
     def _interrupt_for_expired_tool_approval(
@@ -9230,7 +9240,6 @@ class APIServerAdapter(BasePlatformAdapter):
             projected_todos: Optional[List[Dict[str, Any]]] = None
             projected_success: Optional[bool] = None
             user_input_turn_ending = False
-            user_input_reason = None
             normalized_tool_call_id = str(tool_call_id or "")
             normalized_tool_name = str(tool_name or "")
             try:
@@ -9248,31 +9257,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 if isinstance(raw_todos, list):
                     projected_todos = _redact_response_extension_value(raw_todos)
             elif normalized_tool_name == "request_user_input":
-                status = (
-                    parsed_result.get("status")
-                    if isinstance(parsed_result, dict)
-                    else None
-                )
-                # An answered card is recorded by the answer's own delivery
-                # path; only the silent expiry has no other recorder.
-                completion_fields: Optional[Dict[str, Any]] = None
-                if status == "no_response":
-                    user_input_reason = self._user_input_completion_reason(
-                        self._active_run_agents.get(run_id),
-                        normalized_tool_call_id,
-                        approval_session_key,
-                    )
-                    # Only an expired wait closes the card; a stop or disconnect
-                    # leaves it open and answerable.
-                    if user_input_reason == "expired":
-                        completion_fields = {"timed_out": True}
-                # The question is now waiting on the chat, not on this run: the
-                # card stays answerable and a late answer closes the call
-                # through a continuation, so the run must end instead of
-                # letting the agent keep working without the answer.
-                user_input_turn_ending = (
-                    status in {"presented", "no_response"}
-                    and user_input_reason != "superseded"
+                user_input_turn_ending, completion_fields = self._user_input_wait_outcome(
+                    self._active_run_agents.get(run_id), normalized_tool_call_id,
+                    approval_session_key, parsed_result,
                 )
                 if completion_fields is not None:
                     fields = {

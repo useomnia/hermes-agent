@@ -182,13 +182,18 @@ class BlockingWaitRegistry(Generic[ResultT, SurfaceT, PayloadT]):
             if touch_activity_if_due is not None:
                 touch_activity_if_due(activity, activity_label)
 
+        return self._finish_wait(session_key, entry, expired)
+
+    def _finish_wait(
+        self, session_key: str, entry: BlockingWaitEntry[ResultT, PayloadT], expired: bool,
+    ) -> tuple[ResultT | None, str | None]:
         self._drop_wait(session_key, entry)
-        reason = None
-        if entry.result is None:
-            reason = entry.completion_reason or ("expired" if expired else "cancelled")
-            with self._lock:
-                self._completion_reasons[(session_key, call_id)] = reason
-        return entry.result, reason
+        if entry.result is not None:
+            return entry.result, None
+        reason = entry.completion_reason or ("expired" if expired else "cancelled")
+        with self._lock:
+            self._completion_reasons[(session_key, entry.tool_call_id)] = reason
+        return None, reason
 
     def resolve(
         self,
