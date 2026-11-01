@@ -303,12 +303,12 @@ async def test_late_answer_after_stop_replays_once_and_refuses_a_changed_answer(
     assert json.loads(answers[0]["content"])["response"] == "Blue"
 
 
-@pytest.mark.parametrize("reason", ["expired", "cancelled", "no_surface", None])
+@pytest.mark.parametrize("reason", ["expired", "cancelled", "superseded", "no_surface", None])
 def test_user_input_keeps_only_released_waits_open(reason):
     agent = _agent()
     agent._omnio_skip_persist_tool_call_ids = None
     with patch("tools.user_input.consume_user_input_completion_reason", return_value=reason):
-        assert APIServerAdapter._keep_unanswered_user_input(agent, "q1", SESSION) is (reason == "expired")
+        assert APIServerAdapter._user_input_completion_reason(agent, "q1", SESSION) == reason
     assert agent._omnio_skip_persist_tool_call_ids == (
         {"q1"} if reason in {"expired", "cancelled"} else None
     )

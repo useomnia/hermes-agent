@@ -3,7 +3,8 @@
 The agent's ``request_user_input`` tool (shipped by the omnio_interaction plugin)
 asks the user a structured question — choice / confirm / multi_choice / secret /
 form — rendered as a card in the Omnia chat. This BLOCKS the agent worker thread
-until the user answers (or a timeout) and returns the answer as the tool's
+until the user answers, a steer supersedes the question, or the wait expires.
+An answer returns as the tool's
 result, so the answer becomes part of the SAME turn — the way the write-tool
 approval gate (``tools/tool_approval.py``) resumes a gated call inline, rather
 than the older "end the turn, the answer is the next message" shape. That
@@ -58,14 +59,16 @@ _DEFAULT_TIMEOUT_S = 300
 
 # This gate owns a separate instance from tool_approval, so answer and approval
 # state cannot cross-talk. User-input surfaces carry no gate-specific value.
-_wait_registry: BlockingWaitRegistry[str, None, None] = BlockingWaitRegistry()
+_wait_registry: BlockingWaitRegistry[str, Callable[[], None], str] = BlockingWaitRegistry()
 
 
-def register_user_input_session(session_key: str) -> object | None:
+def register_user_input_session(
+    session_key: str, on_waiting: Callable[[], None] | None = None,
+) -> object | None:
     """Mark an interactive chat surface and return its ownership token."""
     if not session_key:
         return None
-    return _wait_registry.register_surface(session_key)
+    return _wait_registry.register_surface(session_key, on_waiting)
 
 
 def unregister_user_input_session(session_key: str, token: object) -> None:
@@ -97,11 +100,13 @@ def consume_user_input_completion_reason(session_key: str) -> Optional[str]:
 def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
     """Block until the user answers the ``request_user_input`` card, or a timeout.
 
-    Returns the user's answer string, or ``None`` when the wait times out or the
+    Returns the user's answer string, or ``None`` when input supersedes the wait,
+    the wait expires, or the
     agent is interrupted (the user stopped the turn, or the chat disconnected).
     The caller (the plugin) maps ``None`` to a "no_response" tool result, which
     the api_server seam treats as turn-ending — the card stays answerable in the
     chat and a late answer closes the call through a continuation of the turn.
+    A recorded supersession instead lets the same run process its queued input.
     """
     if not session_key:
         # No conversation surface to receive an answer on — don't park forever.
@@ -118,8 +123,28 @@ def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
         tool_call_id,
         _input_timeout(),
         "waiting for user input",
+        payload=tool_call_id,
+        on_parked=lambda notify: notify() if notify is not None else None,
     )
     return answer
+
+
+def supersede_user_input(
+    session_key: str, before_release: Callable[[str], None],
+) -> bool:
+    """Release the exact pending question without supplying a user's answer.
+
+    Recording runs under the resolution lock before release. An answer that
+    already won, or a failed recorder, leaves no second resolution behind.
+    """
+    call_id = _wait_registry.waiter_payload(session_key)
+    if call_id is None:
+        return False
+    return _wait_registry.resolve(
+        session_key, call_id, None,
+        before_resolve=lambda: before_release(call_id),
+        completion_reason="superseded",
+    )
 
 
 def resolve_user_input(

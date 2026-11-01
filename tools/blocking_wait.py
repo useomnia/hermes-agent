@@ -26,6 +26,7 @@ class BlockingWaitEntry(Generic[ResultT, PayloadT]):
     tool_call_id: str
     payload: PayloadT | None = None
     result: ResultT | None = None
+    completion_reason: str | None = None
     cancelled: Callable[[], bool] | None = None
 
 
@@ -181,25 +182,31 @@ class BlockingWaitRegistry(Generic[ResultT, SurfaceT, PayloadT]):
             if touch_activity_if_due is not None:
                 touch_activity_if_due(activity, activity_label)
 
+        return self._finish_wait(session_key, entry, expired)
+
+    def _finish_wait(
+        self, session_key: str, entry: BlockingWaitEntry[ResultT, PayloadT], expired: bool,
+    ) -> tuple[ResultT | None, str | None]:
         self._drop_wait(session_key, entry)
-        reason = None
-        if entry.result is None:
-            reason = "expired" if expired else "cancelled"
-            with self._lock:
-                self._completion_reasons[(session_key, call_id)] = reason
-        return entry.result, reason
+        if entry.result is not None:
+            return entry.result, None
+        reason = entry.completion_reason or ("expired" if expired else "cancelled")
+        with self._lock:
+            self._completion_reasons[(session_key, entry.tool_call_id)] = reason
+        return None, reason
 
     def resolve(
         self,
         session_key: str,
         tool_call_id: str,
-        value: ResultT,
+        value: ResultT | None,
         on_release: (
             Callable[[BlockingWaitEntry[ResultT, PayloadT]], None] | None
         ) = None,
         *,
         fallback_on_miss: bool = False,
         before_resolve: Callable[[], None] | None = None,
+        completion_reason: str | None = None,
     ) -> bool:
         """Resolve one matching waiter, or the FIFO head when no id is given.
 
@@ -236,6 +243,7 @@ class BlockingWaitRegistry(Generic[ResultT, SurfaceT, PayloadT]):
                 if entry.cancelled is not None and entry.cancelled():
                     return False
                 entry.result = value
+                entry.completion_reason = completion_reason
                 if on_release is not None:
                     on_release(entry)
         finally:

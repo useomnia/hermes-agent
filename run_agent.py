@@ -3196,6 +3196,13 @@ class AIAgent:
             self._pending_redirect = None
         return text
 
+    def _has_pending_steer(self) -> bool:
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            return bool(getattr(self, "_pending_steer", None))
+        with lock:
+            return bool(self._pending_steer)
+
     def _drain_pending_steer(self) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot.
 

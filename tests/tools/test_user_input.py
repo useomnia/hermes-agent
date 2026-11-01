@@ -13,6 +13,7 @@ from tools.user_input import (
     consume_user_input_completion_reason,
     register_user_input_session,
     resolve_user_input,
+    supersede_user_input,
     unregister_user_input_session,
 )
 
@@ -59,6 +60,78 @@ def _start_wait(
 
 
 class TestAwaitAndResolve:
+    def test_supersession_releases_a_question_without_an_answer(self, monkeypatch):
+        monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "31536000")
+        recorded = []
+        waiter, result = _start_wait("call-question")
+        try:
+            assert supersede_user_input(SESSION, recorded.append) is True
+            waiter.join(timeout=3)
+            assert not waiter.is_alive()
+            assert result["answer"] is None
+            assert recorded == ["call-question"]
+            assert consume_user_input_completion_reason(SESSION) == "superseded"
+        finally:
+            clear_session(SESSION)
+            waiter.join(timeout=3)
+
+    def test_steer_before_parking_releases_the_installed_waiter(self, monkeypatch):
+        monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "31536000")
+        recorded = []
+        register_user_input_session(
+            SESSION, lambda: supersede_user_input(SESSION, recorded.append),
+        )
+        assert await_user_input(SESSION, "call-opening") is None
+        assert recorded == ["call-opening"]
+        assert consume_user_input_completion_reason(SESSION) == "superseded"
+
+    def test_a_failed_supersession_record_keeps_the_question_answerable(self):
+        def fail(_call_id):
+            raise RuntimeError("record unavailable")
+
+        waiter, result = _start_wait("call-question")
+        try:
+            with pytest.raises(RuntimeError, match="record unavailable"):
+                supersede_user_input(SESSION, fail)
+            assert user_input._wait_registry.pending_count(SESSION) == 1
+            assert resolve_user_input(SESSION, "real answer", "call-question", strict=True)
+            waiter.join(timeout=3)
+            assert result["answer"] == "real answer"
+            assert consume_user_input_completion_reason(SESSION) is None
+        finally:
+            clear_session(SESSION)
+            waiter.join(timeout=3)
+
+    @pytest.mark.parametrize("answer_first", [True, False])
+    def test_answer_and_supersession_have_one_winner(self, answer_first):
+        waiter, result = _start_wait("call-question")
+        recorded = []
+        try:
+            if answer_first:
+                assert resolve_user_input(SESSION, "Yes", "call-question", strict=True)
+                assert supersede_user_input(SESSION, recorded.append) is False
+            else:
+                assert supersede_user_input(SESSION, recorded.append)
+                assert resolve_user_input(SESSION, "Yes", "call-question", strict=True) is False
+            waiter.join(timeout=3)
+            assert result["answer"] == ("Yes" if answer_first else None)
+            assert recorded == ([] if answer_first else ["call-question"])
+        finally:
+            clear_session(SESSION)
+            waiter.join(timeout=3)
+
+    def test_superseding_another_session_does_not_release_the_question(self):
+        waiter, result = _start_wait("call-question")
+        try:
+            assert supersede_user_input("another-run", lambda _call: None) is False
+            assert user_input._wait_registry.pending_count(SESSION) == 1
+            assert resolve_user_input(SESSION, "real answer", "call-question", strict=True)
+            waiter.join(timeout=3)
+            assert result["answer"] == "real answer"
+        finally:
+            clear_session(SESSION)
+            waiter.join(timeout=3)
+
     def test_strict_resolution_does_not_release_a_different_question(self):
         waiter, result = _start_wait("call-current")
         try:

@@ -3806,6 +3806,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_progress_events": True,
                 "approval_events": True,
                 "omnio_blocking_interactions": True,
+                "omnio_question_steering": {"apiVersion": 1},
                 "mcp_reload": True,
                 # Named-server reloads (``{"servers": [...]}``) and their
                 # ``live`` mode, safe to request while runs are in flight.
@@ -5303,16 +5304,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         completed["interaction"] = {
                             "answered": parsed.get("response", "")
                         }
-                    if isinstance(parsed, dict) and parsed.get("status") == "no_response":
-                        timed_out = self._keep_unanswered_user_input(
-                            agent_ref[0], tool_call_id, session_id
-                        )
-                        if timed_out:
-                            completed.setdefault("interaction", {})["timed_out"] = True
-                    turn_ending = isinstance(parsed, dict) and parsed.get("status") in {
-                        "presented",
-                        "no_response",
-                    }
+                    turn_ending, completion = self._user_input_wait_outcome(
+                        agent_ref[0], tool_call_id, session_id, parsed,
+                    )
+                    if completion:
+                        completed["interaction"] = completion
                 elif function_name == "todo":
                     todos = parsed.get("todos") if isinstance(parsed, dict) else None
                     if isinstance(todos, list):
@@ -7949,7 +7945,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 accepted = False
             outcome = "queued" if accepted else "failed"
 
-        # Re-check the identity/state after the off-loop call.  A stale
+        return self._settle_live_steer(run_id, lifecycle, agent, task, outcome)
+
+    def _settle_live_steer(
+        self, run_id: str, lifecycle: Dict[str, Any], agent: Any,
+        task: "asyncio.Task", outcome: str,
+    ) -> str:
+        # Re-check the identity/state after the off-loop call. A stale
         # success must not turn into a 200 for a finished or replaced run.
         still_live = (
             lifecycle["accepting"]
@@ -7957,7 +7959,34 @@ class APIServerAdapter(BasePlatformAdapter):
             and lifecycle.get("agent") is agent
             and not task.done()
         )
+        if still_live and outcome in {"queued", "redirected"}:
+            self._supersede_steered_question(run_id, agent)
         return outcome if still_live else "not_found"
+
+    def _supersede_steered_question(self, run_id: str, agent) -> bool:
+        """Let accepted input release a question without stopping other work."""
+        from tools.user_input import supersede_user_input
+
+        if self._active_run_agents.get(run_id) is not agent or agent._has_pending_steer() is not True:
+            return False
+
+        def commit(call_id: str) -> None:
+            log = self._turn_event_logs.get_log(run_id)
+            if log is None:
+                raise RuntimeError("The waiting question has no run log")
+            emitter = TurnEventEmitter(self._turn_event_logs, run_id, log.session_id)
+            recorded = emitter.omnio_event(
+                "response.omnio.interaction_completed",
+                tool_call_id=call_id,
+                disposition="supersede",
+            )
+            if recorded is None:
+                raise RuntimeError("The question supersession could not be recorded")
+            self._user_input_resolutions.setdefault(run_id, {})[call_id] = {
+                "response": None, "action": "supersede",
+            }
+
+        return supersede_user_input(run_id, commit)
 
     def _interrupt_run(
         self,
@@ -8008,17 +8037,28 @@ class APIServerAdapter(BasePlatformAdapter):
         pending.add(tool_call_id)
 
     @staticmethod
-    def _keep_unanswered_user_input(agent, tool_call_id: str, session_key: str) -> bool:
-        """Preserve a released question for a late answer; report expiry only."""
+    def _user_input_completion_reason(agent, tool_call_id: str, session_key: str) -> Optional[str]:
+        """Keep an unanswered call open only when no recorded resolution closed it."""
         try:
             from tools.user_input import consume_user_input_completion_reason
 
             reason = consume_user_input_completion_reason(session_key)
             if reason in {"expired", "cancelled"}:
                 APIServerAdapter._leave_interaction_open(agent, tool_call_id)
-            return reason == "expired"
+            return reason
         except Exception:
-            return False
+            return None
+
+    def _user_input_wait_outcome(
+        self, agent: Any, call_id: str, session_key: str, result: Any,
+    ) -> tuple[bool, Optional[Dict[str, bool]]]:
+        status = result.get("status") if isinstance(result, dict) else None
+        if status != "no_response":
+            return status == "presented", None
+        reason = self._user_input_completion_reason(agent, call_id, session_key)
+        if reason == "superseded":
+            return False, None
+        return True, {"timed_out": True} if reason == "expired" else None
 
     @staticmethod
     def _interrupt_for_expired_tool_approval(
@@ -9217,29 +9257,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 if isinstance(raw_todos, list):
                     projected_todos = _redact_response_extension_value(raw_todos)
             elif normalized_tool_name == "request_user_input":
-                status = (
-                    parsed_result.get("status")
-                    if isinstance(parsed_result, dict)
-                    else None
+                user_input_turn_ending, completion_fields = self._user_input_wait_outcome(
+                    self._active_run_agents.get(run_id), normalized_tool_call_id,
+                    approval_session_key, parsed_result,
                 )
-                # An answered card is recorded by the answer's own delivery
-                # path; only the silent expiry has no other recorder.
-                completion_fields: Optional[Dict[str, Any]] = None
-                if status == "no_response":
-                    timed_out = self._keep_unanswered_user_input(
-                        self._active_run_agents.get(run_id),
-                        normalized_tool_call_id,
-                        approval_session_key,
-                    )
-                    # Only an expired wait closes the card; a stop or disconnect
-                    # leaves it open and answerable.
-                    if timed_out:
-                        completion_fields = {"timed_out": True}
-                # The question is now waiting on the chat, not on this run: the
-                # card stays answerable and a late answer closes the call
-                # through a continuation, so the run must end instead of
-                # letting the agent keep working without the answer.
-                user_input_turn_ending = status in {"presented", "no_response"}
                 if completion_fields is not None:
                     fields = {
                         "tool_call_id": normalized_tool_call_id,
@@ -9558,7 +9579,10 @@ class APIServerAdapter(BasePlatformAdapter):
                                 )
                                 dangerous_approval_registered = True
                                 user_input_token = register_user_input_session(
-                                    approval_session_key
+                                    approval_session_key,
+                                    on_waiting=lambda: loop.call_soon_threadsafe(
+                                        self._supersede_steered_question, run_id, agent,
+                                    ),
                                 )
                                 tool_approval_notify_token = (
                                     register_tool_approval_notify(
