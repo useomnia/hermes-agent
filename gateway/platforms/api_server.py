@@ -7967,7 +7967,7 @@ class APIServerAdapter(BasePlatformAdapter):
         """Let accepted input release a question without stopping other work."""
         from tools.user_input import supersede_user_input
 
-        if self._active_run_agents.get(run_id) is not agent or not agent._has_pending_steer():
+        if self._active_run_agents.get(run_id) is not agent or agent._has_pending_steer() is not True:
             return False
 
         def commit(call_id: str) -> None:

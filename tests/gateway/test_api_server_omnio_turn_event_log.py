@@ -2786,6 +2786,7 @@ async def test_user_input_timeout_interrupts_the_run_and_stamps_timed_out() -> N
         and event.get("tool_call_id") == "call-ask"
     )
     assert completed["timed_out"] is True
+    assert events[-1]["type"] == "response.incomplete"
 
 
 @pytest.mark.asyncio
@@ -2869,7 +2870,6 @@ async def test_steer_yields_a_question_without_timeout_or_hard_stop(
         may_park.set()
         if run_id is not None:
             user_input.clear_session(run_id)
-    assert events[-1]["type"] == "response.incomplete"
 
 
 @pytest.mark.asyncio
