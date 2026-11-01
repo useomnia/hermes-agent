@@ -20,6 +20,7 @@ from aiohttp import ClientResponse, web
 from aiohttp.test_utils import TestClient, TestServer
 
 import tools.tool_approval as tool_approval
+import tools.user_input as user_input
 from agent.background_review import ReviewSummary
 from gateway.config import GatewayConfig, PlatformConfig
 from gateway.platforms import api_server as api_server_module
@@ -64,6 +65,8 @@ def _make_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
+    app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
+    app.router.add_post("/v1/runs/{run_id}/user-input", adapter._handle_run_user_input)
     return app
 
 
@@ -2783,6 +2786,89 @@ async def test_user_input_timeout_interrupts_the_run_and_stamps_timed_out() -> N
         and event.get("tool_call_id") == "call-ask"
     )
     assert completed["timed_out"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["steer", "redirect"])
+@pytest.mark.parametrize("before_park", [False, True])
+async def test_steer_yields_a_question_without_timeout_or_hard_stop(
+    monkeypatch, mode, before_park,
+) -> None:
+    adapter = _make_adapter()
+    monkeypatch.setenv("OMNIO_USER_INPUT_TIMEOUT", "31536000")
+    started = threading.Event()
+    may_park = threading.Event()
+    if not before_park:
+        may_park.set()
+    built = []
+    observed = {}
+
+    def build_agent(**callbacks):
+        def run(**kwargs):
+            from tools.approval import get_current_session_key
+
+            callbacks["tool_start_callback"]("ask", "request_user_input", {})
+            started.set()
+            if not may_park.wait(5):
+                raise RuntimeError("test did not allow question registration")
+            observed["answer"] = user_input.await_user_input(get_current_session_key(), "ask")
+            callbacks["tool_complete_callback"](
+                "ask", "request_user_input", {}, json.dumps({"status": "no_response"}),
+            )
+            observed["steer"] = agent._pending_steer
+            return {"final_response": "Processed background result", "messages": []}
+
+        agent = _agent(run)
+        agent.api_mode = "chat_completions"
+        agent._supports_active_turn_redirect = True
+        agent._executing_tools = True
+        agent._pending_steer = None
+
+        def queue(text):
+            agent._pending_steer = text
+            return True
+
+        agent.steer.side_effect = queue
+        agent.redirect.side_effect = queue
+        agent._has_pending_steer.side_effect = lambda: agent._pending_steer is not None
+        built.append(agent)
+        return agent
+
+    run_id = None
+    try:
+        with patch.object(adapter, "_create_agent", side_effect=build_agent):
+            async with TestClient(TestServer(_make_app(adapter))) as client:
+                response = await client.post("/v1/runs", json={"input": "Ask me", "session_id": "steer-question"})
+                assert response.status == 202, await response.text()
+                run_id = (await response.json())["run_id"]
+                assert await asyncio.to_thread(started.wait, 3)
+                if not before_park:
+                    async def parked():
+                        while not user_input._wait_registry.pending_count(run_id):
+                            await asyncio.sleep(0.01)
+                    await asyncio.wait_for(parked(), 3)
+                steered = await client.post(f"/v1/runs/{run_id}/steer", json={"text": "background complete", "mode": mode})
+                assert steered.status == 200, await steered.text()
+                may_park.set()
+                events_response = await client.get(f"/v1/runs/{run_id}/events")
+                events = _sse_events(await asyncio.wait_for(events_response.text(), 5))
+                late_answer = await client.post(
+                    f"/v1/runs/{run_id}/user-input",
+                    headers={"X-Hermes-Session-Id": "steer-question"},
+                    json={"toolCallId": "ask", "response": "Yes"},
+                )
+                assert late_answer.status == 409
+        completions = [event for event in events if event["type"] == "response.omnio.interaction_completed"]
+        assert completions == [next(event for event in completions if event.get("disposition") == "supersede")]
+        assert "choice" not in completions[0]
+        assert "timed_out" not in completions[0]
+        assert observed == {"answer": None, "steer": "background complete"}
+        assert events[-1]["type"] == "response.completed"
+        built[0].interrupt.assert_not_called()
+    finally:
+        may_park.set()
+        if run_id is not None:
+            user_input.clear_session(run_id)
     assert events[-1]["type"] == "response.incomplete"
 
 
