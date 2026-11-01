@@ -58,14 +58,16 @@ _DEFAULT_TIMEOUT_S = 300
 
 # This gate owns a separate instance from tool_approval, so answer and approval
 # state cannot cross-talk. User-input surfaces carry no gate-specific value.
-_wait_registry: BlockingWaitRegistry[str, None, None] = BlockingWaitRegistry()
+_wait_registry: BlockingWaitRegistry[str, Callable[[], None], str] = BlockingWaitRegistry()
 
 
-def register_user_input_session(session_key: str) -> object | None:
+def register_user_input_session(
+    session_key: str, on_waiting: Callable[[], None] | None = None,
+) -> object | None:
     """Mark an interactive chat surface and return its ownership token."""
     if not session_key:
         return None
-    return _wait_registry.register_surface(session_key)
+    return _wait_registry.register_surface(session_key, on_waiting)
 
 
 def unregister_user_input_session(session_key: str, token: object) -> None:
@@ -118,8 +120,28 @@ def await_user_input(session_key: str, tool_call_id: str = "") -> Optional[str]:
         tool_call_id,
         _input_timeout(),
         "waiting for user input",
+        payload=tool_call_id,
+        on_parked=lambda notify: notify() if notify is not None else None,
     )
     return answer
+
+
+def supersede_user_input(
+    session_key: str, before_release: Callable[[str], None],
+) -> bool:
+    """Release the exact pending question without supplying a user's answer.
+
+    Recording runs under the resolution lock before release. An answer that
+    already won, or a failed recorder, leaves no second resolution behind.
+    """
+    call_id = _wait_registry.waiter_payload(session_key)
+    if call_id is None:
+        return False
+    return _wait_registry.resolve(
+        session_key, call_id, None,
+        before_resolve=lambda: before_release(call_id),
+        completion_reason="superseded",
+    )
 
 
 def resolve_user_input(
