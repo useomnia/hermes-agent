@@ -102,10 +102,19 @@ def iter_sprites_sync_files(
             f"{paths}"
         )
 
-    return [
-        (entry["host_path"], entry["container_path"])
-        for entry in iter_skills_files(container_base=container_base)
-    ]
+    skills_root = get_hermes_home() / "skills"
+    files: list[tuple[str, str]] = []
+    for entry in iter_skills_files(container_base=container_base):
+        source = Path(entry["host_path"])
+        # Usage state belongs to this profile, not to its Toolbox helpers.
+        # Other roots and nested files can legitimately use these names.
+        if source.parent == skills_root and (
+            source.name in {".usage.json", ".usage.json.lock"}
+            or (source.name.startswith(".usage_") and source.name.endswith(".tmp"))
+        ):
+            continue
+        files.append((entry["host_path"], entry["container_path"]))
+    return files
 
 
 # Where the harness cache set lands on the paired Toolbox (see
