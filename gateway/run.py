@@ -3085,6 +3085,17 @@ def _parse_session_key(session_key: str) -> "dict | None":
     return None
 
 
+def _raw_process_event_session_id(evt: dict) -> str:
+    """Recognize API identity without treating partial messaging routes as API."""
+    session_key = str(evt.get("session_key") or "").strip()
+    platform = str(evt.get("platform") or "").strip().lower()
+    if session_key.startswith("agent:") or platform not in {"", "api_server"}:
+        return ""
+    if not platform and any(evt.get(field) for field in ("chat_id", "chat_type", "thread_id")):
+        return ""
+    return str(evt.get("origin_session_id") or session_key or "").strip()
+
+
 def _format_gateway_process_notification(evt: dict) -> "str | None":
     """Format a watch pattern event from completion_queue into a [IMPORTANT:] message."""
     evt_type = evt.get("type", "completion")
@@ -18180,6 +18191,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if platform_name == "api_server" and chat_id and not chat_type:
             chat_type = "dm"
         if not platform_name or not chat_type or not chat_id:
+            # Raw API identities have no messaging source; the caller handles
+            # API delivery and reports failures after trying its existing route.
+            if _raw_process_event_session_id(evt):
+                return None
             logger.warning(
                 "Synthetic event source unresolvable: "
                 "session_key=%r platform=%r chat_type=%r chat_id=%r "
@@ -18264,8 +18279,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if adapter is not None and not adapter_supports_push(adapter):
                     try:
                         logger.info(
-                            "Watch pattern notification — waking api_server "
-                            "session %s via self-post",
+                            "Background notification — delivering API wake "
+                            "for session %s",
                             raw_sid,
                         )
                         await deliver_wake(
@@ -18294,14 +18309,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return True
                     except Exception as e:
                         logger.warning(
-                            "Watch notification self-post wake failed for "
+                            "Background notification API wake failed for "
                             "session %s: %s",
                             raw_sid, e,
                         )
                         return False
                 logger.warning(
                     "Dropping watch notification for raw session %s: no "
-                    "api_server adapter to self-post through",
+                    "non-push api_server adapter for wake delivery",
                     raw_sid,
                 )
                 return None
@@ -18329,8 +18344,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raw_sid = str(evt.get("origin_session_id") or "").strip() or str(source.chat_id or "")
             try:
                 logger.info(
-                    "Watch pattern notification — waking api_server session "
-                    "%s via self-post",
+                    "Background notification — delivering API wake for "
+                    "session %s",
                     raw_sid,
                 )
                 await deliver_wake(
@@ -18356,7 +18371,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
             except Exception as e:
                 logger.warning(
-                    "Watch notification self-post wake failed for session "
+                    "Background notification API wake failed for session "
                     "%s: %s",
                     raw_sid, e,
                 )
