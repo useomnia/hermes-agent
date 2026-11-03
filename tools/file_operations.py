@@ -30,9 +30,12 @@ import re
 import difflib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, ClassVar
+from typing import Optional, List, Dict, Any, ClassVar, TYPE_CHECKING
 from pathlib import Path
 from tools.binary_extensions import BINARY_EXTENSIONS
+
+if TYPE_CHECKING:
+    from tools.patch_parser import PatchOperation
 
 from agent.file_safety import (
     build_write_denied_paths,
@@ -461,7 +464,7 @@ class FileOperations(ABC):
         ...
 
     @abstractmethod
-    def patch_v4a(self, patch_content: str) -> PatchResult:
+    def patch_v4a(self, patch_content: str, *, operations: Optional[List["PatchOperation"]] = None) -> PatchResult:
         """Apply a V4A format patch."""
         ...
 
@@ -1676,7 +1679,7 @@ class ShellFileOperations(FileOperations):
             lsp_diagnostics=write_result.lsp_diagnostics,
         )
     
-    def patch_v4a(self, patch_content: str) -> PatchResult:
+    def patch_v4a(self, patch_content: str, *, operations: Optional[List["PatchOperation"]] = None) -> PatchResult:
         """
         Apply a V4A format patch.
         
@@ -1691,6 +1694,7 @@ class ShellFileOperations(FileOperations):
         
         Args:
             patch_content: V4A format patch string
+            operations: Pre-parsed operations with targets resolved by the caller.
         
         Returns:
             PatchResult with changes made
@@ -1698,9 +1702,10 @@ class ShellFileOperations(FileOperations):
         # Import patch parser
         from tools.patch_parser import parse_v4a_patch, apply_v4a_operations
         
-        operations, parse_error = parse_v4a_patch(patch_content)
-        if parse_error:
-            return PatchResult(error=f"Failed to parse patch: {parse_error}")
+        if operations is None:
+            operations, parse_error = parse_v4a_patch(patch_content)
+            if parse_error:
+                return PatchResult(error=f"Failed to parse patch: {parse_error}")
         
         # Apply operations
         result = apply_v4a_operations(operations, self)

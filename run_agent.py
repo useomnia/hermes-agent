@@ -3250,6 +3250,8 @@ class AIAgent:
         args: Dict[str, Any],
         result: Any,
         is_error: bool,
+        *,
+        task_id: str = "default",
     ) -> None:
         """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier.
 
@@ -3264,14 +3266,23 @@ class AIAgent:
         state = getattr(self, "_turn_failed_file_mutations", None)
         if state is None:
             return
-        targets = _extract_file_mutation_targets(tool_name, args)
+        targets = None
+        try:
+            data = json.loads(result) if isinstance(result, str) else {}
+            captured = data.get("files_targeted") or ([data["resolved_path"]] if data.get("resolved_path") else [])
+            if isinstance(captured, list) and captured and all(isinstance(path, str) and path for path in captured):
+                targets = captured
+        except (ValueError, TypeError, AttributeError):
+            pass
+        if targets is None:
+            targets = _extract_file_mutation_targets(tool_name, args, task_id=task_id)
         if not targets:
             return
         landed = file_mutation_result_landed(tool_name, result)
         if landed:
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
-                changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
+                changed.update(_extract_landed_file_mutation_paths(tool_name, args, result, task_id=task_id))
         if is_error and not landed:
             preview = _extract_error_preview(result)
             for path in targets:
@@ -3283,7 +3294,7 @@ class AIAgent:
                         "tool": tool_name,
                         "error_preview": preview,
                     }
-        else:
+        elif landed:
             for path in targets:
                 state.pop(path, None)
 
@@ -6798,19 +6809,14 @@ class AIAgent:
                 )
 
             from agent.tool_dispatch_helpers import _plan_tool_batch_segments
-            from tools.file_tools import _resolve_base_dir
 
-            _active_env = get_active_env(effective_task_id)
-            _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else Path(_resolve_base_dir(effective_task_id))
             segments = _plan_tool_batch_segments(
                 tool_calls,
-                execution_cwd=_exec_cwd,
+                task_id=effective_task_id,
                 extra_parallel_safe=getattr(self, "_parallel_safe_tools", frozenset()),
             )
-
             if len(segments) == 1:
-                kind = segments[0][0]
-                if kind == "parallel":
+                if segments[0][0] == "parallel":
                     return self._execute_tool_calls_concurrent(
                         assistant_message, messages, effective_task_id, api_call_count
                     )

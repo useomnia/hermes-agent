@@ -20,6 +20,7 @@ list of files that did NOT change.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -149,9 +150,9 @@ class TestRecordFileMutationResult:
             result, is_error=True,
         )
         state = agent._turn_failed_file_mutations
-        assert "/tmp/a.md" in state
-        assert state["/tmp/a.md"]["tool"] == "patch"
-        assert "Could not find old_string" in state["/tmp/a.md"]["error_preview"]
+        assert str(Path("/tmp/a.md").resolve()) in state
+        assert state[str(Path("/tmp/a.md").resolve())]["tool"] == "patch"
+        assert "Could not find old_string" in state[str(Path("/tmp/a.md").resolve())]["error_preview"]
 
     def test_success_removes_prior_failure(self):
         agent = _bare_agent()
@@ -160,14 +161,14 @@ class TestRecordFileMutationResult:
             "patch", {"mode": "replace", "path": "/tmp/a.md", "old_string": "x", "new_string": "y"},
             json.dumps({"error": "not found"}), is_error=True,
         )
-        assert "/tmp/a.md" in agent._turn_failed_file_mutations
+        assert str(Path("/tmp/a.md").resolve()) in agent._turn_failed_file_mutations
         # Second attempt with corrected old_string succeeds
         agent._record_file_mutation_result(
             "patch", {"mode": "replace", "path": "/tmp/a.md", "old_string": "real", "new_string": "fixed"},
             json.dumps({"success": True, "diff": "..."}), is_error=False,
         )
         assert agent._turn_failed_file_mutations == {}
-        assert agent._turn_file_mutation_paths == {"/tmp/a.md"}
+        assert agent._turn_file_mutation_paths == {str(Path("/tmp/a.md").resolve())}
 
     def test_success_records_landed_paths_for_verify_on_stop(self):
         agent = _bare_agent()
@@ -201,7 +202,7 @@ class TestRecordFileMutationResult:
             json.dumps({"error": "write failed"}),
             is_error=True,
         )
-        assert "/tmp/a.py" in agent._turn_failed_file_mutations
+        assert str(Path("/tmp/a.py").resolve()) in agent._turn_failed_file_mutations
 
         result = json.dumps({
             "bytes_written": 24,
@@ -225,7 +226,7 @@ class TestRecordFileMutationResult:
             json.dumps({"error": "Could not find old_string"}),
             is_error=True,
         )
-        assert "/tmp/a.py" in agent._turn_failed_file_mutations
+        assert str(Path("/tmp/a.py").resolve()) in agent._turn_failed_file_mutations
 
         result = json.dumps({
             "success": True,
@@ -255,7 +256,7 @@ class TestRecordFileMutationResult:
         )
         # Keep the original error — swapping to the latest would obscure
         # the initial root cause.
-        assert "first error" in agent._turn_failed_file_mutations["/tmp/a.md"]["error_preview"]
+        assert "first error" in agent._turn_failed_file_mutations[str(Path("/tmp/a.md").resolve())]["error_preview"]
 
     def test_v4a_multi_file_all_tracked(self):
         agent = _bare_agent()
@@ -269,7 +270,7 @@ class TestRecordFileMutationResult:
             "patch", {"mode": "patch", "patch": body},
             json.dumps({"error": "parse failure"}), is_error=True,
         )
-        assert set(agent._turn_failed_file_mutations) == {"/tmp/a.md", "/tmp/b.md"}
+        assert set(agent._turn_failed_file_mutations) == {str(Path(p).resolve()) for p in ("/tmp/a.md", "/tmp/b.md")}
 
     def test_no_state_dict_silent_noop(self):
         """When called outside run_conversation the state dict is absent.

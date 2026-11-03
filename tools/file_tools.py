@@ -8,6 +8,7 @@ import os
 import posixpath
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
@@ -401,15 +402,23 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     """
     container_paths = _uses_container_paths(task_id)
     if container_paths:
-        # Preserve the tilde until ShellFileOperations can expand it against
-        # the sandbox's HOME. Expanding here would use the gateway host HOME
-        # and turn ~/foo into an invalid host path inside Sprites/Docker/SSH.
+        # Known virtual homes resolve here; other remote homes stay deferred
+        # to their backend rather than using the gateway host's HOME.
         if filepath == "~" or filepath.startswith("~/"):
-            return PurePosixPath(filepath)
-        expanded = _expand_tilde(filepath)
+            home = _container_home_for_task(task_id)
+            if home is None:
+                return PurePosixPath(filepath)
+            expanded = _expand_tilde_for_container(filepath, task_id)
+        else:
+            expanded = _expand_tilde(filepath)
         if posixpath.isabs(expanded):
-            return _normalize_without_host_deref(expanded)
-        resolved = _resolve_base_dir(task_id, container_paths=True) / expanded
+            resolved = _normalize_without_host_deref(expanded)
+        else:
+            resolved = _resolve_base_dir(task_id, container_paths=True) / expanded
+        if _terminal_env_type_for_task(task_id) == "sprites":
+            from tools.environments.sprites import _canonicalize_toolbox_path
+
+            resolved = PurePosixPath(_canonicalize_toolbox_path(str(resolved)))
         return _normalize_without_host_deref(resolved)
 
     # Host paths only — never rewrite Linux paths inside a container/WSL env.
@@ -628,12 +637,14 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
-def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
+def _check_sensitive_path(filepath: str, task_id: str = "default", *, resolved_path: str | None = None) -> str | None:
     """Return an error message if the path targets a sensitive system location."""
-    try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
-    except (OSError, ValueError):
-        resolved = filepath
+    resolved = resolved_path
+    if resolved is None:
+        try:
+            resolved = str(_resolve_path_for_task(filepath, task_id))
+        except (OSError, ValueError):
+            resolved = filepath
     normalized = os.path.normpath(_expand_tilde(filepath))
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
@@ -692,7 +703,7 @@ def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | Non
     return None
 
 
-def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | None:
+def _check_cross_profile_path(filepath: str, task_id: str = "default", *, resolved_path: str | None = None) -> str | None:
     """Return a soft-guard warning when ``filepath`` lands in another Hermes
     profile's scoped area, a host-side sandbox-mirror of authoritative profile
     state, or the Docker container's sandbox mirror of Hermes state.
@@ -733,10 +744,12 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
     # Resolve via the task's cwd so a relative ``skills/foo/SKILL.md``
     # in a session that cd'd into ``~/.hermes/profiles/other/`` is
     # classified against the right base.
-    try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
-    except (OSError, ValueError):
-        resolved = filepath
+    resolved = resolved_path
+    if resolved is None:
+        try:
+            resolved = str(_resolve_path_for_task(filepath, task_id))
+        except (OSError, ValueError):
+            resolved = filepath
 
     warning = get_cross_profile_warning(resolved)
     if warning is not None:
@@ -1711,78 +1724,47 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     targets under another profile's skills/plugins/cron/memories
     directory. Same shape as ``write_file``'s flag.
     """
-    # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
-    _paths_to_check = []
-    if path:
-        _paths_to_check.append(path)
+    operations = []
     if mode == "patch" and patch:
-        import re as _re
+        from tools.patch_parser import parse_v4a_patch
         from tools.path_security import has_traversal_component
-        def _reject_v4a_traversal(v4a_path: str) -> str | None:
-            # V4A path headers come from patch CONTENT, not the explicit
-            # ``path=`` arg — so they're more attacker-influenceable (skill
-            # content, web extract, prompt injection). Reject ``..`` traversal
-            # in V4A headers: a legitimate multi-file patch from a single cwd
-            # can always emit absolute paths or paths relative to the agent's
-            # cwd without ``..``. The explicit ``path=`` arg is unchanged
-            # because the agent uses relative ``..`` paths legitimately
-            # (e.g. ``patch path="../other_module/x.py"`` from a worktree).
-            if has_traversal_component(v4a_path):
+
+        operations, parse_error = parse_v4a_patch(patch)
+        if parse_error:
+            return tool_error(f"Failed to parse patch: {parse_error}")
+        _paths_to_check = [
+            target for op in operations for target in (op.file_path, op.new_path)
+            if target is not None
+        ]
+        for target in _paths_to_check:
+            if has_traversal_component(target):
                 return tool_error(
-                    f"V4A patch header contains '..' traversal: {v4a_path!r}. "
+                    f"V4A patch header contains '..' traversal: {target!r}. "
                     "Use the agent's cwd-relative path (no '..') or an absolute "
                     "path in '*** Update File:' / '*** Add File:' / "
                     "'*** Delete File:' / '*** Move File:' headers."
                 )
-            return None
-
-        # ``\s*`` (not ``\s+``) after ``***`` matches patch_parser leniency:
-        # it accepts ``***Update File:`` with no space after the asterisks
-        # (patch_parser.py uses ``\*\*\*\s*Update\s+File:``). Requiring a space
-        # here let a no-space header parse + apply while skipping this check.
-        for _m in _re.finditer(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            v4a_path = _m.group(1).strip()
-            _err = _reject_v4a_traversal(v4a_path)
-            if _err:
-                return _err
-            _paths_to_check.append(v4a_path)
-        # ``*** Move File: src -> dst`` is a valid V4A op (patch_parser.py:114)
-        # but was never extracted, so a Move targeting /etc/crontab skipped the
-        # sensitive-path pre-check. Check BOTH endpoints, and run them through
-        # the same ``..`` traversal rejection as the other headers.
-        for _m in _re.finditer(r'^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$', patch, _re.MULTILINE):
-            for v4a_path in (_m.group(1).strip(), _m.group(2).strip()):
-                _err = _reject_v4a_traversal(v4a_path)
-                if _err:
-                    return _err
-                _paths_to_check.append(v4a_path)
-    for _p in _paths_to_check:
-        sensitive_err = _check_sensitive_path(_p, task_id)
-        if sensitive_err:
-            return tool_error(sensitive_err)
-        if not cross_profile:
-            cross_warning = _check_cross_profile_path(_p, task_id)
-            if cross_warning:
-                return tool_error(cross_warning)
+    else:
+        _paths_to_check = [path] if path else []
     try:
-        # Resolve paths for locking.  Ordered + deduplicated so concurrent
-        # callers lock in the same order — prevents deadlock on overlapping
-        # multi-file V4A patches.
-        _resolved_paths: list[str] = []
-        _seen: set[str] = set()
+        # Capture targets once, keeping raw headers for traversal rejection.
+        _path_to_resolved = {
+            target: str(_resolve_path_for_task(target, task_id))
+            for target in _paths_to_check
+        }
         for _p in _paths_to_check:
-            try:
-                _r = str(_resolve_path_for_task(_p, task_id))
-            except Exception:
-                _r = None
-            if _r and _r not in _seen:
-                _resolved_paths.append(_r)
-                _seen.add(_r)
-        _resolved_paths.sort()
+            resolved = _path_to_resolved[_p]
+            sensitive_err = _check_sensitive_path(_p, task_id, resolved_path=resolved)
+            if sensitive_err:
+                return tool_error(sensitive_err)
+            if not cross_profile:
+                cross_warning = _check_cross_profile_path(_p, task_id, resolved_path=resolved)
+                if cross_warning:
+                    return tool_error(cross_warning)
+        _resolved_paths = sorted(set(_path_to_resolved.values()))
 
         # Acquire per-path locks in sorted order via ExitStack.  On single
-        # path this degenerates to one lock; on empty list (unresolvable)
-        # it's a no-op and execution falls through unchanged.
+        # path this degenerates to one lock; an empty patch takes no locks.
         from contextlib import ExitStack
         with ExitStack() as _locks:
             for _r in _resolved_paths:
@@ -1791,13 +1773,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             # Collect warnings — cross-agent registry first (names sibling),
             # then per-task tracker as a fallback.
             stale_warnings: list[str] = []
-            _path_to_resolved: dict[str, str] = {}
             for _p in _paths_to_check:
-                try:
-                    _r = str(_resolve_path_for_task(_p, task_id))
-                except Exception:
-                    _r = None
-                _path_to_resolved[_p] = _r
+                _r = _path_to_resolved[_p]
                 _cross = file_state.check_stale(task_id, _r) if _r else None
                 _sw = _cross or _check_file_staleness(_p, task_id)
                 if not _sw and _r:
@@ -1824,11 +1801,20 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                resolved_operations = [
+                    replace(
+                        op,
+                        file_path=_path_to_resolved[op.file_path],
+                        new_path=_path_to_resolved[op.new_path] if op.new_path is not None else None,
+                    )
+                    for op in operations
+                ]
+                result = file_ops.patch_v4a(patch, operations=resolved_operations)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
             result_dict = result.to_dict()
+            result_dict["files_targeted"] = list(dict.fromkeys(_path_to_resolved.values()))
             if stale_warnings:
                 result_dict["_warning"] = stale_warnings[0] if len(stale_warnings) == 1 else " | ".join(stale_warnings)
             # Report the ABSOLUTE path(s) actually patched so a wrong-cwd

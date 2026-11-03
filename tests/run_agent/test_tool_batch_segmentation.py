@@ -389,6 +389,88 @@ def agent():
 
 
 class TestSegmentedDispatchIntegration:
+    def test_terminal_cd_replans_following_relative_patch_before_admission(self, agent, tmp_path, monkeypatch):
+        """The suffix must use the directory established by the ordered terminal."""
+        import agent.tool_executor as executor
+        from tools import file_tools, terminal_tool
+
+        first, second = tmp_path / "first", tmp_path / "second"
+        first.mkdir()
+        second.mkdir()
+        (first / "data.txt").write_text("decoy\n")
+        (second / "data.txt").write_text("before\n")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", str(first))
+        monkeypatch.setattr(terminal_tool, "_active_environments", {})
+        monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+        monkeypatch.setattr(file_tools, "_file_ops_cache", {})
+        monkeypatch.setattr(file_tools, "_read_tracker", {})
+        calls = [
+            _tc("terminal", json.dumps({"command": f"cd '{second}'"}), call_id="cd"),
+            _tc("read_file", json.dumps({"path": str(second / "data.txt")}), call_id="before"),
+            _tc("patch", json.dumps({"mode": "patch", "patch": "*** Begin Patch\n*** Update File: data.txt\n@@\n-before\n+after\n*** End Patch"}), call_id="patch"),
+            _tc("read_file", json.dumps({"path": str(second / "data.txt")}), call_id="after"),
+        ]
+        plans = []
+        actual_plan = executor._plan_tool_batch_segments
+
+        def observed_plan(*args, **kwargs):
+            plan = actual_plan(*args, **kwargs)
+            plans.append([(kind, [call.id for call in group]) for kind, group in plan])
+            return plan
+
+        messages = []
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        try:
+            with patch.object(executor, "_plan_tool_batch_segments", observed_plan):
+                agent._execute_tool_calls(SimpleNamespace(tool_calls=calls), messages, "default")
+            assert [m["tool_call_id"] for m in messages] == ["cd", "before", "patch", "after"]
+            assert "before" in messages[1]["content"]
+            assert "after" in messages[3]["content"]
+            assert (second / "data.txt").read_text() == "after\n"
+            assert (first / "data.txt").read_text() == "decoy\n"
+            assert terminal_tool.get_session_cwd("default") == str(second)
+            assert plans and plans[0] == [("sequential", ["before", "patch", "after"])]
+            assert agent._turn_failed_file_mutations == {}
+            assert str(second / "data.txt") in agent._turn_file_mutation_paths
+        finally:
+            for env in terminal_tool._active_environments.values():
+                env.cleanup()
+
+    def test_batch_scopes_use_own_session_not_shared_environment_cwd(self, agent, tmp_path, monkeypatch):
+        from tools import file_tools, terminal_tool
+
+        first, second = tmp_path / "first", tmp_path / "second"
+        first.mkdir()
+        second.mkdir()
+        (first / "data.txt").write_text("first\n")
+        (second / "data.txt").write_text("second\n")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", str(second))
+        monkeypatch.setattr(terminal_tool, "_active_environments", {})
+        monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+        monkeypatch.setattr(file_tools, "_file_ops_cache", {})
+        monkeypatch.setattr(file_tools, "_read_tracker", {})
+        file_tools._get_file_ops("default")
+        terminal_tool.record_session_cwd("one", str(first))
+        terminal_tool.record_session_cwd("two", str(second))
+        calls = [
+            _tc("patch", json.dumps({"mode": "patch", "patch": "*** Begin Patch\n*** Update File: data.txt\n@@\n-first\n+changed\n*** End Patch"}), call_id="patch"),
+            _tc("read_file", json.dumps({"path": str(first / "data.txt")}), call_id="read"),
+        ]
+        assert _plan_tool_batch_segments(calls, task_id="one") == [("sequential", calls)]
+        messages = []
+        try:
+            agent._execute_tool_calls(SimpleNamespace(tool_calls=calls), messages, "one")
+            assert "changed" in messages[1]["content"]
+            assert (first / "data.txt").read_text() == "changed\n"
+            assert (second / "data.txt").read_text() == "second\n"
+            assert terminal_tool.get_session_cwd("two") == str(second)
+        finally:
+            for env in terminal_tool._active_environments.values():
+                env.cleanup()
+
     def test_default_search_root_before_first_tool_uses_configured_workspace(self, agent, tmp_path, monkeypatch):
         """A fresh session can have a file cwd different from the process cwd."""
         from tools import terminal_tool

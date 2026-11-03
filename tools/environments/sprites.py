@@ -23,7 +23,6 @@ from tools.environments.file_sync import (
     iter_sprites_sync_files,
 )
 from tools.file_operations import (
-    PatchResult,
     ReadResult,
     SearchMatch,
     SearchResult,
@@ -75,7 +74,11 @@ def _canonicalize_toolbox_path(path: str) -> str:
     """Normalize absolute Toolbox paths without consulting the host filesystem."""
     expanded = _expand_toolbox_home(path)
     if expanded.startswith("/"):
-        return posixpath.normpath(expanded)
+        normalized = posixpath.normpath(expanded)
+        for alias in ("/brand", "/uploads", "/skills"):
+            if normalized == alias or normalized.startswith(alias + "/"):
+                return "/home" + normalized
+        return normalized
     return expanded
 
 
@@ -706,7 +709,7 @@ class SpritesEnvironment(BaseEnvironment):
     def sync_projected_path(self, path: str) -> None:
         """Refresh host-owned projections before a Toolbox file consumer."""
         path = _canonicalize_toolbox_path(path)
-        if path == "/skills" or path.startswith("/skills/"):
+        if path == "/home/skills" or path.startswith("/home/skills/"):
             self.sync_skill_files()
         elif _is_toolbox_cache_path(path):
             self.sync_cache_files()
@@ -820,8 +823,8 @@ class SpritesFileOperations(ShellFileOperations):
         the virtual home and ``/home/brand`` is the durable brand mount. The
         Sprite process itself runs as ``/home/sprite``; delegating ``~`` to
         ``ShellFileOperations`` would therefore route ``~/brand`` into scratch
-        instead of the mounted brand tree. Keep explicit and non-tilde paths
-        unchanged, and retain the base implementation for ``~user`` paths.
+        instead of the mounted brand tree. Canonicalize legacy mount aliases,
+        and retain the base implementation for ``~user`` paths.
         """
         expanded = (
             _expand_toolbox_home(path)
@@ -842,7 +845,7 @@ class SpritesFileOperations(ShellFileOperations):
         try:
             read_path = _canonicalize_toolbox_path(str(payload.get("path", "")))
             if (payload.get("operation") in {"read", "readRaw", "search", "stat"}
-                    and (read_path == "/skills" or read_path.startswith("/skills/")
+                    and (read_path == "/home/skills" or read_path.startswith("/home/skills/")
                          or _is_toolbox_cache_path(read_path))):
                 self.env.sync_projected_path(read_path)
             return self.env.file_request(payload)
@@ -1047,9 +1050,6 @@ class SpritesFileOperations(ShellFileOperations):
         if error := response.get("error"):
             return WriteResult(error=str(error))
         return WriteResult()
-
-    def patch_v4a(self, patch_content: str) -> PatchResult:
-        return super().patch_v4a(patch_content)
 
     def search(
         self,
