@@ -27,7 +27,9 @@ _SKILLS_BLOCK_RE = re.compile(r"<available_skills>.*?</available_skills>", re.DO
 _SKILL_LINE_PREFIX = "    - "
 
 # Posture-demoted categories render all visible skill names on one shared line.
-_NAMES_ONLY_LINE_RE = re.compile(r"^  .+ \[names only\]: (?P<names>.+)$")
+_NAMES_ONLY_LINE_RE = re.compile(
+    r"^  .+ \[names only\](?: \[category; not callable\])?: (?P<names>.+)$"
+)
 
 # Cap the human-readable "Skills by size" table; ``--json`` always has them all.
 _SKILLS_TABLE_LIMIT = 20
