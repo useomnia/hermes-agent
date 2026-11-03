@@ -336,3 +336,19 @@ def test_snapshot_rebinds_to_active_profile_after_profile_copy(catalog, tmp_path
     prompt_builder.clear_skills_system_prompt_cache()
     actual = prompt_builder.build_skills_system_prompt()
     assert actual == expected
+
+
+def test_slash_and_preload_normalize_against_the_live_profile(catalog, tmp_path, monkeypatch):
+    package(catalog, "ops/initial", name="initial", body="INITIAL PROFILE")
+    active_root = tmp_path / "active-profile" / "skills"
+    directory = package(active_root, "ops/current", name="current", body="ACTIVE PROFILE")
+    # Production keeps the import-time constant while rebinding the profile.
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_tool._SKILLS_DIR_AT_IMPORT)
+    monkeypatch.setenv("HERMES_HOME", str(active_root.parent))
+    commands = skill_commands.scan_skill_commands()
+    assert set(commands) == {"/current"}
+    assert skill_utils.normalize_skill_lookup_name(str(directory)) == "ops/current"
+    loaded = skill_commands._load_skill_payload(str(directory))
+    assert loaded is not None and "ACTIVE PROFILE" in loaded[0]["content"]
+    message = skill_commands.build_skill_invocation_message("/current")
+    assert message is not None and "ACTIVE PROFILE" in message and "INITIAL PROFILE" not in message
