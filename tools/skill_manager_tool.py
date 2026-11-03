@@ -680,7 +680,11 @@ def skill_management_target(name: str) -> Dict[str, Any]:
     if len(matches) != 1:
         return {"success": False, "code": "ambiguous" if matches else "not_found",
                 "error": f"Skill '{name}' is ambiguous." if matches else _skill_not_found_error(name),
-                "matches": [str(path) for _, path in matches]}
+                "matches": [{"name": catalog.load_name(path),
+                             "callable": catalog.load_name(path) is not None}
+                            for _, path in matches],
+                "hint": ("Use an exact callable name from matches. An entry with callable=false "
+                         "has no unambiguous installed identifier; rename a source package before using it.")}
     directory, skill_md = matches[0]
     try:
         declared, _ = _parse_frontmatter(skill_md.read_text(encoding="utf-8"))

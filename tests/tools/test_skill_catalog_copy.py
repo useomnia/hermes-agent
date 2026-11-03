@@ -59,7 +59,11 @@ def test_all_offers_load_exact_entries_and_writes_share_identity(catalog):
         target = manager.skill_management_target(name)
         assert target["success"] and target["editable"]
         assert target["skill_dir"] == str(expected)
-    assert manager.skill_management_target("helper")["code"] == "ambiguous"
+    ambiguous = manager.skill_management_target("helper")
+    assert ambiguous["code"] == "ambiguous"
+    assert {match["name"] for match in ambiguous["matches"]} == names
+    assert all(match["callable"] and view(match["name"])["success"] for match in ambiguous["matches"])
+    assert str(catalog) not in json.dumps(ambiguous)
     assert not json.loads(manager.skill_manage("edit", "helper", content=main(body="WRONG")))["success"]
     assert "FIRST" in (one / "SKILL.md").read_text(encoding="utf-8")
     assert "SECOND" in (two / "SKILL.md").read_text(encoding="utf-8")
@@ -108,7 +112,10 @@ def test_cross_root_same_path_is_omitted_not_shadowed(catalog, tmp_path, monkeyp
     assert not view("same")["success"]
     assert prompt_builder.build_skills_system_prompt() == ""
     assert skill_commands.scan_skill_commands() == {}
-    assert manager.skill_management_target("same")["code"] == "ambiguous"
+    ambiguous = manager.skill_management_target("same")
+    assert ambiguous["code"] == "ambiguous"
+    assert ambiguous["matches"] == [{"name": None, "callable": False}, {"name": None, "callable": False}]
+    assert str(catalog) not in json.dumps(ambiguous) and str(external) not in json.dumps(ambiguous)
 
 
 def test_cross_root_distinct_paths_get_loadable_names(catalog, tmp_path, monkeypatch):
