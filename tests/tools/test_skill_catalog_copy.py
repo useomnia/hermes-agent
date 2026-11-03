@@ -323,3 +323,16 @@ def test_invalid_copy_name_is_reported_without_writing(catalog, name):
     result = manager.copy_skill_package(target_name=name, files={"SKILL.md": main().encode()})
     assert result["code"] == "invalid_name"
     assert list(catalog.iterdir()) == [catalog / ".bundled_manifest"]
+
+
+def test_snapshot_rebinds_to_active_profile_after_profile_copy(catalog, tmp_path, monkeypatch):
+    import shutil
+    package(catalog, "ops/first")
+    expected = prompt_builder.build_skills_system_prompt()
+    assert "helper" in expected
+    copied_home = tmp_path / "copied-profile"
+    shutil.copytree(catalog.parent, copied_home)
+    monkeypatch.setenv("HERMES_HOME", str(copied_home))
+    prompt_builder.clear_skills_system_prompt_cache()
+    actual = prompt_builder.build_skills_system_prompt()
+    assert actual == expected

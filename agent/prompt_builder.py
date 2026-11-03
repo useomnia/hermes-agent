@@ -1493,6 +1493,8 @@ def _load_skills_snapshot(
         return None
     if snapshot.get("version") != _SKILLS_SNAPSHOT_VERSION:
         return None
+    if snapshot.get("skills_dir") != str(skills_dir):
+        return None
     if snapshot.get("agent_help_guidance") != agent_help_guidance:
         return None
     if snapshot.get("manifest") != _build_skills_manifest(skills_dir):
@@ -1511,6 +1513,7 @@ def _write_skills_snapshot(
     """Persist skill metadata to disk for fast cold-start reuse."""
     payload = {
         "version": _SKILLS_SNAPSHOT_VERSION,
+        "skills_dir": str(skills_dir),
         "manifest": manifest,
         "skills": skill_entries,
         "category_descriptions": category_descriptions,
