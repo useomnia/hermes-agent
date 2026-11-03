@@ -352,3 +352,15 @@ def test_slash_and_preload_normalize_against_the_live_profile(catalog, tmp_path,
     assert loaded is not None and "ACTIVE PROFILE" in loaded[0]["content"]
     message = skill_commands.build_skill_invocation_message("/current")
     assert message is not None and "ACTIVE PROFILE" in message and "INITIAL PROFILE" not in message
+
+
+def test_warm_slash_catalog_rebinds_when_active_profile_changes(catalog, tmp_path, monkeypatch):
+    package(catalog, "ops/initial", name="initial", body="INITIAL PROFILE")
+    active_root = tmp_path / "active-profile" / "skills"
+    package(active_root, "ops/current", name="current", body="ACTIVE PROFILE")
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_tool._SKILLS_DIR_AT_IMPORT)
+    assert set(skill_commands.scan_skill_commands()) == {"/initial"}
+    monkeypatch.setenv("HERMES_HOME", str(active_root.parent))
+    assert set(skill_commands.get_skill_commands()) == {"/current"}
+    message = skill_commands.build_skill_invocation_message("/current")
+    assert message is not None and "ACTIVE PROFILE" in message and "INITIAL PROFILE" not in message
