@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+_skill_commands_roots: tuple[str, ...] = ()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -288,8 +289,6 @@ def _build_skill_message(
     session_id: str | None = None,
 ) -> str:
     """Format a loaded skill into a user/system message payload."""
-    from tools.skills_tool import SKILLS_DIR
-
     content = str(loaded_skill.get("content") or "")
 
     # ── Template substitution and inline-shell expansion ──
@@ -363,17 +362,21 @@ def _build_skill_message(
         parts.append("\n[Supporting-file inventory is incomplete; use exact paths linked in the skill instructions.]")
 
     if supporting and skill_dir:
-        try:
-            skill_view_target = str(skill_dir.relative_to(SKILLS_DIR))
-        except ValueError:
-            # Skill is from an external dir — use the skill name instead
-            skill_view_target = skill_dir.name
+        example = loaded_skill.get("file_example") or {}
+        skill_view_target = example.get("name") or loaded_skill.get("name")
+        if not skill_view_target:
+            # Older payloads predate the accepted-identifier record.
+            from tools.skills_tool import _skills_dir
+            try:
+                skill_view_target = skill_dir.relative_to(_skills_dir()).as_posix()
+            except ValueError:
+                skill_view_target = skill_dir.name
         parts.append("")
         parts.append("[This skill has supporting files:]")
         for sf in supporting:
             parts.append(f"- {sf}  ->  {hint_dir / sf}")
         parts.append(
-            f'\nLoad any of these with skill_view(name="{skill_view_target}", '
+            f'\nLoad any of these with skill_view(name={json.dumps(skill_view_target, ensure_ascii=False)}, '
             f'file_path="<path>"), or run scripts directly by absolute path '
             f"(e.g. `node {hint_dir}/scripts/foo.js`)."
         )
@@ -389,107 +392,74 @@ def _build_skill_message(
     return "\n".join(parts)
 
 
-def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
-    """Scan ~/.hermes/skills/ and return a mapping of /command -> skill info.
+def _skill_commands_root_signature() -> tuple[str, ...]:
+    from tools.skills_tool import _skills_dir
+    from agent.skill_utils import get_external_skills_dirs
 
-    Returns:
-        Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
-    """
-    global _skill_commands, _skill_commands_platform
+    return tuple(str(root) for root in [_skills_dir(), *get_external_skills_dirs()])
+
+
+def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
+    """Offer slash commands for the exact identifiers in the native catalog."""
+    global _skill_commands, _skill_commands_platform, _skill_commands_roots
     _skill_commands_platform = _resolve_skill_commands_platform()
+    _skill_commands_roots = _skill_commands_root_signature()
     _skill_commands = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
+        from tools.skills_tool import _skills_dir, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
         from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+        from agent.skill_catalog import resolve_skill_catalog
         from hermes_cli.commands import resolve_command
+
         disabled = _get_disabled_skill_names()
-        seen_names: set = set()
-
-        # Scan local dir first, then external dirs
-        dirs_to_scan = []
-        if SKILLS_DIR.exists():
-            dirs_to_scan.append(SKILLS_DIR)
-        dirs_to_scan.extend(get_external_skills_dirs())
-
+        dirs_to_scan = [_skills_dir(), *get_external_skills_dirs()]
+        entries = []
         for scan_dir in dirs_to_scan:
             for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
-                if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
-                    continue
                 try:
-                    content = skill_md.read_text(encoding='utf-8')
-                    frontmatter, body = _parse_frontmatter(content)
-                    # Skip skills incompatible with the current OS platform
-                    if not skill_matches_platform(frontmatter):
+                    frontmatter, body = _parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+                    if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter):
                         continue
-                    # Skip skills not relevant to the current runtime env
-                    # (kanban/docker/s6). Offer-time only; explicit load bypasses.
-                    if not skill_matches_environment(frontmatter):
-                        continue
-                    name = frontmatter.get('name', skill_md.parent.name)
-                    if name in seen_names:
-                        continue
-                    # Respect user's disabled skills config
+                    name = frontmatter.get("name", skill_md.parent.name)
                     if name in disabled:
                         continue
-                    description = frontmatter.get('description', '')
+                    description = frontmatter.get("description", "")
                     if not description:
-                        for line in body.strip().split('\n'):
-                            line = line.strip()
-                            if line and not line.startswith('#'):
-                                description = line[:80]
-                                break
-                    seen_names.add(name)
-                    cmd_name = slugify_skill_name(name)
-                    if not cmd_name:
-                        continue
-                    # Skip if this skill's auto-generated /command collides
-                    # with a core Hermes slash command (name or alias). The
-                    # skill remains fully loadable via /skill <name>.
-                    # Uses resolve_command() so aliases and case variants are
-                    # covered without maintaining a separate cache.
-                    if resolve_command(cmd_name) is not None:
-                        logger.warning(
-                            "Skill %r generates slash command '/%s' which "
-                            "collides with a core Hermes command; skipping "
-                            "auto-registration. Use '/skill %s' instead.",
-                            name, cmd_name, name,
-                        )
-                        continue
-                    # Dedup on the resolved slug, not just the raw name: two
-                    # distinct frontmatter names can normalize to the same
-                    # slug (e.g. "git_helper" vs "git-helper"). First-wins
-                    # preserves local-before-external precedence.
-                    cmd_key = f"/{cmd_name}"
-                    if cmd_key in _skill_commands:
-                        logger.warning(
-                            "Skill %r maps to slash command %s already claimed "
-                            "by %r; keeping the first and skipping this one.",
-                            name, cmd_key, _skill_commands[cmd_key]["name"],
-                        )
-                        continue
-                    _skill_commands[cmd_key] = {
-                        "name": name,
-                        "description": description or f"Invoke the {name} skill",
-                        "skill_md_path": str(skill_md),
-                        "skill_dir": str(skill_md.parent),
-                    }
+                        description = next((line.strip()[:80] for line in body.strip().splitlines()
+                                            if line.strip() and not line.strip().startswith("#")), "")
+                    entries.append({"name": name, "description": description,
+                                    "skill_md_path": str(skill_md), "skill_dir": str(skill_md.parent)})
                 except Exception:
                     continue
+        for entry in resolve_skill_catalog(entries, dirs_to_scan):
+            name = entry["name"]
+            cmd_name = slugify_skill_name(name)
+            if not cmd_name:
+                continue
+            if resolve_command(cmd_name) is not None:
+                logger.warning("Skill %r collides with core command /%s; use /skill %s.", name, cmd_name, name)
+                continue
+            cmd_key = f"/{cmd_name}"
+            if cmd_key in _skill_commands:
+                logger.warning("Skill %r maps to an already claimed slash command %s; use /skill %s.", name, cmd_key, name)
+                continue
+            _skill_commands[cmd_key] = {**entry, "description": entry["description"] or f"Invoke the {name} skill"}
     except Exception:
-        pass
+        logger.debug("Could not scan skill commands", exc_info=True)
     return _skill_commands
 
 
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     """Return the current skill commands mapping (scan first if empty).
 
-    Rescans when the active platform scope changes (e.g. a gateway
-    process serving Telegram and Discord concurrently) so each platform
-    sees its own ``skills.platform_disabled`` view (#14536).
+    Rescans when the active roots or platform scope change, so another profile
+    cannot receive cached commands from a previous profile, and each platform
+    retains its own ``skills.platform_disabled`` view (#14536).
     """
     if (
         not _skill_commands
         or _skill_commands_platform != _resolve_skill_commands_platform()
+        or _skill_commands_roots != _skill_commands_root_signature()
     ):
         scan_skill_commands()
     return _skill_commands

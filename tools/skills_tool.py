@@ -66,7 +66,6 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
-import hashlib
 import json
 import logging
 import time
@@ -186,30 +185,8 @@ _secret_capture_callback = None
 
 
 def _skill_lookup_path_error(name: str) -> Optional[str]:
-    """Return an error if a local skill lookup *name* can escape search roots.
-
-    The skill ``name`` is joined onto each trusted search dir to build the
-    on-disk lookup path, so it must stay relative and free of ``..`` segments —
-    otherwise ``name="../outside"`` or an absolute path could select a skill
-    (and read files) outside the skills directory. Mirrors the ``file_path``
-    validation done later via ``tools.path_security``. We also reject Windows
-    drive paths (e.g. ``C:\\skills``), whose ``:`` would otherwise be misread as
-    a plugin namespace separator.
-    """
-    from tools.path_security import has_traversal_component
-
-    if not isinstance(name, str):
-        return "Skill name must be a string."
-    candidate = name.strip()
-    if (
-        PurePosixPath(candidate).is_absolute()
-        or PureWindowsPath(candidate).is_absolute()
-        or PureWindowsPath(candidate).drive
-    ):
-        return "Skill name must be a relative path within the skills directory."
-    if has_traversal_component(candidate):
-        return "Skill name cannot contain '..' path traversal components."
-    return None
+    from agent.skill_catalog import skill_lookup_path_error
+    return skill_lookup_path_error(name)
 
 
 def load_env() -> Dict[str, str]:
@@ -748,10 +725,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         return [dict(s) for s in cached[2]]
 
     skills = []
-    seen_names: set = set()
 
-    # Scan local dir first, then external dirs (local takes precedence) —
-    # dirs_to_scan already resolved above for the signature.
+    # Collect metadata in root order; the shared catalog determines which
+    # identifiers address each entry without introducing root precedence.
     for scan_dir in dirs_to_scan:
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
@@ -770,8 +746,6 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     continue
 
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
-                if name in seen_names:
-                    continue
                 if name in disabled:
                     continue
 
@@ -792,6 +766,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     "name": name,
                     "description": description,
                     "category": category,
+                    "skill_md_path": str(skill_md),
                 }
                 metadata = frontmatter.get("metadata")
                 if (
@@ -809,7 +784,6 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     if provenance is not None:
                         skill["provenance"] = provenance
 
-                seen_names.add(name)
                 skills.append(skill)
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -820,6 +794,11 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     "Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True
                 )
                 continue
+
+    from agent.skill_catalog import resolve_skill_catalog
+    skills = resolve_skill_catalog(skills, dirs_to_scan)
+    for skill in skills:
+        skill.pop("skill_md_path", None)
 
     # Store in cache keyed by the scan signature computed BEFORE the scan
     # (a write racing the scan changes the signature, so the next call
@@ -1030,27 +1009,8 @@ def skill_view(
 
 
 def _deduplicate_same_root_skills(candidates, all_dirs):
-    """Upstream #113126: prefer an unambiguous shallow copy of ONE skill."""
-    if len(candidates) < 2:
-        return candidates
-    roots = {
-        max((root for root in all_dirs if path.is_relative_to(root)),
-            key=lambda root: len(root.parts), default=None)
-        for _, path in candidates
-    }
-    if len(roots) != 1 or None in roots:
-        return candidates
-    try:
-        if len({hashlib.sha256(path.read_bytes()).digest() for _, path in candidates}) != 1:
-            return candidates
-    except OSError:
-        return candidates
-    root = roots.pop()
-    def rank(candidate):
-        path = candidate[1]
-        return path.name != "SKILL.md", len(path.relative_to(root).parts)
-    ranked = sorted(candidates, key=rank)
-    return [ranked[0]] if rank(ranked[0]) != rank(ranked[1]) else candidates
+    from agent.skill_catalog import deduplicate_same_root_skills
+    return deduplicate_same_root_skills(candidates, all_dirs)
 
 
 def _load_skill_content(
@@ -1193,88 +1153,9 @@ def _load_skill_content(
         skill_dir = None
         skill_md = None
 
-        # Collision detection: collect ALL candidates across every dir using
-        # every lookup strategy (direct path, recursive by parent dir name,
-        # legacy flat <name>.md). If more than one matches, refuse and tell
-        # the caller — silent shadowing of a local skill by a same-named
-        # external skill is a real bug class (`/skills` shows one, agent
-        # loaded the other) so we surface it loudly instead of guessing.
-        from agent.skill_utils import iter_skill_index_files
+        from agent.skill_catalog import SkillCatalog
 
-        candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
-        seen_md: set = set()
-
-        def _record(sd: Optional[Path], smd: Path) -> None:
-            try:
-                key = smd.resolve()
-            except Exception:
-                key = smd
-            if key in seen_md:
-                return
-            seen_md.add(key)
-            candidates.append((sd, smd))
-
-        for search_dir in all_dirs:
-            # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
-            # at the top of the dir).
-            direct_path = search_dir / name
-            if (
-                not _is_skill_support_path(direct_path)
-                and direct_path.is_dir()
-                and (direct_path / "SKILL.md").exists()
-            ):
-                _record(direct_path, direct_path / "SKILL.md")
-            elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
-                direct_path.with_suffix(".md")
-            ):
-                _record(None, direct_path.with_suffix(".md"))
-
-            # Strategy 1b: categorized form for plugin namespace fall-through
-            # (e.g., a "myplugin:explore" name with no plugin registered also
-            # tries the on-disk path "myplugin/explore").
-            if local_category_name:
-                categorized_path = search_dir / local_category_name
-                if (
-                    not _is_skill_support_path(categorized_path)
-                    and categorized_path.is_dir()
-                    and (categorized_path / "SKILL.md").exists()
-                ):
-                    _record(categorized_path, categorized_path / "SKILL.md")
-                elif categorized_path.with_suffix(
-                    ".md"
-                ).exists() and not _is_skill_support_path(
-                    categorized_path.with_suffix(".md")
-                ):
-                    _record(None, categorized_path.with_suffix(".md"))
-
-            # Strategy 2: recursive by directory name (catches nested skills
-            # like "foundations/runtime/explore-codebase" called by bare name),
-            # plus frontmatter `name:` lookup. `skills_list()` exposes the
-            # frontmatter name, so `skill_view(name)` must accept it too even
-            # when the on-disk directory is a shorter category/alias.
-            for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-                if found_skill_md.parent.name == name:
-                    _record(found_skill_md.parent, found_skill_md)
-                    continue
-                try:
-                    fm_content = found_skill_md.read_text(encoding="utf-8")
-                    fm, _ = _parse_frontmatter(fm_content)
-                except Exception:
-                    fm = {}
-                if fm.get("name") == name:
-                    _record(found_skill_md.parent, found_skill_md)
-
-            # Strategy 3: legacy flat <name>.md files anywhere under the dir.
-            # Exclude skill support docs: references/templates/assets/scripts
-            # are loaded through skill_view(skill, file_path=...) and must not
-            # shadow or collide with real skills that share the same basename.
-            for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md" and not _is_skill_support_path(
-                    found_md
-                ):
-                    _record(None, found_md)
-
-        candidates = _deduplicate_same_root_skills(candidates, all_dirs)
+        candidates = SkillCatalog(all_dirs).select(name, fallback=local_category_name)
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
             logging.getLogger(__name__).warning(

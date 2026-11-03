@@ -1432,7 +1432,7 @@ _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # catches SKILL.md/DESCRIPTION.md mtime and size changes, so a change to how an
 # entry is DERIVED leaves an existing snapshot looking valid and serving the old
 # values indefinitely.
-_SKILLS_SNAPSHOT_VERSION = 3
+_SKILLS_SNAPSHOT_VERSION = 4
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1493,6 +1493,8 @@ def _load_skills_snapshot(
         return None
     if snapshot.get("version") != _SKILLS_SNAPSHOT_VERSION:
         return None
+    if snapshot.get("skills_dir") != str(skills_dir):
+        return None
     if snapshot.get("agent_help_guidance") != agent_help_guidance:
         return None
     if snapshot.get("manifest") != _build_skills_manifest(skills_dir):
@@ -1511,6 +1513,7 @@ def _write_skills_snapshot(
     """Persist skill metadata to disk for fast cold-start reuse."""
     payload = {
         "version": _SKILLS_SNAPSHOT_VERSION,
+        "skills_dir": str(skills_dir),
         "manifest": manifest,
         "skills": skill_entries,
         "category_descriptions": category_descriptions,
@@ -1547,6 +1550,7 @@ def _build_snapshot_entry(
 
     return {
         "skill_name": skill_name,
+        "skill_md_path": str(skill_file),
         "category": category,
         "frontmatter_name": str(frontmatter.get("name", skill_name)),
         "description": description,
@@ -1651,7 +1655,7 @@ def build_skills_system_prompt(
     External skill directories (``skills.external_dirs`` in config.yaml) are
     scanned alongside the local ``~/.hermes/skills/`` directory.  External dirs
     are read-only — they appear in the index but new skills are always created
-    in the local dir.  Local skills take precedence when names collide.
+    in the local dir.  Ambiguous names use an unambiguous relative identifier when one exists.
 
     ``compact_categories`` (e.g. from the coding posture — see
     agent/coding_context.py) demotes whole categories to a names-only line in
@@ -1693,6 +1697,7 @@ def build_skills_system_prompt(
     )
 
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
+    visible_entries: list[dict] = []
     category_descriptions: dict[str, str] = {}
 
     if snapshot is not None:
@@ -1714,9 +1719,7 @@ def build_skills_system_prompt(
                 available_toolsets,
             ):
                 continue
-            skills_by_category.setdefault(category, []).append(
-                (frontmatter_name, entry.get("description", ""))
-            )
+            visible_entries.append(entry)
         category_descriptions = {
             str(k): str(v)
             for k, v in (snapshot.get("category_descriptions") or {}).items()
@@ -1739,9 +1742,7 @@ def build_skills_system_prompt(
                 available_toolsets,
             ):
                 continue
-            skills_by_category.setdefault(entry["category"], []).append(
-                (entry["frontmatter_name"], entry["description"])
-            )
+            visible_entries.append(entry)
 
         # Read category-level DESCRIPTION.md files
         for desc_file in iter_skill_index_files(skills_dir, "DESCRIPTION.md"):
@@ -1767,13 +1768,7 @@ def build_skills_system_prompt(
 
     # ── External skill directories ─────────────────────────────────────
     # Scan external dirs directly (no snapshot caching — they're read-only
-    # and typically small).  Local skills already in skills_by_category take
-    # precedence: we track seen names and skip duplicates from external dirs.
-    seen_skill_names: set[str] = set()
-    for cat_skills in skills_by_category.values():
-        for name, _desc in cat_skills:
-            seen_skill_names.add(name)
-
+    # and typically small). The shared catalog resolves identity across roots.
     for ext_dir in external_dirs:
         if not ext_dir.exists():
             continue
@@ -1785,8 +1780,6 @@ def build_skills_system_prompt(
                 entry = _build_snapshot_entry(skill_file, ext_dir, frontmatter, desc)
                 skill_name = entry["skill_name"]
                 frontmatter_name = entry["frontmatter_name"]
-                if frontmatter_name in seen_skill_names:
-                    continue
                 if frontmatter_name in disabled or skill_name in disabled:
                     continue
                 if not _skill_should_show(
@@ -1795,10 +1788,7 @@ def build_skills_system_prompt(
                     available_toolsets,
                 ):
                     continue
-                seen_skill_names.add(frontmatter_name)
-                skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
-                )
+                visible_entries.append(entry)
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
 
@@ -1815,6 +1805,12 @@ def build_skills_system_prompt(
                 category_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
+
+    from agent.skill_catalog import resolve_skill_catalog
+    for entry in resolve_skill_catalog(visible_entries, [skills_dir, *external_dirs]):
+        skills_by_category.setdefault(entry["category"], []).append(
+            (entry["name"], entry["description"])
+        )
 
     # Posture-driven category demotion (e.g. non-coding skills while pairing
     # on code). Demoted categories stay in the index as a single names-only
