@@ -14,7 +14,7 @@ from tools import skill_manager_tool as manager, skill_package, skill_usage, ski
 def catalog(tmp_path, monkeypatch):
     root = tmp_path / "profile" / "skills"
     root.mkdir(parents=True)
-    (root / ".bundled_manifest").write_text("")
+    (root / ".bundled_manifest").write_text("", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root.parent))
     monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.setattr(skills_tool, "SKILLS_DIR", root)
@@ -55,20 +55,20 @@ def test_all_offers_load_exact_entries_and_writes_share_identity(catalog):
     assert names == {"ops/first", "custom/second"}
     for name, expected in (("ops/first", one), ("custom/second", two)):
         loaded = view(name)
-        assert loaded["success"] and loaded["content"] == (expected / "SKILL.md").read_text()
+        assert loaded["success"] and loaded["content"] == (expected / "SKILL.md").read_text(encoding="utf-8")
         target = manager.skill_management_target(name)
         assert target["success"] and target["editable"]
         assert target["skill_dir"] == str(expected)
     assert manager.skill_management_target("helper")["code"] == "ambiguous"
     assert not json.loads(manager.skill_manage("edit", "helper", content=main(body="WRONG")))["success"]
-    assert "FIRST" in (one / "SKILL.md").read_text()
-    assert "SECOND" in (two / "SKILL.md").read_text()
+    assert "FIRST" in (one / "SKILL.md").read_text(encoding="utf-8")
+    assert "SECOND" in (two / "SKILL.md").read_text(encoding="utf-8")
     index = prompt_builder.build_skills_system_prompt()
     assert "ops/first" in index and "custom/second" in index
     commands = skill_commands.scan_skill_commands()
     assert {entry["name"] for entry in commands.values()} == names
     assert json.loads(manager.skill_manage("edit", "custom/second", content=main("changed", "EDIT")))["success"]
-    assert "EDIT" in (two / "SKILL.md").read_text()
+    assert "EDIT" in (two / "SKILL.md").read_text(encoding="utf-8")
 
 
 def test_declared_name_reads_and_writes_and_creation_alias_collision(catalog):
@@ -83,7 +83,7 @@ def test_declared_name_reads_and_writes_and_creation_alias_collision(catalog):
 @pytest.mark.parametrize("lookup", ["reference", "owner/reference", "owner:reference"])
 def test_package_owned_markdown_never_becomes_a_skill(catalog, lookup):
     directory = package(catalog, "owner", name="owner")
-    (directory / "reference.md").write_text("Owned support")
+    (directory / "reference.md").write_text("Owned support", encoding="utf-8")
     assert not view(lookup)["success"]
     assert view("owner", file_path="reference.md")["content"] == "Owned support"
     assert {entry["name"] for entry in offered()} == {"owner"}
@@ -91,10 +91,10 @@ def test_package_owned_markdown_never_becomes_a_skill(catalog, lookup):
 
 def test_root_doc_does_not_collide_with_real_skill_and_legacy_still_reads(catalog):
     owner = package(catalog, "owner", name="owner")
-    (owner / "helper.md").write_text("Owned support")
+    (owner / "helper.md").write_text("Owned support", encoding="utf-8")
     real = package(catalog, "ops/real")
-    assert view("helper")["content"] == (real / "SKILL.md").read_text()
-    (catalog / "legacy.md").write_text("Legacy body")
+    assert view("helper")["content"] == (real / "SKILL.md").read_text(encoding="utf-8")
+    (catalog / "legacy.md").write_text("Legacy body", encoding="utf-8")
     assert view("legacy")["content"] == "Legacy body"
 
 
@@ -135,16 +135,16 @@ def test_cold_snapshot_warm_and_compact_keep_exact_names(catalog):
 
 def test_nonowned_and_unknown_provenance_fail_closed(catalog):
     directory = package(catalog, "ops/short", name="declared")
-    (catalog / ".bundled_manifest").write_text("short:hash\n")
+    (catalog / ".bundled_manifest").write_text("short:hash\n", encoding="utf-8")
     assert not manager.skill_management_target("declared")["editable"]
     (catalog / ".bundled_manifest").unlink()
     assert manager.skill_management_target("declared")["provenance"] == "unknown"
     assert not manager.skill_management_target("declared")["editable"]
-    (catalog / ".bundled_manifest").write_text("")
+    (catalog / ".bundled_manifest").write_text("", encoding="utf-8")
     assert manager.skill_management_target("declared")["editable"]
     hub = catalog / ".hub"
     hub.mkdir()
-    (hub / "lock.json").write_text(json.dumps({"installed": {"short": {"install_path": "ops/short"}}}))
+    (hub / "lock.json").write_text(json.dumps({"installed": {"short": {"install_path": "ops/short"}}}), encoding="utf-8")
     assert not manager.skill_management_target("declared")["editable"]
     assert directory.exists()
 
@@ -177,7 +177,7 @@ def test_remote_complete_bundle_uses_same_custom_path_and_requested_content(cata
     files = {"SKILL.md": main(extra="author: Source\nmetadata:\n  id: repo-id\n").encode(), "scripts/run.bin": b"\xff\x00"}
     result = manager.copy_skill_package(target_name="repo-copy", files=files, content=main(body="USER EDIT"))
     assert result["success"], result
-    metadata, body = skill_utils.parse_frontmatter((catalog / "repo-copy/SKILL.md").read_text())
+    metadata, body = skill_utils.parse_frontmatter((catalog / "repo-copy/SKILL.md").read_text(encoding="utf-8"))
     assert metadata["author"] == "Source" and metadata["name"] == "repo-copy"
     assert "USER EDIT" in body
     assert (catalog / "repo-copy/scripts/run.bin").read_bytes() == b"\xff\x00"
@@ -297,7 +297,7 @@ def test_wrong_or_ambiguous_source_never_copies(catalog):
 def test_slash_support_hint_retains_qualified_accepted_identifier(catalog):
     first = package(catalog, "ops/first", body="FIRST")
     package(catalog, "other/second", body="SECOND")
-    (first / "root.md").write_text("Support")
+    (first / "root.md").write_text("Support", encoding="utf-8")
     loaded = view("ops/first")
     message = skill_commands._build_skill_message(loaded, first, "Invoke selected skill")
     assert 'skill_view(name="ops/first",' in message
