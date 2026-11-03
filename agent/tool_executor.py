@@ -948,6 +948,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 try:
                     agent._record_file_mutation_result(
                         function_name, function_args, function_result, is_error,
+                        task_id=effective_task_id,
                     )
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
@@ -1679,6 +1680,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 agent._record_file_mutation_result(
                     function_name, function_args, function_result, _is_error_result,
+                    task_id=effective_task_id,
                 )
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
@@ -1827,18 +1829,15 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     """
     from types import SimpleNamespace
 
-    if segments is None:
-        from tools.file_tools import _resolve_base_dir
-
-        _active_env = get_active_env(effective_task_id)
-        _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else Path(_resolve_base_dir(effective_task_id))
-        segments = _plan_tool_batch_segments(
-            assistant_message.tool_calls,
-            execution_cwd=_exec_cwd,
-            extra_parallel_safe=getattr(agent, "_parallel_safe_tools", frozenset()),
-        )
-
-    for kind, calls in segments:
+    pending = list(assistant_message.tool_calls)
+    while pending:
+        if segments is None:
+            segments = _plan_tool_batch_segments(
+                pending,
+                task_id=effective_task_id,
+                extra_parallel_safe=getattr(agent, "_parallel_safe_tools", frozenset()),
+            )
+        kind, calls = segments[0]
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(
@@ -1850,6 +1849,10 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
             )
+        pending = pending[len(calls):]
+        # Ordered tools may change the session cwd. Plan the remaining calls
+        # only after those effects finish, using that session's own record.
+        segments = None
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)

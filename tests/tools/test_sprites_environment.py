@@ -1239,10 +1239,10 @@ def test_sprites_file_operations_should_use_files_endpoint_for_write():
     assert result.error is None
     assert result.bytes_written == 5
     assert env.requests == [
-        {"operation": "readRaw", "path": "/brand/example.txt"},
+        {"operation": "readRaw", "path": "/home/brand/example.txt"},
         {
             "operation": "write",
-            "path": "/brand/example.txt",
+            "path": "/home/brand/example.txt",
             "content": "hello",
             "encoding": "utf-8",
         },

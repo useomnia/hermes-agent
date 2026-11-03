@@ -28,7 +28,7 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Dict, List, Optional
 
 from agent.tool_result_classification import (
@@ -178,6 +178,7 @@ def _plan_tool_batch_segments(
     tool_calls,
     *,
     execution_cwd: Optional[Path] = None,
+    task_id: Optional[str] = None,
     extra_parallel_safe: frozenset[str] = frozenset(),
 ) -> List[tuple]:
     """Split a tool-call batch into ordered ``(kind, calls)`` segments.
@@ -210,7 +211,7 @@ def _plan_tool_batch_segments(
     """
     segments: list[list] = []  # [kind, calls] pairs, normalized to tuples on return
     current: list = []
-    reserved_paths: list[tuple[Path, bool]] = []
+    reserved_paths: list[tuple[PurePath, bool]] = []
 
     def _close_parallel() -> None:
         nonlocal current, reserved_paths
@@ -261,7 +262,9 @@ def _plan_tool_batch_segments(
             continue
 
         if tool_name in _PATH_SCOPED_TOOLS:
-            scoped_paths = _extract_parallel_scope_paths(tool_name, function_args, execution_cwd=execution_cwd)
+            scoped_paths = _extract_parallel_scope_paths(
+                tool_name, function_args, execution_cwd=execution_cwd, task_id=task_id
+            )
             if not scoped_paths:
                 _add_sequential(tool_call)
                 continue
@@ -336,11 +339,13 @@ def _extract_parallel_scope_paths(
     tool_name: str,
     function_args: dict,
     execution_cwd: Optional[Path] = None,
-) -> list[Path]:
+    *,
+    task_id: Optional[str] = None,
+) -> list[PurePath]:
     """Return every canonical scope, or an empty list for an unknown scope.
 
-    *execution_cwd* should be the working directory that the tool will
-    actually use at runtime; otherwise the process cwd is used. Search
+    A supplied task uses the file tool's session-aware resolver, including
+    its remote namespace. Otherwise *execution_cwd* or the process cwd is used. Search
     defaults to that directory only when the path argument is omitted.
     V4A targets come from the same parser the executor uses, including
     both move endpoints, rather than an optional, unrelated ``path``.
@@ -367,12 +372,21 @@ def _extract_parallel_scope_paths(
     else:
         raw_paths = [function_args.get("path", "." if tool_name == "search_files" else None)]
 
-    paths: list[Path] = []
+    paths: list[PurePath] = []
     try:
         for path in raw_paths:
             if not isinstance(path, str) or not path.strip() or "\x00" in path:
                 return []
-            paths.append(_canonical_path(path, execution_cwd))
+            if task_id is None:
+                paths.append(_canonical_path(path, execution_cwd))
+            else:
+                from tools.file_tools import _resolve_path_for_task
+
+                resolved = _resolve_path_for_task(path, task_id)
+                if not resolved.is_absolute():
+                    # Unknown remote homes keep an ordered boundary.
+                    return []
+                paths.append(_canonical_path(str(resolved)) if isinstance(resolved, Path) else resolved)
     except (OSError, ValueError, RuntimeError):
         # A failed expansion or canonicalisation must not crash planning or
         # admit a partial scope. The sequential tool path reports the error.
@@ -384,13 +398,13 @@ def _extract_parallel_scope_path(
     tool_name: str,
     function_args: dict,
     execution_cwd: Optional[Path] = None,
-) -> Optional[Path]:
+) -> Optional[PurePath]:
     """Return the primary target, retained for existing callers."""
     paths = _extract_parallel_scope_paths(tool_name, function_args, execution_cwd)
     return paths[0] if paths else None
 
 
-def _paths_overlap(left: Path, right: Path) -> bool:
+def _paths_overlap(left: PurePath, right: PurePath) -> bool:
     """Return True when two paths may refer to the same subtree.
 
     Both *left* and *right* must already be canonical (as returned by
@@ -466,79 +480,57 @@ def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
         value["text_summary"] = value["text_summary"] + hint
 
 
-def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List[str]:
-    """Return the file paths a ``write_file`` or ``patch`` call is targeting.
-
-    For ``write_file`` and ``patch`` in replace mode this is just ``args["path"]``.
-    For ``patch`` in V4A patch mode we parse the patch content for
-    ``*** Update File:`` / ``*** Add File:`` / ``*** Delete File:`` headers so
-    the verifier can track each file in a multi-file patch separately.
-    """
+def _extract_file_mutation_targets(
+    tool_name: str, args: Dict[str, Any], *, task_id: Optional[str] = None,
+) -> List[str]:
+    """Return every target, using the executor's parser and optional task context."""
     if tool_name not in _FILE_MUTATING_TOOLS:
         return []
-    if tool_name == "write_file":
-        p = args.get("path")
-        return [str(p)] if p else []
-    # tool_name == "patch"
-    mode = args.get("mode") or "replace"
-    if mode == "replace":
-        p = args.get("path")
-        return [str(p)] if p else []
-    if mode == "patch":
-        body = args.get("patch") or ""
-        if not isinstance(body, str) or not body:
+    if tool_name == "patch" and (args.get("mode") or "replace") not in {"patch", "replace"}:
+        return []
+    if tool_name == "patch" and args.get("mode") == "patch":
+        from tools.patch_parser import parse_v4a_patch
+
+        body = args.get("patch")
+        if not isinstance(body, str):
             return []
-        paths: List[str] = []
-        for _m in re.finditer(
-            r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$',
-            body,
-            re.MULTILINE,
-        ):
-            p = _m.group(1).strip()
-            if p:
-                paths.append(p)
-        for _m in re.finditer(
-            r'^\*\*\*\s+Move\s+File:\s*(.+?)\s*->\s*(.+)$',
-            body,
-            re.MULTILINE,
-        ):
-            src = _m.group(1).strip()
-            dst = _m.group(2).strip()
-            if src:
-                paths.append(src)
-            if dst:
-                paths.append(dst)
-        return paths
-    return []
+        operations, error = parse_v4a_patch(body)
+        if error:
+            return []
+        paths = [p for op in operations for p in (op.file_path, op.new_path) if p is not None]
+    else:
+        path = args.get("path")
+        paths = [str(path)] if path else []
+    if task_id is not None:
+        from tools.file_tools import _resolve_path_for_task
+
+        paths = [str(_resolve_path_for_task(path, task_id)) for path in paths]
+    return list(dict.fromkeys(paths))
 
 
 def _extract_landed_file_mutation_paths(
     tool_name: str,
     args: Dict[str, Any],
     result: Any,
+    *,
+    task_id: Optional[str] = None,
 ) -> List[str]:
     """Return the concrete file paths a successful mutation reports."""
-    targets = _extract_file_mutation_targets(tool_name, args)
-    if tool_name not in _FILE_MUTATING_TOOLS or not isinstance(result, str):
-        return targets
-    try:
-        data = json.loads(result.strip())
-    except Exception:
-        return targets
-    if not isinstance(data, dict):
-        return targets
-
-    files = data.get("files_modified")
-    if isinstance(files, list):
-        landed = [str(p) for p in files if p]
-        if landed:
-            return landed
-
-    resolved = data.get("resolved_path")
-    if resolved:
-        return [str(resolved)]
-
-    return targets
+    if tool_name in _FILE_MUTATING_TOOLS and isinstance(result, str):
+        try:
+            data = json.loads(result.strip())
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict):
+            files = data.get("files_modified")
+            if isinstance(files, list):
+                landed = [p for p in files if isinstance(p, str) and p]
+                if landed:
+                    return landed
+            resolved = data.get("resolved_path")
+            if isinstance(resolved, str) and resolved:
+                return [resolved]
+    return _extract_file_mutation_targets(tool_name, args, task_id=task_id)
 
 
 def _extract_error_preview(result: Any, max_len: int = 180) -> str:
