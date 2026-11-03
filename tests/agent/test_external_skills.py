@@ -30,7 +30,7 @@ def hermes_home(tmp_path):
 
 class TestGetExternalSkillsDirs:
     def test_empty_config(self, hermes_home):
-        (hermes_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
+        (hermes_home / "config.yaml").write_text("skills:\n  external_dirs: []\n", encoding="utf-8")
         with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
             from agent.skill_utils import get_external_skills_dirs
             result = get_external_skills_dirs()
@@ -118,8 +118,8 @@ class TestExternalSkillsInFindAll:
         names = [s["name"] for s in skills]
         assert "my-external-skill" in names
 
-    def test_local_takes_precedence(self, hermes_home, external_skills_dir):
-        """If the same skill name exists locally and externally, local wins."""
+    def test_ambiguous_same_path_is_not_advertised(self, hermes_home, external_skills_dir):
+        """A name that native reads refuse must not silently select a root."""
         local_skills = hermes_home / "skills"
         local_skill = local_skills / "my-external-skill"
         local_skill.mkdir(parents=True)
@@ -133,11 +133,13 @@ class TestExternalSkillsInFindAll:
             patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}),
             patch("tools.skills_tool.SKILLS_DIR", local_skills),
         ):
-            from tools.skills_tool import _find_all_skills
+            from tools.skills_tool import _find_all_skills, skill_view
             skills = _find_all_skills()
-        matching = [s for s in skills if s["name"] == "my-external-skill"]
-        assert len(matching) == 1
-        assert matching[0]["description"] == "Local version"
+            loaded = json.loads(skill_view("my-external-skill", preprocess=False))
+        assert skills == []
+        assert loaded["success"] is False
+        assert "Ambiguous skill name" in loaded["error"]
+        assert len(loaded["matches"]) == 2
 
 
 class TestExternalSkillView:
