@@ -690,8 +690,9 @@ def skill_management_target(name: str) -> Dict[str, Any]:
         declared, _ = _parse_frontmatter(skill_md.read_text(encoding="utf-8"))
     except (OSError, UnicodeError) as exc:
         return {"success": False, "code": "unreadable", "error": f"Cannot read the selected skill: {exc}"}
-    aliases = {name, skill_md.parent.name, declared.get("name"),
-               catalog.entries.get(skill_md, (None, None))[1]}
+    aliases = {alias for alias in (name, skill_md.parent.name, declared.get("name"),
+                                   catalog.entries.get(skill_md, (None, None))[1])
+               if isinstance(alias, str)}
     provenance = read_skill_provenance_names()
     local = (directory is not None and directory.resolve().is_relative_to(_skills_dir().resolve())
              and not is_external_skill_path(directory))

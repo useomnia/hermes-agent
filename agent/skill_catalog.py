@@ -85,8 +85,9 @@ class SkillCatalog:
                 relative = path.parent.relative_to(root).as_posix()
                 names = {path.parent.name, relative}
                 declared = frontmatter.get("name")
-                if isinstance(declared, str) and declared:
-                    names.add(declared)
+                if not isinstance(declared, str) or not declared:
+                    declared = path.parent.name
+                names.add(declared)
                 candidate = (path.parent, path)
                 self.entries[path] = (declared or path.parent.name, relative)
                 for name in names:
