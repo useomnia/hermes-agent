@@ -364,3 +364,13 @@ def test_warm_slash_catalog_rebinds_when_active_profile_changes(catalog, tmp_pat
     assert set(skill_commands.get_skill_commands()) == {"/current"}
     message = skill_commands.build_skill_invocation_message("/current")
     assert message is not None and "ACTIVE PROFILE" in message and "INITIAL PROFILE" not in message
+
+
+@pytest.mark.parametrize("declared", ["[not, a, name]", "{unexpected: mapping}"])
+def test_malformed_declared_name_does_not_break_other_catalog_entries(catalog, declared):
+    package(catalog, "valid", name="helper")
+    package(catalog, "malformed", name=declared)
+    index = prompt_builder.build_skills_system_prompt()
+    assert "helper" in index
+    assert view("helper")["success"]
+    assert manager.skill_management_target("malformed")["success"]
