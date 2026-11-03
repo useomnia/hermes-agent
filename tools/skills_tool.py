@@ -79,6 +79,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from tools.registry import registry, tool_error
+from tools.skill_inventory import discover_skill_files
 from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
@@ -1420,47 +1421,13 @@ def _load_skill_content(
                     ensure_ascii=False,
                 )
             if not target_file.is_file():
-                # List available files in the skill directory, organized by type
-                available_files = {
-                    "references": [],
-                    "templates": [],
-                    "assets": [],
-                    "scripts": [],
-                    "other": [],
-                }
-
-                # Scan for all readable files
-                for f in skill_dir.rglob("*"):
-                    if f.is_file() and f.name != "SKILL.md":
-                        rel = str(f.relative_to(skill_dir))
-                        if rel.startswith("references/"):
-                            available_files["references"].append(rel)
-                        elif rel.startswith("templates/"):
-                            available_files["templates"].append(rel)
-                        elif rel.startswith("assets/"):
-                            available_files["assets"].append(rel)
-                        elif rel.startswith("scripts/"):
-                            available_files["scripts"].append(rel)
-                        elif f.suffix in {
-                            ".md",
-                            ".py",
-                            ".yaml",
-                            ".yml",
-                            ".json",
-                            ".tex",
-                            ".sh",
-                        }:
-                            available_files["other"].append(rel)
-
-                # Remove empty categories
-                available_files = {k: v for k, v in available_files.items() if v}
-
+                inventory = discover_skill_files(skill_dir)
                 return json.dumps(
                     {
                         "success": False,
                         "error": f"File '{file_path}' not found in skill '{name}'.",
-                        "available_files": available_files,
-                        "hint": "Use one of the available file paths listed above",
+                        **inventory.response_fields(name, "available_files"),
+                        "hint": "Use an exact listed file_path. Read SKILL.md for additional paths if the inventory is incomplete.",
                     },
                     ensure_ascii=False,
                 )
@@ -1506,50 +1473,7 @@ def _load_skill_content(
         # Reuse the parse from the platform check above
         frontmatter = parsed_frontmatter
 
-        # Get reference, template, asset, and script files if this is a directory-based skill
-        reference_files = []
-        template_files = []
-        asset_files = []
-        script_files = []
-
-        if skill_dir:
-            references_dir = skill_dir / "references"
-            if references_dir.exists():
-                reference_files = [
-                    str(f.relative_to(skill_dir)) for f in references_dir.glob("*.md")
-                ]
-
-            templates_dir = skill_dir / "templates"
-            if templates_dir.exists():
-                for ext in [
-                    "*.md",
-                    "*.py",
-                    "*.yaml",
-                    "*.yml",
-                    "*.json",
-                    "*.tex",
-                    "*.sh",
-                ]:
-                    template_files.extend(
-                        [
-                            str(f.relative_to(skill_dir))
-                            for f in templates_dir.rglob(ext)
-                        ]
-                    )
-
-            # assets/ — agentskills.io standard directory for supplementary files
-            assets_dir = skill_dir / "assets"
-            if assets_dir.exists():
-                for f in assets_dir.rglob("*"):
-                    if f.is_file():
-                        asset_files.append(str(f.relative_to(skill_dir)))
-
-            scripts_dir = skill_dir / "scripts"
-            if scripts_dir.exists():
-                for ext in ["*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"]:
-                    script_files.extend(
-                        [str(f.relative_to(skill_dir)) for f in scripts_dir.glob(ext)]
-                    )
+        inventory = discover_skill_files(skill_dir)
 
         # Read tags/related_skills with backward compat:
         # Check metadata.hermes.* first (agentskills.io convention), fall back to top-level
@@ -1562,17 +1486,6 @@ def _load_skill_content(
         related_skills = _parse_tags(
             hermes_meta.get("related_skills") or frontmatter.get("related_skills", "")
         )
-
-        # Build linked files structure for clear discovery
-        linked_files = {}
-        if reference_files:
-            linked_files["references"] = reference_files
-        if template_files:
-            linked_files["templates"] = template_files
-        if asset_files:
-            linked_files["assets"] = asset_files
-        if script_files:
-            linked_files["scripts"] = script_files
 
         try:
             rel_path = str(skill_md.relative_to(active_skills_dir))
@@ -1675,10 +1588,7 @@ def _load_skill_content(
             "content": rendered_content,
             "path": rel_path,
             "skill_dir": runtime_skill_dir if preprocess else (str(skill_dir) if skill_dir else None),
-            "linked_files": linked_files if linked_files else None,
-            "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
-            if linked_files
-            else None,
+            **inventory.response_fields(name, "linked_files"),
             "required_environment_variables": required_env_vars,
             "required_commands": [],
             "missing_required_environment_variables": remaining_missing_required_envs,
@@ -1817,17 +1727,17 @@ SKILLS_LIST_SCHEMA = {
 
 SKILL_VIEW_SCHEMA = {
     "name": "skill_view",
-    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a 'linked_files' dict showing available references/templates/scripts. To access those, call again with file_path parameter.",
+    "description": "Load a skill's full instructions or one of its support files. For local and external directory skills, the first call returns SKILL.md and a bounded linked_files inventory, including root documents and nested files. file_inventory states whether that inventory is complete; file_example gives exact arguments for one listed file.",
     "parameters": {
         "type": "object",
         "properties": {
             "name": {
                 "type": "string",
-                "description": "The skill name (use skills_list to see available skills). For plugin-provided skills, use the qualified form 'plugin:skill' (e.g. 'superpowers:writing-plans').",
+                "description": "Use an exact listed skill name, not a category label or a guessed directory prefix. Keep a categorized identifier when disambiguating a collision. For plugin-provided skills, use the qualified form 'plugin:skill'.",
             },
             "file_path": {
                 "type": "string",
-                "description": "OPTIONAL: Path to a linked file within the skill (e.g., 'references/api.md', 'templates/config.yaml', 'scripts/validate.py'). Omit to get the main SKILL.md content.",
+                "description": "OPTIONAL: Copy an exact relative path from linked_files, available_files or a link in SKILL.md. Files can be at the skill root; do not add references/ or another prefix. Omit to get the main SKILL.md content.",
             },
             "section": {
                 "type": "string",

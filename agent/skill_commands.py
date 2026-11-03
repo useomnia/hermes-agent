@@ -350,7 +350,7 @@ def _build_skill_message(
         if isinstance(entries, list):
             supporting.extend(entries)
 
-    if not supporting and skill_dir:
+    if not supporting and skill_dir and "file_inventory" not in loaded_skill:
         for subdir in ("references", "templates", "scripts", "assets"):
             subdir_path = skill_dir / subdir
             if subdir_path.exists():
@@ -358,6 +358,9 @@ def _build_skill_message(
                     if f.is_file() and not f.is_symlink():
                         rel = str(f.relative_to(skill_dir))
                         supporting.append(rel)
+
+    if (loaded_skill.get("file_inventory") or {}).get("complete") is False:
+        parts.append("\n[Supporting-file inventory is incomplete; use exact paths linked in the skill instructions.]")
 
     if supporting and skill_dir:
         try:
