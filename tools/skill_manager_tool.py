@@ -645,28 +645,175 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
 
 
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
-    """
-    Find a skill by name across all skill directories.
+    """Find exactly one native directory skill using the read catalog."""
+    from agent.skill_catalog import SkillCatalog
+    from agent.skill_utils import get_all_skills_dirs
+    from tools.skills_tool import _skill_lookup_path_error
 
-    Searches the local skills dir (~/.hermes/skills/) first, then any
-    external dirs configured via skills.external_dirs.  Returns
-    {"path": Path} or None.
+    if _skill_lookup_path_error(name):
+        return None
+    matches = SkillCatalog([_skills_dir(), *get_all_skills_dirs()[1:]]).select(name)
+    if len(matches) != 1 or matches[0][0] is None:
+        return None
+    return {"path": matches[0][0]}
+
+
+def skill_management_target(name: str) -> Dict[str, Any]:
+    """Resolve an adapter write target without duplicating lookup or ownership.
+
+    This is read-only and does not authorize a write. ``editable`` requires a
+    directory in the active profile with known, non-bundled/non-Hub provenance.
+    Unknown provenance and external/symlink targets fail closed for adapters.
+    Native write/background/approval gates still apply to any subsequent edit.
     """
-    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
-    for skills_dir in get_all_skills_dirs():
-        if not skills_dir.exists():
-            continue
-        for skill_md in skills_dir.rglob("SKILL.md"):
-            if is_excluded_skill_path(skill_md):
-                continue
-            if skill_md.parent.name == name:
-                return {"path": skill_md.parent}
-            # Upstream #98099: accept the categorized identifier advertised
-            # by skill_view. Match against each owning root, including external
-            # catalogs, without resolving through a different skill's symlink.
-            if skill_md.parent.relative_to(skills_dir).as_posix() == name:
-                return {"path": skill_md.parent}
+    from agent.skill_catalog import SkillCatalog
+    from agent.skill_utils import get_all_skills_dirs, is_external_skill_path
+    from tools.skill_usage import read_skill_provenance_names
+    from tools.skills_tool import _skill_lookup_path_error
+
+    error = _skill_lookup_path_error(name)
+    if error:
+        return {"success": False, "code": "invalid_name", "error": error}
+    roots = [_skills_dir(), *get_all_skills_dirs()[1:]]
+    catalog = SkillCatalog(roots)
+    matches = catalog.select(name)
+    if len(matches) != 1:
+        return {"success": False, "code": "ambiguous" if matches else "not_found",
+                "error": f"Skill '{name}' is ambiguous." if matches else _skill_not_found_error(name),
+                "matches": [str(path) for _, path in matches]}
+    directory, skill_md = matches[0]
+    try:
+        declared, _ = _parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as exc:
+        return {"success": False, "code": "unreadable", "error": f"Cannot read the selected skill: {exc}"}
+    aliases = {name, skill_md.parent.name, declared.get("name"),
+               catalog.entries.get(skill_md, (None, None))[1]}
+    provenance = read_skill_provenance_names()
+    local = (directory is not None and directory.resolve().is_relative_to(_skills_dir().resolve())
+             and not is_external_skill_path(directory))
+    if local:
+        relative = directory.relative_to(_skills_dir())
+        local = not any(_is_path_redirect(_skills_dir().joinpath(*relative.parts[:index]))
+                        for index in range(1, len(relative.parts) + 1))
+    owned = local and provenance is not None and not any(
+        alias in (provenance[0] | provenance[1]) for alias in aliases if isinstance(alias, str)
+    )
+    owner_root = max((root for root in roots if skill_md.is_relative_to(root)), key=lambda root: len(root.parts))
+    return {"success": True, "name": catalog.load_name(skill_md) or name,
+            "path": (directory or skill_md).relative_to(owner_root).as_posix(),
+            "skill_dir": str(directory) if directory else None,
+            "skill_md_path": str(skill_md), "editable": bool(owned),
+            "provenance": "custom" if owned else "external" if not local else "packaged" if provenance else "unknown"}
+
+
+def skill_copy_preflight() -> Optional[Dict[str, Any]]:
+    """Copy is foreground-only and cannot use single-document approval staging.
+
+    Adapters may call this before collecting a remote package. The public copy
+    helper always repeats it, so direct callers cannot bypass the write gate.
+    """
+    try:
+        from tools.skill_provenance import is_background_review
+        from tools import write_approval
+        if is_background_review():
+            return {"success": False, "code": "write_blocked", "error": "Package copy requires an explicit foreground request."}
+        decision = write_approval.evaluate_gate(write_approval.SKILLS)
+        if not decision.allow:
+            return {"success": False, "code": "write_blocked", "error": decision.message or "Package copy is unavailable while skill write approval is enabled."}
+    except Exception:
+        return {"success": False, "code": "write_blocked", "error": "Could not verify the package-copy write gate."}
     return None
+
+
+def copy_skill_package(source_name=None, *, target_name, files=None, content=None) -> Dict[str, Any]:
+    """Copy one complete package to a new custom skill in the active profile.
+
+    Supply exactly one native source identifier or complete Mapping[str, bytes].
+    Remote adapters must certify complete enumeration before supplying files.
+    This method owns all write gates, validation, security scanning and atomic
+    no-overwrite publication; it never stages just SKILL.md or marks a copy as
+    curator-managed. It changes name and strips metadata.id, preserving authors.
+    """
+    from agent.skill_catalog import SkillCatalog
+    from agent.skill_utils import get_all_skills_dirs
+    from tools.skill_package import PackageError, collect_package, validate_files, stage_package
+    from tools.skills_tool import _is_skill_disabled, _skill_lookup_path_error
+
+    gate = skill_copy_preflight()
+    if gate:
+        return gate
+    error = _validate_name(target_name) if isinstance(target_name, str) else "Target skill name must be a string."
+    if error:
+        return {"success": False, "code": "invalid_name", "error": error}
+    if (source_name is None) == (files is None):
+        return {"success": False, "code": "invalid_source", "error": "Supply exactly one source_name or complete files mapping."}
+    roots = [_skills_dir(), *get_all_skills_dirs()[1:]]
+    try:
+        catalog = SkillCatalog(roots)
+        if catalog.select(target_name) or (_skills_dir() / target_name).exists() or (_skills_dir() / target_name).is_symlink():
+            raise PackageError("target_exists", f"Skill identifier '{target_name}' already exists; choose a new name.")
+        if source_name is not None:
+            error = _skill_lookup_path_error(source_name)
+            if error:
+                raise PackageError("invalid_source", error)
+            matches = catalog.select(source_name)
+            if len(matches) != 1 or matches[0][0] is None:
+                raise PackageError("ambiguous" if len(matches) > 1 else "invalid_source", "Select one exact directory skill as the copy source.")
+            directory, skill_md = matches[0]
+            metadata, _ = _parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+            if _is_skill_disabled(metadata.get("name", directory.name)):
+                raise PackageError("write_blocked", "The selected source skill is disabled.")
+            owner_root = max((root for root in roots if directory.is_relative_to(root)), key=lambda root: len(root.parts))
+            package = collect_package(directory, owner_root)
+        else:
+            package = validate_files(files)
+        original = package["SKILL.md"].decode("utf-8")
+        selected = original if content is None else content
+        if not isinstance(selected, str):
+            raise PackageError("invalid_package", "Replacement SKILL.md content must be text.")
+        error = _validate_frontmatter(selected) or _validate_content_size(selected)
+        if error:
+            raise PackageError("invalid_package", error)
+        frontmatter, body = _parse_frontmatter(selected)
+        original_frontmatter, _ = _parse_frontmatter(original)
+        frontmatter["name"] = target_name
+        if isinstance(frontmatter.get("metadata"), dict):
+            frontmatter["metadata"].pop("id", None)
+        # A copy has a new identity, not a new claimed author.
+        if "author" in original_frontmatter:
+            frontmatter["author"] = original_frontmatter["author"]
+        original_metadata = original_frontmatter.get("metadata")
+        if isinstance(original_metadata, dict) and "author" in original_metadata:
+            if not isinstance(frontmatter.get("metadata"), dict):
+                frontmatter["metadata"] = {}
+            frontmatter["metadata"]["author"] = original_metadata["author"]
+        main = "---\n" + yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True) + "---\n" + body
+        error = _validate_content_size(main)
+        if error:
+            raise PackageError("invalid_package", error)
+        package = validate_files({**package, "SKILL.md": main.encode("utf-8")})
+        # Recheck after collection; an exact destination race is also stopped
+        # by the operating system's no-replace publication, even for empty dirs.
+        if SkillCatalog(roots).select(target_name):
+            raise PackageError("target_exists", "The copy target identifier was claimed during collection.")
+        stage_package(package, _skills_dir(), target_name, _security_scan_skill)
+    except PackageError as exc:
+        return {"success": False, "code": exc.code, "error": str(exc)}
+    except FileExistsError:
+        return {"success": False, "code": "target_exists", "error": "The copy target was claimed before publication."}
+    except (OSError, UnicodeError, ValueError) as exc:
+        return {"success": False, "code": "copy_failed", "error": f"Package copy failed: {exc}"}
+    try:
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+        from agent.skill_commands import scan_skill_commands
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        scan_skill_commands()
+    except Exception:
+        logger.warning("Failed to refresh skills after package copy", exc_info=True)
+    return {"success": True, "name": target_name, "path": target_name,
+            "skill_dir": str(_skills_dir() / target_name),
+            "file_count": len(package), "total_bytes": sum(map(len, package.values())),
+            "message": f"Copied the complete package to custom skill '{target_name}'."}
 
 
 def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
@@ -889,13 +1036,12 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if err:
         return {"success": False, "error": err}
 
-    # Check for name collisions across all directories
-    existing = _find_skill(name)
-    if existing:
-        return {
-            "success": False,
-            "error": f"A skill named '{name}' already exists at {existing['path']}."
-        }
+    # A frontmatter alias or ambiguous name also reserves the identifier.
+    from agent.skill_catalog import SkillCatalog
+    from agent.skill_utils import get_all_skills_dirs
+    matches = SkillCatalog([_skills_dir(), *get_all_skills_dirs()[1:]]).select(name)
+    if matches:
+        return {"success": False, "error": f"A skill named '{name}' already exists at {matches[0][1].parent}."}
 
     # Create the skill directory
     skill_dir = _resolve_skill_dir(name, category)
