@@ -42,6 +42,8 @@ _INCOMPLETE_RECEIPT_METADATA_KEYS = (
     "required_environment_variables",
     "required_commands",
     "usage_hint",
+    "file_inventory",
+    "file_example",
     "org_provenance",
     "compatibility",
     "tags",
@@ -671,6 +673,16 @@ def _skill_view_incomplete_result(content: str, *, tool_name: str = "skill_view"
         if len(rendered) <= _MAX_INCOMPLETE_RECEIPT_CHARS:
             break
         if receipt.pop(key, None) is not None:
+            if key == "linked_files" and "file_inventory" in receipt:
+                receipt["file_inventory"] = {
+                    **receipt["file_inventory"],
+                    "complete": False,
+                    "listed_files": 0,
+                    "limit": "delivery",
+                }
+                receipt.pop("file_example", None)
+                receipt.pop("usage_hint", None)
+                receipt["metadata_omitted"] = True
             rendered = json.dumps(receipt, ensure_ascii=False)
 
     # Still over the cap: coarsen the index into fewer, wider groups rather

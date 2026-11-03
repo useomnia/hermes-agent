@@ -1847,13 +1847,13 @@ def build_skills_system_prompt(
             seen = set()
             if category in demoted:
                 names = sorted({name for name, _ in skills_by_category[category]})
-                index_lines.append(f"  {category} [names only]: {', '.join(names)}")
+                index_lines.append(f"  {category} [names only] [category; not callable]: {', '.join(names)}")
                 continue
             cat_desc = category_descriptions.get(category, "")
             if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
+                index_lines.append(f"  {category} [category; not callable]: {cat_desc}")
             else:
-                index_lines.append(f"  {category}:")
+                index_lines.append(f"  {category} [category; not callable]:")
             for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
                 if name in seen:
                     continue
@@ -1874,6 +1874,8 @@ def build_skills_system_prompt(
         )
         result = (
             "## Skills (mandatory)\n"
+            "Category labels are not callable. Pass an exact listed skill name to skill_view(name); "
+            "never load or prepend a category label. Use the returned support-file paths exactly.\n"
             "Before replying, scan the skills below. If a skill matches or is even partially relevant "
             "to your task, you MUST load it with skill_view(name) and follow its instructions. "
             "Err on the side of loading — it is always better to have context you don't need "
