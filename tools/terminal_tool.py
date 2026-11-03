@@ -2601,13 +2601,12 @@ def terminal_tool(
                 "EOF."
             )
 
-        # The session key that drives cwd records: get_current_session_key()'s
-        # contextvar doesn't cross tool-worker threads, so fall back to the raw
-        # task_id (which IS the session_key for the top-level agent) — a
-        # stable, thread-safe anchor.
+        # Process ownership follows the approval scope. Directory state follows
+        # the raw task shared by terminal, file consumers and scheduling.
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        cwd_key = task_id or "default"
 
         if background:
             # Spawn a tracked background process via the process registry.
@@ -2636,7 +2635,7 @@ def terminal_tool(
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
                 default_cwd=cwd,
-                session_key=session_key,
+                session_key=cwd_key,
             )
             try:
                 if env_type == "local":
@@ -2891,7 +2890,7 @@ def terminal_tool(
             command_cwd = _resolve_command_cwd(
                 workdir=workdir,
                 default_cwd=cwd,
-                session_key=session_key,
+                session_key=cwd_key,
             )
             execute_kwargs = {
                 "timeout": effective_timeout,
@@ -2939,10 +2938,10 @@ def terminal_tool(
             # The env's post-command tracking (marker parse / local sync) has
             # just updated env.cwd with the
             # directory this command finished in. That cwd belongs to THIS
-            # session — record it under the session key so the durable record
+            # session — record it under the task key so the durable record
             # never depends on the shared env surviving or on who drives the
             # env next.
-            record_session_cwd(session_key, getattr(env, "cwd", None))
+            record_session_cwd(cwd_key, getattr(env, "cwd", None))
 
             # Extract output
             output = result.get("output", "")
