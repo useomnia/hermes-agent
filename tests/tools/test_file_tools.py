@@ -28,7 +28,7 @@ class TestReadFileHandler:
         result = json.loads(read_file_tool("/tmp/test.txt"))
         assert result["content"] == "line1\nline2"
         assert result["total_lines"] == 2
-        mock_ops.read_file.assert_called_once_with("/tmp/test.txt", 1, 500)
+        mock_ops.read_file.assert_called_once_with(str(Path("/tmp/test.txt").resolve()), 1, 500)
 
     @patch("tools.file_tools._get_file_ops")
     def test_custom_offset_and_limit(self, mock_get):
@@ -41,7 +41,7 @@ class TestReadFileHandler:
 
         from tools.file_tools import read_file_tool
         read_file_tool("/tmp/big.txt", offset=10, limit=20)
-        mock_ops.read_file.assert_called_once_with("/tmp/big.txt", 10, 20)
+        mock_ops.read_file.assert_called_once_with(str(Path("/tmp/big.txt").resolve()), 10, 20)
 
     @patch("tools.file_tools._get_file_ops")
     def test_invalid_offset_and_limit_are_normalized_before_dispatch(self, mock_get):
@@ -54,7 +54,7 @@ class TestReadFileHandler:
 
         from tools.file_tools import read_file_tool
         read_file_tool("/tmp/big.txt", offset=0, limit=0)
-        mock_ops.read_file.assert_called_once_with("/tmp/big.txt", 1, 1)
+        mock_ops.read_file.assert_called_once_with(str(Path("/tmp/big.txt").resolve()), 1, 1)
 
     @patch("tools.file_tools._get_file_ops")
     def test_exception_returns_error_json(self, mock_get):
