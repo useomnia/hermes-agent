@@ -262,6 +262,18 @@ def test_skills_breakdown_attributes_demoted_category_shared_line(isolated_home)
         assert entry["index_line_skill_count"] == 2
 
 
+@pytest.mark.parametrize("category_marker", ["", " [category; not callable]"])
+def test_skills_breakdown_keeps_legacy_and_marked_compact_names(category_marker):
+    shared_line = f"  connectors/workspace [names only]{category_marker}: alpha, plugin:café"
+    block = f"<available_skills>\n{shared_line}\n</available_skills>"
+
+    entries = _compute_skills_breakdown(block)
+
+    assert {entry["name"] for entry in entries} == {"alpha", "plugin:café"}
+    assert sum(entry["index_line_bytes"] for entry in entries) == len(shared_line.encode("utf-8"))
+    assert all(entry["index_line_skill_count"] == 2 for entry in entries)
+
+
 def test_render_includes_per_component_tables(isolated_home):
     """The rendered report gains the two new sorted tables (additive)."""
     _seed_skill(isolated_home, "demo-skill", "a demo skill")

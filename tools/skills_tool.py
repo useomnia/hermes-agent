@@ -66,7 +66,6 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
-import hashlib
 import json
 import logging
 import time
@@ -79,6 +78,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from tools.registry import registry, tool_error
+from tools.skill_inventory import discover_skill_files
 from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
@@ -185,30 +185,8 @@ _secret_capture_callback = None
 
 
 def _skill_lookup_path_error(name: str) -> Optional[str]:
-    """Return an error if a local skill lookup *name* can escape search roots.
-
-    The skill ``name`` is joined onto each trusted search dir to build the
-    on-disk lookup path, so it must stay relative and free of ``..`` segments —
-    otherwise ``name="../outside"`` or an absolute path could select a skill
-    (and read files) outside the skills directory. Mirrors the ``file_path``
-    validation done later via ``tools.path_security``. We also reject Windows
-    drive paths (e.g. ``C:\\skills``), whose ``:`` would otherwise be misread as
-    a plugin namespace separator.
-    """
-    from tools.path_security import has_traversal_component
-
-    if not isinstance(name, str):
-        return "Skill name must be a string."
-    candidate = name.strip()
-    if (
-        PurePosixPath(candidate).is_absolute()
-        or PureWindowsPath(candidate).is_absolute()
-        or PureWindowsPath(candidate).drive
-    ):
-        return "Skill name must be a relative path within the skills directory."
-    if has_traversal_component(candidate):
-        return "Skill name cannot contain '..' path traversal components."
-    return None
+    from agent.skill_catalog import skill_lookup_path_error
+    return skill_lookup_path_error(name)
 
 
 def load_env() -> Dict[str, str]:
@@ -747,10 +725,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         return [dict(s) for s in cached[2]]
 
     skills = []
-    seen_names: set = set()
 
-    # Scan local dir first, then external dirs (local takes precedence) —
-    # dirs_to_scan already resolved above for the signature.
+    # Collect metadata in root order; the shared catalog determines which
+    # identifiers address each entry without introducing root precedence.
     for scan_dir in dirs_to_scan:
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
@@ -769,8 +746,6 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     continue
 
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
-                if name in seen_names:
-                    continue
                 if name in disabled:
                     continue
 
@@ -791,6 +766,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     "name": name,
                     "description": description,
                     "category": category,
+                    "skill_md_path": str(skill_md),
                 }
                 metadata = frontmatter.get("metadata")
                 if (
@@ -808,7 +784,6 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     if provenance is not None:
                         skill["provenance"] = provenance
 
-                seen_names.add(name)
                 skills.append(skill)
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -819,6 +794,11 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     "Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True
                 )
                 continue
+
+    from agent.skill_catalog import resolve_skill_catalog
+    skills = resolve_skill_catalog(skills, dirs_to_scan)
+    for skill in skills:
+        skill.pop("skill_md_path", None)
 
     # Store in cache keyed by the scan signature computed BEFORE the scan
     # (a write racing the scan changes the signature, so the next call
@@ -1029,27 +1009,8 @@ def skill_view(
 
 
 def _deduplicate_same_root_skills(candidates, all_dirs):
-    """Upstream #113126: prefer an unambiguous shallow copy of ONE skill."""
-    if len(candidates) < 2:
-        return candidates
-    roots = {
-        max((root for root in all_dirs if path.is_relative_to(root)),
-            key=lambda root: len(root.parts), default=None)
-        for _, path in candidates
-    }
-    if len(roots) != 1 or None in roots:
-        return candidates
-    try:
-        if len({hashlib.sha256(path.read_bytes()).digest() for _, path in candidates}) != 1:
-            return candidates
-    except OSError:
-        return candidates
-    root = roots.pop()
-    def rank(candidate):
-        path = candidate[1]
-        return path.name != "SKILL.md", len(path.relative_to(root).parts)
-    ranked = sorted(candidates, key=rank)
-    return [ranked[0]] if rank(ranked[0]) != rank(ranked[1]) else candidates
+    from agent.skill_catalog import deduplicate_same_root_skills
+    return deduplicate_same_root_skills(candidates, all_dirs)
 
 
 def _load_skill_content(
@@ -1192,88 +1153,9 @@ def _load_skill_content(
         skill_dir = None
         skill_md = None
 
-        # Collision detection: collect ALL candidates across every dir using
-        # every lookup strategy (direct path, recursive by parent dir name,
-        # legacy flat <name>.md). If more than one matches, refuse and tell
-        # the caller — silent shadowing of a local skill by a same-named
-        # external skill is a real bug class (`/skills` shows one, agent
-        # loaded the other) so we surface it loudly instead of guessing.
-        from agent.skill_utils import iter_skill_index_files
+        from agent.skill_catalog import SkillCatalog
 
-        candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
-        seen_md: set = set()
-
-        def _record(sd: Optional[Path], smd: Path) -> None:
-            try:
-                key = smd.resolve()
-            except Exception:
-                key = smd
-            if key in seen_md:
-                return
-            seen_md.add(key)
-            candidates.append((sd, smd))
-
-        for search_dir in all_dirs:
-            # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
-            # at the top of the dir).
-            direct_path = search_dir / name
-            if (
-                not _is_skill_support_path(direct_path)
-                and direct_path.is_dir()
-                and (direct_path / "SKILL.md").exists()
-            ):
-                _record(direct_path, direct_path / "SKILL.md")
-            elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
-                direct_path.with_suffix(".md")
-            ):
-                _record(None, direct_path.with_suffix(".md"))
-
-            # Strategy 1b: categorized form for plugin namespace fall-through
-            # (e.g., a "myplugin:explore" name with no plugin registered also
-            # tries the on-disk path "myplugin/explore").
-            if local_category_name:
-                categorized_path = search_dir / local_category_name
-                if (
-                    not _is_skill_support_path(categorized_path)
-                    and categorized_path.is_dir()
-                    and (categorized_path / "SKILL.md").exists()
-                ):
-                    _record(categorized_path, categorized_path / "SKILL.md")
-                elif categorized_path.with_suffix(
-                    ".md"
-                ).exists() and not _is_skill_support_path(
-                    categorized_path.with_suffix(".md")
-                ):
-                    _record(None, categorized_path.with_suffix(".md"))
-
-            # Strategy 2: recursive by directory name (catches nested skills
-            # like "foundations/runtime/explore-codebase" called by bare name),
-            # plus frontmatter `name:` lookup. `skills_list()` exposes the
-            # frontmatter name, so `skill_view(name)` must accept it too even
-            # when the on-disk directory is a shorter category/alias.
-            for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-                if found_skill_md.parent.name == name:
-                    _record(found_skill_md.parent, found_skill_md)
-                    continue
-                try:
-                    fm_content = found_skill_md.read_text(encoding="utf-8")
-                    fm, _ = _parse_frontmatter(fm_content)
-                except Exception:
-                    fm = {}
-                if fm.get("name") == name:
-                    _record(found_skill_md.parent, found_skill_md)
-
-            # Strategy 3: legacy flat <name>.md files anywhere under the dir.
-            # Exclude skill support docs: references/templates/assets/scripts
-            # are loaded through skill_view(skill, file_path=...) and must not
-            # shadow or collide with real skills that share the same basename.
-            for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md" and not _is_skill_support_path(
-                    found_md
-                ):
-                    _record(None, found_md)
-
-        candidates = _deduplicate_same_root_skills(candidates, all_dirs)
+        candidates = SkillCatalog(all_dirs).select(name, fallback=local_category_name)
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
             logging.getLogger(__name__).warning(
@@ -1420,47 +1302,13 @@ def _load_skill_content(
                     ensure_ascii=False,
                 )
             if not target_file.is_file():
-                # List available files in the skill directory, organized by type
-                available_files = {
-                    "references": [],
-                    "templates": [],
-                    "assets": [],
-                    "scripts": [],
-                    "other": [],
-                }
-
-                # Scan for all readable files
-                for f in skill_dir.rglob("*"):
-                    if f.is_file() and f.name != "SKILL.md":
-                        rel = str(f.relative_to(skill_dir))
-                        if rel.startswith("references/"):
-                            available_files["references"].append(rel)
-                        elif rel.startswith("templates/"):
-                            available_files["templates"].append(rel)
-                        elif rel.startswith("assets/"):
-                            available_files["assets"].append(rel)
-                        elif rel.startswith("scripts/"):
-                            available_files["scripts"].append(rel)
-                        elif f.suffix in {
-                            ".md",
-                            ".py",
-                            ".yaml",
-                            ".yml",
-                            ".json",
-                            ".tex",
-                            ".sh",
-                        }:
-                            available_files["other"].append(rel)
-
-                # Remove empty categories
-                available_files = {k: v for k, v in available_files.items() if v}
-
+                inventory = discover_skill_files(skill_dir)
                 return json.dumps(
                     {
                         "success": False,
                         "error": f"File '{file_path}' not found in skill '{name}'.",
-                        "available_files": available_files,
-                        "hint": "Use one of the available file paths listed above",
+                        **inventory.response_fields(name, "available_files"),
+                        "hint": "Use an exact listed file_path. Read SKILL.md for additional paths if the inventory is incomplete.",
                     },
                     ensure_ascii=False,
                 )
@@ -1506,50 +1354,7 @@ def _load_skill_content(
         # Reuse the parse from the platform check above
         frontmatter = parsed_frontmatter
 
-        # Get reference, template, asset, and script files if this is a directory-based skill
-        reference_files = []
-        template_files = []
-        asset_files = []
-        script_files = []
-
-        if skill_dir:
-            references_dir = skill_dir / "references"
-            if references_dir.exists():
-                reference_files = [
-                    str(f.relative_to(skill_dir)) for f in references_dir.glob("*.md")
-                ]
-
-            templates_dir = skill_dir / "templates"
-            if templates_dir.exists():
-                for ext in [
-                    "*.md",
-                    "*.py",
-                    "*.yaml",
-                    "*.yml",
-                    "*.json",
-                    "*.tex",
-                    "*.sh",
-                ]:
-                    template_files.extend(
-                        [
-                            str(f.relative_to(skill_dir))
-                            for f in templates_dir.rglob(ext)
-                        ]
-                    )
-
-            # assets/ — agentskills.io standard directory for supplementary files
-            assets_dir = skill_dir / "assets"
-            if assets_dir.exists():
-                for f in assets_dir.rglob("*"):
-                    if f.is_file():
-                        asset_files.append(str(f.relative_to(skill_dir)))
-
-            scripts_dir = skill_dir / "scripts"
-            if scripts_dir.exists():
-                for ext in ["*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"]:
-                    script_files.extend(
-                        [str(f.relative_to(skill_dir)) for f in scripts_dir.glob(ext)]
-                    )
+        inventory = discover_skill_files(skill_dir)
 
         # Read tags/related_skills with backward compat:
         # Check metadata.hermes.* first (agentskills.io convention), fall back to top-level
@@ -1562,17 +1367,6 @@ def _load_skill_content(
         related_skills = _parse_tags(
             hermes_meta.get("related_skills") or frontmatter.get("related_skills", "")
         )
-
-        # Build linked files structure for clear discovery
-        linked_files = {}
-        if reference_files:
-            linked_files["references"] = reference_files
-        if template_files:
-            linked_files["templates"] = template_files
-        if asset_files:
-            linked_files["assets"] = asset_files
-        if script_files:
-            linked_files["scripts"] = script_files
 
         try:
             rel_path = str(skill_md.relative_to(active_skills_dir))
@@ -1675,10 +1469,7 @@ def _load_skill_content(
             "content": rendered_content,
             "path": rel_path,
             "skill_dir": runtime_skill_dir if preprocess else (str(skill_dir) if skill_dir else None),
-            "linked_files": linked_files if linked_files else None,
-            "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
-            if linked_files
-            else None,
+            **inventory.response_fields(name, "linked_files"),
             "required_environment_variables": required_env_vars,
             "required_commands": [],
             "missing_required_environment_variables": remaining_missing_required_envs,
@@ -1817,17 +1608,17 @@ SKILLS_LIST_SCHEMA = {
 
 SKILL_VIEW_SCHEMA = {
     "name": "skill_view",
-    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a 'linked_files' dict showing available references/templates/scripts. To access those, call again with file_path parameter.",
+    "description": "Load a skill's full instructions or one of its support files. For local and external directory skills, the first call returns SKILL.md and a bounded linked_files inventory, including root documents and nested files. file_inventory states whether that inventory is complete; file_example gives exact arguments for one listed file.",
     "parameters": {
         "type": "object",
         "properties": {
             "name": {
                 "type": "string",
-                "description": "The skill name (use skills_list to see available skills). For plugin-provided skills, use the qualified form 'plugin:skill' (e.g. 'superpowers:writing-plans').",
+                "description": "Use an exact listed skill name, not a category label or a guessed directory prefix. Keep a categorized identifier when disambiguating a collision. For plugin-provided skills, use the qualified form 'plugin:skill'.",
             },
             "file_path": {
                 "type": "string",
-                "description": "OPTIONAL: Path to a linked file within the skill (e.g., 'references/api.md', 'templates/config.yaml', 'scripts/validate.py'). Omit to get the main SKILL.md content.",
+                "description": "OPTIONAL: Copy an exact relative path from linked_files, available_files or a link in SKILL.md. Files can be at the skill root; do not add references/ or another prefix. Omit to get the main SKILL.md content.",
             },
             "section": {
                 "type": "string",

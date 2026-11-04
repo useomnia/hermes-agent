@@ -119,7 +119,7 @@ class TestCompactCategories:
 
         prompt = _stable_prompt(make_agent())
 
-        assert "  connectors [names only]: gmail, hubspot" in prompt
+        assert "  connectors [names only] [category; not callable]: gmail, hubspot" in prompt
         assert "Use HubSpot CRM well" not in prompt
         assert "    - market-map: Map the market" in prompt
         assert NEUTRAL_NAMES_ONLY_NOTE in prompt
@@ -130,7 +130,7 @@ class TestCompactCategories:
 
         prompt = _stable_prompt(make_agent())
 
-        assert "connectors/crm [names only]: hubspot" in prompt
+        assert "connectors/crm [names only] [category; not callable]: hubspot" in prompt
         assert "Use HubSpot CRM well" not in prompt
 
     @pytest.mark.parametrize("skills", [{}, {"compact_categories": []},
