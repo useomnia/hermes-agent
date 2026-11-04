@@ -32,6 +32,15 @@ def pair(tmp_path, monkeypatch):
     monkeypatch.setenv("TERMINAL_ENV", "sprites")
     requests = []
 
+    def stored_path(virtual_path):
+        # The Toolbox exposes each content mount through both virtual roots.
+        for root in ("brand", "uploads", "skills"):
+            alias = f"/home/{root}"
+            if virtual_path == alias or virtual_path.startswith(alias + "/"):
+                virtual_path = virtual_path[len("/home"):]
+                break
+        return toolbox / virtual_path.lstrip("/")
+
     class Files(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -39,7 +48,7 @@ def pair(tmp_path, monkeypatch):
         def do_POST(self):
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append(payload)
-            path = toolbox / payload["path"].lstrip("/")
+            path = stored_path(payload["path"])
             operation = payload["operation"]
             if operation == "write":
                 assert len(payload["content"].encode()) <= 2 * 1024 * 1024
@@ -64,7 +73,7 @@ def pair(tmp_path, monkeypatch):
             query = parse_qs(urlsplit(self.path).query)
             assert self.headers["X-Omnio-Brand"] == "brand-a"
             assert self.headers["Authorization"] == "Bearer test-token"
-            path = toolbox / query["path"][0].lstrip("/")
+            path = stored_path(query["path"][0])
             requests.append({"operation": "raw-read", "path": query["path"][0]})
             if not path.is_file():
                 self.send_error(404)
@@ -77,7 +86,7 @@ def pair(tmp_path, monkeypatch):
             query = parse_qs(urlsplit(self.path).query)
             assert query["overwrite"] == ["true"]
             data = self.rfile.read(int(self.headers["Content-Length"]))
-            path = toolbox / query["path"][0].lstrip("/")
+            path = stored_path(query["path"][0])
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
             requests.append({"operation": "raw-write", "path": query["path"][0]})
@@ -366,7 +375,10 @@ def test_text_artifacts_are_redacted_and_media_is_byte_exact(pair):
     assert (toolbox / f"{SPRITES_CACHE_ROOT}/screenshots/shot.png".lstrip("/")).read_bytes() == png
 
 
-def test_raw_reads_under_the_cache_refresh_the_projection_first(pair):
+@pytest.mark.parametrize("brand_path", [
+    "/brand/notes.txt", "/home/brand/notes.txt", "~/brand/notes.txt",
+])
+def test_raw_reads_under_the_cache_refresh_the_projection_first(pair, brand_path):
     home, toolbox, env, requests = pair
     shots = home / "cache" / "screenshots"
     shots.mkdir(parents=True)
@@ -379,8 +391,9 @@ def test_raw_reads_under_the_cache_refresh_the_projection_first(pair):
     before = len(requests)
     (toolbox / "brand").mkdir()
     (toolbox / "brand" / "notes.txt").write_text("brand")
-    assert env.read_file_bytes("/brand/notes.txt", max_bytes=64) == b"brand"
+    assert env.read_file_bytes(brand_path, max_bytes=64) == b"brand"
     assert [item["operation"] for item in requests[before:]] == ["raw-read"]
+    assert requests[-1]["path"] == "/home/brand/notes.txt"
 
 
 def test_web_and_browser_footers_name_the_toolbox_path(pair):
