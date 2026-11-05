@@ -407,10 +407,16 @@ def _cwd_marker(session_id: str) -> str:
 # with one of these prefixes (or is HERMES_UI_SESSION_ID). Used by unit tests
 # as the Python-side contract for the exclusion set; the dump path unsets by
 # name/prefix instead of grepping declare lines (see below / issue #71296).
+#
+# GH_TOKEN is excluded for the same reason: Omnio's backend injects a fresh,
+# short-lived GitHub token into every command's environment. A snapshot that
+# kept it would ``source`` the token captured when the session started over the
+# fresh one, so every command after the first token's expiry would fail with
+# "Bad credentials".
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_"
     "|HERMES_ORIGIN_TURN_ID|HERMES_INTERACTION_POLICY"
-    "|HERMES_DELEGATION_SYNC_ONLY)"
+    "|HERMES_DELEGATION_SYNC_ONLY|GH_TOKEN=)"
 )
 
 
@@ -441,7 +447,7 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
         "HERMES_UI_SESSION_ID HERMES_ORIGIN_TURN_ID HERMES_INTERACTION_POLICY "
-        "HERMES_DELEGATION_SYNC_ONLY "
+        "HERMES_DELEGATION_SYNC_ONLY GH_TOKEN "
         "2>/dev/null; "
         "export -p; "
         ") || true; } "
