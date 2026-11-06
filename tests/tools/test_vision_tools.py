@@ -25,6 +25,10 @@ from tools.vision_tools import (
     check_vision_requirements,
 )
 
+_TINY_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+)
+
 
 # ---------------------------------------------------------------------------
 # _validate_image_url — urlparse-based validation
@@ -425,7 +429,7 @@ class TestVisionConfig:
     @pytest.mark.asyncio
     async def test_vision_uses_configured_temperature_and_timeout(self, tmp_path):
         img = tmp_path / "test.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        img.write_bytes(_TINY_PNG)
 
         mock_response = MagicMock()
         mock_choice = MagicMock()
@@ -455,7 +459,7 @@ class TestVisionConfig:
     @pytest.mark.asyncio
     async def test_vision_defaults_temperature_when_config_omits_it(self, tmp_path):
         img = tmp_path / "test.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        img.write_bytes(_TINY_PNG)
 
         mock_response = MagicMock()
         mock_choice = MagicMock()
@@ -634,7 +638,7 @@ class TestTildeExpansion:
         fake_home = tmp_path / "fakehome"
         fake_home.mkdir()
         img = fake_home / "test_image.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        img.write_bytes(_TINY_PNG)
 
         # Windows expanduser() prefers USERPROFILE over HOME; POSIX uses HOME.
         monkeypatch.setenv("HOME", str(fake_home))
@@ -690,7 +694,7 @@ class TestFileUriSupport:
     async def test_file_uri_resolved_as_local_path(self, tmp_path):
         """file:///absolute/path should be treated as a local file."""
         img = tmp_path / "photo.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        img.write_bytes(_TINY_PNG)
 
         mock_response = MagicMock()
         mock_choice = MagicMock()
@@ -736,10 +740,10 @@ class TestBase64SizeLimit:
     async def test_oversized_image_rejected_before_api_call(self, tmp_path):
         """Images exceeding the 20 MB hard limit should fail with a clear error."""
         img = tmp_path / "huge.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * (4 * 1024 * 1024))
+        img.write_bytes(_TINY_PNG)
 
         # Patch the hard limit to a small value so the test runs fast.
-        with patch("tools.vision_tools._MAX_BASE64_BYTES", 1000), \
+        with patch("tools.vision_tools._MAX_BASE64_BYTES", 100), \
              patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as mock_llm:
             result = json.loads(await vision_analyze_tool(str(img), "describe this"))
 
@@ -751,7 +755,7 @@ class TestBase64SizeLimit:
     async def test_small_image_not_rejected(self, tmp_path):
         """Images well under the limit should pass the size check."""
         img = tmp_path / "small.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+        img.write_bytes(_TINY_PNG)
 
         mock_response = MagicMock()
         mock_choice = MagicMock()
@@ -782,7 +786,7 @@ class TestErrorClassification:
     async def test_invalid_request_error_gives_image_guidance(self, tmp_path):
         """An invalid_request_error from the API should mention image size/format."""
         img = tmp_path / "test.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        img.write_bytes(_TINY_PNG)
 
         api_error = Exception(
             "Error code: 400 - {'type': 'error', 'error': "
