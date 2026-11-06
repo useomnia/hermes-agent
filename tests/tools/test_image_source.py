@@ -511,6 +511,7 @@ class TestSvgNormalization:
 
     @pytest.mark.asyncio
     async def test_svg_rasterized_when_converter_available(self, tmp_path, monkeypatch):
+        from PIL import Image
         from tools import vision_tools as vt
 
         isrc = _reload(monkeypatch, tmp_path / "hermes")
@@ -521,7 +522,7 @@ class TestSvgNormalization:
         )
 
         def fake_rasterize(svg_path, out_path):
-            out_path.write_bytes(PNG)
+            Image.new("RGB", (4, 4)).save(out_path, format="PNG")
             return True
 
         with patch.object(vt, "_rasterize_svg_to_png", side_effect=fake_rasterize):
@@ -530,7 +531,9 @@ class TestSvgNormalization:
             path, mime, err = vt._normalize_to_supported_image(svg, "image/svg+xml")
         assert err is None
         assert mime == "image/png"
-        assert path.read_bytes() == PNG
+        with Image.open(path) as image:
+            image.load()
+            assert image.size == (4, 4)
         path.unlink()
 
     def test_svg_actionable_error_when_no_converter(self, tmp_path, monkeypatch):

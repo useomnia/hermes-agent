@@ -303,6 +303,47 @@ def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
 def _normalize_to_supported_image(
     image_path: Path, detected_mime: str
 ) -> tuple[Optional[Path], Optional[str], Optional[str]]:
+    """Convert if needed, then fully decode every raster frame before admission.
+
+    Header inspection and Pillow's ``verify()`` do not decode pixel data.
+    Supported inputs keep their original bytes, but must pass the same decode
+    gate as converted images before they can enter a provider request/history.
+    """
+    path, mime, error = _convert_to_supported_image(image_path, detected_mime)
+    if error or path is None:
+        return path, mime, error
+    try:
+        _decode_image_for_vision(path)
+    except Exception as exc:
+        if path != image_path:
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
+        return (
+            None,
+            None,
+            f"Image could not be fully decoded: {exc}. Use another image or "
+            "export a valid PNG or JPEG, then retry vision_analyze. "
+            "The image was not attached or sent to a vision provider.",
+        )
+    return path, mime, None
+
+
+def _decode_image_for_vision(image_path: Path) -> None:
+    """Decode sequentially, sharing Pillow's hard pixel ceiling across frames."""
+    from PIL import Image, ImageSequence
+
+    pixels = 0
+    with Image.open(image_path) as image:
+        for frame in ImageSequence.Iterator(image):
+            pixels += frame.width * frame.height
+            if Image.MAX_IMAGE_PIXELS is not None and pixels > 2 * Image.MAX_IMAGE_PIXELS:
+                raise ValueError("image exceeds the decode pixel limit; use fewer frames or a smaller image")
+            frame.load()
+
+
+def _convert_to_supported_image(
+    image_path: Path, detected_mime: str
+) -> tuple[Optional[Path], Optional[str], Optional[str]]:
     """Ensure an image is in a vision-provider-supported format.
 
     Returns a 3-tuple ``(path, mime, error)``:
@@ -982,12 +1023,12 @@ async def _vision_analyze_native(
         await asyncio.to_thread(temp_image_path.write_bytes, resolved.data)
         should_cleanup = True
 
-        # Normalize unsupported formats (SVG, BMP, ...) to PNG BEFORE embedding.
+        # Normalize formats and fully decode raster pixels BEFORE embedding.
         # Anthropic only accepts jpeg/png/gif/webp; an unsupported media_type
         # baked into immutable history wedges the session with a 400 on every
         # resume.  Convert here so it can never enter history. Offloaded — the
         # rasterizers/Pillow are blocking.
-        normalized_path, detected_mime_type, _norm_err = await asyncio.to_thread(
+        normalized_path, detected_mime_type, _norm_err = await _run_encode_on_cpu_executor(
             _normalize_to_supported_image, temp_image_path, detected_mime_type,
         )
         if _norm_err or normalized_path is None:
@@ -1156,10 +1197,9 @@ async def vision_analyze_tool(
         image_size_bytes = len(resolved.data)
         image_size_kb = image_size_bytes / 1024
         logger.info("Image ready (%.1f KB)", image_size_kb)
-        # Normalize unsupported formats (SVG, BMP, ...) to PNG. Vision providers
-        # reject these media types; convert before encoding. Offloaded — the
-        # rasterizers/Pillow are blocking.
-        normalized_path, detected_mime_type, _norm_err = await asyncio.to_thread(
+        # Normalize formats and fully decode raster pixels before encoding.
+        # Rasterization and decoding share the bounded vision CPU executor.
+        normalized_path, detected_mime_type, _norm_err = await _run_encode_on_cpu_executor(
             _normalize_to_supported_image, temp_image_path, detected_mime_type,
         )
         if _norm_err or normalized_path is None:
