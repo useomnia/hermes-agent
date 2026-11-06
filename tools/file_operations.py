@@ -208,6 +208,10 @@ class PatchResult:
     # See :class:`WriteResult.lsp_diagnostics`.
     lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
+    # Internal validation metadata, not part of the serialized tool result.
+    # Only paths whose UPDATE matching failed belong here; valid neighbours
+    # in a rejected multi-file patch must not accumulate recovery failures.
+    match_failure_paths: List[str] = field(default_factory=list)
     
     def to_dict(self) -> dict:
         result = {"success": self.success}
