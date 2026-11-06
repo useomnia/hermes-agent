@@ -441,7 +441,9 @@ class TestVisionDispatchLoopSafety:
 
 
 def _write_fake_image(dest):
-    """Write minimal bytes so vision_analyze_tool thinks download succeeded."""
+    """Write a decodable image for the successful vision dispatch controls."""
+    from PIL import Image
+
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(b"\xff\xd8\xff" + b"\x00" * 16)
+    Image.new("RGB", (2, 2)).save(dest, format="PNG")
     return dest
