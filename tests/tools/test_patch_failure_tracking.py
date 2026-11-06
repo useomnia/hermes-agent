@@ -243,3 +243,189 @@ class TestPatchFailureEscalation:
         assert "failure #" not in hint, (
             f"task_B's hint cross-contaminated from task_A: {hint!r}"
         )
+
+
+def v4a_update(path, hunks="-shared\n+changed"):
+    return f"*** Update File: {path}\n@@\n{hunks}\n"
+
+
+def v4a_call(body, task="v4a-recovery"):
+    from tools.file_tools import _handle_patch
+
+    return json.loads(_handle_patch(
+        {"mode": "patch", "patch": f"*** Begin Patch\n{body}*** End Patch"},
+        task_id=task,
+    ))
+
+
+@pytest.mark.usefixtures("hermes_home", "fresh_tracker")
+class TestV4ARecovery:
+    @pytest.mark.parametrize("mode", ["patch", "replace"])
+    @pytest.mark.parametrize("missing", [False, True])
+    def test_matching_failures_escalate_without_writes(self, tmp_path, mode, missing):
+        from tools.file_tools import _handle_patch
+
+        target = tmp_path / "repeat.txt"
+        original = "first\nshared\nsecond\nshared\n"
+        target.write_text(original)
+        old = "missing" if missing else "shared"
+        for attempt in range(1, 6):
+            if mode == "patch":
+                result = v4a_call(v4a_update(target, f"-{old}\n+changed"))
+            else:
+                result = json.loads(_handle_patch(
+                    {"mode": mode, "path": str(target), "old_string": old,
+                     "new_string": "changed"}, task_id="v4a-recovery",
+                ))
+            assert result["success"] is False
+            assert target.read_text() == original
+            assert "replace_all" not in result["error"]
+            hint = result.get("_hint", "")
+            if mode == "patch":
+                assert "surrounding lines prefixed by a space" in hint
+                assert "bare @@" in hint
+            if attempt < 3:
+                assert "failure #" not in hint
+            else:
+                assert f"failure #{attempt}" in hint
+                assert "Stop retrying" in hint
+            assert "match_failure_paths" not in result
+
+    def test_unique_context_recovers_one_occurrence_and_resets_counter(self, tmp_path):
+        target = tmp_path / "repeat.txt"
+        target.write_text("first\nshared\nsecond\nshared\n")
+        for _ in range(3):
+            assert v4a_call(v4a_update(target))["success"] is False
+        corrected = v4a_call(v4a_update(target, " first\n-shared\n+changed\n second"))
+        assert corrected["success"] is True, corrected
+        assert target.read_text() == "first\nchanged\nsecond\nshared\n"
+        next_failure = v4a_call(v4a_update(target, "-missing\n+changed"))
+        assert next_failure["success"] is False
+        assert "failure #" not in next_failure["_hint"]
+
+    def test_multi_file_validation_counts_only_failing_file_once(self, tmp_path):
+        bad = tmp_path / "bad.txt"
+        good = tmp_path / "good.txt"
+        original = "first\nshared\nsecond\nshared\n"
+        bad.write_text(original)
+        good.write_text("unique\n")
+        bad_hunks = v4a_update(bad) + v4a_update(bad)
+        body = v4a_update(good, "-unique\n+edited") + bad_hunks
+        for attempt in range(1, 4):
+            result = v4a_call(body)
+            assert result["success"] is False
+            assert bad.read_text() == original
+            assert good.read_text() == "unique\n"
+            if attempt == 3:
+                assert "failure #3" in result["_hint"]
+                assert str(bad.resolve()) in result["_hint"]
+                assert str(good.resolve()) not in result["_hint"]
+            else:
+                assert "failure #" not in result["_hint"]
+        # A neighbour that validated successfully has no accumulated failures.
+        neighbour = v4a_call(v4a_update(good, "-missing\n+edited"))
+        assert "failure #" not in neighbour["_hint"]
+        assert v4a_call(v4a_update(good, "-unique\n+edited"))["success"] is True
+        # Its later success does not clear the actual failing target.
+        still_failing = v4a_call(v4a_update(bad))
+        assert "failure #4" in still_failing["_hint"]
+
+    def test_equivalent_paths_share_counts_but_tasks_and_files_do_not(
+        self, tmp_path, monkeypatch
+    ):
+        from tools import terminal_tool
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+        for task in ("v4a-recovery", "other-task"):
+            terminal_tool.record_session_cwd(task, str(tmp_path))
+        target = tmp_path / "repeat.txt"
+        target.write_text("shared\nshared\n")
+        assert "failure #" not in v4a_call(v4a_update("repeat.txt"))["_hint"]
+        assert "failure #" not in v4a_call(v4a_update(target))["_hint"]
+        assert "failure #3" in v4a_call(v4a_update("repeat.txt"))["_hint"]
+        assert "failure #" not in v4a_call(v4a_update(target), "other-task")["_hint"]
+        other = tmp_path / "other" / "repeat.txt"
+        other.parent.mkdir()
+        other.write_text("shared\nshared\n")
+        assert "failure #" not in v4a_call(v4a_update(other))["_hint"]
+        # Success clears only this task's canonical identity.
+        assert v4a_call(v4a_update(target, "-shared\n-shared\n+fixed"))["success"] is True
+        assert "failure #" not in v4a_call(v4a_update("repeat.txt"))["_hint"]
+
+    def test_each_matching_failure_in_multi_file_patch_receives_its_own_count(self, tmp_path):
+        paths = [tmp_path / "first.txt", tmp_path / "second.txt"]
+        for path in paths:
+            path.write_text("shared\nshared\n")
+        body = "".join(v4a_update(path) for path in paths)
+        for _ in range(3):
+            result = v4a_call(body)
+        assert result["_hint"].count("failure #3") == 2
+        for path in paths:
+            assert str(path.resolve()) in result["_hint"]
+            assert path.read_text() == "shared\nshared\n"
+
+    def test_successful_write_fallback_resets_only_its_task_and_file(self, tmp_path, monkeypatch):
+        from tools.file_operations import WriteResult
+        from tools.file_tools import _get_file_ops, _patch_failure_tracker, write_file_tool
+
+        target = tmp_path / "repeat.txt"
+        other = tmp_path / "other.txt"
+        for path in (target, other):
+            path.write_text("shared\nshared\n")
+            for _ in range(3):
+                v4a_call(v4a_update(path))
+        v4a_call(v4a_update(target), "other-task")
+        with monkeypatch.context() as injection:
+            injection.setattr(
+                _get_file_ops("v4a-recovery"), "write_file",
+                lambda *_: WriteResult(error="write refused"),
+            )
+            failed = json.loads(write_file_tool(str(target), "rebuilt\n", task_id="v4a-recovery"))
+        assert failed.get("error") == "write refused"
+        assert _patch_failure_tracker["v4a-recovery"][str(target.resolve())] == 3
+        result = json.loads(write_file_tool(str(target), "rebuilt\n", task_id="v4a-recovery"))
+        assert not result.get("error"), result
+        assert target.read_text() == "rebuilt\n"
+        assert _patch_failure_tracker["v4a-recovery"] == {str(other.resolve()): 3}
+        assert _patch_failure_tracker["other-task"] == {str(target.resolve()): 1}
+        assert "failure #" not in v4a_call(v4a_update(target))["_hint"]
+
+    @pytest.mark.parametrize("hint", ["shared", "absent"])
+    def test_addition_only_matching_failures_have_mode_correct_help(self, tmp_path, hint):
+        target = tmp_path / "repeat.txt"
+        target.write_text("shared\nshared\n")
+        body = f"*** Update File: {target}\n@@ {hint} @@\n+inserted\n"
+        for _ in range(3):
+            result = v4a_call(body)
+        assert result["success"] is False
+        assert "failure #3" in result["_hint"]
+        assert "replace_all" not in json.dumps(result)
+        assert target.read_text() == "shared\nshared\n"
+
+    def test_non_matching_errors_do_not_increment_or_clear_counts(self, tmp_path, monkeypatch):
+        from tools.file_operations import WriteResult
+        from tools.file_tools import _get_file_ops, _patch_failure_tracker
+
+        target = tmp_path / "repeat.txt"
+        target.write_text("shared\nshared\n")
+        v4a_call(v4a_update(target))
+        with monkeypatch.context() as injection:
+            injection.setattr(
+                _get_file_ops("v4a-recovery"), "write_file",
+                lambda *_: WriteResult(error="Toolbox HTTP 502"),
+            )
+            apply_error = v4a_call(v4a_update(target, "-shared\n-shared\n+changed"))
+        assert "Apply phase failed" in apply_error["error"]
+        assert "Toolbox HTTP 502" in apply_error["error"]
+        assert "_hint" not in apply_error
+        assert target.read_text() == "shared\nshared\n"
+        no_op = v4a_call(v4a_update(target, "-shared\n+shared"))
+        assert "no changes" in no_op["error"]
+        assert "_hint" not in no_op
+        missing_file = v4a_call(v4a_update(tmp_path / "not-there.txt"))
+        assert missing_file["success"] is False
+        assert _patch_failure_tracker["v4a-recovery"] == {str(target.resolve()): 1}
+        assert "failure #" not in v4a_call(v4a_update(target))["_hint"]
+        assert "failure #3" in v4a_call(v4a_update(target))["_hint"]
