@@ -832,6 +832,48 @@ def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
         for rp in resolved_paths:
             task_failures.pop(rp, None)
 
+
+def _patch_recovery_hint(task_id: str, mode: str, paths: list[str], error: str) -> str | None:
+    """Count each failed matching target once and explain recovery in its mode."""
+    failures = [
+        (path, _record_patch_failure(task_id, path))
+        for path in dict.fromkeys(paths)
+    ]
+    if not failures:
+        return None
+    repeated = [(path, count) for path, count in failures if count >= 3]
+    escalation = " ".join(
+        f"This is failure #{count} patching {path!r}." for path, count in repeated
+    )
+    if mode == "patch":
+        guidance = (
+            "Use read_file to read the failing file fresh. Rebuild the failing "
+            "hunk with unchanged surrounding lines prefixed by a space, so the "
+            "whole hunk matches exactly one location. A bare @@ does not select "
+            "an occurrence."
+        )
+        if repeated:
+            return (
+                f"{escalation} Stop retrying the same failing hunk. "
+                f"{guidance} Split the edit into smaller uniquely anchored hunks "
+                "if needed, then verify the resulting file."
+            )
+        return guidance
+    if repeated:
+        return (
+            f"{escalation} Stop retrying with variations of the same old_string. "
+            "Either: (1) re-read the file fresh to verify current content, "
+            "(2) use a longer / more unique old_string with surrounding context "
+            "lines, or (3) use write_file to replace the entire file if the "
+            "targeted region is hard to anchor."
+        )
+    if "Did you mean one of these sections?" in error:
+        return None
+    return (
+        "Use read_file to verify the current content, or search_files to locate "
+        "the text. Include enough surrounding context to match one location."
+    )
+
 # Per-task bounds for the containers inside each _read_tracker[task_id].
 # A CLI session uses one stable task_id for its lifetime; without these
 # caps, a 10k-read session would accumulate ~1.5MB of dict/set state that
@@ -1705,6 +1747,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _update_read_timestamp(path, task_id)
             if not result_dict.get("error"):
                 file_state.note_write(task_id, _resolved)
+                _reset_patch_failures(task_id, [_resolved])
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):
@@ -1841,41 +1884,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 _reset_patch_failures(task_id, [
                     _r for _r in (_path_to_resolved.get(_p) for _p in _paths_to_check) if _r
                 ])
-        # Hint when old_string not found — saves iterations where the agent
-        # retries with stale content instead of re-reading the file.
-        # Suppressed when patch_replace already attached a rich "Did you mean?"
-        # snippet (which is strictly more useful than the generic hint).
-        if result_dict.get("error") and "Could not find" in str(result_dict["error"]):
-            # Track per-file consecutive failures for replace mode.  The
-            # ``path`` arg only exists for replace mode; for V4A patches
-            # we'd need to walk the headers, but in practice V4A failures
-            # are far rarer and the existing _hint covers them adequately.
-            failure_count = 0
-            if mode == "replace" and path:
-                resolved = _path_to_resolved.get(path) or path
-                failure_count = _record_patch_failure(task_id, resolved)
-
-            if failure_count >= 3:
-                # Escalating hint after multiple consecutive failures on the
-                # same path.  Most common cause is a stale view of the file —
-                # the model is retrying with the same old_string against
-                # content that has since changed.  Surface the failure count
-                # so the model recognises it's in a loop and breaks out by
-                # re-reading or falling back to write_file.
-                result_dict["_hint"] = (
-                    f"This is failure #{failure_count} patching {path!r}. "
-                    "Stop retrying with variations of the same old_string. "
-                    "Either: (1) re-read the file fresh to verify current "
-                    "content, (2) use a longer / more unique old_string with "
-                    "surrounding context lines, or (3) use write_file to "
-                    "replace the entire file if the targeted region is hard "
-                    "to anchor."
-                )
-            elif "Did you mean one of these sections?" not in str(result_dict["error"]):
-                result_dict["_hint"] = (
-                    "old_string not found. Use read_file to verify the current "
-                    "content, or search_files to locate the text."
-                )
+            elif result_dict.get("error"):
+                error = str(result_dict["error"])
+                matching_paths = result.match_failure_paths
+                if mode == "replace" and path and (
+                    "Could not find" in error or "matches for old_string" in error
+                ):
+                    matching_paths = [_path_to_resolved[path]]
+                hint = _patch_recovery_hint(task_id, mode, matching_paths, error)
+                if hint:
+                    result_dict["_hint"] = hint
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         return tool_error(str(e))

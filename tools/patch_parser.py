@@ -244,11 +244,11 @@ def _count_occurrences(text: str, pattern: str) -> int:
 def _validate_operations(
     operations: List[PatchOperation],
     file_ops: Any,
-) -> List[str]:
+) -> Tuple[List[str], List[str]]:
     """Validate all operations without writing any files.
 
-    Returns a list of error strings; an empty list means all operations
-    are valid and the apply phase can proceed safely.
+    Returns error strings and the paths whose hunk matching failed. An empty
+    error list means all operations are valid and application can proceed.
 
     For UPDATE operations, hunks are simulated in order so that later
     hunks validate against post-earlier-hunk content (matching apply order).
@@ -257,6 +257,7 @@ def _validate_operations(
     from tools.fuzzy_match import fuzzy_find_and_replace
 
     errors: List[str] = []
+    match_failure_paths: List[str] = []
     real_change_count = 0
 
     for op in operations:
@@ -282,11 +283,13 @@ def _validate_operations(
                     if hunk.context_hint:
                         occurrences = _count_occurrences(simulated, hunk.context_hint)
                         if occurrences == 0:
+                            match_failure_paths.append(op.file_path)
                             errors.append(
                                 f"{op.file_path}: addition-only hunk context hint "
                                 f"'{hunk.context_hint}' not found"
                             )
                         elif occurrences > 1:
+                            match_failure_paths.append(op.file_path)
                             errors.append(
                                 f"{op.file_path}: addition-only hunk context hint "
                                 f"'{hunk.context_hint}' is ambiguous "
@@ -301,6 +304,7 @@ def _validate_operations(
                     simulated, search_pattern, replacement, replace_all=False
                 )
                 if count == 0:
+                    match_failure_paths.append(op.file_path)
                     label = f"'{hunk.context_hint}'" if hunk.context_hint else "(no hint)"
                     msg = (
                         f"{op.file_path}: hunk {hunk_index} {label} not found"
@@ -340,7 +344,7 @@ def _validate_operations(
     if not errors and real_change_count == 0:
         errors.append("Patch contains no changes (all hunks are unchanged)")
 
-    return errors
+    return errors, list(dict.fromkeys(match_failure_paths))
 
 
 def apply_v4a_operations(operations: List[PatchOperation],
@@ -365,12 +369,13 @@ def apply_v4a_operations(operations: List[PatchOperation],
     from tools.file_operations import PatchResult
 
     # ---- Phase 1: validate ----
-    validation_errors = _validate_operations(operations, file_ops)
+    validation_errors, match_failure_paths = _validate_operations(operations, file_ops)
     if validation_errors:
         return PatchResult(
             success=False,
             error="Patch validation failed (no files were modified):\n"
                   + "\n".join(f"  • {e}" for e in validation_errors),
+            match_failure_paths=match_failure_paths,
         )
 
     # ---- Phase 2: apply ----
