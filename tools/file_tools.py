@@ -854,7 +854,7 @@ def _patch_recovery_hint(task_id: str, mode: str, paths: list[str], error: str) 
         )
         if repeated:
             return (
-                f"{escalation} Stop retrying the same ambiguous or missing hunk. "
+                f"{escalation} Stop retrying the same failing hunk. "
                 f"{guidance} Split the edit into smaller uniquely anchored hunks "
                 "if needed, then verify the resulting file."
             )
