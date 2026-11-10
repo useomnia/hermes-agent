@@ -779,6 +779,36 @@ class TestToolHandler:
             clear_session_vars(tokens)
             _servers.pop("test_srv", None)
 
+    @pytest.mark.parametrize("turn_id,conversation_id,expected", [
+        ("turn-a", "conversation-a", {"omnia/originTurnId": "turn-a", "omnia/originConversationId": "conversation-a"}),
+        ("", "conversation-a", {"omnia/originConversationId": "conversation-a"}),
+        ("turn-a", "", {"omnia/originTurnId": "turn-a"}),
+        ("", "", None),
+    ])
+    def test_call_carries_origin_metadata_through_worker_context(self, turn_id, conversation_id, expected):
+        from concurrent.futures import ThreadPoolExecutor
+        from gateway.session_context import clear_session_vars, get_session_env, set_session_vars
+        from tools.mcp_tool import _make_tool_handler, _servers
+        from tools.thread_context import propagate_context_to_thread
+
+        session = MagicMock()
+        session.call_tool = AsyncMock(return_value=_make_call_result('{"data":42}', is_error=False))
+        _servers["origin_meta"] = _make_mock_server("origin_meta", session=session)
+        tokens = set_session_vars(origin_turn_id=turn_id, origin_conversation_id=conversation_id)
+        try:
+            handler = _make_tool_handler("origin_meta", "read", 120)
+            with self._patch_mcp_loop(), ThreadPoolExecutor(max_workers=1) as executor:
+                result = executor.submit(propagate_context_to_thread(lambda: handler({}))).result()
+            assert json.loads(json.loads(result)["result"]) == {"data": 42}
+            kwargs = {"arguments": {}}
+            if expected:
+                kwargs["meta"] = expected
+            session.call_tool.assert_awaited_once_with("read", **kwargs)
+        finally:
+            clear_session_vars(tokens)
+            _servers.pop("origin_meta", None)
+        assert get_session_env("HERMES_ORIGIN_CONVERSATION_ID", "") == ""
+
     def test_successful_call_omits_meta_when_origin_turn_id_is_missing(self, monkeypatch):
         from gateway.session_context import clear_session_vars, set_session_vars
         from tools.mcp_tool import _make_tool_handler, _servers

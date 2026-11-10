@@ -5215,6 +5215,21 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
+def _origin_call_metadata() -> dict[str, str]:
+    """Snapshot product origin ids before crossing onto the MCP event loop."""
+    from gateway.session_context import get_session_env
+
+    fields = {
+        "omnia/originTurnId": "HERMES_ORIGIN_TURN_ID",
+        "omnia/originConversationId": "HERMES_ORIGIN_CONVERSATION_ID",
+    }
+    return {
+        key: value
+        for key, variable in fields.items()
+        if (value := get_session_env(variable, "") or "")
+    }
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -5223,9 +5238,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
-        from gateway.session_context import get_session_env
-
-        origin_turn_id = get_session_env("HERMES_ORIGIN_TURN_ID", "") or ""
+        origin_meta = _origin_call_metadata()
 
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
@@ -5332,10 +5345,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     server._pending_call_context = contextvars.copy_context()
                 try:
                     call_kwargs = {"arguments": args}
-                    if origin_turn_id:
-                        call_kwargs["meta"] = {
-                            "omnia/originTurnId": origin_turn_id,
-                        }
+                    if origin_meta:
+                        call_kwargs["meta"] = origin_meta
                     session = server.session
                     guard_state = getattr(server, "_http_tool_call_guard", None)
                     guarded_session, guard = guard_state if isinstance(guard_state, tuple) else (None, None)
