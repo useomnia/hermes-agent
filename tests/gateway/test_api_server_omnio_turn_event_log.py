@@ -4355,7 +4355,7 @@ async def test_notify_memory_updated_swallows_transport_errors() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("conversation_id", [None, "conversation-a", " conversation-a "])
+@pytest.mark.parametrize("conversation_id", [None, "conversation-a", " conversation-a ", "c" * 255])
 async def test_runs_bind_product_conversation_context(conversation_id) -> None:
     from gateway.session_context import get_session_env
     from tools.thread_context import propagate_context_to_thread
