@@ -80,41 +80,60 @@ def test_export_snippet_shape():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
-def test_shared_snapshot_no_cross_session_leak(tmp_path):
+@pytest.mark.parametrize("next_conversation_id", ["CONVBBB", ""])
+def test_shared_snapshot_no_cross_session_leak(tmp_path, next_conversation_id):
     import threading
 
     from gateway.session_context import _VAR_MAP, _UNSET, set_session_vars
     from tools.environments.local import LocalEnvironment
 
     env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
-    env.init_session()
     try:
-        def run_as(sid):
+        def run_as(sid, conversation_id, *, initialize=False):
             out = {}
 
             def worker():
                 for v in _VAR_MAP.values():
                     v.set(_UNSET)
-                set_session_vars(session_key="k" + sid, session_id=sid, source="desktop")
-                out["r"] = env.execute('echo "[$HERMES_SESSION_ID]"')
+                set_session_vars(
+                    session_key="k" + sid, session_id=sid, source="desktop",
+                    origin_turn_id="turn-" + sid,
+                    origin_conversation_id=conversation_id,
+                )
+                if initialize:
+                    env.init_session()
+                    with open(env._snapshot_path, encoding="utf-8") as snapshot:
+                        out["bootstrap"] = snapshot.read()
+                out["r"] = env.execute(
+                    'printf "[%s][%s][%s]\\n" "$HERMES_SESSION_ID" '
+                    '"$HERMES_ORIGIN_TURN_ID" "$HERMES_ORIGIN_CONVERSATION_ID"'
+                )
 
             t = threading.Thread(target=worker)
             t.start()
             t.join()
-            return out["r"].get("output", "")
+            return out
 
-        out_a = run_as("SIDAAA")
-        out_b = run_as("SIDBBB")
+        result_a = run_as("SIDAAA", "CONVAAA", initialize=True)
+        result_b = run_as("SIDBBB", next_conversation_id)
+        out_a = result_a["r"].get("output", "")
+        out_b = result_b["r"].get("output", "")
 
-        assert "SIDAAA" in out_a, f"session A saw {out_a!r}"
+        assert "[SIDAAA][turn-SIDAAA][CONVAAA]" in out_a
         # The core assertion: B must see its OWN id, not A's leaked via snapshot.
-        assert "SIDBBB" in out_b, f"session B saw {out_b!r}"
+        assert f"[SIDBBB][turn-SIDBBB][{next_conversation_id}]" in out_b
         assert "SIDAAA" not in out_b, f"session B leaked A's id: {out_b!r}"
+        assert "CONVAAA" not in out_b, f"session B leaked A's conversation: {out_b!r}"
 
-        # And the snapshot file must not carry the session id at all.
+        for name in ("HERMES_SESSION_ID", "HERMES_ORIGIN_TURN_ID", "HERMES_ORIGIN_CONVERSATION_ID"):
+            assert name not in result_a["bootstrap"]
+
+        # The refreshed snapshot must not carry the session identity either.
         snap = env._snapshot_path
         if os.path.exists(snap):
-            with open(snap) as f:
-                assert "HERMES_SESSION_ID" not in f.read()
+            with open(snap, encoding="utf-8") as f:
+                snapshot = f.read()
+            for name in ("HERMES_SESSION_ID", "HERMES_ORIGIN_TURN_ID", "HERMES_ORIGIN_CONVERSATION_ID"):
+                assert name not in snapshot
     finally:
         env.cleanup()
