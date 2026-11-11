@@ -4352,3 +4352,60 @@ async def test_notify_memory_updated_swallows_transport_errors() -> None:
     await api_server_module._notify_memory_updated(
         "http://127.0.0.1:1/unreachable", {"run_id": "r"}
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conversation_id", [None, "conversation-a", " conversation-a ", "c" * 255])
+async def test_runs_bind_product_conversation_context(conversation_id) -> None:
+    from gateway.session_context import get_session_env
+    from tools.thread_context import propagate_context_to_thread
+    from concurrent.futures import ThreadPoolExecutor
+
+    adapter = _make_adapter()
+    captured = []
+
+    def run(**_kwargs):
+        def read_context():
+            return (
+                get_session_env("HERMES_ORIGIN_TURN_ID", ""),
+                get_session_env("HERMES_ORIGIN_CONVERSATION_ID", ""),
+            )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            captured.append(executor.submit(propagate_context_to_thread(read_context)).result())
+        return {"final_response": "done", "messages": []}
+
+    body = {"input": "read", "turn_id": "turn-a", "session_id": "hermes-session"}
+    if conversation_id is not None:
+        body["conversation_id"] = conversation_id
+    with patch.object(adapter, "_create_agent", return_value=_agent(run)):
+        response, _ = await _run_without_http_server(adapter, body)
+    assert response.status == 202
+    assert captured == [("turn-a", (conversation_id or "").strip())]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conversation_id", ["", "  ", 42, {}, "c" * 256])
+async def test_runs_reject_invalid_product_conversation(conversation_id) -> None:
+    adapter = _make_adapter()
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        response = await client.post("/v1/runs", json={"input": "read", "conversation_id": conversation_id})
+        assert response.status == 400
+        assert (await response.json())["error"]["code"] == "invalid_conversation_id"
+
+
+def test_product_conversation_context_is_isolated_between_workers() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from gateway.session_context import clear_session_vars, get_session_env, set_session_vars
+
+    barrier = threading.Barrier(2)
+    def read(conversation):
+        tokens = set_session_vars(origin_conversation_id=conversation)
+        try:
+            barrier.wait(timeout=3)
+            return get_session_env("HERMES_ORIGIN_CONVERSATION_ID", "")
+        finally:
+            clear_session_vars(tokens)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        a = executor.submit(read, "conversation-a")
+        b = executor.submit(read, "conversation-b")
+        assert (a.result(), b.result()) == ("conversation-a", "conversation-b")

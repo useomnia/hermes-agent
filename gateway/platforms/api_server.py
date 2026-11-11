@@ -7259,6 +7259,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: str = "",
         profile: str = "",
         origin_turn_id: str = "",
+        origin_conversation_id: str = "",
         interaction_policy: str = "allow",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
@@ -7293,6 +7294,7 @@ class APIServerAdapter(BasePlatformAdapter):
             profile=profile,
             async_delivery=interaction_policy != "forbid",
             origin_turn_id=origin_turn_id,
+            origin_conversation_id=origin_conversation_id,
             interaction_policy=interaction_policy,
         )
 
@@ -8515,6 +8517,19 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         previous_response_id = body.get("previous_response_id")
         explicit_session_id = body.get("session_id")
+        conversation_id = body.get("conversation_id")
+        if conversation_id is not None:
+            if not isinstance(conversation_id, str) or not conversation_id.strip():
+                return web.json_response(
+                    _openai_error("conversation_id must be a non-empty string", code="invalid_conversation_id"),
+                    status=400,
+                )
+            conversation_id = conversation_id.strip()
+            if len(conversation_id) > 255:
+                return web.json_response(
+                    _openai_error("conversation_id is too long", code="invalid_conversation_id"),
+                    status=400,
+                )
         turn_id = body.get("turn_id")
         if turn_id is not None:
             if not isinstance(turn_id, str) or not turn_id.strip():
@@ -9571,6 +9586,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_id=session_id or "",
                                 profile=request_profile or "",
                                 origin_turn_id=str(turn_id) if turn_id else "",
+                                origin_conversation_id=conversation_id or "",
                                 interaction_policy=interaction_policy,
                             )
                             if not interaction_forbidden:

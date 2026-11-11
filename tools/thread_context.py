@@ -118,3 +118,17 @@ def propagate_context_to_thread(target: Callable) -> Callable:
         return ctx.run(_inner)
 
     return _runner
+
+
+def propagate_origin_context_to_thread(target: Callable) -> Callable:
+    """Capture only product origin IDs for a worker with its own session policy."""
+    from gateway.session_context import bound_origin_context, get_session_env
+
+    turn_id = get_session_env("HERMES_ORIGIN_TURN_ID", "") or ""
+    conversation_id = get_session_env("HERMES_ORIGIN_CONVERSATION_ID", "") or ""
+
+    def _runner(*args, **kwargs):
+        with bound_origin_context(turn_id, conversation_id):
+            return target(*args, **kwargs)
+
+    return _runner

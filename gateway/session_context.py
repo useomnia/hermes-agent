@@ -103,6 +103,7 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # the async wake can be redirected (via ``OMNIO_WAKE_HOOK``) into a real
 # product turn instead of the raw self-post — see gateway/wake.py.
 _SESSION_ORIGIN_TURN_ID: ContextVar = ContextVar("HERMES_ORIGIN_TURN_ID", default=_UNSET)
+_SESSION_ORIGIN_CONVERSATION_ID: ContextVar = ContextVar("HERMES_ORIGIN_CONVERSATION_ID", default=_UNSET)
 
 # Whether this run permits interaction with a live user. Request-scoped state
 # prevents concurrent API runs from changing one another's behavior.
@@ -166,6 +167,7 @@ _VAR_MAP = {
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
     "HERMES_ORIGIN_TURN_ID": _SESSION_ORIGIN_TURN_ID,
+    "HERMES_ORIGIN_CONVERSATION_ID": _SESSION_ORIGIN_CONVERSATION_ID,
     "HERMES_INTERACTION_POLICY": _SESSION_INTERACTION_POLICY,
     "HERMES_DELEGATION_SYNC_ONLY": _SESSION_DELEGATION_SYNC_ONLY,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
@@ -206,6 +208,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     origin_turn_id: str = "",
+    origin_conversation_id: str = "",
     interaction_policy: str = "allow",
 ) -> list:
     """Set all session context variables and return reset tokens.
@@ -226,6 +229,9 @@ def set_session_vars(
     ``origin_turn_id`` is the Omnio product turn id (``turn_id`` on
     ``POST /v1/runs``), when the caller has one. Empty on any non-Omnio
     entry point.
+
+    ``origin_conversation_id`` is caller-reported product correlation metadata,
+    independent of the Hermes session id and never used for authorization.
 
     ``interaction_policy`` describes whether this run may ask a live user for
     input or approval. ``forbid`` also forces background delegation onto its
@@ -252,6 +258,7 @@ def set_session_vars(
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
         _SESSION_ORIGIN_TURN_ID.set(origin_turn_id),
+        _SESSION_ORIGIN_CONVERSATION_ID.set(origin_conversation_id),
         _SESSION_INTERACTION_POLICY.set(interaction_policy),
         _SESSION_DELEGATION_SYNC_ONLY.set(
             "1" if interaction_policy == "forbid" else ""
@@ -292,6 +299,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
         _SESSION_ORIGIN_TURN_ID,
+        _SESSION_ORIGIN_CONVERSATION_ID,
         _SESSION_INTERACTION_POLICY,
         _SESSION_DELEGATION_SYNC_ONLY,
     ):
@@ -394,6 +402,18 @@ def current_session_id() -> str | None:
     if value is _UNSET or not isinstance(value, str) or not value:
         return None
     return value
+
+
+@contextmanager
+def bound_origin_context(origin_turn_id: str, origin_conversation_id: str) -> Iterator[None]:
+    """Bind product correlation IDs without changing session or approval state."""
+    turn_token = _SESSION_ORIGIN_TURN_ID.set(origin_turn_id)
+    conversation_token = _SESSION_ORIGIN_CONVERSATION_ID.set(origin_conversation_id)
+    try:
+        yield
+    finally:
+        _SESSION_ORIGIN_CONVERSATION_ID.reset(conversation_token)
+        _SESSION_ORIGIN_TURN_ID.reset(turn_token)
 
 
 @contextmanager
