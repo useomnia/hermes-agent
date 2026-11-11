@@ -405,6 +405,18 @@ def current_session_id() -> str | None:
 
 
 @contextmanager
+def bound_origin_context(origin_turn_id: str, origin_conversation_id: str) -> Iterator[None]:
+    """Bind product correlation IDs without changing session or approval state."""
+    turn_token = _SESSION_ORIGIN_TURN_ID.set(origin_turn_id)
+    conversation_token = _SESSION_ORIGIN_CONVERSATION_ID.set(origin_conversation_id)
+    try:
+        yield
+    finally:
+        _SESSION_ORIGIN_CONVERSATION_ID.reset(conversation_token)
+        _SESSION_ORIGIN_TURN_ID.reset(turn_token)
+
+
+@contextmanager
 def bound_session_id(session_id: str | None) -> Iterator[None]:
     """Bind ``session_id`` as the calling session for this context only.
 

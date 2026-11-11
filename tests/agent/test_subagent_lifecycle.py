@@ -29,6 +29,35 @@ class FakeChild:
         self.interrupted = True
 
 
+def test_plugin_lifecycle_should_retain_origin_in_child_execution(monkeypatch):
+    import gateway.session_context as context
+    from tools.mcp_tool import _origin_call_metadata
+
+    parent = SimpleNamespace(session_id="plugin-parent", enabled_toolsets=["file"])
+    child = FakeChild("sa-origin-plugin")
+    child.session_id = "plugin-child"
+    observed = []
+
+    def run(**_kwargs):
+        observed.append((_origin_call_metadata(), context.current_session_id()))
+        return {"final_response": "done", "completed": True, "api_calls": 1, "messages": []}
+
+    child.run_conversation = run
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda **_kwargs: child)
+    saved = {var: var.get() for var in context._VAR_MAP.values()}
+    try:
+        context.set_session_vars(origin_turn_id="plugin-turn", origin_conversation_id="plugin-conversation")
+        service = SubagentLifecycleService(lambda: parent)
+        handle = service.launch(SubagentLaunchRequest(goal="read", allowed_toolsets=("file",)))
+        assert service.wait(handle, timeout_seconds=5).state is SubagentState.SUCCEEDED
+        assert observed == [({
+            "omnia/originTurnId": "plugin-turn", "omnia/originConversationId": "plugin-conversation",
+        }, "plugin-child")]
+    finally:
+        for var, value in saved.items():
+            var.set(value)
+
+
 @pytest.fixture
 def lifecycle(monkeypatch):
     parent = SimpleNamespace(session_id="parent-1", enabled_toolsets=["file"])

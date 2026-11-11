@@ -15,7 +15,10 @@ import threading
 import time
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, call, patch
+
+import pytest
 
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
@@ -36,6 +39,214 @@ from tools.delegate_tool import (
     _resolve_delegation_credentials,
     _inherit_parent_base_url,
 )
+
+
+@pytest.fixture
+def origin_delegation(monkeypatch):
+    import gateway.session_context as context
+    import tools.delegate_tool as delegation
+    import tools.mcp_tool as mcp
+    from tools.process_registry import process_registry
+    from tools.terminal_tool import _get_approval_callback, set_approval_callback
+
+    saved = {var: var.get() for var in context._VAR_MAP.values()}
+    saved_async = context._SESSION_ASYNC_DELIVERY.get()
+    saved_engaged = context._session_context_engaged
+    saved_callback = _get_approval_callback()
+    calls, observations, responses = [], [], []
+    config = {"max_concurrent_children": 2, "max_spawn_depth": 3}
+    hook = [None]
+    parent = _make_mock_parent()
+    parent.session_id = "parent-session"
+    parent._interrupt_requested = False
+    parent.enabled_toolsets = ["file"]
+    monkeypatch.setattr(delegation, "_load_config", lambda: config)
+    monkeypatch.setattr(delegation, "_resolve_delegation_credentials", lambda *_: {
+        "model": "test", "provider": None, "base_url": None,
+        "api_key": None, "api_mode": None, "command": None, "args": None,
+    })
+
+    async def call_tool(name, **kwargs):
+        calls.append({"name": name, **kwargs})
+        return types.SimpleNamespace(
+            content=[types.SimpleNamespace(text='{"data":42}')], isError=False,
+        )
+
+    mcp._ensure_mcp_loop()
+    server = mcp.MCPServerTask("delegation-origin")
+    server.session = types.SimpleNamespace(call_tool=call_tool)
+    monkeypatch.setitem(mcp._servers, "delegation-origin", server)
+    handler = mcp._make_tool_handler("delegation-origin", "read", 10)
+
+    def build(**kwargs):
+        child = _make_role_mock_child()
+        child.session_id = "child-" + kwargs["goal"]
+        child._subagent_id = "sa-" + kwargs["goal"]
+        child._delegate_depth = parent._delegate_depth + 1
+        child._delegate_role = kwargs.get("role", "leaf")
+        child.tool_progress_callback = None
+        child.session_estimated_cost_usd = 0.0
+        context._SESSION_ID.set(child.session_id)
+
+        def run(user_message, **_kwargs):
+            if hook[0] is not None:
+                hook[0](child, user_message)
+            observations.append({
+                "goal": user_message,
+                "session": context.current_session_id(),
+                "approval": _get_approval_callback(),
+                "approval_session": context.get_session_env("HERMES_SESSION_KEY", ""),
+            })
+            responses.append(json.loads(handler({"goal": user_message})))
+            return {"final_response": "done", "completed": True, "api_calls": 1, "messages": []}
+
+        child.run_conversation.side_effect = run
+        return child
+
+    monkeypatch.setattr(delegation, "_build_child_preserving_parent_tools", build)
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    context.set_session_vars(
+        platform="api_server", chat_id="parent-session", session_id="parent-session",
+        session_key="parent-approval-session", origin_turn_id="turn-a",
+        origin_conversation_id="conversation-a",
+    )
+    try:
+        yield types.SimpleNamespace(
+            parent=parent, calls=calls, observations=observations, responses=responses,
+            config=config, hook=hook, queue=process_registry.completion_queue,
+        )
+    finally:
+        for var, value in saved.items():
+            var.set(value)
+        context._SESSION_ASYNC_DELIVERY.set(saved_async)
+        context._session_context_engaged = saved_engaged
+        set_approval_callback(saved_callback)
+
+
+@pytest.mark.parametrize(("background", "task_count"), [(False, 1), (False, 2), (True, 1), (True, 2)])
+def test_should_retain_origin_ids_in_delegated_mcp_calls(origin_delegation, background, task_count):
+    fixture = origin_delegation
+    result = json.loads(delegate_task(
+        tasks=[{"goal": f"read-{index}"} for index in range(task_count)],
+        parent_agent=fixture.parent, background=background,
+    ))
+    if background:
+        assert fixture.queue.get(timeout=5)["type"] == "async_delegation"
+    else:
+        assert all(entry["status"] == "completed" for entry in result["results"])
+    assert len(fixture.calls) == task_count
+    assert all(call["meta"] == {
+        "omnia/originTurnId": "turn-a", "omnia/originConversationId": "conversation-a",
+    } for call in fixture.calls)
+
+
+def test_should_keep_child_session_identity_when_origin_ids_are_present(origin_delegation):
+    fixture = origin_delegation
+    delegate_task(tasks=[{"goal": "read-0"}, {"goal": "read-1"}], parent_agent=fixture.parent)
+    assert {item["session"] for item in fixture.observations} == {"child-read-0", "child-read-1"}
+    assert all(item["approval_session"] == "" for item in fixture.observations)
+
+
+@pytest.mark.parametrize("auto_approve", [False, True])
+def test_should_preserve_child_approval_policy_when_parent_is_interactive(origin_delegation, auto_approve):
+    from tools.delegate_tool import _subagent_auto_approve, _subagent_auto_deny
+    from tools.terminal_tool import set_approval_callback
+
+    fixture = origin_delegation
+    fixture.config["subagent_auto_approve"] = auto_approve
+    set_approval_callback(lambda *_args, **_kwargs: "parent-interactive")
+    delegate_task(goal="read", parent_agent=fixture.parent)
+    assert fixture.observations[0]["approval"] is (
+        _subagent_auto_approve if auto_approve else _subagent_auto_deny
+    )
+
+
+@pytest.mark.parametrize(("turn", "conversation"), [("", ""), ("turn-only", ""), ("", "conversation-only")])
+def test_should_omit_absent_origin_ids_for_legacy_delegation(origin_delegation, turn, conversation):
+    from gateway.session_context import set_session_vars
+
+    fixture = origin_delegation
+    set_session_vars(origin_turn_id=turn, origin_conversation_id=conversation)
+    delegate_task(goal="read", parent_agent=fixture.parent)
+    expected = {}
+    if turn:
+        expected["omnia/originTurnId"] = turn
+    if conversation:
+        expected["omnia/originConversationId"] = conversation
+    assert fixture.calls[0].get("meta", {}) == expected
+
+
+def test_should_isolate_origin_ids_between_overlapping_delegations(origin_delegation):
+    from gateway.session_context import set_session_vars
+
+    fixture = origin_delegation
+    barrier = threading.Barrier(2)
+    fixture.hook[0] = lambda *_: barrier.wait(timeout=5)
+
+    def run(ident):
+        set_session_vars(origin_turn_id="turn-" + ident, origin_conversation_id="conversation-" + ident)
+        return json.loads(delegate_task(goal=ident, parent_agent=fixture.parent))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = executor.submit(run, "a"), executor.submit(run, "b")
+        assert first.result()["results"][0]["status"] == "completed"
+        assert second.result()["results"][0]["status"] == "completed"
+    assert {call["arguments"]["goal"]: call.get("meta") for call in fixture.calls} == {
+        ident: {"omnia/originTurnId": "turn-" + ident, "omnia/originConversationId": "conversation-" + ident}
+        for ident in ("a", "b")
+    }
+
+
+def test_should_keep_detached_origin_after_parent_context_is_cleared(origin_delegation):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    fixture = origin_delegation
+    entered, release = threading.Event(), threading.Event()
+
+    def wait_for_parent(*_):
+        entered.set()
+        assert release.wait(timeout=5)
+
+    fixture.hook[0] = wait_for_parent
+    delegate_task(goal="detached", parent_agent=fixture.parent, background=True)
+    try:
+        assert entered.wait(timeout=5)
+        clear_session_vars([])
+        set_session_vars(origin_turn_id="turn-b", origin_conversation_id="conversation-b")
+    finally:
+        release.set()
+    assert fixture.queue.get(timeout=5)["type"] == "async_delegation"
+    assert fixture.calls[0]["meta"] == {
+        "omnia/originTurnId": "turn-a", "omnia/originConversationId": "conversation-a",
+    }
+
+
+def test_should_retain_root_origin_in_nested_delegation(origin_delegation):
+    fixture = origin_delegation
+
+    def spawn_grandchild(child, goal):
+        if goal == "orchestrator":
+            child._delegate_depth = 1
+            child._interrupt_requested = False
+            child._active_children = []
+            child._active_children_lock = threading.Lock()
+            result = json.loads(delegate_task(goal="grandchild", parent_agent=child))
+            assert result["results"][0]["status"] == "completed"
+
+    fixture.hook[0] = spawn_grandchild
+    delegate_task(goal="orchestrator", role="orchestrator", parent_agent=fixture.parent)
+    assert len(fixture.calls) == 2
+    assert all(call.get("meta") == {
+        "omnia/originTurnId": "turn-a", "omnia/originConversationId": "conversation-a",
+    } for call in fixture.calls)
+
+
+def test_should_preserve_delegated_mcp_arguments_and_result(origin_delegation):
+    fixture = origin_delegation
+    delegate_task(goal="read", parent_agent=fixture.parent)
+    assert fixture.calls[0]["arguments"] == {"goal": "read"}
+    assert json.loads(fixture.responses[0]["result"]) == {"data": 42}
 
 
 def _make_mock_parent(depth=0):

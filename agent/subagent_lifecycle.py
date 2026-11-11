@@ -255,7 +255,11 @@ class SubagentLifecycleService:
             _REGISTRY.records[subagent_id] = record
             if request.correlation_id:
                 _REGISTRY.correlations[correlation_key] = subagent_id
-        record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+        from tools.thread_context import propagate_origin_context_to_thread
+
+        record.future = _EXECUTOR.submit(
+            propagate_origin_context_to_thread(self._run), record, request.goal, parent
+        )
         return handle
 
     def status(self, handle: SubagentHandle) -> SubagentStatus:

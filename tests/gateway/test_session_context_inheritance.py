@@ -43,6 +43,45 @@ from tools.environments.local import _make_run_env
 
 SESSION_VARS = list(_VAR_MAP.keys())
 
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_origin_worker_should_restore_existing_context_after_exit(raises):
+    from concurrent.futures import ThreadPoolExecutor
+    from gateway.session_context import current_session_id, get_session_env
+    from tools.thread_context import propagate_origin_context_to_thread
+
+    observed = []
+
+    def observe():
+        observed.append((
+            get_session_env("HERMES_ORIGIN_TURN_ID"),
+            get_session_env("HERMES_ORIGIN_CONVERSATION_ID"),
+            current_session_id(),
+            get_session_env("HERMES_SESSION_KEY"),
+        ))
+        if raises:
+            raise ValueError("child failed")
+
+    set_session_vars(origin_turn_id="source-turn", origin_conversation_id="source-conversation")
+    wrapped = propagate_origin_context_to_thread(observe)
+
+    def worker():
+        set_session_vars(
+            session_id="worker-session", session_key="worker-approval",
+            origin_turn_id="previous-turn", origin_conversation_id="previous-conversation",
+        )
+        if raises:
+            with pytest.raises(ValueError, match="child failed"):
+                wrapped()
+        else:
+            wrapped()
+        return (get_session_env("HERMES_ORIGIN_TURN_ID"), get_session_env("HERMES_ORIGIN_CONVERSATION_ID"))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        assert executor.submit(worker).result() == ("previous-turn", "previous-conversation")
+        assert executor.submit(worker).result() == ("previous-turn", "previous-conversation")
+    assert observed == [("source-turn", "source-conversation", "worker-session", "worker-approval")] * 2
+
 MINE = dict(
     session_key="agent:main:discord:thread:MINE:MINE",
     platform="discord",
