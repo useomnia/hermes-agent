@@ -425,6 +425,18 @@ MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
+def _tool_call_executes(agent: Any, tool_call_id: str) -> bool:
+    """Whether a started tool call runs, rather than being refused unexecuted.
+
+    The conversation loop lists a refused call (a tool the run does not offer,
+    or a call skipped beside an invalid one) in ``unexecuted_tool_call_ids``
+    while its callbacks fire. Such a call keeps its function-call item, but its
+    arguments never become a client card.
+    """
+    unexecuted = getattr(agent, "unexecuted_tool_call_ids", None)
+    return not (isinstance(unexecuted, set) and tool_call_id in unexecuted)
+
+
 def _project_custom_tool_inputs(function_name: str, function_args: Any) -> dict[str, Any]:
     """Copy allowlisted tool inputs onto client-visible progress events."""
     output_key = _CUSTOM_TOOL_INPUT_KEYS.get(function_name)
@@ -5274,7 +5286,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "toolCallId": tool_call_id,
                     "status": "running",
                 }
-                progress.update(_project_custom_tool_inputs(function_name, function_args))
+                if _tool_call_executes(agent_ref[0], tool_call_id):
+                    progress.update(_project_custom_tool_inputs(function_name, function_args))
                 _stream_q.put(("__tool_progress__", progress))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
@@ -9084,7 +9097,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 emitter.semantic_tool_start(tool_call_id, tool_name)
 
         def _emit_tool_start(
-            tool_call_id: str, tool_name: str, function_args: Dict[str, Any]
+            tool_call_id: str,
+            tool_name: str,
+            function_args: Dict[str, Any],
+            executes: bool = True,
         ) -> None:
             nonlocal strip_tool_separator_on_next_message
             if not tool_call_id or not tool_name or tool_name.startswith("_"):
@@ -9101,12 +9117,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     # this execution proves the in-progress item is real.
                     abandoned_pending_tool_call_ids.discard(tool_call_id)
                     early_generating_tool_call_ids.discard(tool_call_id)
-                    emitter.function_call_arguments(
-                        tool_call_id, tool_name,
-                        copy.deepcopy(function_args)
-                        if isinstance(function_args, dict)
-                        else {},
-                    )
+                    if executes:
+                        emitter.function_call_arguments(
+                            tool_call_id, tool_name,
+                            copy.deepcopy(function_args)
+                            if isinstance(function_args, dict)
+                            else {},
+                        )
                     _start_complete_brand_setup_progress(tool_call_id, tool_name)
                 elif semantic_tool_calls.get(tool_call_id) != tool_name:
                     # Tool Search keeps the provider-authored ``tool_call``
@@ -9124,7 +9141,8 @@ class APIServerAdapter(BasePlatformAdapter):
             args_copy = copy.deepcopy(function_args) if isinstance(function_args, dict) else {}
             started_tool_calls[tool_call_id] = (tool_name, args_copy)
             emitter.function_call_start(tool_call_id, tool_name)
-            emitter.function_call_arguments(tool_call_id, tool_name, args_copy)
+            if executes:
+                emitter.function_call_arguments(tool_call_id, tool_name, args_copy)
             _start_complete_brand_setup_progress(tool_call_id, tool_name)
 
         def _emit_tool_generation_start(
@@ -9192,12 +9210,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
         def _tool_start_cb(tool_call_id, tool_name, function_args) -> None:
+            # Read while the callback runs: the conversation loop lists a
+            # refused call only for the duration of its callbacks.
+            call_id = str(tool_call_id or "")
+            executes = _tool_call_executes(self._active_run_agents.get(run_id), call_id)
             try:
                 loop.call_soon_threadsafe(
                     _emit_tool_start,
-                    str(tool_call_id or ""),
+                    call_id,
                     str(tool_name or ""),
                     copy.deepcopy(function_args) if isinstance(function_args, dict) else {},
+                    executes,
                 )
             except RuntimeError:
                 pass
