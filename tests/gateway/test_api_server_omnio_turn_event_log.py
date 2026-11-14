@@ -12,6 +12,7 @@ import asyncio
 import json
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -4040,6 +4041,111 @@ async def test_runs_default_interaction_policy_allows_async_delegation() -> None
 
     assert started.status == 202
     assert captured["delegation_sync_only"] == ""
+
+
+_QUESTION = {"kind": "choice", "question": "Which page first?", "options": ["A", "B"]}
+
+
+def _agent_refusing_question_call(**kwargs: Any) -> MagicMock:
+    """An agent whose model calls ``request_user_input`` and has it refused.
+
+    The refusal goes through the conversation loop's own path for a call that
+    never reaches the executor, as for a tool the run does not offer.
+    """
+    from agent.conversation_loop import _emit_unexecuted_tool_call_callbacks
+
+    holder: Dict[str, MagicMock] = {}
+
+    def run(**_kwargs: Any) -> Dict[str, Any]:
+        call = SimpleNamespace(
+            id="call-q",
+            function=SimpleNamespace(
+                name="request_user_input", arguments=json.dumps(_QUESTION)
+            ),
+        )
+        _emit_unexecuted_tool_call_callbacks(
+            holder["agent"],
+            call,
+            "Tool 'request_user_input' does not exist. Available tools: terminal",
+        )
+        return {"final_response": "done", "messages": []}
+
+    agent = _agent(run)
+    agent.tool_progress_callback = kwargs.get("tool_progress_callback")
+    agent.tool_start_callback = kwargs["tool_start_callback"]
+    agent.tool_complete_callback = kwargs["tool_complete_callback"]
+    agent.unexecuted_tool_call_ids = set()
+    holder["agent"] = agent
+    return agent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["forbid", "allow"])
+async def test_runs_refused_question_call_opens_no_card(policy: str) -> None:
+    """A question call that never executes never reaches the client as a card."""
+    adapter = _make_adapter()
+
+    with patch.object(adapter, "_create_agent", side_effect=_agent_refusing_question_call):
+        _started, events = await _run_without_http_server(
+            adapter,
+            {"input": "ask", "session_id": f"session-{policy}", "interaction_policy": policy},
+        )
+
+    assert "response.omnio.interaction" not in [event["type"] for event in events]
+
+
+@pytest.mark.asyncio
+async def test_runs_refused_question_call_keeps_its_function_call_item() -> None:
+    """The refused call itself stays in the transcript, with its error result."""
+    adapter = _make_adapter()
+
+    with patch.object(adapter, "_create_agent", side_effect=_agent_refusing_question_call):
+        _started, events = await _run_without_http_server(
+            adapter,
+            {"input": "ask", "session_id": "session-refused", "interaction_policy": "forbid"},
+        )
+
+    assert [
+        event["item"]["call_id"]
+        for event in events
+        if event["type"] == "response.output_item.added"
+        and event["item"].get("type") == "function_call"
+    ] == ["call-q"]
+
+
+@pytest.mark.asyncio
+async def test_runs_executed_question_call_opens_its_card() -> None:
+    """A question call the run offers and executes still opens its card."""
+    adapter = _make_adapter()
+
+    def create_agent(**kwargs: Any) -> MagicMock:
+        tool_start = kwargs["tool_start_callback"]
+        tool_complete = kwargs["tool_complete_callback"]
+
+        def run(**_kwargs: Any) -> Dict[str, Any]:
+            tool_start("call-q", "request_user_input", dict(_QUESTION))
+            tool_complete(
+                "call-q",
+                "request_user_input",
+                dict(_QUESTION),
+                json.dumps({"status": "answered", "response": "A"}),
+            )
+            return {"final_response": "done", "messages": []}
+
+        agent = _agent(run)
+        agent.unexecuted_tool_call_ids = set()
+        return agent
+
+    with patch.object(adapter, "_create_agent", side_effect=create_agent):
+        _started, events = await _run_without_http_server(
+            adapter, {"input": "ask", "session_id": "session-executed"}
+        )
+
+    assert [
+        event["interaction"]
+        for event in events
+        if event["type"] == "response.omnio.interaction"
+    ] == [_QUESTION]
 
 
 def _projection_events(run_id: str, store: TurnEventLogStore) -> List[Dict[str, Any]]:
