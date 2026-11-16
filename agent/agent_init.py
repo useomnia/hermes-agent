@@ -769,6 +769,10 @@ def init_agent(
     agent.tool_progress_callback = tool_progress_callback
     agent.tool_start_callback = tool_start_callback
     agent.tool_complete_callback = tool_complete_callback
+    # Tool calls whose start/complete callbacks fire while the call is
+    # refused instead of executed (see ``_emit_unexecuted_tool_call_callbacks``).
+    # A callback reads it to keep such a call's arguments off client cards.
+    agent.unexecuted_tool_call_ids = set()
     agent.suppress_status_output = False
     agent.thinking_callback = thinking_callback
     agent.reasoning_callback = reasoning_callback

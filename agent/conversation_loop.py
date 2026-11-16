@@ -790,7 +790,24 @@ def _emit_unexecuted_tool_call_callbacks(agent, tc, error_content: str) -> None:
     error/skip result here in the conversation loop without ever reaching
     the executor — an invalid-named call, or a valid-named call skipped
     because a sibling in the same batch was invalid.
+
+    The call is listed in ``agent.unexecuted_tool_call_ids`` while the
+    callbacks run, so a callback can tell it apart from a call that executes:
+    a tool the run never offered (or never ran) must not open a client card.
     """
+    tc_id = getattr(tc, "id", None)
+    unexecuted = getattr(agent, "unexecuted_tool_call_ids", None)
+    marked = isinstance(unexecuted, set) and bool(tc_id)
+    if marked:
+        unexecuted.add(tc_id)
+    try:
+        _fire_unexecuted_tool_call_callbacks(agent, tc, error_content)
+    finally:
+        if marked:
+            unexecuted.discard(tc_id)
+
+
+def _fire_unexecuted_tool_call_callbacks(agent, tc, error_content: str) -> None:
     tc_id = getattr(tc, "id", None)
     name = getattr(tc.function, "name", None) if hasattr(tc, "function") else None
     if not tc_id or not (name or "").strip():
