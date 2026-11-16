@@ -791,8 +791,18 @@ class TurnEventEmitter:
         )
 
     def function_call_arguments(
-        self, call_id: str, name: str, arguments: Dict[str, Any]
+        self,
+        call_id: str,
+        name: str,
+        arguments: Dict[str, Any],
+        *,
+        project: bool = True,
     ) -> None:
+        """Record an allowlisted call's arguments and project them to the client.
+
+        The arguments always stay on the function-call item. ``project=False``
+        keeps them off the client extension event, for a call that never runs.
+        """
         state = self._function_calls.get(call_id)
         if (
             state is None
@@ -812,7 +822,7 @@ class TurnEventEmitter:
             output_index=state["output_index"],
             delta=serialized,
         )
-        if client_projection_withheld(name, arguments):
+        if not project or client_projection_withheld(name, arguments):
             return
         extension_type, payload_key = _TOOL_EXTENSION_EVENTS[name]
         self.omnio_event(

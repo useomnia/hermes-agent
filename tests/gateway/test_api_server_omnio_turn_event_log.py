@@ -4096,7 +4096,7 @@ async def test_runs_refused_question_call_opens_no_card(policy: str) -> None:
 
 @pytest.mark.asyncio
 async def test_runs_refused_question_call_keeps_its_function_call_item() -> None:
-    """The refused call itself stays in the transcript, with its error result."""
+    """The refused call itself stays in the transcript, with its arguments."""
     adapter = _make_adapter()
 
     with patch.object(adapter, "_create_agent", side_effect=_agent_refusing_question_call):
@@ -4106,11 +4106,11 @@ async def test_runs_refused_question_call_keeps_its_function_call_item() -> None
         )
 
     assert [
-        event["item"]["call_id"]
+        (event["item"]["call_id"], json.loads(event["item"]["arguments"]))
         for event in events
-        if event["type"] == "response.output_item.added"
+        if event["type"] == "response.output_item.done"
         and event["item"].get("type") == "function_call"
-    ] == ["call-q"]
+    ] == [("call-q", _QUESTION)]
 
 
 @pytest.mark.asyncio
