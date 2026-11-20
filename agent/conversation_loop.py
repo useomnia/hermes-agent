@@ -1324,6 +1324,11 @@ def run_conversation(
     # would invalidate the cached history prefix). Follow the anchor as this
     # run grows; if compaction removes it, use the new complete tail.
     _continuation_prefill_anchor = messages[-1] if continuation and messages else None
+    preserve_user_turns = getattr(agent, "_preserve_durable_user_turns", False) is True
+    durable_user_turns = (
+        {id(message) for message in conversation_history or [] if message.get("role") == "user"}
+        if preserve_user_turns else set()
+    )
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -1500,7 +1505,9 @@ def run_conversation(
         # flush cursor (_last_flushed_db_idx) when repair compacts the list,
         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
-        repaired_seq = repair_message_sequence_with_cursor(agent, messages)
+        repaired_seq = repair_message_sequence_with_cursor(
+            agent, messages, merge_adjacent_users=not preserve_user_turns,
+        )
         if repaired_seq > 0:
             request_logger.info(
                 "Repaired %s message-alternation violations before request (session=%s)",
@@ -1509,6 +1516,7 @@ def run_conversation(
             )
 
         api_messages = []
+        continuation_prefill_index = None
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
 
@@ -1605,9 +1613,21 @@ def run_conversation(
                         if _agg_slot and _agg_slot.get("model"):
                             _sanitize_model = _agg_slot["model"]
                 agent._sanitize_tool_calls_for_strict_api(api_msg, model=_sanitize_model)
-            # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
-            # The signature field helps maintain reasoning continuity
+            if (
+                api_msg.get("role") == "user"
+                and idx > 0
+                and id(messages[idx - 1]) in durable_user_turns
+            ):
+                # A stopped Turn can leave only its User input in durable history.
+                # Keep it as context, with a separate role for the next request.
+                api_messages.append({
+                    "role": "assistant",
+                    "content": "The preceding request ended without a reply. Awaiting the next request.",
+                })
+            # Keep reasoning_details for OpenRouter's reasoning continuity.
             api_messages.append(api_msg)
+            if msg is _continuation_prefill_anchor:
+                continuation_prefill_index = len(api_messages)
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
@@ -1681,16 +1701,15 @@ def run_conversation(
             except Exception as _moa_exc:
                 logger.warning("MoA context aggregation failed: %s", _moa_exc)
 
+        if continuation_prefill_index is not None:
+            continuation_prefill_index += int(bool(effective_system))
+        elif continuation:
+            continuation_prefill_index = len(api_messages)
         api_messages = insert_ephemeral_messages(
             api_messages,
             agent.prefill_messages,
             before_current_user=getattr(agent, "_prefill_before_current_user", False),
-            at_index=(
-                next((idx + 1 for idx, message in enumerate(messages)
-                      if message is _continuation_prefill_anchor), len(messages))
-                + int(bool(effective_system))
-                if continuation else None
-            ),
+            at_index=continuation_prefill_index,
         )
 
         # Per-turn context selection hook (additive, no-op by default).

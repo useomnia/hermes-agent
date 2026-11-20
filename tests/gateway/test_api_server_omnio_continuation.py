@@ -3,6 +3,7 @@
 import asyncio
 import json
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -276,6 +277,75 @@ async def test_stopped_question_history_accepts_a_new_user_message(adapter, db):
     assert len(pending) == 1
     assert json.loads(pending[0]["content"])["status"] == "pending"
     assert db.get_messages_as_conversation(SESSION) == saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_reply", [None, "Some work was completed."])
+@pytest.mark.parametrize("shared_state", [False, True])
+async def test_fresh_run_preserves_the_previous_user_turn_boundary(
+    adapter, db, monkeypatch, prior_reply, shared_state,
+):
+    from run_agent import AIAgent
+
+    db.append_message(SESSION, "user", "Run the long task.")
+    if prior_reply is not None:
+        db.append_message(SESSION, "assistant", prior_reply)
+    saved = db.get_messages_as_conversation(SESSION)
+    requests = []
+
+    def complete(**kwargs):
+        requests.append([dict(message) for message in kwargs["messages"]])
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="New reply.", reasoning=None, tool_calls=[]),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+
+    monkeypatch.setattr("run_agent.OpenAI", lambda **kwargs: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=complete))
+    ))
+
+    def build_agent(**kwargs):
+        agent = AIAgent(
+            model="test-model", api_key="test-key", base_url="http://localhost:8080/v1",
+            platform="api_server", session_id=SESSION, session_db=db,
+            max_iterations=3, quiet_mode=True, skip_memory=True,
+        )
+        agent._disable_streaming = True
+        agent.prefill_messages = kwargs["prefill_messages"] or []
+        agent._prefill_before_current_user = kwargs["prefill_before_current_user"]
+        return agent
+
+    body = {"input": "Reply in one sentence.", **_identity("new-turn")}
+    if shared_state:
+        body["ag_ui_state"] = {"form": "latest"}
+    with patch.object(adapter, "_create_agent", side_effect=build_agent):
+        async with TestClient(TestServer(_app(adapter))) as client:
+            response = await client.post("/v1/runs", headers=AUTH, json=body)
+            assert response.status == 202, await response.text()
+            run_id = (await response.json())["run_id"]
+            events = await client.get(f"/v1/runs/{run_id}/events", headers=AUTH)
+            await events.text()
+
+    sent = [message for message in requests[0] if message["role"] != "system"]
+    assert [message["role"] for message in sent] == ["user", "assistant", "user"]
+    assert sent[0]["content"] == "Run the long task."
+    if shared_state:
+        assert '<ag-ui-shared-state>{"form":"latest"}</ag-ui-shared-state>' in sent[2]["content"]
+        assert sent[2]["content"].endswith("Reply in one sentence.")
+    else:
+        assert sent[2]["content"] == "Reply in one sentence."
+    if prior_reply is None:
+        assert "ended without a reply" in sent[1]["content"]
+    else:
+        assert sent[1]["content"] == prior_reply
+    durable = db.get_messages_as_conversation(SESSION)
+    assert durable[:len(saved)] == saved
+    assert [(m["role"], m["content"]) for m in durable[len(saved):]] == [
+        ("user", "Reply in one sentence."), ("assistant", "New reply."),
+    ]
 
 
 @pytest.mark.asyncio

@@ -472,7 +472,9 @@ def note_turn_persisted(agent):
     agent._inflight_turn_session_id = None
 
 
-def repair_message_sequence(agent, messages: List[Dict]) -> int:
+def repair_message_sequence(
+    agent, messages: List[Dict], *, merge_adjacent_users: bool = True
+) -> int:
     """Collapse malformed role-alternation left in the live history.
 
     Providers (OpenAI, OpenRouter, Anthropic) expect strict alternation:
@@ -503,7 +505,7 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
       1. Stray ``tool`` messages whose ``tool_call_id`` doesn't match
          any preceding assistant tool_call — dropped.
       2. Consecutive ``user`` messages — merged with newline separator
-         so no user input is lost.
+         unless the caller preserves durable Turn boundaries in its API copy.
 
     Deliberately does NOT rewind orphan ``assistant(tool_calls)+tool``
     pairs that precede a user message — that pattern IS valid when the
@@ -652,6 +654,11 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 known_tool_ids = set()
             filtered.append(msg)
 
+    if not merge_adjacent_users:
+        if repairs:
+            messages[:] = filtered
+        return repairs
+
     # Pass 2: merge consecutive user messages. Preserves all user input
     # so nothing the user typed is lost.
     merged: List[Dict] = []
@@ -691,7 +698,9 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     return repairs
 
 
-def repair_message_sequence_with_cursor(agent, messages: List[Dict]) -> int:
+def repair_message_sequence_with_cursor(
+    agent, messages: List[Dict], *, merge_adjacent_users: bool = True
+) -> int:
     """Run :func:`repair_message_sequence` and keep the SessionDB flush
     cursor consistent with the compacted list (#44837).
 
@@ -715,7 +724,7 @@ def repair_message_sequence_with_cursor(agent, messages: List[Dict]) -> int:
     if isinstance(flush_cursor, int) and flush_cursor > 0:
         pre_repair_flushed_ids = {id(m) for m in messages[:flush_cursor]}
 
-    repairs = repair_message_sequence(agent, messages)
+    repairs = repair_message_sequence(agent, messages, merge_adjacent_users=merge_adjacent_users)
 
     if repairs > 0 and hasattr(agent, "_last_flushed_db_idx"):
         if pre_repair_flushed_ids is not None:
