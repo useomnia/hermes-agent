@@ -8655,7 +8655,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # gateways retain the legacy body/response/input history precedence.
         conversation_history: List[Dict[str, str]] = []
         stored_session_id = None
-        if explicit_session_id and self._api_key:
+        uses_session_history = bool(explicit_session_id and self._api_key)
+        if uses_session_history:
             conversation_history = await self._conversation_history_for_session(
                 explicit_session_id
             )
@@ -9446,6 +9447,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
 
                 agent = await self._run_in_executor_tracked(_build_agent)
+                agent._preserve_durable_user_turns = uses_session_history and turn_id is not None
                 agent.context_notes_callback = _context_notes_cb
 
                 def _memory_review_cb(summary: str) -> None:
