@@ -39,6 +39,7 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent.context_notes import context_note_message, is_context_note_only
 from agent.display import (
     KawaiiSpinner,
     build_tool_preview,
@@ -1310,8 +1311,6 @@ def run_conversation(
                 if message.get("role") == "tool"
             }
             if _continuation_boundary_tool_call_ids <= resolved_ids:
-                from agent.context_notes import context_note_message
-
                 receipts = (_metadata or {}).get("_omnio_continuation_notes", {})
                 pending_notes = [note for receipt in receipts.values() if receipt.get("deferred")
                                  for note in receipt["notes"]]
@@ -1517,6 +1516,7 @@ def run_conversation(
 
         api_messages = []
         continuation_prefill_index = None
+        follows_durable_user = False
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
 
@@ -1613,17 +1613,17 @@ def run_conversation(
                         if _agg_slot and _agg_slot.get("model"):
                             _sanitize_model = _agg_slot["model"]
                 agent._sanitize_tool_calls_for_strict_api(api_msg, model=_sanitize_model)
-            if (
-                api_msg.get("role") == "user"
-                and idx > 0
-                and id(messages[idx - 1]) in durable_user_turns
-            ):
-                # A stopped Turn can leave only its User input in durable history.
-                # Keep it as context, with a separate role for the next request.
-                api_messages.append({
-                    "role": "assistant",
-                    "content": "The preceding request ended without a reply. Awaiting the next request.",
-                })
+            if preserve_user_turns:
+                if api_msg.get("role") != "user":
+                    follows_durable_user = False
+                elif not is_context_note_only(msg.get("content")):
+                    # App notes travel as user-role data and do not start a Turn.
+                    if follows_durable_user:
+                        api_messages.append({
+                            "role": "assistant",
+                            "content": "The preceding request ended without a reply. Awaiting the next request.",
+                        })
+                    follows_durable_user = id(msg) in durable_user_turns
             # Keep reasoning_details for OpenRouter's reasoning continuity.
             api_messages.append(api_msg)
             if msg is _continuation_prefill_anchor:

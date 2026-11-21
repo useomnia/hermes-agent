@@ -279,18 +279,9 @@ async def test_stopped_question_history_accepts_a_new_user_message(adapter, db):
     assert db.get_messages_as_conversation(SESSION) == saved
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("prior_reply", [None, "Some work was completed."])
-@pytest.mark.parametrize("shared_state", [False, True])
-async def test_fresh_run_preserves_the_previous_user_turn_boundary(
-    adapter, db, monkeypatch, prior_reply, shared_state,
-):
+async def _capture_run_model_messages(adapter, db, monkeypatch, body):
     from run_agent import AIAgent
 
-    db.append_message(SESSION, "user", "Run the long task.")
-    if prior_reply is not None:
-        db.append_message(SESSION, "assistant", prior_reply)
-    saved = db.get_messages_as_conversation(SESSION)
     requests = []
 
     def complete(**kwargs):
@@ -318,9 +309,6 @@ async def test_fresh_run_preserves_the_previous_user_turn_boundary(
         agent._prefill_before_current_user = kwargs["prefill_before_current_user"]
         return agent
 
-    body = {"input": "Reply in one sentence.", **_identity("new-turn")}
-    if shared_state:
-        body["ag_ui_state"] = {"form": "latest"}
     with patch.object(adapter, "_create_agent", side_effect=build_agent):
         async with TestClient(TestServer(_app(adapter))) as client:
             response = await client.post("/v1/runs", headers=AUTH, json=body)
@@ -329,7 +317,25 @@ async def test_fresh_run_preserves_the_previous_user_turn_boundary(
             events = await client.get(f"/v1/runs/{run_id}/events", headers=AUTH)
             await events.text()
 
-    sent = [message for message in requests[0] if message["role"] != "system"]
+    return [message for message in requests[0] if message["role"] != "system"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_reply", [None, "Some work was completed."])
+@pytest.mark.parametrize("shared_state", [False, True])
+async def test_fresh_run_preserves_the_previous_user_turn_boundary(
+    adapter, db, monkeypatch, prior_reply, shared_state,
+):
+    db.append_message(SESSION, "user", "Run the long task.")
+    if prior_reply is not None:
+        db.append_message(SESSION, "assistant", prior_reply)
+    saved = db.get_messages_as_conversation(SESSION)
+    body = {"input": "Reply in one sentence.", **_identity("new-turn")}
+    if shared_state:
+        body["ag_ui_state"] = {"form": "latest"}
+
+    sent = await _capture_run_model_messages(adapter, db, monkeypatch, body)
+
     assert [message["role"] for message in sent] == ["user", "assistant", "user"]
     assert sent[0]["content"] == "Run the long task."
     if shared_state:
@@ -346,6 +352,58 @@ async def test_fresh_run_preserves_the_previous_user_turn_boundary(
     assert [(m["role"], m["content"]) for m in durable[len(saved):]] == [
         ("user", "Reply in one sentence."), ("assistant", "New reply."),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared_state", [False, True])
+async def test_late_answer_sends_context_notes_after_the_tool_result(
+    adapter, db, monkeypatch, shared_state,
+):
+    from agent.context_notes import context_note_message
+
+    db.append_message(SESSION, "user", "Ask me before continuing.")
+    db.append_message(
+        SESSION, "assistant", "", tool_calls=[_call("q1", "request_user_input")]
+    )
+    notes = ["This Conversation belongs to Project Alpha.", "Project Alpha changed."]
+    body = _continue(continuation={
+        "close": {"kind": "answer", "tool_call_id": "q1", "response": "Blue"},
+        "notes": notes,
+    })
+    if shared_state:
+        body["ag_ui_state"] = {"form": "latest"}
+
+    sent = await _capture_run_model_messages(adapter, db, monkeypatch, body)
+
+    assert [message["role"] for message in sent] == ["user", "assistant", "tool", "user"]
+    assert sent[0]["content"] == "Ask me before continuing."
+    assert sent[2]["tool_call_id"] == "q1"
+    assert json.loads(sent[2]["content"]) == {"status": "answered", "response": "Blue"}
+    note_text = "\n\n".join(context_note_message(note)["content"] for note in notes)
+    assert sent[3]["content"].startswith(note_text)
+    if shared_state:
+        assert sent[3]["content"].endswith('<ag-ui-shared-state>{"form":"latest"}</ag-ui-shared-state>')
+    else:
+        assert sent[3]["content"] == note_text
+
+
+@pytest.mark.asyncio
+async def test_saved_note_leaves_the_stopped_user_turn_boundary_intact(adapter, db, monkeypatch):
+    from agent.context_notes import context_note_message
+
+    db.append_message(SESSION, "user", "Run the long task.")
+    note = context_note_message("Project Alpha changed.")["content"]
+    db.append_message(SESSION, "user", note)
+    saved = db.get_messages_as_conversation(SESSION)
+    body = {"input": "Reply in one sentence.", **_identity("new-turn")}
+
+    sent = await _capture_run_model_messages(adapter, db, monkeypatch, body)
+
+    assert [message["role"] for message in sent] == ["user", "assistant", "user"]
+    assert sent[0]["content"] == f"Run the long task.\n\n{note}"
+    assert "ended without a reply" in sent[1]["content"]
+    assert sent[2]["content"] == "Reply in one sentence."
+    assert db.get_messages_as_conversation(SESSION)[:len(saved)] == saved
 
 
 @pytest.mark.asyncio

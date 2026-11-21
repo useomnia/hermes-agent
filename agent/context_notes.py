@@ -39,3 +39,17 @@ def context_note_message(note: str) -> dict[str, str]:
         "role": "user",
         "content": f"{CONTEXT_NOTE_OPEN}\n{content}\n{CONTEXT_NOTE_CLOSE}",
     }
+
+
+def is_context_note_only(content: object) -> bool:
+    """Recognize app facts carried in a user-role message without a User's input."""
+    opening = CONTEXT_NOTE_OPEN + "\n"
+    closing = "\n" + CONTEXT_NOTE_CLOSE
+    if not isinstance(content, str) or not content.startswith(opening):
+        return False
+    while content.startswith(opening):
+        _, closed, content = content.partition(closing)
+        if not closed:
+            return False
+        content = content.lstrip()
+    return not content
