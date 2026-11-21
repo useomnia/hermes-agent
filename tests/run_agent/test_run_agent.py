@@ -9001,6 +9001,17 @@ class TestSupportsReasoningExtraBody:
             agent.model = model
             assert agent._supports_reasoning_extra_body() is True, model
 
+    def test_meta_models_are_treated_as_reasoning_capable(self):
+        agent = self._make_agent()
+        for model in ("meta/muse-ember", "meta/muse-spark-1.3", "meta/muse-glimmer-30b"):
+            agent.model = model
+            assert agent._supports_reasoning_extra_body() is True, model
+
+    def test_meta_llama_models_stay_outside_the_meta_prefix(self):
+        agent = self._make_agent()
+        agent.model = "meta-llama/llama-4-maverick"
+        assert agent._supports_reasoning_extra_body() is False
+
 
 class TestMemoryContextSanitization:
     """sanitize_context() helper correctness — used at provider boundaries."""
